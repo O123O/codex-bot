@@ -20,4 +20,32 @@ export class RuntimeStore {
       ...(row.delivery_cursor ? { deliveryCursor: String(row.delivery_cursor) } : {}),
     };
   }
+
+  listSessions(): Array<{ endpointId: string; threadId: string; managementState: ManagementState; nativeStatus: string }> {
+    return (this.db.prepare("SELECT endpoint_id, thread_id, management_state, native_status FROM session_runtime").all() as Array<Record<string, unknown>>).map((row) => ({
+      endpointId: String(row.endpoint_id), threadId: String(row.thread_id), managementState: String(row.management_state) as ManagementState, nativeStatus: String(row.native_status),
+    }));
+  }
+
+  beginEpoch(endpointId: string, threadId: string, baselineTurnId: string | undefined, startedAt: number): string {
+    const id = `epoch_${crypto.randomUUID()}`;
+    this.db.prepare("INSERT INTO managed_epochs(id, endpoint_id, thread_id, baseline_turn_id, started_at) VALUES (?, ?, ?, ?, ?)")
+      .run(id, endpointId, threadId, baselineTurnId ?? null, startedAt);
+    return id;
+  }
+
+  endEpoch(endpointId: string, threadId: string, endedAt: number): void {
+    this.db.prepare("UPDATE managed_epochs SET ended_at = ? WHERE id = (SELECT id FROM managed_epochs WHERE endpoint_id = ? AND thread_id = ? AND ended_at IS NULL ORDER BY started_at DESC LIMIT 1)")
+      .run(endedAt, endpointId, threadId);
+  }
+
+  currentEpoch(endpointId: string, threadId: string): { id: string; baselineTurnId?: string; startedAt: number } | undefined {
+    const row = this.db.prepare("SELECT * FROM managed_epochs WHERE endpoint_id = ? AND thread_id = ? AND ended_at IS NULL ORDER BY started_at DESC LIMIT 1").get(endpointId, threadId) as Record<string, unknown> | undefined;
+    return row ? { id: String(row.id), ...(row.baseline_turn_id ? { baselineTurnId: String(row.baseline_turn_id) } : {}), startedAt: Number(row.started_at) } : undefined;
+  }
+
+  latestEpoch(endpointId: string, threadId: string): { id: string; baselineTurnId?: string; startedAt: number; endedAt?: number } | undefined {
+    const row = this.db.prepare("SELECT * FROM managed_epochs WHERE endpoint_id = ? AND thread_id = ? ORDER BY started_at DESC LIMIT 1").get(endpointId, threadId) as Record<string, unknown> | undefined;
+    return row ? { id: String(row.id), ...(row.baseline_turn_id ? { baselineTurnId: String(row.baseline_turn_id) } : {}), startedAt: Number(row.started_at), ...(row.ended_at ? { endedAt: Number(row.ended_at) } : {}) } : undefined;
+  }
 }
