@@ -70,6 +70,27 @@ export class OperationStore {
     return { id, state: "prepared" };
   }
 
+  get(id: string): OperationRecord | undefined {
+    const row = this.db.prepare("SELECT id, state, receipt_json FROM operations WHERE id = ?").get(id) as Record<string, unknown> | undefined;
+    return row ? { id: String(row.id), state: String(row.state) as OperationState, ...(row.receipt_json ? { receipt: JSON.parse(String(row.receipt_json)) } : {}) } : undefined;
+  }
+
+  replayDirective(contextId: string, kind: string, binding: unknown): OperationRecord | undefined {
+    const row = this.db.prepare("SELECT kind, binding_hash, operation_id FROM directive_consumptions WHERE context_id = ?").get(contextId) as Record<string, unknown> | undefined;
+    if (!row) return undefined;
+    if (String(row.kind) !== kind || String(row.binding_hash) !== hash(binding)) {
+      throw new AppError("DIRECTIVE_ALREADY_CONSUMED", "directive authorization was already consumed with a different target, mode, or arguments");
+    }
+    return this.get(String(row.operation_id));
+  }
+
+  bindDirective(contextId: string, kind: string, binding: unknown, operationId: string): void {
+    const replay = this.replayDirective(contextId, kind, binding);
+    if (replay) return;
+    this.db.prepare("INSERT INTO directive_consumptions(context_id, kind, binding_hash, operation_id, created_at) VALUES (?, ?, ?, ?, ?)")
+      .run(contextId, kind, hash(binding), operationId, Date.now());
+  }
+
   markDispatched(id: string): void {
     this.setState(id, "dispatched");
   }

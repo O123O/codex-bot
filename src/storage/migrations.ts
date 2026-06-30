@@ -43,6 +43,13 @@ export const migrations = [
     updated_at INTEGER NOT NULL,
     UNIQUE(context_id, attempt_id, call_id, kind)
   );
+  CREATE TABLE IF NOT EXISTS directive_consumptions (
+    context_id TEXT PRIMARY KEY REFERENCES source_contexts(id),
+    kind TEXT NOT NULL,
+    binding_hash TEXT NOT NULL,
+    operation_id TEXT NOT NULL REFERENCES operations(id),
+    created_at INTEGER NOT NULL
+  );
 
   CREATE TABLE IF NOT EXISTS deliveries (
     id TEXT PRIMARY KEY,
