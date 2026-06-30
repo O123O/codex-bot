@@ -31,6 +31,10 @@ export class RuntimeStore {
     return row?.active_turn_id ?? undefined;
   }
 
+  setDeliveryCursor(endpointId: string, threadId: string, cursor: string): void {
+    this.db.prepare("UPDATE session_runtime SET delivery_cursor = ? WHERE endpoint_id = ? AND thread_id = ?").run(cursor, endpointId, threadId);
+  }
+
   setModel(endpointId: string, threadId: string, model: string): void {
     this.db.prepare("UPDATE session_runtime SET model = ? WHERE endpoint_id = ? AND thread_id = ?").run(model, endpointId, threadId);
   }

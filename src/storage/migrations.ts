@@ -23,6 +23,7 @@ export const migrations = [
     id TEXT PRIMARY KEY,
     context_id TEXT NOT NULL REFERENCES source_contexts(id),
     turn_id TEXT,
+    trigger_kind TEXT NOT NULL DEFAULT 'user',
     state TEXT NOT NULL,
     created_at INTEGER NOT NULL
   );
