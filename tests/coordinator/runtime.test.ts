@@ -33,3 +33,14 @@ test("post-dispatch coordinator failure creates one recovery context with receip
   assert.equal(first?.kind, "recovery");
   assert.match(first?.rawText ?? "", /uncertain/);
 });
+
+test("coordinator context exists before turn/start dispatch and later binds the real turn id", () => {
+  const db = createTestDatabase();
+  const operations = new OperationStore(db);
+  operations.createSourceContext({ id: "ctx", kind: "telegram", sourceId: "4", rawText: "go", attachmentIds: [] });
+  const runtime = new CoordinatorRuntime(db, operations, new DeliveryStore(db), { destination: "1" });
+  runtime.prepareAttempt("ctx", "attempt", "user");
+  assert.equal(runtime.current()?.turnId, "pending:attempt");
+  runtime.bindTurn("attempt", "real-turn");
+  assert.equal(runtime.current()?.turnId, "real-turn");
+});

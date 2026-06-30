@@ -32,20 +32,25 @@ export class LocalEndpoint {
       stdio: ["pipe", "pipe", "pipe"],
     });
     this.child = child;
-    this.client = new JsonRpcClient(child.stdout, child.stdin, { requestTimeoutMs: this.options.requestTimeoutMs ?? 30_000 });
-    this.client.onNotification((method, params) => this.events.emit("notification", method, params));
-    this.client.onServerRequest((request) => this.handleServerRequest(request));
+    const client = new JsonRpcClient(child.stdout, child.stdin, { requestTimeoutMs: this.options.requestTimeoutMs ?? 30_000 });
+    this.client = client;
+    client.onNotification((method, params) => this.events.emit("notification", method, params));
+    client.onServerRequest((request) => this.handleServerRequest(request));
     child.once("exit", () => {
-      this.client?.close(new Error("app-server process exited"));
-      if (this.state !== "stopped") this.state = "unavailable";
-      this.events.emit("unavailable");
+      client.close(new Error("app-server process exited"));
+      if (this.child === child) {
+        delete this.child;
+        if (this.client === client) delete this.client;
+        if (this.state !== "stopped") this.state = "unavailable";
+        this.events.emit("unavailable");
+      }
     });
     try {
-      await this.client.request("initialize", {
+      await client.request("initialize", {
         clientInfo: { name: "codex_chat_bot", title: "Codex Chat Bot", version: "0.1.0" },
         capabilities: { experimentalApi: true },
       });
-      this.client.notify("initialized", {});
+      client.notify("initialized", {});
       this.state = "ready";
       this.events.emit("ready");
     } catch (error) {

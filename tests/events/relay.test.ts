@@ -71,3 +71,9 @@ test("ready reconciliation reads history after baseline and advances a durable c
   assert.deepEqual(deliveries.listReady().map((item) => item.body), ["[payments] done"]);
 });
 
+test("terminal notification with partial items reads the authoritative completed turn", async () => {
+  const { endpoint, deliveries, relay } = await fixture();
+  endpoint.turns = [terminal("readback", "completed", "from history")];
+  await relay.handleNotification("local", "turn/completed", { threadId: "worker", turn: terminal("readback", "completed", "") });
+  assert.deepEqual(deliveries.listReady().map((item) => item.body), ["[payments] from history"]);
+});

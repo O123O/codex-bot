@@ -3,6 +3,20 @@ import type { BotConfig } from "./config.ts";
 export interface BotApp { start(): Promise<void>; stop(): Promise<void> }
 export interface AppPhase { name: string; start(): Promise<void>; stop(): Promise<void> }
 
+export class TerminalInbox<T> {
+  private readonly values = new Map<string, T>();
+  constructor(private readonly maxEntries = 100) {}
+  publish(turnId: string, value: T): void {
+    this.values.set(turnId, value);
+    if (this.values.size > this.maxEntries) this.values.delete(this.values.keys().next().value!);
+  }
+  take(turnId: string): T | undefined {
+    const value = this.values.get(turnId);
+    this.values.delete(turnId);
+    return value;
+  }
+}
+
 interface TimerApi {
   setInterval(callback: () => void, ms: number): unknown;
   clearInterval(handle: any): void;

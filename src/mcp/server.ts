@@ -122,6 +122,8 @@ export function buildCodexChildEnvironment(host: NodeJS.ProcessEnv, mcpToken: st
 export function coordinatorTurnConfig(mcpUrl: string, _mcpToken: string): Record<string, unknown> {
   return {
     mcp_servers: { codex_bot_manager: { url: mcpUrl, bearer_token_env_var: "CODEX_BOT_MCP_TOKEN" } },
-    shell_environment_policy: { exclude: ["CODEX_BOT_MCP_TOKEN", "TELEGRAM_BOT_TOKEN", "TELEGRAM_OWNER_ID", "TELEGRAM_DESTINATION_CHAT_ID"] },
+    allow_login_shell: false,
+    "shell_environment_policy.inherit": "core",
+    "shell_environment_policy.exclude": ["CODEX_BOT_MCP_TOKEN", "TELEGRAM_BOT_TOKEN", "TELEGRAM_OWNER_ID", "TELEGRAM_DESTINATION_CHAT_ID"],
   };
 }

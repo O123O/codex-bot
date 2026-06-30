@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { composeApp, type AppPhase } from "../src/app.ts";
+import { composeApp, TerminalInbox, type AppPhase } from "../src/app.ts";
 
 test("composition starts in order, starts each worker once, and stops in reverse", async () => {
   const events: string[] = [];
@@ -40,4 +40,11 @@ test("maintenance scheduling is deterministic and stops cleanly", async () => {
   await app.stop();
   assert.deepEqual(events, ["maintain"]);
   assert.equal(clears, 1);
+});
+
+test("terminal inbox preserves a completion that precedes attempt registration", () => {
+  const inbox = new TerminalInbox<{ status: string }>();
+  inbox.publish("turn", { status: "completed" });
+  assert.deepEqual(inbox.take("turn"), { status: "completed" });
+  assert.equal(inbox.take("turn"), undefined);
 });

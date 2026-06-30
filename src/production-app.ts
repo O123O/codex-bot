@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import { AttachmentStore } from "./attachments/store.ts";
 import { LocalEndpoint } from "./app-server/local-endpoint.ts";
 import { AppServerPool } from "./app-server/pool.ts";
-import { composeApp, type AppPhase, type BotApp } from "./app.ts";
+import { composeApp, TerminalInbox, type AppPhase, type BotApp } from "./app.ts";
 import type { BotConfig } from "./config.ts";
 import { CoordinatorNotebook } from "./coordinator/notebook.ts";
 import { CoordinatorRuntime } from "./coordinator/runtime.ts";
@@ -57,6 +57,7 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
   let acceptingReadyEvents = false;
   const unsubscribers: Array<() => void> = [];
   const terminalWaiters = new Map<string, { resolve(): void; reject(error: unknown): void; eventIds: string[] }>();
+  const earlyCoordinatorTerminals = new TerminalInbox<any>();
   const enqueuedEvents = new Set<string>();
 
   const phases: AppPhase[] = [
@@ -220,32 +221,43 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
     const input: any[] = [{ type: "text", text: isInternal ? `Project session event metadata:\n${source.rawText}` : source.rawText, text_elements: [] }];
     if (!isInternal) input.push(...source.attachmentIds.map((id) => attachments.toUserInput(contextId, id as any)));
     const attemptId = `attempt_${crypto.randomUUID()}`;
+    coordinator.prepareAttempt(contextId, attemptId, isInternal ? "internal" : "user");
     const response = await pool.startTurn<any>(identity.endpoint, { threadId: identity.thread_id, clientUserMessageId: contextId, input });
     const turnId = String(response.turn.id);
-    if (isInternal) coordinator.beginInternalAttempt(contextId, attemptId, turnId); else coordinator.beginUserAttempt(contextId, attemptId, turnId);
-    await new Promise<void>((resolvePromise, rejectPromise) => terminalWaiters.set(turnId, { resolve: resolvePromise, reject: rejectPromise, eventIds }));
+    coordinator.bindTurn(attemptId, turnId);
+    const terminal = new Promise<void>((resolvePromise, rejectPromise) => terminalWaiters.set(turnId, { resolve: resolvePromise, reject: rejectPromise, eventIds }));
+    const early = earlyCoordinatorTerminals.take(turnId);
+    if (early) await processCoordinatorTerminal(early);
+    await terminal;
   }
 
   async function onNotification(method: string, params: any): Promise<void> {
     const identity = registry.snapshot().coordinator;
     if (method === "turn/completed" && params.threadId === identity.thread_id) {
-      const messages = finals.persistTerminalTurn(endpoint.id, identity.thread_id, params.turn, Date.now());
-      if (params.turn.status === "completed") coordinator.handleTerminal(params.turn.id, messages.map((message) => message.body).join("\n") || undefined);
-      else coordinator.failAttempt(params.turn.id, params.turn.error);
       pool.markTurnTerminal(endpoint.id, identity.thread_id, params.turn.id);
-      const waiter = terminalWaiters.get(params.turn.id);
-      if (waiter) {
-        if (waiter.eventIds.length > 0) {
-          const placeholders = waiter.eventIds.map(() => "?").join(",");
-          db.prepare(`UPDATE events SET state = 'processed' WHERE id IN (${placeholders})`).run(...waiter.eventIds);
-          for (const id of waiter.eventIds) enqueuedEvents.delete(id);
-        }
-        terminalWaiters.delete(params.turn.id); waiter.resolve();
-      }
+      if (!terminalWaiters.has(params.turn.id)) earlyCoordinatorTerminals.publish(params.turn.id, params);
+      else await processCoordinatorTerminal(params);
       return;
     }
     await relay.handleNotification(endpoint.id, method, params);
     await enqueuePendingEvents();
+  }
+
+  async function processCoordinatorTerminal(params: any): Promise<void> {
+    const identity = registry.snapshot().coordinator;
+    const history = await pool.request<any>(identity.endpoint, "thread/read", { threadId: identity.thread_id, includeTurns: true });
+    const turn = history.thread.turns.find((candidate: any) => candidate.id === params.turn.id) ?? params.turn;
+    const messages = finals.persistTerminalTurn(endpoint.id, identity.thread_id, turn, Date.now());
+    if (turn.status === "completed") coordinator.handleTerminal(turn.id, messages.map((message) => message.body).join("\n") || undefined);
+    else coordinator.failAttempt(turn.id, turn.error);
+    const waiter = terminalWaiters.get(turn.id);
+    if (!waiter) return;
+    if (waiter.eventIds.length > 0) {
+      const placeholders = waiter.eventIds.map(() => "?").join(",");
+      db.prepare(`UPDATE events SET state = 'processed' WHERE id IN (${placeholders})`).run(...waiter.eventIds);
+      for (const id of waiter.eventIds) enqueuedEvents.delete(id);
+    }
+    terminalWaiters.delete(turn.id); waiter.resolve();
   }
 
   async function enqueuePendingEvents(): Promise<void> {

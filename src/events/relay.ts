@@ -49,16 +49,20 @@ export class EventRelay {
         if (cursorIndex >= 0) index = Math.max(index, cursorIndex + 1);
       }
       for (const turn of turns.slice(index)) {
-        await this.handleTerminal(endpointId, session.thread_id, turn, nickname);
+        await this.handleTerminal(endpointId, session.thread_id, turn, nickname, true);
         this.runtime.setDeliveryCursor(endpointId, session.thread_id, turn.id);
       }
     }
   }
 
-  private async handleTerminal(endpointId: string, threadId: string, turn: TerminalTurn, knownNickname?: string): Promise<void> {
+  private async handleTerminal(endpointId: string, threadId: string, turn: TerminalTurn, knownNickname?: string, authoritative = false): Promise<void> {
     const state = this.runtime.getSession(endpointId, threadId);
     const nickname = knownNickname ?? this.nickname(endpointId, threadId);
     if (!nickname || state?.managementState !== "managed" || !this.runtime.currentEpoch(endpointId, threadId)) return;
+    if (!authoritative) {
+      const history = await this.pool.request<{ thread: { turns: TerminalTurn[] } }>(endpointId, "thread/read", { threadId, includeTurns: true });
+      turn = history.thread.turns.find((candidate) => candidate.id === turn.id) ?? turn;
+    }
     this.runtime.setActiveTurn(endpointId, threadId, undefined);
     this.pool.markTurnTerminal(endpointId, threadId, turn.id);
     const messages = this.finals.persistTerminalTurn(endpointId, threadId, turn, this.options.clock.now());
@@ -82,4 +86,3 @@ export class EventRelay {
     return Object.entries(this.registry.snapshot().sessions).find(([, session]) => session.endpoint === endpointId && session.thread_id === threadId)?.[0];
   }
 }
-

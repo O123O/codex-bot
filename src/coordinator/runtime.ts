@@ -13,6 +13,19 @@ export class CoordinatorRuntime {
   beginUserAttempt(contextId: string, attemptId: string, turnId: string): void { this.begin(contextId, attemptId, turnId, "user"); }
   beginInternalAttempt(contextId: string, attemptId: string, turnId: string): void { this.begin(contextId, attemptId, turnId, "internal"); }
 
+  prepareAttempt(contextId: string, attemptId: string, triggerKind: "user" | "internal"): void {
+    const provisionalTurnId = `pending:${attemptId}`;
+    this.db.prepare(`INSERT OR REPLACE INTO coordinator_attempts(id, context_id, turn_id, trigger_kind, state, created_at)
+      VALUES (?, ?, ?, ?, 'active', ?)`)
+      .run(attemptId, contextId, provisionalTurnId, triggerKind, Date.now());
+    this.active = { contextId, attemptId, turnId: provisionalTurnId, triggerKind };
+  }
+
+  bindTurn(attemptId: string, turnId: string): void {
+    this.db.prepare("UPDATE coordinator_attempts SET turn_id = ? WHERE id = ? AND state = 'active'").run(turnId, attemptId);
+    if (this.active?.attemptId === attemptId) this.active = { ...this.active, turnId };
+  }
+
   current(): ActiveCoordinatorContext | undefined { return this.active ? { ...this.active } : undefined; }
 
   handleTerminal(turnId: string, finalText?: string): void {
@@ -37,10 +50,8 @@ export class CoordinatorRuntime {
   }
 
   private begin(contextId: string, attemptId: string, turnId: string, triggerKind: "user" | "internal"): void {
-    this.db.prepare(`INSERT OR REPLACE INTO coordinator_attempts(id, context_id, turn_id, trigger_kind, state, created_at)
-      VALUES (?, ?, ?, ?, 'active', ?)`)
-      .run(attemptId, contextId, turnId, triggerKind, Date.now());
-    this.active = { contextId, attemptId, turnId, triggerKind };
+    this.prepareAttempt(contextId, attemptId, triggerKind);
+    this.bindTurn(attemptId, turnId);
   }
 
   private attempt(turnId: string): ActiveCoordinatorContext | undefined {

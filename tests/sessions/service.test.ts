@@ -19,11 +19,12 @@ class ServiceEndpoint implements AppServerEndpoint {
   readonly calls: Array<{ method: string; params: any }> = [];
   status = "idle";
   activeTurnId = "active-1";
+  lastClientId: string | undefined;
   async request<T>(method: string, params: any): Promise<T> {
     this.calls.push({ method, params });
-    if (method === "turn/start") return { turn: { id: "started-1" } } as T;
+    if (method === "turn/start") { this.lastClientId = params.clientUserMessageId; return { turn: { id: "started-1" } } as T; }
     if (method === "turn/steer") return { turnId: params.expectedTurnId } as T;
-    if (method === "thread/read") return { thread: { id: "thread", cwd: params.cwd, status: { type: this.status }, turns: [] } } as T;
+    if (method === "thread/read") return { thread: { id: "thread", cwd: params.cwd, status: { type: this.status }, turns: this.lastClientId ? [{ id: "started-1", items: [{ type: "userMessage", clientId: this.lastClientId }] }] : [] } } as T;
     if (method === "thread/goal/get") return { goal: null } as T;
     if (method === "model/list") return { data: [{ id: "gpt-5" }], nextCursor: null } as T;
     return { goal: { objective: params.objective, status: params.status } } as T;

@@ -45,3 +45,20 @@ test("failed starts and endpoint loss release capacity", async () => {
   await pool.startTurn("local", { threadId: "t2", input: [] });
 });
 
+test("a terminal notification that arrives before turn/start responds does not leak capacity", async () => {
+  let resolveStart!: (value: any) => void;
+  let reads = 0;
+  const endpoint: AppServerEndpoint = {
+    id: "local", state: "ready",
+    request: async <T>(method: string) => method === "turn/start"
+      ? new Promise<T>((resolve) => { resolveStart = resolve; })
+      : { thread: { turns: ++reads === 1 ? [] : [{ id: "turn-early", items: [{ type: "userMessage", clientId: "message-1" }] }] } } as T,
+  };
+  const pool = new AppServerPool([endpoint], { maxConcurrentTurns: 1, sleep: async () => undefined });
+  const starting = pool.startTurn("local", { threadId: "t1", clientUserMessageId: "message-1", input: [] });
+  pool.markTurnTerminal("local", "t1", "turn-early");
+  resolveStart({ turn: { id: "wrong-thread-like-id" } });
+  assert.equal((await starting).turn.id, "turn-early");
+  assert.equal(reads, 2);
+  assert.equal(pool.activeTurnCount, 0);
+});

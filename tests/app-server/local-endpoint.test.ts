@@ -43,3 +43,28 @@ test("declines approval requests and emits a blocked event", async () => {
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(blocked.length, 1);
 });
+
+test("a delayed exit from an old child cannot close a restarted endpoint", async () => {
+  class DelayedChild extends FakeChild {
+    override kill() { this.killed = true; return true; }
+    exitNow() { this.emit("exit", 0, null); }
+  }
+  const children = [new DelayedChild(), new DelayedChild()];
+  for (const child of children) {
+    child.stdin.on("data", (chunk) => {
+      const request = JSON.parse(chunk.toString()) as Record<string, unknown>;
+      if (request.method === "initialize") child.stdout.write(`${JSON.stringify({ id: request.id, result: {} })}\n`);
+      if (request.method === "model/list") child.stdout.write(`${JSON.stringify({ id: request.id, result: { data: [], nextCursor: null } })}\n`);
+    });
+  }
+  let index = 0;
+  const endpoint = new LocalEndpoint({ codexBinary: "codex", spawn: () => children[index++] as never });
+  await endpoint.start();
+  await endpoint.stop();
+  await endpoint.start();
+  children[0]!.exitNow();
+  assert.deepEqual(await endpoint.request("model/list", {}), { data: [], nextCursor: null });
+  assert.equal(endpoint.state, "ready");
+  await endpoint.stop();
+  children[1]!.exitNow();
+});
