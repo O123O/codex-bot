@@ -123,6 +123,7 @@ export const migrations = [
   );
   CREATE TABLE IF NOT EXISTS attachments (
     id TEXT PRIMARY KEY,
+    scope_id TEXT NOT NULL,
     display_name TEXT NOT NULL,
     media_type TEXT NOT NULL,
     local_path TEXT NOT NULL,
