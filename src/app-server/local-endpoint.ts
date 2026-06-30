@@ -21,7 +21,7 @@ export class LocalEndpoint {
   private client?: JsonRpcClient;
   private readonly events = new EventEmitter();
 
-  constructor(private readonly options: { codexBinary: string; spawn?: Spawn; env?: NodeJS.ProcessEnv; requestTimeoutMs?: number }) {}
+  constructor(private readonly options: { codexBinary: string; spawn?: Spawn; env?: NodeJS.ProcessEnv; requestTimeoutMs?: number; expectedVersion?: string }) {}
 
   async start(): Promise<void> {
     if (this.state === "ready") return;
@@ -32,24 +32,43 @@ export class LocalEndpoint {
       stdio: ["pipe", "pipe", "pipe"],
     });
     this.child = child;
+    child.stderr.on("data", () => { /* continuously drain; never log potentially sensitive app-server stderr */ });
     const client = new JsonRpcClient(child.stdout, child.stdin, { requestTimeoutMs: this.options.requestTimeoutMs ?? 30_000 });
     this.client = client;
     client.onNotification((method, params) => this.events.emit("notification", method, params));
     client.onServerRequest((request) => this.handleServerRequest(request));
-    child.once("exit", () => {
-      client.close(new Error("app-server process exited"));
+    child.once("error", (error) => {
+      client.close(error);
       if (this.child === child) {
         delete this.child;
         if (this.client === client) delete this.client;
-        if (this.state !== "stopped") this.state = "unavailable";
-        this.events.emit("unavailable");
+        if (this.state !== "stopped") {
+          this.state = "unavailable";
+          this.events.emit("unavailable");
+        }
+      }
+    });
+    child.once("exit", () => {
+      client.close(new Error("app-server process exited"));
+      if (this.child === child) {
+        const unexpectedly = this.state !== "stopped";
+        delete this.child;
+        if (this.client === client) delete this.client;
+        if (unexpectedly) {
+          this.state = "unavailable";
+          this.events.emit("unavailable");
+        }
       }
     });
     try {
-      await client.request("initialize", {
+      const initialized = await client.request<{ userAgent?: string }>("initialize", {
         clientInfo: { name: "codex_chat_bot", title: "Codex Chat Bot", version: "0.1.0" },
         capabilities: { experimentalApi: true },
       });
+      if (this.options.expectedVersion) {
+        const actual = /\/(\d+\.\d+\.\d+)(?:\s|\()/u.exec(initialized.userAgent ?? "")?.[1];
+        if (actual !== this.options.expectedVersion) throw new AppError("UNSUPPORTED_CAPABILITY", `expected Codex app-server ${this.options.expectedVersion}, received ${actual ?? "unknown"}`);
+      }
       client.notify("initialized", {});
       this.state = "ready";
       this.events.emit("ready");
@@ -79,6 +98,11 @@ export class LocalEndpoint {
   onReady(listener: () => void): () => void {
     this.events.on("ready", listener);
     return () => this.events.off("ready", listener);
+  }
+
+  onUnavailable(listener: () => void): () => void {
+    this.events.on("unavailable", listener);
+    return () => this.events.off("unavailable", listener);
   }
 
   onPermissionBlocked(listener: (event: PermissionBlockedEvent) => void): () => void {

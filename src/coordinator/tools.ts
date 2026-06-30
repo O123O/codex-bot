@@ -8,7 +8,7 @@ export interface ToolCallContext { sourceContextId: string; attemptId: string; t
 export type ToolHandler = (context: ToolCallContext, args: unknown) => Promise<unknown>;
 
 const nickname = z.string().min(1);
-const schemas = {
+export const COORDINATOR_TOOL_SCHEMAS = {
   list_managed_sessions: z.object({}).strict(),
   discover_sessions: z.object({ endpoint: z.string().optional(), search: z.string().optional(), cwd: z.string().optional(), cursor: z.string().optional(), limit: z.number().int().positive().max(100).optional() }).strict(),
   get_session_status: z.object({ nickname: nickname }).strict(),
@@ -33,9 +33,13 @@ const schemas = {
   send_chat_attachment: z.object({ file_handle: z.string().min(1), caption: z.string().optional(), reply_to: z.number().int().optional() }).strict(),
 } as const;
 
-export const TOOL_NAMES = Object.freeze(Object.keys(schemas)) as readonly (keyof typeof schemas)[];
-export type CoordinatorToolName = keyof typeof schemas;
+export const TOOL_NAMES = Object.freeze(Object.keys(COORDINATOR_TOOL_SCHEMAS)) as readonly (keyof typeof COORDINATOR_TOOL_SCHEMAS)[];
+export type CoordinatorToolName = keyof typeof COORDINATOR_TOOL_SCHEMAS;
 type Action = (args: any, context: ToolCallContext) => Promise<any>;
+
+export const READ_ONLY_TOOLS = new Set<CoordinatorToolName>([
+  "list_managed_sessions", "discover_sessions", "get_session_status", "read_worker_message", "list_models", "get_goal",
+]);
 
 export function createCoordinatorTools(
   operations: OperationStore,
@@ -45,7 +49,7 @@ export function createCoordinatorTools(
   const result = {} as Record<CoordinatorToolName, ToolHandler>;
   for (const name of TOOL_NAMES) {
     result[name] = async (context, raw) => {
-      const args = schemas[name].parse(raw) as any;
+      const args = COORDINATOR_TOOL_SCHEMAS[name].parse(raw) as any;
       const source = operations.getSourceContext(context.sourceContextId);
       if (!source) throw new AppError("OPERATION_CONFLICT", "tool call is not bound to an active source context");
       let directive: { kind: "pass" | "collect"; binding: unknown } | undefined;
@@ -75,7 +79,8 @@ export function createCoordinatorTools(
 
       const action = actions[name];
       if (!action) throw new AppError("UNSUPPORTED_CAPABILITY", `tool is not configured: ${name}`);
-      operations.markDispatched(operation.id);
+      const sideEffecting = !READ_ONLY_TOOLS.has(name);
+      if (sideEffecting) operations.markDispatched(operation.id);
       try {
         const actionResult = await action(directive?.kind === "collect" ? { ...args, direct: true } : args, context);
         const receipt = directive?.kind === "pass"
@@ -86,7 +91,7 @@ export function createCoordinatorTools(
         operations.succeed(operation.id, receipt);
         return receipt;
       } catch (error) {
-        operations.fail(operation.id, { message: error instanceof Error ? error.message : String(error) }, true);
+        operations.fail(operation.id, { message: error instanceof Error ? error.message : String(error) }, sideEffecting);
         throw error;
       }
     };

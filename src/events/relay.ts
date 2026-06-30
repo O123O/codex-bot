@@ -49,6 +49,7 @@ export class EventRelay {
         if (cursorIndex >= 0) index = Math.max(index, cursorIndex + 1);
       }
       for (const turn of turns.slice(index)) {
+        if (!new Set(["completed", "failed", "interrupted"]).has(turn.status)) break;
         await this.handleTerminal(endpointId, session.thread_id, turn, nickname, true);
         this.runtime.setDeliveryCursor(endpointId, session.thread_id, turn.id);
       }
@@ -67,12 +68,16 @@ export class EventRelay {
     this.pool.markTurnTerminal(endpointId, threadId, turn.id);
     const messages = this.finals.persistTerminalTurn(endpointId, threadId, turn, this.options.clock.now());
     const eventId = `terminal:${endpointId}:${threadId}:${turn.id}`;
-    this.persistEvent(eventId, endpointId, threadId, turn.id, "turn_terminal", { nickname, turnId: turn.id, status: turn.status, finalMessageCount: messages.length });
+    this.persistEvent(eventId, endpointId, threadId, turn.id, "turn_terminal", {
+      final: true, nickname, endpointId, threadId, turnId: turn.id, completedAt: turn.completedAt ?? this.options.clock.now(), status: turn.status,
+      finalMessageIds: messages.map((message) => message.id), deliveryState: "prepared",
+    });
     if (messages.length === 0 && turn.status !== "completed") {
       this.deliveries.prepare({ id: `${eventId}:warning`, kind: "worker_warning", destination: this.options.destination, body: `[${nickname}] turn ${turn.id} ${turn.status} without a final response`, mandatory: true });
     }
     for (const message of messages) {
-      this.deliveries.prepare({ id: `worker:${endpointId}:${threadId}:${message.turnId}:${message.itemId}`, kind: "worker_final", destination: this.options.destination, body: `[${nickname}] ${message.body}`, mandatory: true });
+      const status = turn.status === "completed" ? "" : ` · ${turn.status}`;
+      this.deliveries.prepare({ id: `worker:${endpointId}:${threadId}:${message.turnId}:${message.itemId}`, kind: "worker_final", destination: this.options.destination, body: `[${nickname}${status}] ${message.body}`, mandatory: true });
     }
   }
 

@@ -81,6 +81,7 @@ test("detach ends the epoch and attach requires idle both before and after resum
   endpoint.afterResume = () => { endpoint.status = "active"; };
   await assert.rejects(lifecycle.attach("payments"), (error: unknown) => error instanceof AppError && error.code === "SESSION_BUSY");
   assert.equal(runtime.getSession("local", "thread-1")?.managementState, "detached");
+  assert.equal(endpoint.calls.at(-1)?.method, "thread/unsubscribe");
 
   endpoint.status = "idle";
   endpoint.afterResume = undefined;

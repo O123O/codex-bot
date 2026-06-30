@@ -106,14 +106,17 @@ export class SessionRegistry {
     });
   }
 
-  async reload(): Promise<boolean> {
-    try {
-      const document = await normalize(JSON.parse(await readFile(this.path, "utf8")) as RegistryDocument);
-      this.document = document;
-      return true;
-    } catch {
-      return false;
-    }
+  async reload(validate?: (document: RegistryDocument) => Promise<void>): Promise<boolean> {
+    return this.lock(async () => {
+      try {
+        const document = await normalize(JSON.parse(await readFile(this.path, "utf8")) as RegistryDocument);
+        await validate?.(structuredClone(document));
+        this.document = document;
+        return true;
+      } catch {
+        return false;
+      }
+    });
   }
 
   private async replace(document: RegistryDocument): Promise<void> {

@@ -20,13 +20,22 @@ class ServiceEndpoint implements AppServerEndpoint {
   status = "idle";
   activeTurnId = "active-1";
   lastClientId: string | undefined;
+  historyTurnStatus: string | undefined;
+  goal: any = null;
+  loseNextGoalResponse = false;
   async request<T>(method: string, params: any): Promise<T> {
     this.calls.push({ method, params });
     if (method === "turn/start") { this.lastClientId = params.clientUserMessageId; return { turn: { id: "started-1" } } as T; }
     if (method === "turn/steer") return { turnId: params.expectedTurnId } as T;
-    if (method === "thread/read") return { thread: { id: "thread", cwd: params.cwd, status: { type: this.status }, turns: this.lastClientId ? [{ id: "started-1", items: [{ type: "userMessage", clientId: this.lastClientId }] }] : [] } } as T;
-    if (method === "thread/goal/get") return { goal: null } as T;
+    if (method === "thread/read") return { thread: { id: "thread", cwd: params.cwd, status: { type: this.status }, turns: this.lastClientId ? [{ id: "started-1", ...(this.historyTurnStatus ? { status: this.historyTurnStatus } : {}), items: [{ type: "userMessage", clientId: this.lastClientId }] }] : [] } } as T;
+    if (method === "thread/goal/get") return { goal: this.goal } as T;
     if (method === "model/list") return { data: [{ id: "gpt-5" }], nextCursor: null } as T;
+    if (method === "thread/goal/set") {
+      this.goal = { ...(this.goal ?? {}), ...(params.objective ? { objective: params.objective } : {}), status: params.status, ...(params.tokenBudget ? { tokenBudget: params.tokenBudget } : {}) };
+      if (this.loseNextGoalResponse) { this.loseNextGoalResponse = false; throw new Error("response lost"); }
+      return { goal: this.goal } as T;
+    }
+    if (method === "thread/goal/clear") { this.goal = null; return { goal: null } as T; }
     return { goal: { objective: params.objective, status: params.status } } as T;
   }
 }
@@ -73,14 +82,35 @@ test("send enforces managed state and start/steer preconditions", async () => {
   await assert.rejects(service.send("payments", "x", { mode: "steer" }), (error: unknown) => error instanceof AppError && error.code === "SESSION_IDLE");
 });
 
+test("status composes registry, runtime, native state, settings, and goal", async () => {
+  const { runtime, service } = await fixture();
+  runtime.setModel("local", "thread", "gpt-5");
+  const status = await service.status("payments") as any;
+  assert.equal(status.nickname, "payments");
+  assert.equal(status.managementState, "managed");
+  assert.equal(status.nativeStatus.type, "idle");
+  assert.deepEqual(status.pendingSettings, { model: "gpt-5" });
+  assert.equal(status.goal, null);
+});
+
+test("a turn already terminal when turn/start resolves is not recorded as active", async () => {
+  const { endpoint, runtime, service } = await fixture();
+  endpoint.historyTurnStatus = "completed";
+  await service.send("payments", "fast", { clientUserMessageId: "fast-message" });
+  assert.equal(runtime.activeTurn("local", "thread"), undefined);
+});
+
 test("collect returns coordinator bodies or creates chronological direct deliveries", async () => {
   const { finals, deliveries, service } = await fixture();
   finals.persistTerminalTurn("local", "thread", { id: "one", status: "completed", completedAt: 1, items: [{ type: "agentMessage", id: "i1", text: "old", phase: "final_answer" }] }, 1);
   finals.persistTerminalTurn("local", "thread", { id: "two", status: "completed", completedAt: 2, items: [{ type: "agentMessage", id: "i2", text: "new", phase: "final_answer" }] }, 2);
   assert.deepEqual((await service.collect("payments", 2)).map((message) => message.body), ["old", "new"]);
-  const receipt = await service.collect("payments", 2, { direct: true, destination: "chat" });
+  const receipt = await service.collect("payments", 2, { direct: true, destination: "chat", deliveryKey: "request-1" });
   assert.equal(receipt.length, 2);
   assert.deepEqual(deliveries.listReady().map((delivery) => delivery.body), ["[payments] old", "[payments] new"]);
+  const secondRequest = await service.collect("payments", 2, { direct: true, destination: "chat", deliveryKey: "request-2" });
+  assert.notDeepEqual(secondRequest, receipt);
+  assert.equal(deliveries.listReady().length, 4);
   await assert.rejects(service.collect("payments", 21), RangeError);
 });
 
@@ -94,4 +124,12 @@ test("goal operations replace, pause, resume and cancel without exposing complet
     ["thread/goal/set", "active"], ["thread/goal/set", "paused"], ["thread/goal/set", "active"], ["thread/goal/clear", undefined],
   ]);
   assert.equal("completeGoal" in service, false);
+});
+
+test("a lost goal response is reconciled against native goal state", async () => {
+  const { endpoint, service } = await fixture();
+  endpoint.loseNextGoalResponse = true;
+  const result = await service.setGoal("payments", "ship it", 1_000) as any;
+  assert.equal(result.goal.objective, "ship it");
+  assert.equal(endpoint.calls.filter((call) => call.method === "thread/goal/set").length, 1);
 });

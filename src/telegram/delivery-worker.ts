@@ -1,13 +1,17 @@
 import { AppError } from "../core/errors.ts";
+import type { AttachmentStore, FileHandleId } from "../attachments/store.ts";
 import type { DeliveryStore } from "../storage/delivery-store.ts";
 import { TelegramApiError } from "./api.ts";
 
-interface DeliveryApi { sendMessage(chatId: string | number, body: string): Promise<{ message_id: number }> }
+interface DeliveryApi {
+  sendMessage(chatId: string | number, body: string, replyTo?: number): Promise<{ message_id: number }>;
+  sendDocument?(chatId: string | number, file: { stream: AsyncIterable<Uint8Array | string>; size: number; displayName: string; mediaType: string; caption?: string; replyTo?: number }): Promise<{ message_id: number }>;
+}
 
 export class DeliveryWorker {
   private timer: ReturnType<typeof setInterval> | undefined;
 
-  constructor(private readonly store: DeliveryStore, private readonly api: DeliveryApi) {}
+  constructor(private readonly store: DeliveryStore, private readonly api: DeliveryApi, private readonly attachments?: AttachmentStore) {}
 
   async processOne(id: string): Promise<void> {
     const delivery = this.store.get(id);
@@ -16,13 +20,32 @@ export class DeliveryWorker {
       throw new AppError("DELIVERY_UNCERTAIN", `optional delivery ${id} may already have been sent`);
     }
     const body = delivery.state === "uncertain" ? this.recoveryEnvelope(delivery.body, delivery.id) : delivery.body;
-    this.store.markDispatched(id);
+    let upload: Awaited<ReturnType<AttachmentStore["openForUpload"]>> | undefined;
     try {
-      const result = await this.api.sendMessage(delivery.destination, body);
+      if (delivery.attachmentId) {
+        if (!delivery.attachmentScopeId || !this.attachments || !this.api.sendDocument) throw new AppError("ATTACHMENT_INVALID", "attachment delivery is not configured");
+        upload = await this.attachments.openForUpload(delivery.attachmentScopeId, delivery.attachmentId as FileHandleId);
+      }
+      this.store.markDispatched(id);
+      const result = upload
+        ? await this.api.sendDocument!(delivery.destination, { stream: upload.stream, size: upload.size, displayName: upload.displayName, mediaType: upload.mediaType, ...(body ? { caption: body } : {}), ...(delivery.replyTo === undefined ? {} : { replyTo: delivery.replyTo }) })
+        : await this.api.sendMessage(delivery.destination, body, delivery.replyTo);
       this.store.confirm(id, String(result.message_id));
     } catch (error) {
       if (error instanceof TelegramApiError && error.deterministic) this.store.fail(id);
+      else this.store.markUncertain(id);
+      if (!delivery.mandatory) {
+        this.store.prepare({
+          id: `delivery-warning:${id}`,
+          kind: "delivery_warning",
+          destination: delivery.destination,
+          body: `[system] delivery ${id} could not be confirmed and was not automatically retried`,
+          mandatory: true,
+        });
+      }
       throw error;
+    } finally {
+      await upload?.close();
     }
   }
 

@@ -34,21 +34,15 @@ export class AppServerPool {
     const reservation = `${endpointId}:${params.threadId}:pending:${crypto.randomUUID()}`;
     this.active.add(reservation);
     try {
-      let response = await this.request<T>(endpointId, "turn/start", params);
-      if (typeof params.clientUserMessageId === "string") {
-        const deadline = Date.now() + (this.options.reconciliationTimeoutMs ?? 5_000);
-        let actual: { id: string; items: Array<{ type: string; clientId?: string | null }> } | undefined;
-        do {
-          const history = await this.request<{ thread: { turns: Array<{ id: string; items: Array<{ type: string; clientId?: string | null }> }> } }>(
-            endpointId, "thread/read", { threadId: params.threadId, includeTurns: true },
-          );
-          actual = [...history.thread.turns].reverse().find((turn) => turn.items.some((item) => item.type === "userMessage" && item.clientId === params.clientUserMessageId));
-          if (actual) break;
-          if (Date.now() >= deadline) throw new AppError("OPERATION_UNCERTAIN", "turn/start returned but its clientUserMessageId was not found in thread history");
-          await (this.options.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms))))(this.options.reconciliationPollMs ?? 25);
-        } while (!actual);
-        response = { ...response, turn: actual } as T;
+      let response: T;
+      try {
+        response = await this.request<T>(endpointId, "turn/start", params);
+      } catch (error) {
+        if (typeof params.clientUserMessageId !== "string") throw error;
+        const actual = await this.findStartedTurn(endpointId, params.threadId, params.clientUserMessageId);
+        response = { turn: actual } as unknown as T;
       }
+      if (typeof params.clientUserMessageId === "string") response = { ...response, turn: await this.findStartedTurn(endpointId, params.threadId, params.clientUserMessageId, response.turn.id) } as T;
       this.active.delete(reservation);
       const key = this.turnKey(endpointId, params.threadId, response.turn.id);
       if (!this.terminalBeforeStart.delete(key)) this.active.add(key);
@@ -60,10 +54,18 @@ export class AppServerPool {
   }
 
   async interrupt(endpointId: string, threadId: string, turnId: string): Promise<void> {
+    let terminal = false;
     try {
       await this.request(endpointId, "turn/interrupt", { threadId, turnId });
+      terminal = true;
+    } catch (error) {
+      try {
+        const history = await this.request<{ thread: { turns: Array<{ id: string; status: string }> } }>(endpointId, "thread/read", { threadId, includeTurns: true });
+        terminal = history.thread.turns.some((turn) => turn.id === turnId && new Set(["completed", "failed", "interrupted"]).has(turn.status));
+      } catch { /* the original interrupt outcome remains uncertain */ }
+      if (!terminal) throw error;
     } finally {
-      this.markTurnTerminal(endpointId, threadId, turnId);
+      if (terminal) this.markTurnTerminal(endpointId, threadId, turnId);
     }
   }
 
@@ -81,6 +83,21 @@ export class AppServerPool {
   }
 
   get activeTurnCount(): number { return this.active.size; }
+
+  private async findStartedTurn(endpointId: string, threadId: string, clientUserMessageId: string, candidateTurnId?: string): Promise<{ id: string; items: Array<{ type: string; clientId?: string | null }> }> {
+    const deadline = Date.now() + (this.options.reconciliationTimeoutMs ?? 30_000);
+    do {
+      const history = await this.request<{ thread: { turns: Array<{ id: string; items: Array<{ type: string; clientId?: string | null }> }> } }>(
+        endpointId, "thread/read", { threadId, includeTurns: true },
+      );
+      const actual = [...history.thread.turns].reverse().find((turn) =>
+        turn.items.some((item) => item.type === "userMessage" && item.clientId === clientUserMessageId)
+        || (candidateTurnId !== undefined && turn.id === candidateTurnId));
+      if (actual) return actual;
+      if (Date.now() >= deadline) throw new AppError("OPERATION_UNCERTAIN", "turn/start outcome could not be proven by turn ID or clientUserMessageId in thread history");
+      await (this.options.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms))))(this.options.reconciliationPollMs ?? 25);
+    } while (true);
+  }
 
   private turnKey(endpointId: string, threadId: string, turnId: string): string {
     return `${endpointId}:${threadId}:${turnId}`;

@@ -16,6 +16,10 @@ const configSchema = z.object({
   MCP_PORT: z.coerce.number().int().min(0).max(65_535).default(43_721),
   ATTACHMENT_MAX_BYTES: positiveInt.default(20 * 1024 * 1024),
   ATTACHMENT_STORE_MAX_BYTES: positiveInt.default(1024 * 1024 * 1024),
+  SANDBOX_MODE: z.enum(["read-only", "workspace-write", "danger-full-access"]).default("workspace-write"),
+}).refine((value) => value.TELEGRAM_DESTINATION_CHAT_ID === value.TELEGRAM_OWNER_ID, {
+  path: ["TELEGRAM_DESTINATION_CHAT_ID"],
+  message: "must equal TELEGRAM_OWNER_ID for the single-user private-chat MVP",
 });
 
 export interface BotConfig {
@@ -31,6 +35,7 @@ export interface BotConfig {
   mcpPort: number;
   attachmentMaxBytes: number;
   attachmentStoreMaxBytes: number;
+  sandboxMode: "read-only" | "workspace-write" | "danger-full-access";
 }
 
 export function loadConfig(env: Record<string, string | undefined>): BotConfig {
@@ -48,5 +53,6 @@ export function loadConfig(env: Record<string, string | undefined>): BotConfig {
     mcpPort: parsed.MCP_PORT,
     attachmentMaxBytes: parsed.ATTACHMENT_MAX_BYTES,
     attachmentStoreMaxBytes: parsed.ATTACHMENT_STORE_MAX_BYTES,
+    sandboxMode: parsed.SANDBOX_MODE,
   };
 }

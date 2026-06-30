@@ -7,15 +7,23 @@ export class RuntimeStore {
   setSession(endpointId: string, threadId: string, managementState: ManagementState, nativeStatus = "notLoaded"): void {
     this.db.prepare(`INSERT INTO session_runtime(endpoint_id, thread_id, management_state, native_status)
       VALUES (?, ?, ?, ?)
-      ON CONFLICT(endpoint_id, thread_id) DO UPDATE SET management_state = excluded.management_state, native_status = excluded.native_status`)
+      ON CONFLICT(endpoint_id, thread_id) DO UPDATE SET
+        restore_state = CASE
+          WHEN excluded.management_state = 'unavailable' AND session_runtime.management_state <> 'unavailable' THEN session_runtime.management_state
+          WHEN excluded.management_state = 'unavailable' THEN session_runtime.restore_state
+          ELSE NULL
+        END,
+        management_state = excluded.management_state,
+        native_status = excluded.native_status`)
       .run(endpointId, threadId, managementState, nativeStatus);
   }
 
-  getSession(endpointId: string, threadId: string): { managementState: ManagementState; nativeStatus: string; deliveryCursor?: string } | undefined {
+  getSession(endpointId: string, threadId: string): { managementState: ManagementState; restoreState?: ManagementState; nativeStatus: string; deliveryCursor?: string } | undefined {
     const row = this.db.prepare("SELECT * FROM session_runtime WHERE endpoint_id = ? AND thread_id = ?").get(endpointId, threadId) as Record<string, unknown> | undefined;
     if (!row) return undefined;
     return {
       managementState: String(row.management_state) as ManagementState,
+      ...(row.restore_state ? { restoreState: String(row.restore_state) as ManagementState } : {}),
       nativeStatus: String(row.native_status),
       ...(row.delivery_cursor ? { deliveryCursor: String(row.delivery_cursor) } : {}),
     };
@@ -54,9 +62,11 @@ export class RuntimeStore {
     return value;
   }
 
-  listSessions(): Array<{ endpointId: string; threadId: string; managementState: ManagementState; nativeStatus: string }> {
-    return (this.db.prepare("SELECT endpoint_id, thread_id, management_state, native_status FROM session_runtime").all() as Array<Record<string, unknown>>).map((row) => ({
-      endpointId: String(row.endpoint_id), threadId: String(row.thread_id), managementState: String(row.management_state) as ManagementState, nativeStatus: String(row.native_status),
+  listSessions(): Array<{ endpointId: string; threadId: string; managementState: ManagementState; restoreState?: ManagementState; nativeStatus: string }> {
+    return (this.db.prepare("SELECT endpoint_id, thread_id, management_state, restore_state, native_status FROM session_runtime").all() as Array<Record<string, unknown>>).map((row) => ({
+      endpointId: String(row.endpoint_id), threadId: String(row.thread_id), managementState: String(row.management_state) as ManagementState,
+      ...(row.restore_state ? { restoreState: String(row.restore_state) as ManagementState } : {}),
+      nativeStatus: String(row.native_status),
     }));
   }
 

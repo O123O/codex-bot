@@ -21,6 +21,7 @@ async function writeAtomic(path: string, document: NotebookDocument): Promise<vo
 }
 
 export class CoordinatorNotebook {
+  private tail: Promise<void> = Promise.resolve();
   private constructor(private readonly path: string, private document: NotebookDocument) {}
 
   static async bootstrap(path: string, examplePath: string): Promise<CoordinatorNotebook> {
@@ -43,11 +44,20 @@ export class CoordinatorNotebook {
   }
 
   async reconcileNicknames(nicknamesByThread: ReadonlyMap<string, string>): Promise<void> {
-    const sessions: NotebookDocument["sessions"] = {};
-    for (const [nickname, entry] of Object.entries(this.document.sessions)) {
-      sessions[nicknamesByThread.get(entry.thread_id) ?? nickname] = entry;
+    const previous = this.tail;
+    let release!: () => void;
+    this.tail = new Promise<void>((resolve) => { release = resolve; });
+    await previous;
+    try {
+      const current = notebookSchema.parse(JSON.parse(await readFile(this.path, "utf8")));
+      const sessions: NotebookDocument["sessions"] = {};
+      for (const [nickname, entry] of Object.entries(current.sessions)) {
+        sessions[nicknamesByThread.get(entry.thread_id) ?? nickname] = entry;
+      }
+      this.document = { version: 1, sessions };
+      await writeAtomic(this.path, this.document);
+    } finally {
+      release();
     }
-    this.document = { version: 1, sessions };
-    await writeAtomic(this.path, this.document);
   }
 }

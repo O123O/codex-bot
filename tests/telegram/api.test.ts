@@ -15,6 +15,16 @@ test("Bot API retries 429 using retry_after and returns the result", async () =>
   assert.deepEqual(sleeps, [2_000]);
 });
 
+test("message replies use Telegram reply_parameters", async () => {
+  let body: any;
+  const api = new TelegramApi("token", { fetch: (async (_input, init) => {
+    body = JSON.parse(String(init?.body));
+    return new Response(JSON.stringify({ ok: true, result: { message_id: 9 } }));
+  }) as typeof fetch });
+  await api.sendMessage(1, "reply", 77);
+  assert.deepEqual(body.reply_parameters, { message_id: 77, allow_sending_without_reply: true });
+});
+
 test("long polling is abortable and file downloads expose a stream", async () => {
   const fetch: typeof globalThis.fetch = async (input, init) => {
     const url = String(input);
@@ -50,9 +60,10 @@ test("document upload streams multipart bytes and includes the safe display name
     return new Response(JSON.stringify({ ok: true, result: { message_id: 8 } }));
   };
   const api = new TelegramApi("token", { fetch });
-  await api.sendDocument(9, { stream: (async function* () { yield Buffer.from("payload"); })(), size: 7, displayName: "report.txt", mediaType: "text/plain" });
+  await api.sendDocument(9, { stream: (async function* () { yield Buffer.from("payload"); })(), size: 7, displayName: "report.txt", mediaType: "text/plain", replyTo: 77 });
   assert.match(body, /name="chat_id"/);
   assert.match(body, /filename="report.txt"/);
   assert.match(body, /payload/);
+  assert.match(body, /name="reply_parameters"/);
+  assert.match(body, /"message_id":77/);
 });
-

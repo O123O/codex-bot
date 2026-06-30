@@ -21,7 +21,11 @@ test("loopback MCP requires bearer auth, advertises instructions, lists tools, a
   const transport = new StreamableHTTPClientTransport(new URL(server.url), { requestInit: { headers: { authorization: "Bearer secret" } } });
   await client.connect(transport as any);
   assert.match(client.getInstructions() ?? "", /coordinator/i);
-  assert.deepEqual((await client.listTools()).tools.map((tool) => tool.name).sort(), [...TOOL_NAMES].sort());
+  const advertised = (await client.listTools()).tools;
+  assert.deepEqual(advertised.map((tool) => tool.name).sort(), [...TOOL_NAMES].sort());
+  const send = advertised.find((tool) => tool.name === "send_to_session");
+  assert.deepEqual(new Set(send?.inputSchema.required), new Set(["nickname", "content", "mode"]));
+  assert.ok(send?.inputSchema.properties?.nickname);
   const result = await client.callTool({ name: "list_managed_sessions", arguments: {} });
   assert.equal(result.isError, undefined);
   assert.equal(received.sourceContextId, "ctx");

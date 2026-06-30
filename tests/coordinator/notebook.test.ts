@@ -27,6 +27,17 @@ test("reconciles a nickname by stable thread id", async () => {
   assert.equal(notebook.snapshot().sessions.old, undefined);
 });
 
+test("nickname reconciliation reloads coordinator edits instead of overwriting them with a stale snapshot", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "codex-bot-notebook-"));
+  const example = join(dir, "example.json");
+  const live = join(dir, "session-status.json");
+  await writeFile(example, '{"version":1,"sessions":{}}');
+  const notebook = await CoordinatorNotebook.bootstrap(live, example);
+  await writeFile(live, '{"version":1,"sessions":{"old":{"thread_id":"t1","project_status":"new coordinator edit","updated_at":"now"}}}');
+  await notebook.reconcileNicknames(new Map([["t1", "new"]]));
+  assert.equal(notebook.snapshot().sessions.new?.project_status, "new coordinator edit");
+});
+
 test("invalid live JSON is quarantined and recreated", async () => {
   const dir = await mkdtemp(join(tmpdir(), "codex-bot-notebook-"));
   const example = join(dir, "example.json");

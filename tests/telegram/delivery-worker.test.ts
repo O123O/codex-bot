@@ -1,5 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { mkdtemp } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { Readable } from "node:stream";
+import { AttachmentStore } from "../../src/attachments/store.ts";
 import { AppError } from "../../src/core/errors.ts";
 import { createTestDatabase } from "../../src/storage/database.ts";
 import { DeliveryStore } from "../../src/storage/delivery-store.ts";
@@ -39,4 +44,43 @@ test("optional uncertain tool output is not automatically retried", async () => 
   const worker = new DeliveryWorker(store, { sendMessage: async () => { sends += 1; return { message_id: 1 }; } });
   await assert.rejects(worker.processOne(delivery.id), (error: unknown) => error instanceof AppError && error.code === "DELIVERY_UNCERTAIN");
   assert.equal(sends, 0);
+  assert.equal(store.get(`delivery-warning:${delivery.id}`)?.mandatory, true);
+});
+
+test("a nondeterministic send failure is persisted as uncertain immediately", async () => {
+  const store = new DeliveryStore(createTestDatabase());
+  const delivery = store.prepare({ id: "d_network", kind: "text", destination: "7", body: "x", mandatory: true });
+  const worker = new DeliveryWorker(store, { sendMessage: async () => { throw new Error("socket reset"); } });
+  await assert.rejects(worker.processOne(delivery.id), /socket reset/);
+  assert.equal(store.get(delivery.id)?.state, "uncertain");
+});
+
+test("an optional delivery failure creates one mandatory visible warning", async () => {
+  const store = new DeliveryStore(createTestDatabase());
+  const delivery = store.prepare({ id: "d_optional_network", kind: "text", destination: "7", body: "x", mandatory: false });
+  const worker = new DeliveryWorker(store, { sendMessage: async () => { throw new Error("socket reset"); } });
+  await assert.rejects(worker.processOne(delivery.id));
+  await assert.rejects(worker.processOne(delivery.id), (error: unknown) => error instanceof AppError && error.code === "DELIVERY_UNCERTAIN");
+  assert.deepEqual(store.listReady().filter((item) => item.id.startsWith("delivery-warning:")).map((item) => item.body), [
+    "[system] delivery d_optional_network could not be confirmed and was not automatically retried",
+  ]);
+});
+
+test("attachment deliveries use the durable outbox and scoped private snapshot", async () => {
+  const db = createTestDatabase();
+  const attachments = new AttachmentStore(db, await mkdtemp(join(tmpdir(), "delivery-file-")), { maxFileBytes: 100, maxStoreBytes: 100 });
+  await attachments.initialize();
+  const file = await attachments.ingest("ctx", Readable.from(["payload"]), { displayName: "report.txt", mediaType: "text/plain" });
+  const store = new DeliveryStore(db);
+  const delivery = store.prepareAttachment({ id: "d_file", kind: "attachment", destination: "7", body: "caption", mandatory: false, attachmentId: file.id, attachmentScopeId: "ctx" });
+  assert.equal((db.prepare("SELECT ref_count FROM attachments WHERE id = ?").get(file.id) as any).ref_count, 1);
+  let uploaded = "";
+  const worker = new DeliveryWorker(store, {
+    sendMessage: async () => ({ message_id: 1 }),
+    sendDocument: async (_chat, upload) => { for await (const chunk of upload.stream) uploaded += Buffer.from(chunk).toString(); assert.equal(upload.caption, "caption"); return { message_id: 22 }; },
+  }, attachments);
+  await worker.processOne(delivery.id);
+  assert.equal(uploaded, "payload");
+  assert.equal(store.get(delivery.id)?.telegramMessageId, "22");
+  assert.equal((db.prepare("SELECT ref_count FROM attachments WHERE id = ?").get(file.id) as any).ref_count, 0);
 });

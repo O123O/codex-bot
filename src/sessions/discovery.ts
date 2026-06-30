@@ -32,10 +32,10 @@ export class SessionDiscovery {
     this.snapshotTtlMs = options.snapshotTtlMs ?? 5 * 60_000;
   }
 
-  async list(query: { endpointId: string; cwd?: string; limit?: number; cursor?: string }): Promise<{ sessions: DiscoveredSession[]; nextCursor?: string }> {
+  async list(query: { endpointId: string; search?: string; cwd?: string; limit?: number; cursor?: string }): Promise<{ sessions: DiscoveredSession[]; nextCursor?: string }> {
     const limit = query.limit ?? 20;
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) throw new RangeError("limit must be between 1 and 100");
-    const queryHash = this.queryHash(query.endpointId, query.cwd, limit);
+    const queryHash = this.queryHash(query.endpointId, query.search, query.cwd, limit);
     let snapshotId: string;
     let offset = 0;
     let rows: DiscoveredSession[];
@@ -51,6 +51,10 @@ export class SessionDiscovery {
       rows = JSON.parse(String(record.rows_json)) as DiscoveredSession[];
     } else {
       rows = await this.fetchAll(query.endpointId, query.cwd);
+      if (query.search) {
+        const needle = query.search.toLocaleLowerCase();
+        rows = rows.filter((row) => `${row.id}\n${row.cwd}\n${row.preview}`.toLocaleLowerCase().includes(needle));
+      }
       snapshotId = `snap_${crypto.randomUUID()}`;
       this.db.prepare("INSERT INTO discovery_snapshots(id, query_hash, rows_json, expires_at) VALUES (?, ?, ?, ?)")
         .run(snapshotId, queryHash, JSON.stringify(rows), this.clock.now() + this.snapshotTtlMs);
@@ -96,8 +100,8 @@ export class SessionDiscovery {
     return [...rows.values()].sort((left, right) => right.updatedAt - left.updatedAt || left.id.localeCompare(right.id));
   }
 
-  private queryHash(endpointId: string, cwd: string | undefined, limit: number): string {
-    return createHash("sha256").update(JSON.stringify({ endpointId, cwd: cwd ?? null, limit })).digest("hex");
+  private queryHash(endpointId: string, search: string | undefined, cwd: string | undefined, limit: number): string {
+    return createHash("sha256").update(JSON.stringify({ endpointId, search: search ?? null, cwd: cwd ?? null, limit })).digest("hex");
   }
 
   private encodeCursor(id: string, offset: number, queryHash: string): string {

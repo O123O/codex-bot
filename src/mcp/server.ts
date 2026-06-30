@@ -4,7 +4,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
 import type { CoordinatorToolName, ToolCallContext, ToolHandler } from "../coordinator/tools.ts";
-import { TOOL_NAMES } from "../coordinator/tools.ts";
+import { COORDINATOR_TOOL_SCHEMAS, TOOL_NAMES } from "../coordinator/tools.ts";
 
 export interface CoordinatorContextProvider {
   current(): { contextId: string; attemptId: string; turnId: string } | undefined;
@@ -76,7 +76,7 @@ export class LoopbackMcpServer {
       { instructions: "Coordinator-only manager tools. Choose the correct managed session, ask the user when ambiguous, and use ordinary send/collect tools for /pass and /collect." },
     );
     for (const name of TOOL_NAMES) {
-      mcp.registerTool(name, { description: `Codex bot coordinator operation: ${name}`, inputSchema: z.object({}).catchall(z.unknown()) }, async (args, extra) => {
+      mcp.registerTool(name, { description: `Codex bot coordinator operation: ${name.replaceAll("_", " ")}`, inputSchema: COORDINATOR_TOOL_SCHEMAS[name] as any }, async (args: any, extra: any) => {
         const active = this.contexts.current();
         if (!active) throw new Error("No active coordinator source context");
         const context: ToolCallContext = { sourceContextId: active.contextId, attemptId: active.attemptId, turnId: active.turnId, callId: `mcp:${String(extra.requestId)}` };

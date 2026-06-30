@@ -2,6 +2,7 @@ import { realpath } from "node:fs/promises";
 import type { AppServerPool } from "../app-server/pool.ts";
 import type { Clock } from "../core/clock.ts";
 import { AppError } from "../core/errors.ts";
+import type { ManagementState } from "../core/types.ts";
 import type { SessionRegistry } from "../registry/session-registry.ts";
 import type { RuntimeStore } from "../storage/runtime-store.ts";
 
@@ -16,13 +17,15 @@ export class SessionLifecycle {
     private readonly registry: SessionRegistry,
     private readonly runtime: RuntimeStore,
     private readonly clock: Clock,
+    private readonly execution: { sandboxMode: "read-only" | "workspace-write" | "danger-full-access" } = { sandboxMode: "workspace-write" },
   ) {}
 
   async create(nickname: string, endpointId: string, projectDir: string): Promise<void> {
     await this.lock(`${endpointId}:new:${nickname}`, async () => {
+      if (this.registry.get(nickname)) throw new AppError("OPERATION_CONFLICT", `nickname already exists: ${nickname}`);
       const canonical = await realpath(projectDir);
       const response = await this.pool.request<ThreadResponse>(endpointId, "thread/start", {
-        cwd: canonical, approvalPolicy: "never", sandbox: "danger-full-access", ephemeral: false,
+        cwd: canonical, approvalPolicy: "never", sandbox: this.execution.sandboxMode, ephemeral: false,
       });
       await this.verifyCwd(response.thread.cwd, canonical);
       this.requireIdle(response.thread);
@@ -38,6 +41,7 @@ export class SessionLifecycle {
 
   async adopt(nickname: string, endpointId: string, threadId: string, projectDir: string): Promise<void> {
     await this.lock(`${endpointId}:${threadId}`, async () => {
+      if (this.registry.get(nickname)) throw new AppError("OPERATION_CONFLICT", `nickname already exists: ${nickname}`);
       const canonical = await realpath(projectDir);
       const response = await this.read(endpointId, threadId);
       await this.verifyCwd(response.thread.cwd, canonical);
@@ -51,6 +55,7 @@ export class SessionLifecycle {
   async detach(nickname: string): Promise<void> {
     const session = this.required(nickname);
     await this.lock(`${session.endpoint}:${session.thread_id}`, async () => {
+      this.requireManagementState(session.endpoint, session.thread_id, ["managed"]);
       const response = await this.read(session.endpoint, session.thread_id);
       this.requireIdle(response.thread);
       this.runtime.setSession(session.endpoint, session.thread_id, "detaching", "idle");
@@ -63,19 +68,23 @@ export class SessionLifecycle {
   async attach(nickname: string): Promise<void> {
     const session = this.required(nickname);
     await this.lock(`${session.endpoint}:${session.thread_id}`, async () => {
+      this.requireManagementState(session.endpoint, session.thread_id, ["detached", "unavailable"]);
       const before = await this.read(session.endpoint, session.thread_id);
       this.requireIdle(before.thread);
       this.runtime.setSession(session.endpoint, session.thread_id, "attaching", "idle");
+      let resumed = false;
       try {
-        const resumed = await this.pool.request<ThreadResponse>(session.endpoint, "thread/resume", {
-          threadId: session.thread_id, cwd: session.project_dir, approvalPolicy: "never", sandbox: "danger-full-access",
+        const response = await this.pool.request<ThreadResponse>(session.endpoint, "thread/resume", {
+          threadId: session.thread_id, cwd: session.project_dir, approvalPolicy: "never", sandbox: this.execution.sandboxMode,
         });
-        await this.verifyCwd(resumed.thread.cwd, session.project_dir);
+        resumed = true;
+        await this.verifyCwd(response.thread.cwd, session.project_dir);
         const after = await this.read(session.endpoint, session.thread_id);
         this.requireIdle(after.thread);
         this.runtime.beginEpoch(session.endpoint, session.thread_id, this.baseline(after.thread), this.clock.now());
         this.runtime.setSession(session.endpoint, session.thread_id, "managed", "idle");
       } catch (error) {
+        if (resumed) await this.pool.request(session.endpoint, "thread/unsubscribe", { threadId: session.thread_id }).catch(() => undefined);
         this.runtime.setSession(session.endpoint, session.thread_id, "detached", before.thread.status.type);
         throw error;
       }
@@ -85,6 +94,7 @@ export class SessionLifecycle {
   async archive(nickname: string): Promise<void> {
     const session = this.required(nickname);
     await this.lock(`${session.endpoint}:${session.thread_id}`, async () => {
+      this.requireManagementState(session.endpoint, session.thread_id, ["managed", "detached"]);
       const response = await this.read(session.endpoint, session.thread_id);
       this.requireIdle(response.thread);
       await this.pool.request(session.endpoint, "thread/archive", { threadId: session.thread_id });
@@ -103,11 +113,6 @@ export class SessionLifecycle {
         const nickname = this.nicknameFor(entry.endpointId, entry.threadId);
         this.runtime.setSession(entry.endpointId, entry.threadId, "detached", entry.nativeStatus);
         if (nickname) await this.attach(nickname);
-      } else if (entry.managementState === "unavailable") {
-        try {
-          const response = await this.read(entry.endpointId, entry.threadId);
-          this.runtime.setSession(entry.endpointId, entry.threadId, "managed", response.thread.status.type);
-        } catch { /* remains unavailable */ }
       }
     }
   }
@@ -128,6 +133,11 @@ export class SessionLifecycle {
 
   private requireIdle(thread: ThreadView): void {
     if (thread.status.type !== "idle") throw new AppError("SESSION_BUSY", `thread ${thread.id} is ${thread.status.type}`);
+  }
+
+  private requireManagementState(endpointId: string, threadId: string, allowed: ManagementState[]): void {
+    const current = this.runtime.getSession(endpointId, threadId)?.managementState;
+    if (!current || !allowed.includes(current)) throw new AppError("OPERATION_CONFLICT", `thread ${threadId} is ${current ?? "unregistered"}, expected ${allowed.join(" or ")}`);
   }
 
   private async verifyCwd(actual: string, expected: string): Promise<void> {

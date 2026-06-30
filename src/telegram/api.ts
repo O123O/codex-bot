@@ -39,9 +39,9 @@ export class TelegramApi {
     return this.json<TelegramUpdate[]>("getUpdates", { offset, timeout: 50, allowed_updates: ["message"] }, signal);
   }
 
-  async sendMessage(chatId: number | string, text: string): Promise<{ message_id: number }> {
+  async sendMessage(chatId: number | string, text: string, replyTo?: number): Promise<{ message_id: number }> {
     let result: { message_id: number } | undefined;
-    for (const part of splitTelegramText(text)) result = await this.json("sendMessage", { chat_id: chatId, text: part });
+    for (const part of splitTelegramText(text)) result = await this.json("sendMessage", { chat_id: chatId, text: part, ...(replyTo === undefined ? {} : { reply_parameters: { message_id: replyTo, allow_sending_without_reply: true } }) });
     return result as { message_id: number };
   }
 
@@ -52,11 +52,13 @@ export class TelegramApi {
     return { stream: Readable.from(response.body as unknown as AsyncIterable<Uint8Array>), ...(info.file_size === undefined ? {} : { size: info.file_size }) };
   }
 
-  async sendDocument(chatId: number | string, file: { stream: AsyncIterable<Uint8Array | string>; size: number; displayName: string; mediaType: string }): Promise<{ message_id: number }> {
+  async sendDocument(chatId: number | string, file: { stream: AsyncIterable<Uint8Array | string>; size: number; displayName: string; mediaType: string; caption?: string; replyTo?: number }): Promise<{ message_id: number }> {
     const boundary = `codexbot-${crypto.randomUUID()}`;
     const safeName = file.displayName.replace(/["\r\n]/gu, "_");
+    const captionPart = file.caption === undefined ? "" : `--${boundary}\r\nContent-Disposition: form-data; name="caption"\r\n\r\n${file.caption}\r\n`;
+    const replyPart = file.replyTo === undefined ? "" : `--${boundary}\r\nContent-Disposition: form-data; name="reply_parameters"\r\n\r\n${JSON.stringify({ message_id: file.replyTo, allow_sending_without_reply: true })}\r\n`;
     const preamble = Buffer.from(
-      `--${boundary}\r\nContent-Disposition: form-data; name="chat_id"\r\n\r\n${chatId}\r\n` +
+      `--${boundary}\r\nContent-Disposition: form-data; name="chat_id"\r\n\r\n${chatId}\r\n${captionPart}${replyPart}` +
       `--${boundary}\r\nContent-Disposition: form-data; name="document"; filename="${safeName}"\r\nContent-Type: ${file.mediaType}\r\n\r\n`,
     );
     const ending = Buffer.from(`\r\n--${boundary}--\r\n`);
@@ -91,4 +93,3 @@ export class TelegramApi {
     return payload.result;
   }
 }
-

@@ -75,8 +75,8 @@ export class AttachmentStore {
       for (const part of parts) {
         const attachment = await this.ingest(scopeId, part.stream, part);
         total += attachment.size;
-        if (total > maxMessageBytes) this.invalid("attachments exceed per-message limit");
         saved.push(attachment);
+        if (total > maxMessageBytes) this.invalid("attachments exceed per-message limit");
       }
       return saved;
     } catch (error) {

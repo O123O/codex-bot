@@ -62,3 +62,29 @@ test("a terminal notification that arrives before turn/start responds does not l
   assert.equal(reads, 2);
   assert.equal(pool.activeTurnCount, 0);
 });
+
+test("a lost turn/start response is proven from history instead of retransmitted", async () => {
+  let starts = 0;
+  const endpoint: AppServerEndpoint = {
+    id: "local", state: "ready",
+    request: async <T>(method: string) => {
+      if (method === "turn/start") { starts += 1; throw new Error("response lost"); }
+      return { thread: { turns: [{ id: "created", status: "inProgress", items: [{ type: "userMessage", clientId: "stable-client-id" }] }] } } as T;
+    },
+  };
+  const pool = new AppServerPool([endpoint], { maxConcurrentTurns: 1 });
+  assert.equal((await pool.startTurn("local", { threadId: "t", clientUserMessageId: "stable-client-id", input: [] })).turn.id, "created");
+  assert.equal(starts, 1);
+});
+
+test("a lost interrupt response succeeds only when the exact turn is proven terminal", async () => {
+  const endpoint: AppServerEndpoint = {
+    id: "local", state: "ready",
+    request: async <T>(method: string) => {
+      if (method === "turn/interrupt") throw new Error("response lost");
+      return { thread: { turns: [{ id: "turn-1", status: "interrupted" }] } } as T;
+    },
+  };
+  const pool = new AppServerPool([endpoint], { maxConcurrentTurns: 1 });
+  await pool.interrupt("local", "thread", "turn-1");
+});

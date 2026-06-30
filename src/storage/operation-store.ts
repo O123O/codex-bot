@@ -45,6 +45,17 @@ export class OperationStore {
     };
   }
 
+  listPendingSourceContexts(kinds: readonly SourceContext["kind"][]): SourceContext[] {
+    if (kinds.length === 0) return [];
+    const placeholders = kinds.map(() => "?").join(",");
+    const rows = this.db.prepare(`SELECT id FROM source_contexts WHERE state = 'pending' AND kind IN (${placeholders}) ORDER BY created_at, id`).all(...kinds) as Array<{ id: string }>;
+    return rows.map((row) => this.getSourceContext(row.id)!).filter(Boolean);
+  }
+
+  setSourceState(id: string, state: "pending" | "completed" | "superseded"): void {
+    this.db.prepare("UPDATE source_contexts SET state = ? WHERE id = ?").run(state, id);
+  }
+
   prepare(input: { contextId: string; attemptId: string; callId: string; kind: string; args: unknown }): OperationRecord {
     const argsJson = canonical(input.args);
     const argsHash = hash(input.args);

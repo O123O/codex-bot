@@ -44,3 +44,14 @@ test("coordinator context exists before turn/start dispatch and later binds the 
   runtime.bindTurn("attempt", "real-turn");
   assert.equal(runtime.current()?.turnId, "real-turn");
 });
+
+test("successful read-only tools do not force a recovery context after a failed attempt", () => {
+  const db = createTestDatabase();
+  const operations = new OperationStore(db);
+  operations.createSourceContext({ id: "ctx-read", kind: "telegram", sourceId: "3", rawText: "status", attachmentIds: [] });
+  const runtime = new CoordinatorRuntime(db, operations, new DeliveryStore(db), { destination: "chat" });
+  runtime.beginUserAttempt("ctx-read", "a-read", "t-read");
+  const operation = operations.prepare({ contextId: "ctx-read", attemptId: "a-read", callId: "c", kind: "get_session_status", args: {} });
+  operations.succeed(operation.id, { status: "idle" });
+  assert.equal(runtime.failAttempt("t-read", "model failed"), undefined);
+});

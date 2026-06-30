@@ -77,3 +77,14 @@ test("terminal notification with partial items reads the authoritative completed
   await relay.handleNotification("local", "turn/completed", { threadId: "worker", turn: terminal("readback", "completed", "") });
   assert.deepEqual(deliveries.listReady().map((item) => item.body), ["[payments] from history"]);
 });
+
+test("reconciliation stops at an in-progress turn without advancing past it", async () => {
+  const { endpoint, runtime, deliveries, relay } = await fixture();
+  endpoint.turns = [terminal("baseline"), { id: "working", status: "inProgress", completedAt: null, items: [] }];
+  await relay.reconcileEndpoint("local");
+  assert.equal(runtime.getSession("local", "worker")?.deliveryCursor, undefined);
+
+  endpoint.turns = [terminal("baseline"), terminal("working", "completed", "later")];
+  await relay.reconcileEndpoint("local");
+  assert.deepEqual(deliveries.listReady().map((item) => item.body), ["[payments] later"]);
+});

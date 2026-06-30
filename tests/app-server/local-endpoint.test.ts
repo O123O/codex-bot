@@ -44,6 +44,17 @@ test("declines approval requests and emits a blocked event", async () => {
   assert.equal(blocked.length, 1);
 });
 
+test("rejects an app-server version outside the generated protocol pin", async () => {
+  const child = new FakeChild();
+  child.stdin.on("data", (chunk) => {
+    const request = JSON.parse(chunk.toString()) as Record<string, unknown>;
+    if (request.method === "initialize") child.stdout.write(`${JSON.stringify({ id: request.id, result: { userAgent: "codex_chat_bot/9.9.9 (test)" } })}\n`);
+  });
+  const endpoint = new LocalEndpoint({ codexBinary: "codex", spawn: () => child as never, expectedVersion: "0.142.4" });
+  await assert.rejects(endpoint.start(), /expected Codex app-server 0\.142\.4/);
+  assert.equal(endpoint.state, "unavailable");
+});
+
 test("a delayed exit from an old child cannot close a restarted endpoint", async () => {
   class DelayedChild extends FakeChild {
     override kill() { this.killed = true; return true; }

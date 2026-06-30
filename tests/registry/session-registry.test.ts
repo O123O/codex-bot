@@ -38,6 +38,19 @@ test("invalid external replacement preserves last known-good state", async () =>
   assert.equal(registry.snapshot().version, 1);
 });
 
+test("external replacement is activated only after asynchronous mapping validation", async () => {
+  const { dir, path, registry } = await fixture();
+  await writeFile(path, JSON.stringify({
+    version: 1,
+    coordinator: { endpoint: "local", thread_id: "coordinator", project_dir: dir },
+    sessions: { payments: { endpoint: "local", thread_id: "t1", project_dir: dir } },
+  }));
+  assert.equal(await registry.reload(async () => { throw new Error("thread cwd mismatch"); }), false);
+  assert.equal(registry.get("payments"), undefined);
+  assert.equal(await registry.reload(async () => undefined), true);
+  assert.equal(registry.get("payments")?.thread_id, "t1");
+});
+
 test("concurrent writes preserve both unique registrations", async () => {
   const { dir, registry } = await fixture();
   await Promise.all([

@@ -28,6 +28,20 @@ export class CoordinatorRuntime {
 
   current(): ActiveCoordinatorContext | undefined { return this.active ? { ...this.active } : undefined; }
 
+  contextForTurn(turnId: string): ActiveCoordinatorContext | undefined {
+    const attempt = this.attempt(turnId);
+    return attempt ? { ...attempt } : undefined;
+  }
+
+  activeAttempts(): ActiveCoordinatorContext[] {
+    return (this.db.prepare("SELECT context_id, id, turn_id, trigger_kind FROM coordinator_attempts WHERE state = 'active' ORDER BY created_at, id").all() as Array<Record<string, unknown>>).map((row) => ({
+      contextId: String(row.context_id),
+      attemptId: String(row.id),
+      turnId: String(row.turn_id),
+      triggerKind: String(row.trigger_kind) as "user" | "internal",
+    }));
+  }
+
   handleTerminal(turnId: string, finalText?: string): void {
     const attempt = this.attempt(turnId);
     if (!attempt) return;
@@ -41,7 +55,10 @@ export class CoordinatorRuntime {
   failAttempt(turnId: string, error: unknown): SourceContext | undefined {
     const attempt = this.attempt(turnId);
     if (!attempt) return undefined;
-    const effects = this.db.prepare("SELECT id, state, receipt_json FROM operations WHERE context_id = ? AND attempt_id = ? AND state IN ('dispatched','succeeded','uncertain')")
+    const effects = this.db.prepare(`SELECT id, state, receipt_json FROM operations
+      WHERE context_id = ? AND attempt_id = ?
+        AND state IN ('dispatched','succeeded','uncertain')
+        AND kind NOT IN ('list_managed_sessions','discover_sessions','get_session_status','read_worker_message','list_models','get_goal')`)
       .all(attempt.contextId, attempt.attemptId) as Array<Record<string, unknown>>;
     this.db.prepare("UPDATE coordinator_attempts SET state = 'failed' WHERE turn_id = ?").run(turnId);
     if (this.active?.turnId === turnId) this.active = undefined;

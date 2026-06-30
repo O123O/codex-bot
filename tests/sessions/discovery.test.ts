@@ -65,3 +65,10 @@ test("discovery exhausts both archives and returns stable filtered snapshot page
   assert.equal(discovery.cleanupExpired(), 1);
 });
 
+test("discovery search filters the combined snapshot by id, cwd, or preview", async () => {
+  const endpoint = new DiscoveryEndpoint();
+  endpoint.pages.set("false:first", { data: [row("one", 2, { preview: "Payments API" }), row("two", 1, { cwd: "/work/website" })], nextCursor: null });
+  endpoint.pages.set("true:first", { data: [], nextCursor: null });
+  const discovery = new SessionDiscovery(createTestDatabase(), new AppServerPool([endpoint], { maxConcurrentTurns: 2 }));
+  assert.deepEqual((await discovery.list({ endpointId: "local", search: "payments" })).sessions.map((item) => item.id), ["one"]);
+});

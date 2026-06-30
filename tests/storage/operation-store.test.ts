@@ -38,3 +38,13 @@ test("a context with dispatched effects is atomically superseded once", () => {
   assert.equal(recovery.id, replay.id);
   assert.equal(store.getSourceContext("ctx")?.supersededBy, recovery.id);
 });
+
+test("pending Telegram and recovery contexts survive process-local queue loss", () => {
+  const store = new OperationStore(createTestDatabase());
+  store.createSourceContext({ id: "telegram-1", kind: "telegram", sourceId: "1", rawText: "hello", attachmentIds: [] });
+  store.createSourceContext({ id: "recovery-1", kind: "recovery", sourceId: "telegram-1", rawText: "[]", attachmentIds: [] });
+  store.createSourceContext({ id: "event-1", kind: "event_batch", sourceId: "batch", rawText: "[]", attachmentIds: [] });
+  store.setSourceState("telegram-1", "completed");
+
+  assert.deepEqual(store.listPendingSourceContexts(["telegram", "recovery"]).map((context) => context.id), ["recovery-1"]);
+});

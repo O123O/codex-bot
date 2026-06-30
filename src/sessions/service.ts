@@ -23,18 +23,28 @@ export class SessionService {
     const input = options.input ?? [{ type: "text", text, text_elements: [] }];
     if (activeTurn) {
       if (mode === "start") throw new AppError("SESSION_BUSY", `${nickname} already has an active turn`);
-      const response = await this.pool.request<{ turnId: string }>(session.endpoint, "turn/steer", {
-        threadId: session.thread_id, ...(options.clientUserMessageId ? { clientUserMessageId: options.clientUserMessageId } : {}), input, expectedTurnId: activeTurn,
-      });
-      return { mode: "steer", turnId: response.turnId };
+      try {
+        const response = await this.pool.request<{ turnId: string }>(session.endpoint, "turn/steer", {
+          threadId: session.thread_id, ...(options.clientUserMessageId ? { clientUserMessageId: options.clientUserMessageId } : {}), input, expectedTurnId: activeTurn,
+        });
+        return { mode: "steer", turnId: response.turnId };
+      } catch (error) {
+        if (!options.clientUserMessageId) throw error;
+        const history = await this.pool.request<any>(session.endpoint, "thread/read", { threadId: session.thread_id, includeTurns: true });
+        const proven = history.thread.turns.find((turn: any) => turn.id === activeTurn && turn.items.some((item: any) => item.type === "userMessage" && item.clientId === options.clientUserMessageId));
+        if (!proven) throw error;
+        return { mode: "steer", turnId: activeTurn };
+      }
     }
     if (mode === "steer") throw new AppError("SESSION_IDLE", `${nickname} has no active turn`);
     const settings = this.runtime.settings(session.endpoint, session.thread_id);
-    const response = await this.pool.startTurn<{ turn: { id: string } }>(session.endpoint, {
+    const response = await this.pool.startTurn<{ turn: { id: string; status?: string } }>(session.endpoint, {
       threadId: session.thread_id, ...(options.clientUserMessageId ? { clientUserMessageId: options.clientUserMessageId } : {}), input, ...settings,
     });
     this.runtime.consumeSettings(session.endpoint, session.thread_id);
-    this.runtime.setActiveTurn(session.endpoint, session.thread_id, response.turn.id);
+    if (!new Set(["completed", "failed", "interrupted"]).has(response.turn.status ?? "")) {
+      this.runtime.setActiveTurn(session.endpoint, session.thread_id, response.turn.id);
+    }
     return { mode: "start", turnId: response.turn.id };
   }
 
@@ -49,52 +59,107 @@ export class SessionService {
 
   collect(nickname: string, count: number): Promise<LogicalFinalMessage[]>;
   collect(nickname: string, count: number, options: { direct?: false; destination?: string }): Promise<LogicalFinalMessage[]>;
-  collect(nickname: string, count: number, options: { direct: true; destination: string }): Promise<Array<{ deliveryId: string }>>;
-  async collect(nickname: string, count: number, options: { direct?: boolean; destination?: string } = {}): Promise<LogicalFinalMessage[] | Array<{ deliveryId: string }>> {
+  collect(nickname: string, count: number, options: { direct: true; destination: string; deliveryKey?: string }): Promise<Array<{ deliveryId: string }>>;
+  async collect(nickname: string, count: number, options: { direct?: boolean; destination?: string; deliveryKey?: string } = {}): Promise<LogicalFinalMessage[] | Array<{ deliveryId: string }>> {
     const session = this.required(nickname);
     const messages = this.finals.list(session.endpoint, session.thread_id, count);
     if (!options.direct) return messages;
     if (!options.destination) throw new TypeError("destination is required for direct collection");
     return messages.map((message) => ({
       deliveryId: this.deliveries.prepare({
-        id: `collect:${session.endpoint}:${session.thread_id}:${message.turnId}:${message.itemId}:${options.destination}`,
-        kind: "collection", destination: options.destination!, body: `[${nickname}] ${message.body}`, mandatory: false,
+        id: `collect:${options.deliveryKey ?? "legacy"}:${session.endpoint}:${session.thread_id}:${message.turnId}:${message.itemId}:${options.destination}`,
+        kind: "collection", destination: options.destination!, body: `[${nickname}] ${message.body}`, mandatory: true,
       }).id,
     }));
   }
 
-  status(nickname: string): Promise<unknown> {
+  async status(nickname: string): Promise<unknown> {
     const session = this.required(nickname);
-    return this.pool.request(session.endpoint, "thread/read", { threadId: session.thread_id, includeTurns: false });
+    const native = await this.pool.request<any>(session.endpoint, "thread/read", { threadId: session.thread_id, includeTurns: false });
+    const runtime = this.runtime.getSession(session.endpoint, session.thread_id);
+    const goal = await this.getGoal(nickname).catch(() => undefined);
+    return {
+      nickname,
+      endpoint: session.endpoint,
+      threadId: session.thread_id,
+      projectDir: session.project_dir,
+      managementState: runtime?.managementState ?? "unavailable",
+      nativeStatus: native.thread.status,
+      activeTurnId: this.runtime.activeTurn(session.endpoint, session.thread_id) ?? null,
+      pendingSettings: this.runtime.settings(session.endpoint, session.thread_id),
+      deliveryCursor: runtime?.deliveryCursor ?? null,
+      goal: goal && typeof goal === "object" && "goal" in goal ? (goal as any).goal : goal ?? null,
+    };
   }
 
-  models(endpointId: string): Promise<unknown> { return this.pool.request(endpointId, "model/list", {}); }
+  async models(endpointId: string): Promise<unknown> { return { data: await this.listModels(endpointId), nextCursor: null }; }
 
   async setModel(nickname: string, model: string): Promise<void> {
-    const session = this.required(nickname); this.runtime.setModel(session.endpoint, session.thread_id, model);
+    const session = this.required(nickname);
+    const available = await this.listModels(session.endpoint);
+    if (!available.some((candidate) => candidate.id === model || candidate.model === model)) throw new AppError("UNSUPPORTED_CAPABILITY", `unknown model for ${session.endpoint}: ${model}`);
+    this.runtime.setModel(session.endpoint, session.thread_id, model);
   }
 
   async setEffort(nickname: string, effort: string): Promise<void> {
-    const session = this.required(nickname); this.runtime.setEffort(session.endpoint, session.thread_id, effort);
+    const session = this.required(nickname);
+    const available = await this.listModels(session.endpoint);
+    const pendingModel = this.runtime.settings(session.endpoint, session.thread_id).model;
+    const model = available.find((candidate) => candidate.id === pendingModel || candidate.model === pendingModel) ?? available.find((candidate) => candidate.isDefault) ?? available[0];
+    if (model?.supportedReasoningEfforts && !model.supportedReasoningEfforts.some((candidate: any) => candidate.reasoningEffort === effort || candidate === effort)) {
+      throw new AppError("UNSUPPORTED_CAPABILITY", `reasoning effort ${effort} is not supported by ${model.id ?? model.model}`);
+    }
+    this.runtime.setEffort(session.endpoint, session.thread_id, effort);
   }
 
   getGoal(nickname: string): Promise<unknown> {
     const session = this.required(nickname); return this.pool.request(session.endpoint, "thread/goal/get", { threadId: session.thread_id });
   }
 
-  setGoal(nickname: string, objective: string, tokenBudget?: number): Promise<unknown> {
-    const session = this.required(nickname); return this.pool.request(session.endpoint, "thread/goal/set", { threadId: session.thread_id, objective, status: "active", ...(tokenBudget === undefined ? {} : { tokenBudget }) });
+  async setGoal(nickname: string, objective: string, tokenBudget?: number): Promise<unknown> {
+    const session = this.required(nickname);
+    try {
+      return await this.pool.request(session.endpoint, "thread/goal/set", { threadId: session.thread_id, objective, status: "active", ...(tokenBudget === undefined ? {} : { tokenBudget }) });
+    } catch (error) {
+      const current = await this.getGoal(nickname).catch(() => undefined) as any;
+      const goal = current?.goal;
+      if (goal?.objective === objective && goal?.status === "active" && (tokenBudget === undefined || goal.tokenBudget === tokenBudget || goal.token_budget === tokenBudget)) return current;
+      throw error;
+    }
   }
 
   pauseGoal(nickname: string): Promise<unknown> { return this.setGoalStatus(nickname, "paused"); }
   resumeGoal(nickname: string): Promise<unknown> { return this.setGoalStatus(nickname, "active"); }
 
-  cancelGoal(nickname: string): Promise<unknown> {
-    const session = this.required(nickname); return this.pool.request(session.endpoint, "thread/goal/clear", { threadId: session.thread_id });
+  async cancelGoal(nickname: string): Promise<unknown> {
+    const session = this.required(nickname);
+    try { return await this.pool.request(session.endpoint, "thread/goal/clear", { threadId: session.thread_id }); }
+    catch (error) {
+      const current = await this.getGoal(nickname).catch(() => undefined) as any;
+      if (current && current.goal == null) return current;
+      throw error;
+    }
   }
 
-  private setGoalStatus(nickname: string, status: "paused" | "active"): Promise<unknown> {
-    const session = this.required(nickname); return this.pool.request(session.endpoint, "thread/goal/set", { threadId: session.thread_id, status });
+  private async setGoalStatus(nickname: string, status: "paused" | "active"): Promise<unknown> {
+    const session = this.required(nickname);
+    try { return await this.pool.request(session.endpoint, "thread/goal/set", { threadId: session.thread_id, status }); }
+    catch (error) {
+      const current = await this.getGoal(nickname).catch(() => undefined) as any;
+      if (current?.goal?.status === status) return current;
+      throw error;
+    }
+  }
+
+  private async listModels(endpointId: string): Promise<any[]> {
+    const data: any[] = [];
+    let cursor: string | null = null;
+    do {
+      const page: { data?: any[]; nextCursor?: string | null } = await this.pool.request(endpointId, "model/list", cursor ? { cursor } : {});
+      data.push(...(page.data ?? []));
+      cursor = page.nextCursor ?? null;
+    } while (cursor);
+    return data;
   }
 
   private required(nickname: string) {
