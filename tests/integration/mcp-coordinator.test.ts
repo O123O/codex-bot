@@ -6,13 +6,13 @@ import test from "node:test";
 import { LocalEndpoint } from "../../src/app-server/local-endpoint.ts";
 import { AppServerPool } from "../../src/app-server/pool.ts";
 import { createCoordinatorTools } from "../../src/coordinator/tools.ts";
-import { buildCodexChildEnvironment, coordinatorTurnConfig, LoopbackMcpServer } from "../../src/mcp/server.ts";
+import { buildCodexChildEnvironment, coordinatorTurnConfig, LoopbackMcpServer, secureShellConfig } from "../../src/mcp/server.ts";
 import { createTestDatabase } from "../../src/storage/database.ts";
 import { OperationStore } from "../../src/storage/operation-store.ts";
 
 const enabled = process.env.RUN_CODEX_INTEGRATION === "1";
 
-test("real coordinator can call manager MCP while its shell cannot read the bearer token", { skip: !enabled, timeout: 180_000 }, async (t) => {
+test("real coordinator can call its approved manager MCP while a project worker cannot enumerate it", { skip: !enabled, timeout: 180_000 }, async (t) => {
   const db = createTestDatabase();
   const operations = new OperationStore(db);
   operations.createSourceContext({ id: "ctx", kind: "telegram", sourceId: "1", rawText: "integration", attachmentIds: [] });
@@ -22,10 +22,22 @@ test("real coordinator can call manager MCP while its shell cannot read the bear
   const endpoint = new LocalEndpoint({ id: "coordinator-local", codexBinary: "codex", env: buildCodexChildEnvironment(process.env, token), requestTimeoutMs: 30_000 });
   const worker = new LocalEndpoint({ id: "local", codexBinary: "codex", env: buildCodexChildEnvironment(process.env), requestTimeoutMs: 30_000 });
   let active = { contextId: "ctx", attemptId: "attempt", turnId: "pending" };
-  const mcp = new LoopbackMcpServer(tools, { current: () => active }, { host: "127.0.0.1", port: 0, token, allowedClientPid: () => endpoint.pid });
+  const mcp = new LoopbackMcpServer(tools, { current: () => active }, { host: "127.0.0.1", port: 0, token, allowedClientPid: () => endpoint.mcpClientPid });
   await mcp.start(); t.after(() => mcp.stop());
   await endpoint.start(); t.after(() => endpoint.stop());
   await worker.start(); t.after(() => worker.stop());
+  const workerThread = await worker.request<any>("thread/start", {
+    cwd: await mkdtemp(join(tmpdir(), "codex-bot-worker-mcp-")), approvalPolicy: "never", sandbox: "workspace-write", ephemeral: true,
+    config: secureShellConfig(),
+  });
+  const workerServerNames: string[] = [];
+  let cursor: string | null | undefined;
+  do {
+    const page = await worker.request<any>("mcpServerStatus/list", { threadId: workerThread.thread.id, cursor, limit: 100, detail: "toolsAndAuthOnly" });
+    workerServerNames.push(...page.data.map((server: any) => server.name));
+    cursor = page.nextCursor;
+  } while (cursor);
+  assert.equal(workerServerNames.includes("codex_bot_manager"), false);
   assert.equal((await fetch(mcp.url, { method: "POST", headers: { authorization: `Bearer ${token}` }, body: "{}" })).status, 403, "a valid token is insufficient outside the coordinator app-server process");
   const cwd = await mkdtemp(join(tmpdir(), "codex-bot-real-mcp-"));
   const thread = await endpoint.request<any>("thread/start", {
@@ -42,7 +54,7 @@ test("real coordinator can call manager MCP while its shell cannot read the bear
   const started = await pool.startTurn<any>(endpoint.id, {
     threadId: thread.thread.id,
     clientUserMessageId: "mcp-integration",
-    input: [{ type: "text", text: "Call list_managed_sessions once. Then run `if printenv CODEX_BOT_MCP_TOKEN >/dev/null; then echo TOKEN_VISIBLE; else echo TOKEN_HIDDEN; fi`. Reply with exactly MCP_OK only if the tool succeeds and the command prints TOKEN_HIDDEN.", text_elements: [] }],
+    input: [{ type: "text", text: "Call list_managed_sessions once. Reply with exactly MCP_OK only if the tool succeeds.", text_elements: [] }],
   });
   active = { ...active, turnId: started.turn.id };
   const completed = await terminal;

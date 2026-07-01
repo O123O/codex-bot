@@ -133,14 +133,9 @@ async function requestBelongsToPid(connection: TcpConnectionTuple, pid: number |
     const table = await readFile("/proc/net/tcp", "utf8").catch(() => "");
     const inodes = new Set(tcpConnectionInodes(table, connection));
     if (inodes.size === 0) return false;
-    const procEntries = await readdir("/proc");
-    for (const entry of procEntries) {
-      const ownerPid = Number(entry);
-      if (!Number.isSafeInteger(ownerPid) || !await isDescendantOrSelf(ownerPid, pid)) continue;
-      for (const fd of await readdir(`/proc/${ownerPid}/fd`).catch(() => [])) {
-        const target = await readlink(`/proc/${ownerPid}/fd/${fd}`).catch(() => "");
-        if (target.startsWith("socket:[") && inodes.has(target.slice(8, -1))) return true;
-      }
+    for (const fd of await readdir(`/proc/${pid}/fd`).catch(() => [])) {
+      const target = await readlink(`/proc/${pid}/fd/${fd}`).catch(() => "");
+      if (target.startsWith("socket:[") && inodes.has(target.slice(8, -1))) return true;
     }
     return false;
   } catch {
@@ -152,19 +147,6 @@ function ipv4ProcHex(address: string | undefined): string | undefined {
   const octets = address?.split(".").map(Number);
   if (!octets || octets.length !== 4 || octets.some((octet) => !Number.isInteger(octet) || octet < 0 || octet > 255)) return undefined;
   return [...octets].reverse().map((octet) => octet.toString(16).toUpperCase().padStart(2, "0")).join("");
-}
-
-async function isDescendantOrSelf(candidate: number, root: number): Promise<boolean> {
-  let current = candidate;
-  const visited = new Set<number>();
-  while (current > 1 && !visited.has(current)) {
-    if (current === root) return true;
-    visited.add(current);
-    const stat = await readFile(`/proc/${current}/stat`, "utf8").catch(() => "");
-    const fields = stat.slice(stat.lastIndexOf(")") + 1).trim().split(/\s+/u);
-    current = Number(fields[1] ?? 0);
-  }
-  return current === root;
 }
 
 async function readJson(request: AsyncIterable<Uint8Array>): Promise<unknown> {

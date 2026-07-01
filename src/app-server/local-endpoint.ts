@@ -1,5 +1,6 @@
 import { spawn as nodeSpawn, type ChildProcessWithoutNullStreams, type SpawnOptionsWithoutStdio } from "node:child_process";
 import { EventEmitter } from "node:events";
+import { readFile } from "node:fs/promises";
 import { AppError } from "../core/errors.ts";
 import { JsonRpcClient } from "./json-rpc-client.ts";
 import type { RpcRequest } from "./protocol.ts";
@@ -13,21 +14,44 @@ export interface PermissionBlockedEvent {
 }
 
 type Spawn = (command: string, args: readonly string[], options: SpawnOptionsWithoutStdio) => ChildProcessWithoutNullStreams;
+type ResolveMcpClientPid = (rootPid: number) => Promise<number>;
+
+async function readDirectChildren(pid: number): Promise<number[]> {
+  let value: string;
+  try { value = await readFile(`/proc/${pid}/task/${pid}/children`, "utf8"); }
+  catch (error) { throw new AppError("UNSUPPORTED_CAPABILITY", "unable to verify Codex launcher topology", { cause: error }); }
+  if (!value.trim()) return [];
+  const children = value.trim().split(/\s+/u).map(Number);
+  if (children.some((child) => !Number.isSafeInteger(child) || child <= 1)) throw new AppError("UNSUPPORTED_CAPABILITY", "invalid Codex launcher topology");
+  return children;
+}
+
+export async function resolveMcpClientPid(rootPid: number, childrenOf: (pid: number) => Promise<readonly number[]> = readDirectChildren): Promise<number> {
+  if (process.platform !== "linux") throw new AppError("UNSUPPORTED_CAPABILITY", "manager MCP process verification requires Linux");
+  const children = await childrenOf(rootPid);
+  if (children.length === 0) return rootPid;
+  if (children.length !== 1) throw new AppError("UNSUPPORTED_CAPABILITY", "unsupported Codex launcher topology");
+  const [protocolPid] = children;
+  if (!protocolPid || (await childrenOf(protocolPid)).length !== 0) throw new AppError("UNSUPPORTED_CAPABILITY", "unsupported Codex launcher topology");
+  return protocolPid;
+}
 
 export class LocalEndpoint {
   readonly id: string;
   state: "starting" | "ready" | "unavailable" | "stopped" = "stopped";
   private child?: ChildProcessWithoutNullStreams;
   private client?: JsonRpcClient;
+  private protocolPid?: number;
   private readonly events = new EventEmitter();
 
-  constructor(private readonly options: { id?: string; codexBinary: string; spawn?: Spawn; env?: NodeJS.ProcessEnv; requestTimeoutMs?: number; expectedVersion?: string }) {
+  constructor(private readonly options: { id?: string; codexBinary: string; spawn?: Spawn; env?: NodeJS.ProcessEnv; requestTimeoutMs?: number; expectedVersion?: string; resolveMcpClientPid?: ResolveMcpClientPid }) {
     this.id = options.id ?? "local";
   }
 
   async start(): Promise<void> {
     if (this.state === "ready") return;
     this.state = "starting";
+    delete this.protocolPid;
     const spawn = this.options.spawn ?? nodeSpawn;
     const child = spawn(this.options.codexBinary, ["app-server", "--listen", "stdio://"], {
       env: this.options.env ?? process.env,
@@ -43,6 +67,7 @@ export class LocalEndpoint {
       client.close(error);
       if (this.child === child) {
         delete this.child;
+        delete this.protocolPid;
         if (this.client === client) delete this.client;
         if (this.state !== "stopped") {
           this.state = "unavailable";
@@ -55,6 +80,7 @@ export class LocalEndpoint {
       if (this.child === child) {
         const unexpectedly = this.state !== "stopped";
         delete this.child;
+        delete this.protocolPid;
         if (this.client === client) delete this.client;
         if (unexpectedly) {
           this.state = "unavailable";
@@ -71,6 +97,7 @@ export class LocalEndpoint {
         const actual = /\/(\d+\.\d+\.\d+)(?:\s|\()/u.exec(initialized.userAgent ?? "")?.[1];
         if (actual !== this.options.expectedVersion) throw new AppError("UNSUPPORTED_CAPABILITY", `expected Codex app-server ${this.options.expectedVersion}, received ${actual ?? "unknown"}`);
       }
+      if (child.pid !== undefined) this.protocolPid = await (this.options.resolveMcpClientPid ?? resolveMcpClientPid)(child.pid);
       client.notify("initialized", {});
       this.state = "ready";
       this.events.emit("ready");
@@ -84,6 +111,7 @@ export class LocalEndpoint {
 
   async stop(): Promise<void> {
     this.state = "stopped";
+    delete this.protocolPid;
     const child = this.child;
     this.client?.close();
     if (!child) return;
@@ -121,6 +149,7 @@ export class LocalEndpoint {
   }
 
   get pid(): number | undefined { return this.child?.pid; }
+  get mcpClientPid(): number | undefined { return this.protocolPid; }
 
   onPermissionBlocked(listener: (event: PermissionBlockedEvent) => void): () => void {
     this.events.on("permissionBlocked", listener);

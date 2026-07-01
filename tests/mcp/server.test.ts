@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
 import test from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
@@ -54,6 +56,37 @@ test("a bearer token alone is rejected outside the authorized process tree", asy
   const server = new LoopbackMcpServer(tools, { current: () => undefined }, { host: "127.0.0.1", port: 0, token: "secret", allowedClientPid: () => -1 });
   await server.start(); t.after(() => server.stop());
   assert.equal((await fetch(server.url, { method: "POST", headers: { authorization: "Bearer secret" }, body: "{}" })).status, 403);
+});
+
+test("a token-bearing child of the exact MCP client process is rejected", async (t) => {
+  const operations = new OperationStore(createTestDatabase());
+  const tools = createCoordinatorTools(operations, {}, { maxCollectCount: 20 });
+  let allowedPid: number | undefined;
+  const server = new LoopbackMcpServer(tools, { current: () => undefined }, { host: "127.0.0.1", port: 0, token: "secret", allowedClientPid: () => allowedPid });
+  await server.start(); t.after(() => server.stop());
+
+  const requester = `setTimeout(async () => {
+    const response = await fetch(process.env.MCP_URL, { method: "POST", headers: { authorization: "Bearer " + process.env.MCP_TOKEN }, body: "{}" });
+    process.stdout.write(String(response.status));
+  }, 50);`;
+  const run = async (nested: boolean): Promise<number> => {
+    const source = nested
+      ? `const { spawnSync } = require("node:child_process"); const result = spawnSync(process.execPath, ["-e", ${JSON.stringify(requester)}], { env: process.env, encoding: "utf8" }); process.stdout.write(result.stdout); process.exitCode = result.status ?? 1;`
+      : requester;
+    const child = spawn(process.execPath, ["-e", source], {
+      env: { MCP_URL: server.url, MCP_TOKEN: "secret", PATH: process.env.PATH ?? "" },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    allowedPid = child.pid;
+    let stdout = "";
+    child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
+    const [code] = await once(child, "exit");
+    assert.equal(code, 0);
+    return Number(stdout);
+  };
+
+  assert.notEqual(await run(false), 403, "the exact socket owner must be accepted");
+  assert.equal(await run(true), 403, "a descendant must be rejected even when it has the bearer token");
 });
 
 test("client socket lookup matches the complete IPv4 tuple instead of only its ports", () => {
