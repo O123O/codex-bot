@@ -26,6 +26,7 @@
 - Modify `src/coordinator/notebook.ts`: initialize only an absent notebook and preserve invalid existing bytes.
 - Modify `.env.example` and `README.md`: document the external workdir, policy ownership, customization, backup, and repair workflow.
 - Create `tests/cli.test.ts`, `tests/coordinator/workspace.test.ts`, and `tests/coordinator/policy.test.ts`; modify `tests/config.test.ts`.
+- Create `tests/main.test.ts`: verify direct-execution detection uses URL-safe path conversion.
 
 ### Task 1: CLI and configuration contract
 
@@ -67,6 +68,21 @@ test("does not echo an unknown argument into a startup error", () => {
 test("formats only known user-facing startup failures", () => {
   assert.equal(formatStartupError(new AppError("CONFIGURATION_ERROR", "managed file changed")), "CONFIGURATION_ERROR: managed file changed");
   assert.equal(formatStartupError(new Error("request contained secret-token")), "startup failed");
+});
+```
+
+Create `tests/main.test.ts`:
+
+```ts
+import assert from "node:assert/strict";
+import { pathToFileURL } from "node:url";
+import test from "node:test";
+import { isDirectExecution } from "../src/main.ts";
+
+test("detects direct execution for URL-sensitive filesystem paths", () => {
+  const path = "/tmp/codex bot#入口/main.ts";
+  assert.equal(isDirectExecution(pathToFileURL(path).href, path), true);
+  assert.equal(isDirectExecution("file:///other/main.ts", path), false);
 });
 ```
 
@@ -163,6 +179,12 @@ export function loadConfig(
 Update `src/main.ts` to pass `process.argv.slice(2)` through the parser and report only formatted failures:
 
 ```ts
+import { pathToFileURL } from "node:url";
+
+export function isDirectExecution(moduleUrl: string, argvEntry: string | undefined): boolean {
+  return argvEntry !== undefined && moduleUrl === pathToFileURL(argvEntry).href;
+}
+
 export async function main(env = process.env, argv: readonly string[] = process.argv.slice(2)): Promise<void> {
   const app = await createApp(loadConfig(env, parseCliArgs(argv)));
   await app.start();
@@ -176,7 +198,7 @@ export async function main(env = process.env, argv: readonly string[] = process.
   process.once("SIGTERM", stop);
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (isDirectExecution(import.meta.url, process.argv[1])) {
   void main().catch((error) => {
     process.stderr.write(`codex-bot: ${formatStartupError(error)}\n`);
     process.exitCode = 1;
@@ -189,7 +211,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
 Run:
 
 ```bash
-npm test -- tests/cli.test.ts tests/config.test.ts
+npm test -- tests/cli.test.ts tests/main.test.ts tests/config.test.ts
 npm run typecheck
 ```
 
@@ -198,7 +220,7 @@ Expected: both commands PASS.
 - [ ] **Step 5: Commit the CLI/config slice**
 
 ```bash
-git add src/cli.ts src/config.ts src/main.ts src/core/errors.ts tests/cli.test.ts tests/config.test.ts
+git add src/cli.ts src/config.ts src/main.ts src/core/errors.ts tests/cli.test.ts tests/main.test.ts tests/config.test.ts
 git commit -m "feat: configure external coordinator workdir"
 ```
 
@@ -217,7 +239,7 @@ Use temporary directories and temporary template files to cover these independen
 ```ts
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, readlink, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readlink, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
@@ -325,9 +347,30 @@ test("rejects direct, nested, and symlink-equivalent overlap with backend state"
   await assert.rejects(prepareCoordinatorWorkspace({ ...aliased.options, workdir: join(actualData, "manager"), dataDir: dataAlias }), /must be separate from backend state/);
 });
 
+test("rejects a backend alias located inside the canonical coordinator tree", async () => {
+  const fixture = await fixtureWithTemplates("policy-v1\n");
+  await mkdir(fixture.workdir, { recursive: true });
+  const safeBackend = join(dirname(fixture.workdir), "safe-backend");
+  await mkdir(safeBackend, { recursive: true });
+  const mutableAlias = join(fixture.workdir, "data-link");
+  await symlink(safeBackend, mutableAlias, "dir");
+  await assert.rejects(prepareCoordinatorWorkspace({ ...fixture.options, dataDir: mutableAlias }), /configured data directory.*must be separate/);
+});
+
+test("returns canonical backend paths for exclusive production use", async () => {
+  const fixture = await fixtureWithTemplates("policy-v1\n");
+  const safeBackend = join(dirname(fixture.workdir), "safe-backend");
+  const externalAlias = join(dirname(fixture.workdir), "external-data-link");
+  await mkdir(safeBackend, { recursive: true });
+  await symlink(safeBackend, externalAlias, "dir");
+  const prepared = await prepareCoordinatorWorkspace({ ...fixture.options, dataDir: externalAlias });
+  assert.equal(prepared.dataRoot, await realpath(safeBackend));
+  assert.notEqual(prepared.dataRoot, externalAlias);
+});
+
 test("rejects a registry path inside the coordinator workspace", async () => {
   const fixture = await fixtureWithTemplates("policy-v1\n");
-  await assert.rejects(prepareCoordinatorWorkspace({ ...fixture.options, registryPath: join(fixture.workdir, "sessions.json") }), /registry.*coordinator workdir/);
+  await assert.rejects(prepareCoordinatorWorkspace({ ...fixture.options, registryPath: join(fixture.workdir, "sessions.json") }), /coordinator workdir.*registry/);
 });
 
 test("reports an unusable workdir without exposing the raw filesystem failure", async () => {
@@ -361,7 +404,7 @@ Create `src/coordinator/workspace.ts` with:
 ```ts
 import { createHash, randomUUID } from "node:crypto";
 import { lstat, mkdir, readFile, realpath, rename, unlink, writeFile } from "node:fs/promises";
-import { basename, dirname, isAbsolute, join, parse, relative, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
 import { AppError } from "../core/errors.ts";
 import { CoordinatorNotebook } from "./notebook.ts";
 
@@ -378,18 +421,27 @@ export interface CoordinatorWorkspaceOptions {
 
 export interface PreparedCoordinatorWorkspace {
   root: string;
+  dataRoot: string;
+  registryPath: string;
   notebook: CoordinatorNotebook;
   warnings: string[];
 }
 
 export async function prepareCoordinatorWorkspace(options: CoordinatorWorkspaceOptions): Promise<PreparedCoordinatorWorkspace> {
   try {
+    const requestedRoot = resolve(options.workdir);
+    const requestedDataRoot = resolve(options.dataDir);
+    const requestedRegistryPath = resolve(options.registryPath);
+    assertSeparated(requestedRoot, requestedDataRoot, "data directory");
+    assertSeparated(requestedRoot, requestedRegistryPath, "registry path");
     await mkdir(options.workdir, { recursive: true, mode: 0o700 });
     await mkdir(options.dataDir, { recursive: true, mode: 0o700 });
     await mkdir(dirname(options.registryPath), { recursive: true, mode: 0o700 });
     const root = await realpath(options.workdir);
     const dataRoot = await realpath(options.dataDir);
     const registryPath = await canonicalFilePath(options.registryPath);
+    assertSeparated(root, requestedDataRoot, "configured data directory");
+    assertSeparated(root, requestedRegistryPath, "configured registry path");
     assertSeparated(root, dataRoot, "data directory");
     assertSeparated(root, registryPath, "registry path");
   const policyPath = join(root, POLICY_FILE);
@@ -423,7 +475,7 @@ export async function prepareCoordinatorWorkspace(options: CoordinatorWorkspaceO
   const notebook = await CoordinatorNotebook.bootstrap(join(root, "session-status.json"), options.notebookTemplatePath);
   const gitRoot = await findGitAncestor(root);
   const warnings = gitRoot ? [`Coordinator workdir ${root} is inside Git worktree ${gitRoot}; Codex may inherit parent instructions.`] : [];
-  return { root, notebook, warnings };
+  return { root, dataRoot, registryPath, notebook, warnings };
   } catch (error) {
     if (error instanceof AppError) throw error;
     throw managedError(`cannot prepare coordinator workdir ${options.workdir}`);
@@ -734,8 +786,9 @@ Expected: FAIL because production still derives the coordinator directory from t
 In `src/production-app.ts`:
 
 - replace `repositoryRoot` and `join(repositoryRoot, "coordinator")` with a read-only asset root derived from `import.meta.url` as `../assets/coordinator`;
-- declare `let coordinatorDir = config.coordinatorWorkdir`, `let notebook`, and `let coordinatorWarnings: string[] = []`;
+- declare `let coordinatorDir = config.coordinatorWorkdir`, `let dataDir = config.dataDir`, `let registryPath = config.sessionRegistryPath`, `let notebook`, and `let coordinatorWarnings: string[] = []`;
 - insert a first phase named `coordinator-workspace` that calls `prepareCoordinatorWorkspace({ workdir: config.coordinatorWorkdir, dataDir: config.dataDir, registryPath: config.sessionRegistryPath, policyTemplatePath: join(assetRoot, "AGENTS.md"), notebookTemplatePath: join(assetRoot, "session-status.example.json") })`, then assigns its canonical root, notebook, and warnings;
+- assign `prepared.dataRoot` and `prepared.registryPath` to the production `dataDir` and `registryPath` variables, then use only those canonical variables for the SQLite database, attachment store, registry open/reload, and every later backend-state path access; never use the original `config.dataDir` or `config.sessionRegistryPath` after preparation;
 - remove coordinator-directory creation from the storage phase;
 - remove `CoordinatorNotebook.bootstrap` from the registry phase;
 - initialize the registry's default coordinator mapping with the prepared canonical directory;

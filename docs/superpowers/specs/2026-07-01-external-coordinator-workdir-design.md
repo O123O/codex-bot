@@ -28,7 +28,7 @@ An existing valid notebook is opened unchanged. An existing unreadable, malforme
 
 The coordinator thread is started or resumed with the canonical coordinator workdir as its exact `cwd`. Its registry mapping must use that same path. The backend database, registry, and attachment store stay outside this workdir so the coordinator cannot rewrite authoritative backend state through normal workspace access.
 
-This separation is enforced rather than documented only. Startup canonicalizes the coordinator directory, data directory, and registry location through their existing parents, then rejects equality or containment in either direction. This catches direct paths, nested paths, and symlink aliases before Codex starts. The attachment store is already beneath the data directory and is covered by the same check.
+This separation is enforced rather than documented only. Startup checks both configured lexical paths and canonical targets for the coordinator directory, data directory, and registry location, then rejects equality or containment in either direction. A backend path alias located inside the canonical coordinator tree is rejected even when it points elsewhere, because the coordinator could otherwise access or replace that alias. After validation, production uses only the returned canonical backend paths. This catches direct paths, nested paths, mutable aliases, and symlink-equivalent targets before Codex starts. The attachment store is already beneath the data directory and is covered by the same check.
 
 ## Instruction ownership and updates
 
