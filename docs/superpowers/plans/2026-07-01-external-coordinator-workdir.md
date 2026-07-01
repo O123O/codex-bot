@@ -20,7 +20,10 @@
 - Create `assets/coordinator/session-status.example.json`: packaged notebook seed.
 - Delete `coordinator/AGENTS.override.md` and `coordinator/session-status.example.json`: remove runtime assets from the source-owned coordinator cwd.
 - Delete `coordinator/.gitignore`: the source checkout no longer owns a live coordinator notebook.
+- Modify `.gitignore`: keep the existing ignored legacy notebook protected after deleting its nested ignore file.
 - Modify `src/production-app.ts`: add workspace preparation as the first phase and use its canonical path/notebook/warnings.
+- Create `tests/production-startup.test.ts`: prove the real production composition prepares the external workspace before endpoint startup and persists its canonical identity.
+- Modify `src/coordinator/notebook.ts`: initialize only an absent notebook and preserve invalid existing bytes.
 - Modify `.env.example` and `README.md`: document the external workdir, policy ownership, customization, backup, and repair workflow.
 - Create `tests/cli.test.ts`, `tests/coordinator/workspace.test.ts`, and `tests/coordinator/policy.test.ts`; modify `tests/config.test.ts`.
 
@@ -52,6 +55,13 @@ test("rejects missing, repeated, and unknown CLI arguments", () => {
   assert.throws(() => parseCliArgs(["--workdir"]), /requires a path/);
   assert.throws(() => parseCliArgs(["--workdir", "one", "--workdir", "two"]), /only once/);
   assert.throws(() => parseCliArgs(["--unknown"]), /unknown argument/);
+});
+
+test("does not echo an unknown argument into a startup error", () => {
+  let failure: unknown;
+  try { parseCliArgs(["--unknown=secret-token"]); } catch (error) { failure = error; }
+  assert.equal(formatStartupError(failure), "CONFIGURATION_ERROR: unknown argument");
+  assert.doesNotMatch(formatStartupError(failure), /secret-token/);
 });
 
 test("formats only known user-facing startup failures", () => {
@@ -99,7 +109,7 @@ export function parseCliArgs(argv: readonly string[]): CliOptions {
   let coordinatorWorkdir: string | undefined;
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index]!;
-    if (argument !== "--workdir") throw new AppError("CONFIGURATION_ERROR", `unknown argument: ${argument}`);
+    if (argument !== "--workdir") throw new AppError("CONFIGURATION_ERROR", "unknown argument");
     if (coordinatorWorkdir !== undefined) throw new AppError("CONFIGURATION_ERROR", "--workdir may be specified only once");
     const value = argv[index + 1];
     if (!value || value.startsWith("--")) throw new AppError("CONFIGURATION_ERROR", "--workdir requires a path");
@@ -197,6 +207,8 @@ git commit -m "feat: configure external coordinator workdir"
 **Files:**
 - Create: `tests/coordinator/workspace.test.ts`
 - Create: `src/coordinator/workspace.ts`
+- Modify: `tests/coordinator/notebook.test.ts`
+- Modify: `src/coordinator/notebook.ts`
 
 - [ ] **Step 1: Write the workspace state-machine tests**
 
@@ -207,8 +219,9 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, readlink, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
+import { formatStartupError } from "../../src/cli.ts";
 import { prepareCoordinatorWorkspace, type CoordinatorWorkspaceOptions } from "../../src/coordinator/workspace.ts";
 
 function sha256(value: string): string {
@@ -228,12 +241,14 @@ async function fixtureWithTemplates(policy: string, options: { nestedInGit?: boo
   if (options.nestedInGit) await mkdir(join(gitRoot, ".git"), { recursive: true });
   const policyTemplate = join(assets, "AGENTS.md");
   const notebookTemplate = join(assets, "session-status.example.json");
+  const dataDir = join(root, "backend-data");
+  const registryPath = join(root, "backend-registry", "sessions.json");
   await writeFile(policyTemplate, policy);
   await writeFile(notebookTemplate, '{"version":1,"sessions":{}}\n');
   return {
     workdir,
     policyTemplate,
-    options: { workdir, policyTemplatePath: policyTemplate, notebookTemplatePath: notebookTemplate },
+    options: { workdir, dataDir, registryPath, policyTemplatePath: policyTemplate, notebookTemplatePath: notebookTemplate },
   };
 }
 
@@ -294,9 +309,40 @@ test("warns when the workspace has a Git ancestor", async () => {
   const prepared = await prepareCoordinatorWorkspace(fixture.options);
   assert.match(prepared.warnings.join("\n"), /Git worktree.*parent instructions/);
 });
+
+test("rejects direct, nested, and symlink-equivalent overlap with backend state", async () => {
+  const direct = await fixtureWithTemplates("policy-v1\n");
+  await assert.rejects(prepareCoordinatorWorkspace({ ...direct.options, dataDir: direct.workdir }), /must be separate from backend state/);
+
+  const nested = await fixtureWithTemplates("policy-v1\n");
+  await assert.rejects(prepareCoordinatorWorkspace({ ...nested.options, dataDir: join(nested.workdir, "data") }), /must be separate from backend state/);
+
+  const aliased = await fixtureWithTemplates("policy-v1\n");
+  const actualData = join(dirname(aliased.workdir), "actual-data");
+  const dataAlias = join(dirname(aliased.workdir), "data-alias");
+  await mkdir(actualData, { recursive: true });
+  await symlink(actualData, dataAlias, "dir");
+  await assert.rejects(prepareCoordinatorWorkspace({ ...aliased.options, workdir: join(actualData, "manager"), dataDir: dataAlias }), /must be separate from backend state/);
+});
+
+test("rejects a registry path inside the coordinator workspace", async () => {
+  const fixture = await fixtureWithTemplates("policy-v1\n");
+  await assert.rejects(prepareCoordinatorWorkspace({ ...fixture.options, registryPath: join(fixture.workdir, "sessions.json") }), /registry.*coordinator workdir/);
+});
+
+test("reports an unusable workdir without exposing the raw filesystem failure", async () => {
+  const fixture = await fixtureWithTemplates("policy-v1\n");
+  const blockingFile = join(dirname(fixture.workdir), "not-a-directory");
+  await writeFile(blockingFile, "private contents");
+  let failure: unknown;
+  try { await prepareCoordinatorWorkspace({ ...fixture.options, workdir: join(blockingFile, "manager") }); }
+  catch (error) { failure = error; }
+  assert.equal(formatStartupError(failure), `CONFIGURATION_ERROR: cannot prepare coordinator workdir ${join(blockingFile, "manager")}`);
+  assert.doesNotMatch(formatStartupError(failure), /ENOTDIR|private contents/);
+});
 ```
 
-The fixture must create a policy template and `session-status.example.json` outside the target workdir. Add a separate restart assertion proving an existing notebook is not replaced.
+The fixture must create a policy template and `session-status.example.json` outside the target workdir. Add a separate restart assertion proving an existing valid notebook is not replaced. Replace the current notebook quarantine test with a regression that writes invalid bytes, expects `CoordinatorNotebook.bootstrap` to reject with the notebook path, and proves those bytes remain unchanged and no `.invalid-*` file is created.
 
 - [ ] **Step 2: Run the workspace tests and verify they fail**
 
@@ -315,7 +361,7 @@ Create `src/coordinator/workspace.ts` with:
 ```ts
 import { createHash, randomUUID } from "node:crypto";
 import { lstat, mkdir, readFile, realpath, rename, unlink, writeFile } from "node:fs/promises";
-import { basename, dirname, join, parse } from "node:path";
+import { basename, dirname, isAbsolute, join, parse, relative, sep } from "node:path";
 import { AppError } from "../core/errors.ts";
 import { CoordinatorNotebook } from "./notebook.ts";
 
@@ -324,6 +370,8 @@ const DIGEST_FILE = ".codex-bot-agents.sha256";
 
 export interface CoordinatorWorkspaceOptions {
   workdir: string;
+  dataDir: string;
+  registryPath: string;
   policyTemplatePath: string;
   notebookTemplatePath: string;
 }
@@ -335,8 +383,15 @@ export interface PreparedCoordinatorWorkspace {
 }
 
 export async function prepareCoordinatorWorkspace(options: CoordinatorWorkspaceOptions): Promise<PreparedCoordinatorWorkspace> {
-  await mkdir(options.workdir, { recursive: true, mode: 0o700 });
-  const root = await realpath(options.workdir);
+  try {
+    await mkdir(options.workdir, { recursive: true, mode: 0o700 });
+    await mkdir(options.dataDir, { recursive: true, mode: 0o700 });
+    await mkdir(dirname(options.registryPath), { recursive: true, mode: 0o700 });
+    const root = await realpath(options.workdir);
+    const dataRoot = await realpath(options.dataDir);
+    const registryPath = await canonicalFilePath(options.registryPath);
+    assertSeparated(root, dataRoot, "data directory");
+    assertSeparated(root, registryPath, "registry path");
   const policyPath = join(root, POLICY_FILE);
   const digestPath = join(root, DIGEST_FILE);
   const packagedPolicy = await readFile(options.policyTemplatePath);
@@ -369,8 +424,37 @@ export async function prepareCoordinatorWorkspace(options: CoordinatorWorkspaceO
   const gitRoot = await findGitAncestor(root);
   const warnings = gitRoot ? [`Coordinator workdir ${root} is inside Git worktree ${gitRoot}; Codex may inherit parent instructions.`] : [];
   return { root, notebook, warnings };
+  } catch (error) {
+    if (error instanceof AppError) throw error;
+    throw managedError(`cannot prepare coordinator workdir ${options.workdir}`);
+  }
 }
 ```
+
+Keep the implementation body indented inside the `try`. Add canonical containment helpers:
+
+```ts
+async function canonicalFilePath(path: string): Promise<string> {
+  try { return await realpath(path); }
+  catch (error) {
+    if (!isErrno(error, "ENOENT")) throw error;
+    return join(await realpath(dirname(path)), basename(path));
+  }
+}
+
+function assertSeparated(workdir: string, protectedPath: string, label: string): void {
+  if (contains(workdir, protectedPath) || contains(protectedPath, workdir)) {
+    throw managedError(`coordinator workdir ${workdir} and backend ${label} ${protectedPath} must be separate from backend state`);
+  }
+}
+
+function contains(parent: string, child: string): boolean {
+  const candidate = relative(parent, child);
+  return candidate === "" || (!candidate.startsWith(`..${sep}`) && candidate !== ".." && !isAbsolute(candidate));
+}
+```
+
+The error message for the registry check must contain both “registry” and “coordinator workdir”; the generic data message must contain “must be separate from backend state.”
 
 Implement the helpers as:
 
@@ -428,6 +512,8 @@ function isErrno(error: unknown, code: string): error is NodeJS.ErrnoException {
 }
 ```
 
+Change `CoordinatorNotebook.bootstrap` so only `ENOENT` initializes from the example. Parse existing bytes outside the `ENOENT` handler. Wrap unreadable/invalid existing notebooks in `AppError("CONFIGURATION_ERROR", `invalid coordinator notebook ${path}`)` without renaming or writing the live file. Initialize a missing notebook through the existing atomic JSON writer so its mode is 0600.
+
 - [ ] **Step 4: Verify workspace behavior and types**
 
 Run:
@@ -442,7 +528,7 @@ Expected: PASS with no warnings or leaked temporary files.
 - [ ] **Step 5: Commit the workspace bootstrapper**
 
 ```bash
-git add src/coordinator/workspace.ts tests/coordinator/workspace.test.ts
+git add src/coordinator/workspace.ts tests/coordinator/workspace.test.ts src/coordinator/notebook.ts tests/coordinator/notebook.test.ts
 git commit -m "feat: guard coordinator workspace policy"
 ```
 
@@ -455,6 +541,7 @@ git commit -m "feat: guard coordinator workspace policy"
 - Delete: `coordinator/AGENTS.override.md`
 - Delete: `coordinator/session-status.example.json`
 - Delete: `coordinator/.gitignore`
+- Modify: `.gitignore`
 
 - [ ] **Step 1: Write a failing policy contract test**
 
@@ -547,7 +634,14 @@ User output and attachments: `send_chat_message`, `prepare_chat_attachment`, `se
 Tool schemas define exact arguments. Backend validation is authoritative for authorization, canonical paths, exact directives, idempotency, and delivery. Never expose tokens, hidden message bodies, internal tool chatter, or backend-only identifiers unless needed for diagnosis.
 ```
 
-Create `assets/coordinator/session-status.example.json` with the existing `{ "version": 1, "sessions": {} }` structure. Remove the two tracked source-runtime assets under `coordinator/`; do not touch the ignored live `coordinator/session-status.json` in the developer checkout.
+Create `assets/coordinator/session-status.example.json` with the existing `{ "version": 1, "sessions": {} }` structure. Before removing `coordinator/.gitignore`, add these exact legacy protections to the root `.gitignore`:
+
+```gitignore
+coordinator/session-status.json
+coordinator/session-status.json.invalid-*
+```
+
+Then remove the tracked source-runtime assets under `coordinator/`; do not touch the ignored live `coordinator/session-status.json` in the developer checkout.
 
 - [ ] **Step 4: Verify the policy contract**
 
@@ -563,7 +657,7 @@ Expected: PASS; the test proves the detailed policy and absence of default marke
 - [ ] **Step 5: Commit the packaged assets**
 
 ```bash
-git add assets/coordinator tests/coordinator/policy.test.ts coordinator/AGENTS.override.md coordinator/session-status.example.json coordinator/.gitignore
+git add .gitignore assets/coordinator tests/coordinator/policy.test.ts coordinator/AGENTS.override.md coordinator/session-status.example.json coordinator/.gitignore
 git commit -m "feat: package coordinator management playbook"
 ```
 
@@ -571,21 +665,69 @@ git commit -m "feat: package coordinator management playbook"
 
 **Files:**
 - Modify: `src/production-app.ts`
+- Create: `tests/production-startup.test.ts`
 - Modify: `tests/coordinator/identity.test.ts`
 
-- [ ] **Step 1: Extend the identity test for an explicit external workdir**
+- [ ] **Step 1: Write a failing production-startup test and extend identity error coverage**
 
-Add a test whose registry default, configured `coordinatorDir`, and fake app-server response all use a temporary external directory while `process.cwd()` is different. Assert the `thread/start` call receives the external canonical directory in `cwd`, and the persisted registry coordinator mapping uses it.
+Create `tests/production-startup.test.ts` with a temporary external coordinator directory, data directory, and registry path. Build a complete `BotConfig` with `mcpPort: 0` and a definitely missing `codexBinary`, start the real production app, and expect endpoint startup to fail:
 
-- [ ] **Step 2: Run the identity test and record the baseline**
+```ts
+import assert from "node:assert/strict";
+import { mkdtemp, readFile, realpath } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { fileURLToPath } from "node:url";
+import { join } from "node:path";
+import test from "node:test";
+import type { BotConfig } from "../src/config.ts";
+import { buildProductionApp } from "../src/production-app.ts";
+
+test("production prepares the configured coordinator workdir before endpoint startup", async () => {
+  const root = await mkdtemp(join(tmpdir(), "codex-bot-production-workdir-"));
+  const workdir = join(root, "external-coordinator");
+  const dataDir = join(root, "backend-data");
+  const registryPath = join(root, "backend-registry", "sessions.json");
+  const policyAsset = fileURLToPath(new URL("../assets/coordinator/AGENTS.md", import.meta.url));
+  const config: BotConfig = {
+    telegramBotToken: "test-token",
+    telegramOwnerId: 42,
+    telegramDestinationChatId: 42,
+    coordinatorWorkdir: workdir,
+    dataDir,
+    sessionRegistryPath: registryPath,
+    codexBinary: join(root, "missing-codex"),
+    maxConcurrentTurns: 1,
+    maxCollectCount: 20,
+    mcpHost: "127.0.0.1",
+    mcpPort: 0,
+    attachmentMaxBytes: 1024,
+    attachmentStoreMaxBytes: 4096,
+    sandboxMode: "workspace-write",
+  };
+  const app = await buildProductionApp(config);
+  await assert.rejects(app.start());
+  await app.stop();
+
+  assert.equal(await readFile(join(workdir, "AGENTS.md"), "utf8"), await readFile(policyAsset, "utf8"));
+  assert.match(await readFile(join(workdir, ".codex-bot-agents.sha256"), "utf8"), /^[a-f0-9]{64}\n$/u);
+  assert.deepEqual(JSON.parse(await readFile(join(workdir, "session-status.json"), "utf8")), { version: 1, sessions: {} });
+  assert.equal(JSON.parse(await readFile(registryPath, "utf8")).coordinator.project_dir, await realpath(workdir));
+});
+```
+
+This test must use a workdir outside the source checkout. It proves workspace preparation and registry initialization happen before the deliberately failing endpoint phase; under the current implementation it fails because production ignores `BotConfig.coordinatorWorkdir` and uses the source-relative directory.
+
+In `tests/coordinator/identity.test.ts`, add one case where the registry coordinator directory differs from the configured external workdir. Assert `resumeCoordinatorIdentity` rejects with `AppError` code `CONFIGURATION_ERROR`, the formatted message names the configured path, and no app-server request occurs. Retain the existing exact-cwd tests.
+
+- [ ] **Step 2: Run the production and identity tests and verify the red state**
 
 Run:
 
 ```bash
-npm test -- tests/coordinator/identity.test.ts
+npm test -- tests/production-startup.test.ts tests/coordinator/identity.test.ts
 ```
 
-Expected before production wiring: the new identity-level test may already PASS because `resumeCoordinatorIdentity` correctly honors its parameter. This is a characterization test for the existing boundary; Tasks 1–3 provide the required red tests for new logic. Do not alter identity behavior merely to force a failure.
+Expected: FAIL because production still derives the coordinator directory from the source checkout and identity mismatches are not sanitized configuration errors.
 
 - [ ] **Step 3: Replace the source-relative coordinator directory with a preparation phase**
 
@@ -593,12 +735,14 @@ In `src/production-app.ts`:
 
 - replace `repositoryRoot` and `join(repositoryRoot, "coordinator")` with a read-only asset root derived from `import.meta.url` as `../assets/coordinator`;
 - declare `let coordinatorDir = config.coordinatorWorkdir`, `let notebook`, and `let coordinatorWarnings: string[] = []`;
-- insert a first phase named `coordinator-workspace` that calls `prepareCoordinatorWorkspace({ workdir: config.coordinatorWorkdir, policyTemplatePath: join(assetRoot, "AGENTS.md"), notebookTemplatePath: join(assetRoot, "session-status.example.json") })`, then assigns its canonical root, notebook, and warnings;
+- insert a first phase named `coordinator-workspace` that calls `prepareCoordinatorWorkspace({ workdir: config.coordinatorWorkdir, dataDir: config.dataDir, registryPath: config.sessionRegistryPath, policyTemplatePath: join(assetRoot, "AGENTS.md"), notebookTemplatePath: join(assetRoot, "session-status.example.json") })`, then assigns its canonical root, notebook, and warnings;
 - remove coordinator-directory creation from the storage phase;
 - remove `CoordinatorNotebook.bootstrap` from the registry phase;
 - initialize the registry's default coordinator mapping with the prepared canonical directory;
 - enqueue each preparation warning as a mandatory `system_warning` delivery once storage and registry state are available; and
 - leave `startOrResumeCoordinator` passing the prepared canonical directory into `resumeCoordinatorIdentity`.
+
+Change coordinator identity path mismatches in `src/coordinator/identity.ts` to `AppError("CONFIGURATION_ERROR", ...)` messages that include the configured coordinator path but do not echo an unexpected app-server path. This makes the existing safe startup formatter useful without exposing arbitrary external values.
 
 Do not move the backend DB, registry, or attachments into the coordinator workdir. Do not add relocation or silently rewrite an existing coordinator mapping.
 
@@ -607,7 +751,7 @@ Do not move the backend DB, registry, or attachments into the coordinator workdi
 Run:
 
 ```bash
-npm test -- tests/app.test.ts tests/coordinator/workspace.test.ts tests/coordinator/identity.test.ts tests/coordinator/notebook.test.ts
+npm test -- tests/production-startup.test.ts tests/app.test.ts tests/coordinator/workspace.test.ts tests/coordinator/identity.test.ts tests/coordinator/notebook.test.ts
 npm run typecheck
 ```
 
@@ -616,7 +760,7 @@ Expected: PASS. Inspect `src/production-app.ts` with `rg 'repositoryRoot|join\(.
 - [ ] **Step 5: Commit production wiring**
 
 ```bash
-git add src/production-app.ts tests/coordinator/identity.test.ts
+git add src/production-app.ts src/coordinator/identity.ts tests/production-startup.test.ts tests/coordinator/identity.test.ts
 git commit -m "feat: start coordinator from prepared workdir"
 ```
 
@@ -625,7 +769,6 @@ git commit -m "feat: start coordinator from prepared workdir"
 **Files:**
 - Modify: `.env.example`
 - Modify: `README.md`
-- Modify: `.gitignore`
 
 - [ ] **Step 1: Add the external workdir to example configuration**
 
@@ -657,7 +800,7 @@ Add an “Coordinator instructions” subsection stating:
 - recovery from a guard failure is either restoring the exact managed file or moving custom content to the override and deleting both managed file and digest together; and
 - placing the workdir inside a Git worktree can cause parent instruction inheritance.
 
-Remove the obsolete `coordinator/.gitignore` entry from the root `.gitignore`; retain generic ignores for live notebook files where useful to developer tests.
+Do not remove the root `.gitignore` patterns `coordinator/session-status.json` and `coordinator/session-status.json.invalid-*`; they protect the legacy live notebook that is intentionally not migrated or deleted by this change.
 
 - [ ] **Step 3: Verify documentation has no obsolete runtime paths**
 
@@ -665,15 +808,16 @@ Run:
 
 ```bash
 rg -n 'coordinator/AGENTS\.override|coordinator/session-status|dedicated directory inside the repository' README.md .env.example
+git check-ignore coordinator/session-status.json
 git diff --check
 ```
 
-Expected: no obsolete README/setup matches and no whitespace errors.
+Expected: no obsolete README/setup matches, `coordinator/session-status.json` remains ignored by the root rule, and there are no whitespace errors.
 
 - [ ] **Step 4: Commit documentation**
 
 ```bash
-git add .env.example .gitignore README.md
+git add .env.example README.md
 git commit -m "docs: explain coordinator workdir ownership"
 ```
 

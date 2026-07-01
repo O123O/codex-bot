@@ -24,7 +24,11 @@ Before starting either app-server endpoint, the bot prepares the coordinator wor
 - `.codex-bot-agents.sha256`, containing the SHA-256 digest of the last policy version installed by the bot; and
 - `session-status.json`, initialized from the packaged example only when absent.
 
+An existing valid notebook is opened unchanged. An existing unreadable, malformed, or schema-invalid notebook stops startup without moving, truncating, quarantining, or replacing it; preserving supervision intent is safer than silently resetting it.
+
 The coordinator thread is started or resumed with the canonical coordinator workdir as its exact `cwd`. Its registry mapping must use that same path. The backend database, registry, and attachment store stay outside this workdir so the coordinator cannot rewrite authoritative backend state through normal workspace access.
+
+This separation is enforced rather than documented only. Startup canonicalizes the coordinator directory, data directory, and registry location through their existing parents, then rejects equality or containment in either direction. This catches direct paths, nested paths, and symlink aliases before Codex starts. The attachment store is already beneath the data directory and is covered by the same check.
 
 ## Instruction ownership and updates
 
@@ -101,7 +105,7 @@ Codex may discover instructions between a detected project root and the coordina
 
 ## Failure behavior
 
-Workspace preparation completes before app-server startup. Any missing configuration, unreadable directory, managed-file mismatch, partial managed state, or identity mismatch stops startup. CLI errors must name the affected path without exposing Telegram tokens, message contents, or other secrets.
+Workspace preparation completes before app-server startup. Any missing configuration, path overlap, unreadable directory, managed-file mismatch, partial managed state, invalid notebook, or identity mismatch stops startup. User-facing configuration errors name the affected trusted path without echoing arbitrary CLI arguments, Telegram tokens, message contents, raw filesystem errors, or other untrusted values.
 
 Managed file and hash updates use temporary files in the coordinator directory followed by atomic renames. The policy file is committed before the hash so a crash cannot record a digest for policy bytes that were not installed; an interrupted update will be rejected safely on the next startup.
 
@@ -111,6 +115,7 @@ Automated tests cover:
 
 - CLI parsing, environment fallback, precedence, missing values, and unknown arguments;
 - relative-path canonicalization independent of the bot installation path;
+- rejection when coordinator and backend state paths overlap directly, by containment, or through a symlink;
 - first-run workspace initialization;
 - unchanged managed policy on restart;
 - packaged policy upgrade when the installed file is unmodified;
