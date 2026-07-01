@@ -8,6 +8,13 @@ interface Pending {
   timeout: NodeJS.Timeout;
 }
 
+export class JsonRpcResponseError extends Error {
+  constructor(readonly code: number, readonly rpcMessage: string, readonly data?: unknown) {
+    super(`${code}: ${rpcMessage}`);
+    this.name = "JsonRpcResponseError";
+  }
+}
+
 export class JsonRpcClient {
   private nextId = 1;
   private readonly pending = new Map<number | string, Pending>();
@@ -84,7 +91,7 @@ export class JsonRpcClient {
       if (!pending) return;
       clearTimeout(pending.timeout);
       this.pending.delete(message.id);
-      if (message.error) pending.reject(new Error(`${message.error.code}: ${message.error.message}`));
+      if (message.error) pending.reject(new JsonRpcResponseError(message.error.code, message.error.message, message.error.data));
       else pending.resolve(message.result);
       return;
     }

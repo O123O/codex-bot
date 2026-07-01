@@ -12,7 +12,7 @@ import type { BotConfig } from "./config.ts";
 import { AppError } from "./core/errors.ts";
 import { runBackground } from "./core/background.ts";
 import { SessionDashboard } from "./coordinator/session-dashboard.ts";
-import { activateCoordinatorProfileIdentity, listCoordinatorThreadCandidates, resumeCoordinatorIdentity } from "./coordinator/identity.ts";
+import { activateCoordinatorProfileIdentity, resumeCoordinatorIdentity } from "./coordinator/identity.ts";
 import { recordCoordinatorAuthenticationFailure } from "./coordinator/auth-recovery.ts";
 import { buildCoordinatorChildEnvironment, prepareCoordinatorProfile, startAuthenticatedCoordinatorEndpoint, type PreparedCoordinatorProfile } from "./coordinator/profile.ts";
 import { recoverCoordinatorProfileAttempts, type LegacyCoordinatorTurn } from "./coordinator/profile-migration.ts";
@@ -253,8 +253,7 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
           coordinatorDir,
           activationRequired: coordinatorProfile.activationRequired,
           beforeReset: recoverLegacyCoordinatorAttempts,
-          captureCreationBaseline: async () => (await listCoordinatorThreadCandidates(coordinatorEndpoint, coordinatorDir)).map((candidate) => candidate.id),
-          markActivated: (baseline) => coordinatorProfile.markActivated(baseline),
+          markActivated: () => coordinatorProfile.markActivated(),
         });
         await startOrResumeCoordinator();
         await reconcileOperations();
@@ -787,7 +786,9 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
       sandboxMode: config.sandboxMode,
       config: coordinatorTurnConfig(mcp.url, token),
       creationNonce: coordinatorProfile.creationNonce,
-      creationBaseline: coordinatorProfile.creationBaseline,
+      pendingThreadId: coordinatorProfile.pendingThreadId,
+      recordPendingThread: (threadId) => coordinatorProfile.recordPendingThread(threadId),
+      clearPendingThread: (threadId) => coordinatorProfile.clearPendingThread(threadId),
     });
     runtime.setSession(coordinatorEndpoint.id, resumed.threadId, "managed", resumed.nativeStatus);
   }

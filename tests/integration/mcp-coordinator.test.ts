@@ -1,16 +1,94 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { LocalEndpoint } from "../../src/app-server/local-endpoint.ts";
+import { JsonRpcResponseError } from "../../src/app-server/json-rpc-client.ts";
 import { AppServerPool } from "../../src/app-server/pool.ts";
 import { createCoordinatorTools } from "../../src/coordinator/tools.ts";
+import { buildCoordinatorChildEnvironment } from "../../src/coordinator/profile.ts";
 import { buildCodexChildEnvironment, coordinatorTurnConfig, LoopbackMcpServer, secureShellConfig } from "../../src/mcp/server.ts";
 import { createTestDatabase } from "../../src/storage/database.ts";
 import { OperationStore } from "../../src/storage/operation-store.ts";
 
 const enabled = process.env.RUN_CODEX_INTEGRATION === "1";
+
+async function writeSkill(root: string, name: string): Promise<void> {
+  const path = join(root, name);
+  await mkdir(path, { recursive: true });
+  await writeFile(join(path, "SKILL.md"), `---\nname: ${name}\ndescription: Integration fixture ${name}\n---\n\n# ${name}\n`);
+}
+
+test("isolated app-server persists thread provenance and excludes normal-home skills", { skip: !enabled, timeout: 60_000 }, async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "codex-bot-profile-integration-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const normalHome = join(root, "normal-home");
+  const coordinatorHome = join(root, "coordinator-home");
+  const coordinatorCodexHome = join(root, "coordinator-codex");
+  const workdir = join(root, "coordinator-workdir");
+  const repository = join(root, "repository");
+  const nestedWorkdir = join(repository, "manager");
+  await Promise.all([
+    mkdir(coordinatorCodexHome, { recursive: true }), mkdir(workdir, { recursive: true }),
+    mkdir(join(repository, ".git"), { recursive: true }), mkdir(nestedWorkdir, { recursive: true }),
+    writeSkill(join(normalHome, ".agents/skills"), "normal-user-only"),
+    writeSkill(join(coordinatorHome, ".agents/skills"), "coordinator-only"),
+    writeSkill(join(workdir, ".agents/skills"), "coordinator-workdir"),
+    writeSkill(join(repository, ".agents/skills"), "repository-parent"),
+  ]);
+  const endpoint = new LocalEndpoint({
+    id: "coordinator-local",
+    codexBinary: "codex",
+    env: buildCoordinatorChildEnvironment({ ...process.env, HOME: normalHome }, { home: coordinatorHome, codexHome: coordinatorCodexHome }),
+    expectedCodexHome: coordinatorCodexHome,
+    requestTimeoutMs: 30_000,
+  });
+  await endpoint.start();
+  t.after(() => endpoint.stop());
+
+  const skills = await endpoint.request<any>("skills/list", { cwds: [workdir, nestedWorkdir], forceReload: true });
+  const names = new Map<string, string[]>(skills.data.map((entry: any) => [entry.cwd, entry.skills.map((skill: any) => skill.name)]));
+  assert.equal(names.get(workdir)?.includes("coordinator-only"), true);
+  assert.equal(names.get(workdir)?.includes("coordinator-workdir"), true);
+  assert.equal(names.get(workdir)?.includes("normal-user-only"), false);
+  assert.equal(names.get(nestedWorkdir)?.includes("repository-parent"), true);
+  assert.equal(names.get(nestedWorkdir)?.includes("normal-user-only"), false);
+
+  const volatile = await endpoint.request<any>("thread/start", {
+    cwd: workdir,
+    approvalPolicy: "never",
+    sandbox: "workspace-write",
+    ephemeral: false,
+    threadSource: crypto.randomUUID(),
+  });
+  await endpoint.stop();
+  await endpoint.start();
+  await assert.rejects(endpoint.request("thread/read", { threadId: volatile.thread.id, includeTurns: false }),
+    (error: unknown) => error instanceof JsonRpcResponseError && error.code === -32600 && error.rpcMessage === `thread not loaded: ${volatile.thread.id}`);
+
+  const nonce = crypto.randomUUID();
+  const started = await endpoint.request<any>("thread/start", {
+    cwd: workdir,
+    approvalPolicy: "never",
+    sandbox: "workspace-write",
+    ephemeral: false,
+    threadSource: nonce,
+  });
+  const name = `codex-bot-coordinator:${nonce}`;
+  await endpoint.request("thread/name/set", { threadId: started.thread.id, name });
+  await endpoint.stop();
+  await endpoint.start();
+  const read = await endpoint.request<any>("thread/read", { threadId: started.thread.id, includeTurns: false });
+  assert.deepEqual({
+    start: started.thread.threadSource ?? null,
+    read: read.thread.threadSource ?? null,
+    startSource: started.thread.source,
+    readSource: read.thread.source,
+    name: read.thread.name,
+    cwd: read.thread.cwd,
+  }, { start: nonce, read: nonce, startSource: started.thread.source, readSource: read.thread.source, name, cwd: workdir });
+});
 
 test("real coordinator can call its approved manager MCP while a project worker cannot enumerate it", { skip: !enabled, timeout: 180_000 }, async (t) => {
   const db = createTestDatabase();

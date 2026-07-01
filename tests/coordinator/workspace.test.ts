@@ -98,7 +98,7 @@ test("workspace preparation preserves an existing dashboard for later migration"
 test("warns when the workspace has a Git ancestor", async () => {
   const fixture = await fixtureWithTemplates("policy-v1\n", { nestedInGit: true });
   const prepared = await prepareCoordinatorWorkspace(fixture.options);
-  assert.match(prepared.warnings.join("\n"), /Git worktree.*parent instructions/);
+  assert.match(prepared.warnings.join("\n"), /Git worktree.*parent instructions, project configuration, and repository skills/);
 });
 
 test("rejects direct, nested, and symlink-equivalent overlap with backend state", async () => {

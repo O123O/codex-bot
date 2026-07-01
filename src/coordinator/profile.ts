@@ -8,13 +8,13 @@ import { buildCodexChildEnvironment } from "../mcp/server.ts";
 const markerSchema = z.object({
   version: z.literal(1),
   creation_nonce: z.uuid(),
-  creation_baseline: z.array(z.string().min(1)),
+  pending_thread_id: z.string().min(1).nullable(),
 }).strict();
 
 interface MarkerDocument {
   version: 1;
   creation_nonce: string;
-  creation_baseline: string[];
+  pending_thread_id: string | null;
 }
 
 export interface PreparedCoordinatorProfile {
@@ -24,8 +24,10 @@ export interface PreparedCoordinatorProfile {
   markerPath: string;
   activationRequired: boolean;
   creationNonce: string;
-  creationBaseline: readonly string[];
-  markActivated(creationBaseline: readonly string[]): Promise<void>;
+  pendingThreadId: string | null;
+  markActivated(): Promise<void>;
+  recordPendingThread(threadId: string): Promise<void>;
+  clearPendingThread(threadId: string): Promise<void>;
 }
 
 export async function prepareCoordinatorProfile(dataRoot: string): Promise<PreparedCoordinatorProfile> {
@@ -46,21 +48,35 @@ export async function prepareCoordinatorProfile(dataRoot: string): Promise<Prepa
       markerPath,
       activationRequired: existing === undefined,
       creationNonce: existing?.creation_nonce ?? randomUUID(),
-      creationBaseline: existing ? [...existing.creation_baseline] : [],
-      async markActivated(values): Promise<void> {
-        const creationBaseline = [...new Set(values)].sort();
-        if (creationBaseline.some((value) => value.length === 0)) throw managedError("coordinator profile activation baseline is invalid");
-        const document: MarkerDocument = { version: 1, creation_nonce: result.creationNonce, creation_baseline: creationBaseline };
+      pendingThreadId: existing?.pending_thread_id ?? null,
+      async markActivated(): Promise<void> {
+        const document: MarkerDocument = { version: 1, creation_nonce: result.creationNonce, pending_thread_id: null };
         const current = await readMarker(markerPath);
         if (current) {
-          if (current.creation_nonce !== document.creation_nonce || !sameStrings(current.creation_baseline, creationBaseline)) {
-            throw managedError("coordinator profile activation marker already records a different baseline");
-          }
+          if (current.creation_nonce !== document.creation_nonce) throw managedError("coordinator profile activation marker records a different nonce");
         } else {
           await atomicWrite(markerPath, Buffer.from(`${JSON.stringify(document, null, 2)}\n`));
         }
         result.activationRequired = false;
-        result.creationBaseline = creationBaseline;
+        result.pendingThreadId = current?.pending_thread_id ?? null;
+      },
+      async recordPendingThread(threadId): Promise<void> {
+        if (!threadId) throw managedError("coordinator pending thread identity is invalid");
+        const current = await requireCurrentMarker(markerPath, result.creationNonce);
+        if (current.pending_thread_id && current.pending_thread_id !== threadId) throw managedError("coordinator profile records a different pending thread");
+        if (current.pending_thread_id === null) await writeMarker(markerPath, { ...current, pending_thread_id: threadId });
+        result.activationRequired = false;
+        result.pendingThreadId = threadId;
+      },
+      async clearPendingThread(threadId): Promise<void> {
+        const current = await requireCurrentMarker(markerPath, result.creationNonce);
+        if (current.pending_thread_id === null) {
+          result.pendingThreadId = null;
+          return;
+        }
+        if (current.pending_thread_id !== threadId) throw managedError("coordinator pending thread identity does not match the activation marker");
+        await writeMarker(markerPath, { ...current, pending_thread_id: null });
+        result.pendingThreadId = null;
       },
     };
     return result;
@@ -137,11 +153,18 @@ async function readMarker(path: string): Promise<MarkerDocument | undefined> {
   let parsed: MarkerDocument;
   try { parsed = markerSchema.parse(JSON.parse(await readFile(path, "utf8"))) as MarkerDocument; }
   catch { throw managedError("coordinator profile activation marker is invalid"); }
-  if (!sameStrings(parsed.creation_baseline, [...new Set(parsed.creation_baseline)].sort())) {
-    throw managedError("coordinator profile activation marker is invalid");
-  }
   await chmod(path, 0o600);
   return parsed;
+}
+
+async function requireCurrentMarker(path: string, nonce: string): Promise<MarkerDocument> {
+  const marker = await readMarker(path);
+  if (!marker || marker.creation_nonce !== nonce) throw managedError("coordinator profile activation marker changed unexpectedly");
+  return marker;
+}
+
+async function writeMarker(path: string, marker: MarkerDocument): Promise<void> {
+  await atomicWrite(path, Buffer.from(`${JSON.stringify(marker, null, 2)}\n`));
 }
 
 async function atomicWrite(path: string, contents: Uint8Array): Promise<void> {
@@ -160,10 +183,6 @@ async function atomicWrite(path: string, contents: Uint8Array): Promise<void> {
   } finally {
     await unlink(temporary).catch((error) => { if (!isErrno(error, "ENOENT")) throw error; });
   }
-}
-
-function sameStrings(left: readonly string[], right: readonly string[]): boolean {
-  return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
 function contains(parent: string, child: string): boolean {

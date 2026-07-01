@@ -72,7 +72,7 @@ export async function prepareCoordinatorWorkspace(options: CoordinatorWorkspaceO
     }
 
     const gitRoot = await findGitAncestor(root);
-    const warnings = gitRoot ? [`Coordinator workdir ${root} is inside Git worktree ${gitRoot}; Codex may inherit parent instructions.`] : [];
+    const warnings = gitRoot ? [`Coordinator workdir ${root} is inside Git worktree ${gitRoot}; Codex may inherit parent instructions, project configuration, and repository skills.`] : [];
     return { root, dataRoot, registryPath, dashboardPath: join(root, "session-status.json"), warnings };
   } catch (error) {
     if (error instanceof AppError) throw error;

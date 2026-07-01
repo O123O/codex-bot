@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { PassThrough } from "node:stream";
 import test from "node:test";
-import { JsonRpcClient } from "../../src/app-server/json-rpc-client.ts";
+import { JsonRpcClient, JsonRpcResponseError } from "../../src/app-server/json-rpc-client.ts";
 
 function harness() {
   const fromServer = new PassThrough();
@@ -43,4 +43,16 @@ test("rejects all pending requests when the stream closes", async () => {
   const pending = client.request("one", {});
   fromServer.destroy(new Error("closed"));
   await assert.rejects(pending, /closed/);
+});
+
+test("preserves structured JSON-RPC response errors", async () => {
+  const { client, fromServer, written } = harness();
+  const pending = client.request("thread/read", { threadId: "missing" });
+  await new Promise((resolve) => setImmediate(resolve));
+  const request = written[0] as { id: number };
+  fromServer.write(`${JSON.stringify({ id: request.id, error: { code: -32600, message: "thread not loaded: missing", data: { kind: "missing" } } })}\n`);
+  await assert.rejects(pending, (error: unknown) => error instanceof JsonRpcResponseError
+    && error.code === -32600
+    && error.rpcMessage === "thread not loaded: missing"
+    && (error.data as any).kind === "missing");
 });

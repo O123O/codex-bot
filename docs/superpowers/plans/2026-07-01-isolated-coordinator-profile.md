@@ -79,14 +79,16 @@ export interface PreparedCoordinatorProfile {
   markerPath: string;
   activationRequired: boolean;
   creationNonce: string;
-  creationBaseline: readonly string[];
-  markActivated(creationBaseline: readonly string[]): Promise<void>;
+  pendingThreadId: string | null;
+  markActivated(): Promise<void>;
+  recordPendingThread(threadId: string): Promise<void>;
+  clearPendingThread(threadId: string): Promise<void>;
 }
 
 export async function prepareCoordinatorProfile(dataRoot: string): Promise<PreparedCoordinatorProfile>;
 ```
 
-Use `lstat` before trusting existing objects; directories must be real directories rather than symbolic links. Create/chmod profile directories to `0700`, canonicalize them, and require that they remain descendants of the canonical data root. Parse `profile.json` with a strict schema equivalent to `{ version: z.literal(1), creation_nonce: z.string().uuid(), creation_baseline: z.array(z.string().min(1)) }`; reject duplicates and non-sorted baselines. For an absent marker, generate `creationNonce` with `randomUUID()`. `markActivated(creationBaseline)` sorts/deduplicates its input, writes that nonce, creates a mode-`0600` temporary regular file, `fsync`s it, renames it to `profile.json`, `fsync`s the parent directory, and updates the returned object's in-memory `activationRequired`/`creationBaseline` state for the same startup. It may idempotently accept an already-valid identical marker but must never replace a different valid marker, an invalid marker, or a symbolic-link marker.
+Use `lstat` before trusting existing objects; directories must be real directories rather than symbolic links. Create/chmod profile directories to `0700`, canonicalize them, and require that they remain descendants of the canonical data root. Parse `profile.json` with a strict schema equivalent to `{ version: z.literal(1), creation_nonce: z.string().uuid(), pending_thread_id: z.string().min(1).nullable() }`. For an absent marker, generate `creationNonce` with `randomUUID()`. Every marker transition is a mode-`0600`, file-and-directory-`fsync` atomic replacement guarded by the expected current nonce/pending ID. `markActivated`, `recordPendingThread`, and `clearPendingThread` update the returned in-memory state only after the durable write and reject conflicting transitions.
 
 - [ ] **Step 4: Run the profile tests and verify GREEN**
 
@@ -340,27 +342,18 @@ assert.equal(await activateCoordinatorProfileIdentity({
   legacyEndpointId: "local",
   coordinatorDir: dir,
   activationRequired: true,
-  beforeReset: async () => { order.push("reconcile"); },
-  captureCreationBaseline: async () => { order.push("baseline"); return ["pre-existing-thread"]; },
-  markActivated: async (baseline) => { order.push(`marker:${baseline.join(",")}`); },
+    beforeReset: async () => { order.push("reconcile"); },
+    markActivated: async () => { order.push("marker"); },
 }), true);
-assert.deepEqual(order, ["reconcile", "baseline", "marker:pre-existing-thread"]);
+assert.deepEqual(order, ["reconcile", "marker"]);
 assert.equal(registry.snapshot().coordinator.thread_id, "pending");
 assert.equal(registry.snapshot().coordinator.endpoint, "coordinator-local");
 assert.deepEqual(registry.snapshot().sessions, originalSessions);
 ```
 
-Intercept the registry write or read the file after each callback to prove the durable order is `beforeReset` → exhaustive baseline capture → registry pending → marker. Add tests that no activation work happens when `activationRequired` is false; endpoint/workdir mismatch fails before `beforeReset`; baseline capture failure leaves the registry unchanged; and marker failure leaves the registry pending so retry is safe.
+Intercept the registry write or read the file after each callback to prove the durable order is `beforeReset` → registry pending → marker. Add tests that no activation work happens when `activationRequired` is false; endpoint/workdir mismatch fails before `beforeReset`; and marker failure leaves the registry pending so retry is safe.
 
-Add pending-identity discovery tests. The fake endpoint returns paginated `thread/list` rows for `sourceKinds: ["appServer"]`, `archived: false`, `useStateDbOnly: false`, and the exact coordinator `cwd`. Prove:
-
-- no matching post-baseline candidate calls `thread/start` with `threadSource: creationNonce`;
-- a sole pre-existing baseline candidate with the nonce is ignored and a new thread is started;
-- a sole post-baseline candidate with a different or null `threadSource` is ignored and a new nonce-tagged thread is started;
-- one exact, persistent, top-level candidate absent from the baseline with `threadSource === creationNonce` calls `thread/resume` and stores that ID;
-- two matching post-baseline candidates fail with `CONFIGURATION_ERROR` before starting or resuming either;
-- ephemeral, child, archived, and mismatched-cwd rows are ignored;
-- all pages are exhausted before the choice is made.
+Add pending-identity receipt tests. Prove a fresh create calls `thread/start` with `threadSource: creationNonce`, durably records the returned ID, calls `thread/name/set` with `codex-bot-coordinator:<nonce>`, commits the registry, then clears the receipt. For an existing receipt, require `thread/read` and resume to match ID, cwd, nonce, and name. Exact structured JSON-RPC `-32600` plus `thread not loaded` clears the receipt and retries creation; timeouts, transport errors, auth errors, other `-32600` messages, or any provenance mismatch preserve the receipt and fail closed. A non-pending registry resume clears only a matching stale receipt after successful verification.
 
 - [ ] **Step 2: Run identity tests and verify RED**
 
@@ -384,16 +377,13 @@ export async function activateCoordinatorProfileIdentity(input: {
   coordinatorDir: string;
   activationRequired: boolean;
   beforeReset(): Promise<void>;
-  captureCreationBaseline(): Promise<readonly string[]>;
-  markActivated(creationBaseline: readonly string[]): Promise<void>;
+  markActivated(): Promise<void>;
 }): Promise<boolean>;
 ```
 
-If activation is required, validate first, await `beforeReset`, exhaustively capture the isolated endpoint's eligible pre-creation thread IDs, atomically set only the coordinator to `{ endpoint: endpointId, thread_id: "pending", project_dir: coordinatorDir }`, then persist that exact baseline through `markActivated`. Do not catch failures and do not mutate project mappings.
+If activation is required, validate first, await `beforeReset`, atomically set only the coordinator to `{ endpoint: endpointId, thread_id: "pending", project_dir: coordinatorDir }`, then persist the activation marker. Do not catch failures and do not mutate project mappings.
 
-When `resumeCoordinatorIdentity` sees `thread_id: "pending"`, exhaust `thread/list` for non-archived app-server threads in the exact canonical workdir. Filter ephemeral and child rows, require `threadSource === creationNonce`, then subtract `creationBaseline`. Start with `threadSource: creationNonce` only when there are no matching post-baseline candidates, resume the sole match, and fail closed on matching ambiguity. Never adopt a baseline or nonce-mismatched candidate. Apply returned thread ID, cwd, and nonce verification to both start and recovered resume paths. This makes `profile marker exists + registry pending` a durable, provenance-preserving creation-recovery state across a crash after app-server persisted a new thread but before the registry write.
-
-Export the exhaustive `listCoordinatorThreadCandidates(endpoint, coordinatorDir)` helper so first activation and pending recovery use identical pagination and structural filtering. Add `creationNonce: string` and `creationBaseline: readonly string[]` to `resumeCoordinatorIdentity` input; ordinary non-pending resume ignores them.
+When `resumeCoordinatorIdentity` sees `thread_id: "pending"`, recover the exact pending receipt or execute the two-phase start/record/name-set/registry/clear sequence. Add structured `JsonRpcResponseError` code/message preservation in `json-rpc-client.ts`; only exact thread-not-loaded clears a receipt. Add `creationNonce`, `pendingThreadId`, `recordPendingThread`, and `clearPendingThread` to identity input.
 
 - [ ] **Step 4: Run identity tests and verify GREEN**
 
@@ -550,7 +540,7 @@ await recoverCoordinatorProfileAttempts({
 
 `completeLegacyCoordinatorTurn` persists terminal agent messages under the semantic `coordinator-local` identity, then calls `CoordinatorRuntime.handleTerminal` so an already-produced user answer is queued exactly once. Then start/resume the coordinator with the existing manager MCP config. Leave scheduler and polling disabled until this completes. The existing post-start operation and attempt reconciliation remains in place for ordinary restarts.
 
-The activation call supplies `captureCreationBaseline: () => listCoordinatorThreadCandidates(coordinatorEndpoint, coordinatorDir)` and `markActivated: (baseline) => coordinatorProfile.markActivated(baseline)`. Every call to `resumeCoordinatorIdentity` supplies `creationNonce: coordinatorProfile.creationNonce` and `creationBaseline: coordinatorProfile.creationBaseline`, including reconnect. Thus a foreign isolated-profile thread can never become the manager merely because it was created after activation and shares the coordinator cwd.
+The activation call supplies `markActivated: () => coordinatorProfile.markActivated()`. Every call to `resumeCoordinatorIdentity` supplies the nonce, pending ID, and guarded receipt callbacks, including reconnect. Thus only the exact two-phase bot creation can become the manager.
 
 On reconnect, authentication failure must leave the coordinator endpoint stopped/unavailable, keep scheduling disabled, and call `recordCoordinatorAuthenticationFailure(deliveries, destination, endpointIncident, error)`. Implement that function in `src/coordinator/auth-recovery.ts`; it prepares `id: coordinator-auth-required:<incident>` as a mandatory `system_warning` containing only the actionable `coordinator-login` instruction and structural error text. `DeliveryStore.prepare` provides same-incident idempotency. Bounded reconnect continues without accepting coordinator turns.
 
@@ -592,7 +582,7 @@ coordinator-codex-home/
 
 Start a `LocalEndpoint` with `HOME=coordinator-home`, `CODEX_HOME=coordinator-codex-home`, and `expectedCodexHome=coordinator-codex-home`. Call `skills/list` with `cwds: [coordinatorWorkdir]` and `forceReload: true`. Assert that `coordinator-only` and `coordinator-workdir` are present and `normal-user-only` is absent. This test does not make a model request and must not read or copy real credentials.
 
-On the same isolated app-server, call `thread/start` with a random `threadSource` nonce, `ephemeral: false`, and the coordinator workdir. Exhaust `thread/list` and assert the returned thread preserves that exact `threadSource`; call `thread/read` and assert it again. This protocol check proves the provenance field used by crash recovery is durable and discoverable without a model turn.
+On the same isolated app-server, call `thread/start` with a random `threadSource` nonce, verify the zero-turn thread does not survive a restart, then repeat with `thread/name/set` using the nonce-tagged coordinator name. Restart and assert `thread/read` preserves the exact ID, cwd, name, and `threadSource`. This protocol check proves the two-phase materialization boundary without a model turn.
 
 Add a second workdir nested beneath a temporary `.git` root containing `.agents/skills/repository-parent/SKILL.md`. Assert Codex discovers `repository-parent`, while still excluding `normal-user-only`. This defines the promised boundary precisely: real-home skills are isolated, but repository skills intentionally follow Codex project discovery.
 
@@ -624,7 +614,7 @@ Document the profile layout and one-time login command:
 DATA_DIR="$HOME/.codex-bot/data" codex-bot coordinator-login
 ```
 
-State that the coordinator excludes real-home user configuration/skills, while workers continue using the real home and `~/.codex`. Document `<COORDINATOR_WORKDIR>/.agents/skills` and `<DATA_DIR>/coordinator-profile/home/.agents/skills`, and explain that a coordinator workdir nested in Git still inherits that repository's guidance, project config, and repo skills. Update the existing workspace warning and its unit test accordingly. Document fresh coordinator thread creation on first upgrade, persisted-thread discovery after a creation crash, preserved worker/backend state, reconnect authentication warnings, and backup sensitivity of isolated auth/session data. Update troubleshooting for the authentication error.
+State that the coordinator excludes real-home user configuration/skills, while workers continue using the real home and `~/.codex`. Document `<COORDINATOR_WORKDIR>/.agents/skills` and `<DATA_DIR>/coordinator-profile/home/.agents/skills`, and explain that a coordinator workdir nested in Git still inherits that repository's guidance, project config, and repo skills. Update the existing workspace warning and its unit test accordingly. Document two-phase coordinator creation recovery, preserved worker/backend state, reconnect authentication warnings, and backup sensitivity of isolated auth/session data. Update troubleshooting for the authentication error.
 
 - [ ] **Step 5: Run docs/package checks and commit**
 

@@ -4,7 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { formatStartupError } from "../../src/cli.ts";
-import { activateCoordinatorProfileIdentity, listCoordinatorThreadCandidates, resumeCoordinatorIdentity } from "../../src/coordinator/identity.ts";
+import { activateCoordinatorProfileIdentity, resumeCoordinatorIdentity } from "../../src/coordinator/identity.ts";
+import { JsonRpcResponseError } from "../../src/app-server/json-rpc-client.ts";
 import { AppError } from "../../src/core/errors.ts";
 import { SessionRegistry } from "../../src/registry/session-registry.ts";
 
@@ -84,7 +85,7 @@ test("configured coordinator directory mismatch is a safe startup error before a
   assert.equal(requests, 0);
 });
 
-test("first profile activation validates, captures a baseline, resets only coordinator, then marks", async () => {
+test("first profile activation validates, resets only coordinator, then marks", async () => {
   const root = await mkdtemp(join(tmpdir(), "coordinator-profile-activation-"));
   const coordinatorDir = join(root, "coordinator");
   const projectOne = join(root, "one");
@@ -111,18 +112,13 @@ test("first profile activation validates, captures a baseline, resets only coord
       order.push("reconcile");
       assert.equal(registry.snapshot().coordinator.thread_id, "legacy");
     },
-    captureCreationBaseline: async () => {
-      order.push("baseline");
-      assert.equal(registry.snapshot().coordinator.thread_id, "legacy");
-      return ["pre-existing"];
-    },
-    markActivated: async (baseline) => {
-      order.push(`marker:${baseline.join(",")}`);
+    markActivated: async () => {
+      order.push("marker");
       assert.equal(JSON.parse(await readFile(path, "utf8")).coordinator.thread_id, "pending");
     },
   });
   assert.equal(activated, true);
-  assert.deepEqual(order, ["reconcile", "baseline", "marker:pre-existing"]);
+  assert.deepEqual(order, ["reconcile", "marker"]);
   assert.equal(registry.snapshot().coordinator.thread_id, "pending");
   assert.equal(registry.snapshot().coordinator.endpoint, "coordinator-local");
   assert.deepEqual(registry.snapshot().sessions, sessions);
@@ -140,122 +136,179 @@ test("profile activation is skipped when durable and fails before unsafe mutatio
   let callbacks = 0;
   assert.equal(await activateCoordinatorProfileIdentity({
     registry, endpointId: "coordinator-local", legacyEndpointId: "local", coordinatorDir: registered, activationRequired: false,
-    beforeReset: async () => { callbacks += 1; }, captureCreationBaseline: async () => { callbacks += 1; return []; }, markActivated: async () => { callbacks += 1; },
+    beforeReset: async () => { callbacks += 1; }, markActivated: async () => { callbacks += 1; },
   }), false);
   assert.equal(callbacks, 0);
 
   await assert.rejects(activateCoordinatorProfileIdentity({
     registry, endpointId: "coordinator-local", legacyEndpointId: "local", coordinatorDir: configured, activationRequired: true,
-    beforeReset: async () => { callbacks += 1; }, captureCreationBaseline: async () => [], markActivated: async () => {},
+    beforeReset: async () => { callbacks += 1; }, markActivated: async () => {},
   }), /does not match configured workdir/);
   assert.equal(callbacks, 0);
   assert.equal(registry.snapshot().coordinator.thread_id, "thread");
 
   await assert.rejects(activateCoordinatorProfileIdentity({
     registry, endpointId: "coordinator-local", legacyEndpointId: "local", coordinatorDir: registered, activationRequired: true,
-    beforeReset: async () => {}, captureCreationBaseline: async () => { throw new Error("list failed"); }, markActivated: async () => {},
-  }), /list failed/);
-  assert.equal(registry.snapshot().coordinator.thread_id, "thread");
-
-  await assert.rejects(activateCoordinatorProfileIdentity({
-    registry, endpointId: "coordinator-local", legacyEndpointId: "local", coordinatorDir: registered, activationRequired: true,
-    beforeReset: async () => {}, captureCreationBaseline: async () => [], markActivated: async () => { throw new Error("marker failed"); },
+    beforeReset: async () => {}, markActivated: async () => { throw new Error("marker failed"); },
   }), /marker failed/);
   assert.equal(registry.snapshot().coordinator.thread_id, "pending");
 });
 
-test("candidate discovery exhausts pages and filters nonpersistent or mismatched threads", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "coordinator-candidates-"));
-  const other = await mkdtemp(join(tmpdir(), "coordinator-candidates-other-"));
-  const calls: any[] = [];
-  const endpoint = {
-    id: "coordinator-local",
-    request: async <T>(method: string, params: any) => {
-      assert.equal(method, "thread/list");
-      calls.push(params);
-      return (params.cursor ? {
-        data: [
-          { id: "child", cwd: dir, ephemeral: false, parentThreadId: "parent", threadSource: "nonce" },
-          { id: "other", cwd: other, ephemeral: false, parentThreadId: null, threadSource: "nonce" },
-        ], nextCursor: null,
-      } : {
-        data: [
-          { id: "valid", cwd: dir, ephemeral: false, parentThreadId: null, threadSource: "nonce" },
-          { id: "ephemeral", cwd: dir, ephemeral: true, parentThreadId: null, threadSource: "nonce" },
-        ], nextCursor: "next",
-      }) as T;
-    },
-  };
-  assert.deepEqual(await listCoordinatorThreadCandidates(endpoint, dir), [{ id: "valid", threadSource: "nonce" }]);
-  assert.equal(calls.length, 2);
-  for (const call of calls) {
-    assert.equal(call.cwd, dir);
-    assert.equal(call.archived, false);
-    assert.equal(call.useStateDbOnly, false);
-    assert.deepEqual(call.sourceKinds, ["appServer"]);
-  }
-});
-
-test("pending identity resumes only the sole bot-nonce post-baseline candidate", async () => {
-  const run = async (rows: any[], baseline: string[]) => {
-    const dir = await mkdtemp(join(tmpdir(), "coordinator-pending-"));
-    const path = join(dir, "sessions.json");
-    const registry = await SessionRegistry.open(path, {
-      version: 1, coordinator: { endpoint: "coordinator-local", thread_id: "pending", project_dir: dir }, sessions: {},
-    });
-    const calls: Array<{ method: string; params: any }> = [];
-    const endpoint = {
-      id: "coordinator-local",
-      request: async <T>(method: string, params: any) => {
-        calls.push({ method, params });
-        if (method === "thread/list") return { data: rows.map((row) => ({ cwd: dir, ephemeral: false, parentThreadId: null, ...row })), nextCursor: null } as T;
-        const id = method === "thread/start" ? "created" : params.threadId;
-        return { thread: { id, cwd: dir, threadSource: "bot-nonce", status: { type: "idle" } } } as T;
-      },
-    };
-    const result = await resumeCoordinatorIdentity({
-      registry, endpoint, legacyEndpointId: "local", coordinatorDir: dir, sandboxMode: "workspace-write", config: {},
-      creationNonce: "bot-nonce", creationBaseline: baseline,
-    });
-    return { result, calls, registry };
-  };
-
-  const recovered = await run([
-    { id: "baseline", threadSource: "bot-nonce" },
-    { id: "foreign", threadSource: "other" },
-    { id: "created-before-crash", threadSource: "bot-nonce" },
-  ], ["baseline"]);
-  assert.equal(recovered.calls.at(-1)?.method, "thread/resume");
-  assert.equal(recovered.calls.at(-1)?.params.threadId, "created-before-crash");
-  assert.equal(recovered.result.threadId, "created-before-crash");
-
-  const fresh = await run([
-    { id: "baseline", threadSource: "bot-nonce" },
-    { id: "foreign", threadSource: "other" },
-  ], ["baseline"]);
-  assert.equal(fresh.calls.at(-1)?.method, "thread/start");
-  assert.equal(fresh.calls.at(-1)?.params.threadSource, "bot-nonce");
-  assert.equal(fresh.result.threadId, "created");
-});
-
-test("pending identity fails closed on multiple matching post-baseline candidates", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "coordinator-pending-ambiguous-"));
+test("fresh pending identity records, materializes, commits, and clears in order", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "coordinator-two-phase-"));
   const registry = await SessionRegistry.open(join(dir, "sessions.json"), {
     version: 1, coordinator: { endpoint: "coordinator-local", thread_id: "pending", project_dir: dir }, sessions: {},
   });
-  let mutations = 0;
+  const order: string[] = [];
   const endpoint = {
     id: "coordinator-local",
-    request: async <T>(method: string) => {
-      if (method === "thread/list") return { data: ["one", "two"].map((id) => ({ id, cwd: dir, ephemeral: false, parentThreadId: null, threadSource: "bot-nonce" })), nextCursor: null } as T;
-      mutations += 1;
-      return {} as T;
+    request: async <T>(method: string, params: any) => {
+      order.push(method);
+      if (method === "thread/start") {
+        assert.equal(params.threadSource, "bot-nonce");
+        return { thread: { id: "created", cwd: dir, threadSource: "bot-nonce", name: null, status: { type: "idle" } } } as T;
+      }
+      if (method === "thread/name/set") {
+        assert.equal(params.name, "codex-bot-coordinator:bot-nonce");
+        assert.equal(registry.snapshot().coordinator.thread_id, "pending");
+        return {} as T;
+      }
+      if (method === "thread/read") return { thread: { id: "created", cwd: dir, threadSource: "bot-nonce", name: "codex-bot-coordinator:bot-nonce", status: { type: "idle" } } } as T;
+      throw new Error(`unexpected ${method}`);
     },
   };
-  await assert.rejects(resumeCoordinatorIdentity({
+  const result = await resumeCoordinatorIdentity({
     registry, endpoint, legacyEndpointId: "local", coordinatorDir: dir, sandboxMode: "workspace-write", config: {},
-    creationNonce: "bot-nonce", creationBaseline: [],
-  }), (error: unknown) => error instanceof AppError && error.code === "CONFIGURATION_ERROR" && /multiple/.test(error.message));
-  assert.equal(mutations, 0);
-  assert.equal(registry.snapshot().coordinator.thread_id, "pending");
+    creationNonce: "bot-nonce", pendingThreadId: null,
+    recordPendingThread: async (id) => { order.push(`record:${id}`); assert.equal(registry.snapshot().coordinator.thread_id, "pending"); },
+    clearPendingThread: async (id) => { order.push(`clear:${id}`); assert.equal(registry.snapshot().coordinator.thread_id, id); },
+  });
+  assert.equal(result.threadId, "created");
+  assert.deepEqual(order, ["thread/start", "record:created", "thread/name/set", "thread/read", "clear:created"]);
+});
+
+test("pending receipt resumes only exact durable provenance", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "coordinator-receipt-"));
+  const registry = await SessionRegistry.open(join(dir, "sessions.json"), {
+    version: 1, coordinator: { endpoint: "coordinator-local", thread_id: "pending", project_dir: dir }, sessions: {},
+  });
+  const calls: string[] = [];
+  const endpoint = {
+    id: "coordinator-local",
+    request: async <T>(method: string, params: any) => {
+      calls.push(method);
+      assert.equal(params.threadId, "receipt-thread");
+      return { thread: { id: "receipt-thread", cwd: dir, threadSource: "bot-nonce", name: "codex-bot-coordinator:bot-nonce", status: { type: "idle" } } } as T;
+    },
+  };
+  let cleared: string | undefined;
+  const result = await resumeCoordinatorIdentity({
+    registry, endpoint, legacyEndpointId: "local", coordinatorDir: dir, sandboxMode: "workspace-write", config: {},
+    creationNonce: "bot-nonce", pendingThreadId: "receipt-thread",
+    recordPendingThread: async () => { throw new Error("must not record"); }, clearPendingThread: async (id) => { cleared = id; },
+  });
+  assert.deepEqual(calls, ["thread/read", "thread/resume"]);
+  assert.equal(result.threadId, "receipt-thread");
+  assert.equal(cleared, "receipt-thread");
+});
+
+test("registered identity clears a matching stale creation receipt after verified resume", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "coordinator-stale-receipt-"));
+  const registry = await SessionRegistry.open(join(dir, "sessions.json"), {
+    version: 1, coordinator: { endpoint: "coordinator-local", thread_id: "registered-thread", project_dir: dir }, sessions: {},
+  });
+  const calls: string[] = [];
+  const endpoint = {
+    id: "coordinator-local",
+    request: async <T>(method: string, params: any) => {
+      calls.push(method);
+      assert.equal(params.threadId, "registered-thread");
+      return {
+        thread: {
+          id: "registered-thread",
+          cwd: dir,
+          threadSource: "bot-nonce",
+          name: "codex-bot-coordinator:bot-nonce",
+          status: { type: "idle" },
+        },
+      } as T;
+    },
+  };
+  let cleared: string | undefined;
+  const result = await resumeCoordinatorIdentity({
+    registry, endpoint, legacyEndpointId: "local", coordinatorDir: dir, sandboxMode: "workspace-write", config: {},
+    creationNonce: "bot-nonce", pendingThreadId: "registered-thread",
+    recordPendingThread: async () => { throw new Error("must not record"); },
+    clearPendingThread: async (id) => { cleared = id; },
+  });
+  assert.deepEqual(calls, ["thread/resume"]);
+  assert.equal(result.threadId, "registered-thread");
+  assert.equal(cleared, "registered-thread");
+});
+
+test("only exact thread-not-loaded clears a pending receipt", async () => {
+  const run = async (failure: Error) => {
+    const dir = await mkdtemp(join(tmpdir(), "coordinator-receipt-error-"));
+    const registry = await SessionRegistry.open(join(dir, "sessions.json"), {
+      version: 1, coordinator: { endpoint: "coordinator-local", thread_id: "pending", project_dir: dir }, sessions: {},
+    });
+    const cleared: string[] = [];
+    const recorded: string[] = [];
+    const endpoint = {
+      id: "coordinator-local",
+      request: async <T>(method: string, params: any) => {
+        if (method === "thread/read" && params.threadId === "lost") throw failure;
+        if (method === "thread/start") return { thread: { id: "replacement", cwd: dir, threadSource: "bot-nonce", name: null, status: { type: "idle" } } } as T;
+        if (method === "thread/name/set") return {} as T;
+        if (method === "thread/read") return { thread: { id: "replacement", cwd: dir, threadSource: "bot-nonce", name: "codex-bot-coordinator:bot-nonce", status: { type: "idle" } } } as T;
+        throw new Error(`unexpected ${method}`);
+      },
+    };
+    const action = resumeCoordinatorIdentity({
+      registry, endpoint, legacyEndpointId: "local", coordinatorDir: dir, sandboxMode: "workspace-write", config: {},
+      creationNonce: "bot-nonce", pendingThreadId: "lost",
+      recordPendingThread: async (id) => { recorded.push(id); }, clearPendingThread: async (id) => { cleared.push(id); },
+    });
+    return { action, cleared, recorded, registry };
+  };
+
+  const missing = await run(new JsonRpcResponseError(-32600, "thread not loaded: lost"));
+  assert.equal((await missing.action).threadId, "replacement");
+  assert.deepEqual(missing.cleared, ["lost", "replacement"]);
+  assert.deepEqual(missing.recorded, ["replacement"]);
+
+  for (const failure of [
+    new JsonRpcResponseError(-32600, "invalid request"),
+    new JsonRpcResponseError(-32000, "thread not loaded: lost"),
+    new Error("app-server request timed out: thread/read"),
+  ]) {
+    const unsafe = await run(failure);
+    await assert.rejects(unsafe.action, (error: unknown) => error === failure);
+    assert.deepEqual(unsafe.cleared, []);
+    assert.deepEqual(unsafe.recorded, []);
+    assert.equal(unsafe.registry.snapshot().coordinator.thread_id, "pending");
+  }
+});
+
+test("pending receipt provenance mismatch fails without clearing", async () => {
+  for (const field of ["id", "cwd", "threadSource", "name"] as const) {
+    const dir = await mkdtemp(join(tmpdir(), "coordinator-provenance-"));
+    const other = await mkdtemp(join(tmpdir(), "coordinator-provenance-other-"));
+    const registry = await SessionRegistry.open(join(dir, "sessions.json"), {
+      version: 1, coordinator: { endpoint: "coordinator-local", thread_id: "pending", project_dir: dir }, sessions: {},
+    });
+    let cleared = false;
+    const thread = { id: "receipt", cwd: dir, threadSource: "nonce", name: "codex-bot-coordinator:nonce", status: { type: "idle" } };
+    if (field === "id") thread.id = "other";
+    if (field === "cwd") thread.cwd = other;
+    if (field === "threadSource") thread.threadSource = "other";
+    if (field === "name") thread.name = "other";
+    await assert.rejects(resumeCoordinatorIdentity({
+      registry,
+      endpoint: { id: "coordinator-local", request: async <T>() => ({ thread } as T) },
+      legacyEndpointId: "local", coordinatorDir: dir, sandboxMode: "workspace-write", config: {},
+      creationNonce: "nonce", pendingThreadId: "receipt", recordPendingThread: async () => {}, clearPendingThread: async () => { cleared = true; },
+    }), /identity|working directory|nonce|name/);
+    assert.equal(cleared, false);
+  }
 });

@@ -22,24 +22,30 @@ test("prepares private coordinator profile directories and a durable activation 
   assert.equal(profile.codexHome, join(profile.root, "codex"));
   assert.equal(profile.markerPath, join(profile.root, "profile.json"));
   assert.equal(profile.activationRequired, true);
-  assert.deepEqual(profile.creationBaseline, []);
+  assert.equal(profile.pendingThreadId, null);
   assert.match(profile.creationNonce, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u);
   for (const path of [profile.root, profile.home, profile.codexHome]) assert.equal((await stat(path)).mode & 0o777, 0o700);
 
-  await profile.markActivated(["thread-z", "thread-a", "thread-z"]);
+  await profile.markActivated();
   assert.equal(profile.activationRequired, false);
-  assert.deepEqual(profile.creationBaseline, ["thread-a", "thread-z"]);
+  assert.equal(profile.pendingThreadId, null);
   assert.equal((await stat(profile.markerPath)).mode & 0o777, 0o600);
   assert.deepEqual(JSON.parse(await readFile(profile.markerPath, "utf8")), {
-    version: 1, creation_nonce: profile.creationNonce, creation_baseline: ["thread-a", "thread-z"],
+    version: 1, creation_nonce: profile.creationNonce, pending_thread_id: null,
   });
+
+  await profile.recordPendingThread("thread-a");
+  assert.equal(profile.pendingThreadId, "thread-a");
+  await profile.recordPendingThread("thread-a");
+  await assert.rejects(profile.recordPendingThread("thread-b"), /different pending thread/);
 
   const reopened = await prepareCoordinatorProfile(dataRoot);
   assert.equal(reopened.activationRequired, false);
   assert.equal(reopened.creationNonce, profile.creationNonce);
-  assert.deepEqual(reopened.creationBaseline, ["thread-a", "thread-z"]);
-  await reopened.markActivated(["thread-z", "thread-a"]);
-  await assert.rejects(reopened.markActivated(["different"]), /activation marker already records a different baseline/);
+  assert.equal(reopened.pendingThreadId, "thread-a");
+  await assert.rejects(reopened.clearPendingThread("thread-b"), /does not match/);
+  await reopened.clearPendingThread("thread-a");
+  assert.equal(reopened.pendingThreadId, null);
 });
 
 test("repairs private directory modes without replacing directories", async (t) => {
@@ -74,11 +80,10 @@ test("rejects symlinks and non-directories anywhere in the managed profile path"
 test("rejects malformed, noncanonical, unsupported, and symlink activation markers", async (t) => {
   const invalid = [
     "not-json",
-    JSON.stringify({ version: 2, creation_nonce: crypto.randomUUID(), creation_baseline: [] }),
-    JSON.stringify({ version: 1, creation_nonce: "not-a-uuid", creation_baseline: [] }),
-    JSON.stringify({ version: 1, creation_nonce: crypto.randomUUID(), creation_baseline: ["z", "a"] }),
-    JSON.stringify({ version: 1, creation_nonce: crypto.randomUUID(), creation_baseline: ["a", "a"] }),
-    JSON.stringify({ version: 1, creation_nonce: crypto.randomUUID(), creation_baseline: [], extra: true }),
+    JSON.stringify({ version: 2, creation_nonce: crypto.randomUUID(), pending_thread_id: null }),
+    JSON.stringify({ version: 1, creation_nonce: "not-a-uuid", pending_thread_id: null }),
+    JSON.stringify({ version: 1, creation_nonce: crypto.randomUUID(), pending_thread_id: "" }),
+    JSON.stringify({ version: 1, creation_nonce: crypto.randomUUID(), pending_thread_id: null, extra: true }),
   ];
   for (const contents of invalid) {
     const { root, dataRoot } = await fixture();
@@ -94,7 +99,7 @@ test("rejects malformed, noncanonical, unsupported, and symlink activation marke
   const profileRoot = join(dataRoot, "coordinator-profile");
   await mkdir(profileRoot);
   const target = join(root, "marker-target");
-  await writeFile(target, JSON.stringify({ version: 1, creation_nonce: crypto.randomUUID(), creation_baseline: [] }));
+  await writeFile(target, JSON.stringify({ version: 1, creation_nonce: crypto.randomUUID(), pending_thread_id: null }));
   await symlink(target, join(profileRoot, "profile.json"));
   await assert.rejects(prepareCoordinatorProfile(dataRoot), /activation marker must be a regular file/);
 });

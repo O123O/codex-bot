@@ -8,7 +8,7 @@ The MVP runs on one machine. One token-free app-server hosts all project session
 
 - Linux (race-safe outbound attachment handling uses `O_NOFOLLOW` and `/proc/self/fd`)
 - Node.js 24 or newer
-- `codex-cli 0.142.4` authenticated for the account that runs the bot
+- `codex-cli 0.142.4` authenticated for project work, plus an independently authenticated coordinator profile (setup below)
 - A Telegram bot token from BotFather
 - The numeric Telegram user ID of the only authorized owner
 
@@ -24,7 +24,7 @@ npm install --global --prefix "$HOME/.local" "./$archive"
 rm -- "$archive"
 ```
 
-`npm run build` creates a fully bundled `dist/codex-bot` executable. The installed command needs Node.js 24+, Codex authentication, and a `codex` executable; it does not need TSX, TypeScript source files, or a runtime dependency tree.
+`npm run build` creates a fully bundled `dist/codex-bot` executable. The installed command needs Node.js 24+, a `codex` executable, and the two Codex profiles described below; it does not need TSX, TypeScript source files, or a runtime dependency tree.
 
 The archive contains the executable and its two coordinator template assets. `$HOME/.local/bin` must be in `PATH`.
 
@@ -32,7 +32,13 @@ Set `TELEGRAM_BOT_TOKEN`, `TELEGRAM_OWNER_ID`, `TELEGRAM_DESTINATION_CHAT_ID`, a
 
 `--workdir` overrides `COORDINATOR_WORKDIR`. Relative coordinator, data, and registry paths resolve from the shell launch directory; use absolute paths when the bot must behave identically regardless of where it is launched. Startup rejects any direct, nested, or symlink-aliased overlap between the coordinator workdir and authoritative backend state.
 
-Codex authentication may come from the normal `CODEX_HOME` profile or supported environment credentials such as `OPENAI_API_KEY`. The owned app-servers inherit only the environment needed by Codex and proxy settings. Telegram secrets are removed. A random loopback MCP bearer token exists only in the coordinator app-server, is excluded from model-launched shell commands, and is insufficient without the coordinator process identity.
+Project workers use the account runner's normal `HOME`, `CODEX_HOME`, configuration, and skills. The coordinator uses private `HOME` and `CODEX_HOME` directories below `<DATA_DIR>/coordinator-profile` and never copies or links credentials from the normal profile. Authenticate it once after setting the same `DATA_DIR` used by the bot:
+
+```bash
+DATA_DIR="$HOME/.codex-bot/data" codex-bot coordinator-login
+```
+
+This starts Codex device authentication in the isolated profile. It does not need Telegram variables or start the bot. Supported provider environment credentials such as `OPENAI_API_KEY` may also satisfy the coordinator app-server when Codex does not require its own login. The owned app-servers otherwise inherit only the environment needed by Codex and proxy settings. Telegram secrets are removed. A random loopback MCP bearer token exists only in the coordinator app-server, is excluded from model-launched shell commands, and is insufficient without the coordinator process identity.
 
 After exporting the configuration, run the installed command from any directory:
 
@@ -49,6 +55,8 @@ npm start -- --workdir "$HOME/.codex-bot/coordinator"
 ```
 
 Send SIGINT or SIGTERM for graceful shutdown. Startup performs migrations, validates the registry, reconciles missed worker history and uncertain outbox rows, resumes or creates the coordinator, and only then begins Telegram polling.
+
+On the first startup after upgrading to isolated profiles, the bot creates a new coordinator thread inside the private profile. It preserves all project-session mappings and durable manager state, but does not copy the old coordinator transcript from the normal Codex home. Thread creation uses a durable nonce-tagged receipt so an app-server or process crash cannot silently select an unrelated thread.
 
 ## How it behaves
 
@@ -75,6 +83,8 @@ cp "$COORDINATOR_WORKDIR/AGENTS.md" "$COORDINATOR_WORKDIR/AGENTS.override.md"
 Codex gives `AGENTS.override.md` precedence in that directory. The bot never creates, reads, updates, or deletes it. Because it replaces the managed prompt completely, retain the routing, automatic-delivery, read-only dashboard/registry, exact-directive, goal, attachment, and recovery behavior you still want.
 
 To recover from a managed-policy guard error, either restore `AGENTS.md` to the exact content represented by the stored digest, or move the desired custom policy to `AGENTS.override.md` and delete both `AGENTS.md` and `.codex-bot-agents.sha256`; the bot then reinstalls a fresh managed pair. A coordinator workdir inside a Git worktree is allowed but produces a warning because Codex may also inherit instructions from that repository's project root.
+
+The coordinator does not inherit the account runner's home-scoped Codex configuration or skills. Put coordinator-only Codex configuration in `<DATA_DIR>/coordinator-profile/codex/config.toml`, home-scoped skills in `<DATA_DIR>/coordinator-profile/home/.agents/skills`, or project-scoped skills in `<coordinator-workdir>/.agents/skills`. If the coordinator workdir is inside a Git worktree, Codex can also inherit that repository's parent `AGENTS.md`, `.codex/config.toml`, and `.agents/skills`; startup warns about this boundary.
 
 ### Exact pass-through
 
@@ -121,12 +131,15 @@ Coordinator tool effects use a separate operation ledger keyed by source context
 - `data/bot.sqlite3`: offsets, operations, outbox, events, runtime state, dashboard observations/notes, notification inbox, epochs, discovery snapshots, and attachment metadata
 - `data/sessions.json`: backend session identity registry (read-only to the coordinator)
 - `data/attachments/`: private temporary attachment snapshots
+- `<DATA_DIR>/coordinator-profile/profile.json`: isolated coordinator activation and crash-recovery receipt
+- `<DATA_DIR>/coordinator-profile/codex/`: isolated coordinator Codex configuration, authentication, and thread storage
+- `<DATA_DIR>/coordinator-profile/home/`: isolated coordinator operating-system home and optional home-scoped skills
 - `<coordinator-workdir>/AGENTS.md`: bot-managed coordinator playbook
 - `<coordinator-workdir>/.codex-bot-agents.sha256`: installed-playbook digest
 - `<coordinator-workdir>/AGENTS.override.md`: optional, entirely user-owned replacement prompt
 - `<coordinator-workdir>/session-status.json`: backend-generated mode-0400 session dashboard
 
-Back up the SQLite database, registry, and external coordinator workdir together while the bot is stopped. Do not restore `session-status.json` independently from SQLite; it is rebuilt at startup. Attachment blobs are transient; include them only if outstanding handles must survive restore. Logs contain structural metadata only and must never include ignored sender content, message bodies, tokens, or attachment bytes.
+Back up the SQLite database, registry, complete coordinator profile, and external coordinator workdir together while the bot is stopped. The coordinator profile contains authentication secrets and thread history; protect the backup accordingly. Do not restore `session-status.json` independently from SQLite; it is rebuilt at startup. Attachment blobs are transient; include them only if outstanding handles must survive restore. Logs contain structural metadata only and must never include ignored sender content, message bodies, tokens, or attachment bytes.
 
 If dashboard rendering fails after a confirmed action, the action remains confirmed. SQLite keeps the projection dirty, emits one structural warning for the failure episode, and maintenance retries without replaying the app-server action. Repair the coordinator directory/path permissions, then wait for maintenance or restart. Startup will not run the coordinator until a complete dashboard has been written.
 
@@ -147,7 +160,8 @@ RUN_TELEGRAM_LIVE=1 npm test -- tests/integration/telegram-live.test.ts
 
 ## Troubleshooting
 
-- `ENDPOINT_UNAVAILABLE`: check `codex --version`, Codex authentication, proxy variables, and app-server stderr.
+- `ENDPOINT_UNAVAILABLE`: check `codex --version`, the applicable project or coordinator authentication, proxy variables, and app-server stderr.
+- Coordinator authentication required: run `DATA_DIR="<the bot's data directory>" codex-bot coordinator-login`, complete device authentication, then restart the bot. Do not copy the normal profile's `auth.json`.
 - `CONFIGURATION_ERROR`: check `--workdir`/`COORDINATOR_WORKDIR`, path separation, the managed `AGENTS.md` digest pair, a legacy dashboard awaiting migration, and the coordinator path stored in the session registry.
 - `CWD_MISMATCH`: the persisted thread directory differs from the registry's canonical project path; do not force-attach it.
 - `SESSION_BUSY`: wait, steer the exact active turn, or interrupt it before lifecycle changes.
