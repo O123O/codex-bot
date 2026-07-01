@@ -25,9 +25,11 @@ test("a version-1 database upgrades delivery attachment and reply columns", asyn
   assert.ok(columns.includes("attachment_id"));
   assert.ok(columns.includes("attachment_scope_id"));
   assert.ok(columns.includes("reply_to"));
-  assert.equal((upgraded.prepare("SELECT MAX(version) AS version FROM schema_migrations").get() as any).version, 4);
+  assert.equal((upgraded.prepare("SELECT MAX(version) AS version FROM schema_migrations").get() as any).version, 5);
   assert.ok(upgraded.prepare("SELECT name FROM sqlite_master WHERE name = 'turn_attachment_refs'").get());
   assert.ok(upgraded.prepare("SELECT name FROM sqlite_master WHERE name = 'operation_attachment_refs'").get());
+  assert.ok(upgraded.prepare("SELECT name FROM sqlite_master WHERE name = 'session_dashboard_facts'").get());
+  assert.ok(upgraded.prepare("SELECT name FROM sqlite_master WHERE name = 'session_dashboard_notifications'").get());
   upgraded.close();
 });
 
@@ -48,6 +50,6 @@ test("a newer version-1 database with delivery columns upgrades idempotently", a
   `);
   old.close();
   const upgraded = openDatabase(path);
-  assert.equal((upgraded.prepare("SELECT MAX(version) AS version FROM schema_migrations").get() as any).version, 4);
+  assert.equal((upgraded.prepare("SELECT MAX(version) AS version FROM schema_migrations").get() as any).version, 5);
   upgraded.close();
 });

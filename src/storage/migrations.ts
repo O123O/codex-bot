@@ -175,4 +175,77 @@ export const migrations: readonly Migration[] = [
     PRIMARY KEY(hold_id, attachment_id)
   );
   `,
+  `
+  CREATE TABLE IF NOT EXISTS session_dashboard_facts (
+    endpoint_id TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
+    last_sent_json TEXT,
+    last_sent_operation_sequence INTEGER,
+    last_worker_event_json TEXT,
+    last_worker_turn_ordinal INTEGER,
+    current_model TEXT,
+    current_effort TEXT,
+    current_settings_observed_at INTEGER,
+    current_settings_observation_sequence INTEGER,
+    token_usage_json TEXT,
+    token_turn_id TEXT,
+    token_turn_ordinal INTEGER,
+    token_observation_sequence INTEGER,
+    goal_json TEXT,
+    goal_observed INTEGER NOT NULL DEFAULT 0,
+    goal_source_time INTEGER,
+    goal_observation_sequence INTEGER,
+    lifecycle_observed_at INTEGER,
+    newest_observation_at INTEGER,
+    PRIMARY KEY(endpoint_id, thread_id)
+  );
+  CREATE TABLE IF NOT EXISTS session_manager_notes (
+    endpoint_id TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
+    project_summary TEXT,
+    supervision_objective TEXT,
+    pending_follow_up TEXT,
+    updated_at INTEGER,
+    PRIMARY KEY(endpoint_id, thread_id)
+  );
+  CREATE TABLE IF NOT EXISTS session_turn_order (
+    endpoint_id TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
+    turn_id TEXT NOT NULL,
+    started_at INTEGER,
+    turn_ordinal INTEGER NOT NULL,
+    PRIMARY KEY(endpoint_id, thread_id, turn_id),
+    UNIQUE(endpoint_id, thread_id, turn_ordinal)
+  );
+  CREATE TABLE IF NOT EXISTS session_note_operations (
+    operation_id TEXT PRIMARY KEY,
+    endpoint_id TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
+    patch_json TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS session_dashboard_meta (
+    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+    coordinator_root TEXT,
+    legacy_migration_complete INTEGER NOT NULL DEFAULT 0,
+    dirty INTEGER NOT NULL DEFAULT 1,
+    revision INTEGER NOT NULL DEFAULT 0,
+    next_observation_sequence INTEGER NOT NULL DEFAULT 1,
+    last_render_error TEXT,
+    render_failure_generation INTEGER NOT NULL DEFAULT 0
+  );
+  INSERT OR IGNORE INTO session_dashboard_meta(singleton) VALUES (1);
+  CREATE TABLE IF NOT EXISTS session_dashboard_notifications (
+    sequence INTEGER PRIMARY KEY,
+    endpoint_id TEXT NOT NULL,
+    method TEXT NOT NULL,
+    params_json TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'pending',
+    received_at INTEGER NOT NULL,
+    error_json TEXT
+  );
+  CREATE INDEX IF NOT EXISTS session_dashboard_notifications_state_idx
+    ON session_dashboard_notifications(state, sequence);
+  `,
 ];
