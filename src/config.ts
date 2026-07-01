@@ -44,8 +44,10 @@ export interface BotConfig {
 export interface ConfigOverrides { coordinatorWorkdir?: string }
 
 export function loadConfig(env: Record<string, string | undefined>, overrides: ConfigOverrides = {}): BotConfig {
-  const parsed = configSchema.parse(env);
-  const workdir = overrides.coordinatorWorkdir ?? parsed.COORDINATOR_WORKDIR;
+  const parsed = configSchema.parse(overrides.coordinatorWorkdir === undefined
+    ? env
+    : { ...env, COORDINATOR_WORKDIR: overrides.coordinatorWorkdir });
+  const workdir = parsed.COORDINATOR_WORKDIR;
   if (!workdir) throw new AppError("CONFIGURATION_ERROR", "COORDINATOR_WORKDIR or --workdir is required");
   return {
     telegramBotToken: parsed.TELEGRAM_BOT_TOKEN,

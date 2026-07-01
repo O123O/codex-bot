@@ -46,3 +46,8 @@ test("CLI workdir overrides the environment and resolves from the launch directo
   const config = loadConfig(baseEnv({ COORDINATOR_WORKDIR: "from-env" }), { coordinatorWorkdir: "from-cli" });
   assert.equal(config.coordinatorWorkdir, resolve("from-cli"));
 });
+
+test("CLI workdir takes precedence before an invalid environment workdir is validated", () => {
+  const config = loadConfig(baseEnv({ COORDINATOR_WORKDIR: "" }), { coordinatorWorkdir: "from-cli" });
+  assert.equal(config.coordinatorWorkdir, resolve("from-cli"));
+});

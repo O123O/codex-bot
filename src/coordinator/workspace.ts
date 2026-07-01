@@ -40,6 +40,8 @@ export async function prepareCoordinatorWorkspace(options: CoordinatorWorkspaceO
     const registryPath = await canonicalFilePath(options.registryPath);
     assertSeparated(root, requestedDataRoot, "configured data directory");
     assertSeparated(root, requestedRegistryPath, "configured registry path");
+    assertSeparated(requestedRoot, dataRoot, "canonical data directory");
+    assertSeparated(requestedRoot, registryPath, "canonical registry path");
     assertSeparated(root, dataRoot, "data directory");
     assertSeparated(root, registryPath, "registry path");
 

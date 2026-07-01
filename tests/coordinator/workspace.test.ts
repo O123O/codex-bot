@@ -127,6 +127,22 @@ test("rejects a backend alias located inside the canonical coordinator tree", as
   await assert.rejects(prepareCoordinatorWorkspace({ ...fixture.options, dataDir: mutableAlias }), /configured data directory.*must be separate/);
 });
 
+test("rejects a lexical workdir alias located inside the canonical data directory", async () => {
+  const fixture = await fixtureWithTemplates("policy-v1\n");
+  const realData = join(dirname(fixture.workdir), "real-data");
+  const safeWorkdir = join(dirname(fixture.workdir), "safe-workdir");
+  const dataAlias = join(dirname(fixture.workdir), "external-data-alias");
+  const workdirAlias = join(realData, "manager-link");
+  await mkdir(realData, { recursive: true });
+  await mkdir(safeWorkdir, { recursive: true });
+  await symlink(realData, dataAlias, "dir");
+  await symlink(safeWorkdir, workdirAlias, "dir");
+  await assert.rejects(
+    prepareCoordinatorWorkspace({ ...fixture.options, workdir: workdirAlias, dataDir: dataAlias }),
+    /coordinator workdir.*data directory.*must be separate/,
+  );
+});
+
 test("returns canonical backend paths for exclusive production use", async () => {
   const fixture = await fixtureWithTemplates("policy-v1\n");
   const safeBackend = join(dirname(fixture.workdir), "safe-backend");
