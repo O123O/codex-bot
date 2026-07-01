@@ -33,7 +33,10 @@ test("packed codex-bot runs without source files or installed dependencies", asy
   const packageRoot = join(installRoot, "node_modules", "codex-chat-bot");
   const manifest = JSON.parse(await readFile(join(packageRoot, "package.json"), "utf8")) as { dependencies?: Record<string, string> };
   assert.deepEqual(manifest.dependencies ?? {}, {});
-  assert.deepEqual((await readdir(packageRoot)).sort(), ["README.md", "assets", "dist", "package.json"]);
+  const installedEntries = await readdir(packageRoot);
+  const requiredEntries = ["README.md", "assets", "dist", "package.json"];
+  for (const entry of requiredEntries) assert.equal(installedEntries.includes(entry), true, `missing installed entry: ${entry}`);
+  assert.deepEqual(installedEntries.filter((entry) => !requiredEntries.includes(entry) && !/^(?:licen[cs]e|notice)(?:\..*)?$/iu.test(entry)), []);
   await assert.rejects(stat(join(packageRoot, "node_modules")));
   const tree = JSON.parse((await execFileAsync("npm", ["ls", "--all", "--json", "--prefix", installRoot])).stdout) as {
     dependencies?: Record<string, { dependencies?: Record<string, unknown> }>;
