@@ -23,24 +23,23 @@ async function fixtureWithTemplates(policy: string, options: { nestedInGit?: boo
   await mkdir(assets, { recursive: true });
   if (options.nestedInGit) await mkdir(join(gitRoot, ".git"), { recursive: true });
   const policyTemplate = join(assets, "AGENTS.md");
-  const notebookTemplate = join(assets, "session-status.example.json");
   const dataDir = join(root, "backend-data");
   const registryPath = join(root, "backend-registry", "sessions.json");
   await writeFile(policyTemplate, policy);
-  await writeFile(notebookTemplate, '{"version":1,"sessions":{}}\n');
   return {
     workdir,
     policyTemplate,
-    options: { workdir, dataDir, registryPath, policyTemplatePath: policyTemplate, notebookTemplatePath: notebookTemplate },
+    options: { workdir, dataDir, registryPath, policyTemplatePath: policyTemplate },
   };
 }
 
-test("installs the managed policy, digest, and notebook in a new workspace", async () => {
+test("installs the managed policy and returns the generated dashboard path", async () => {
   const fixture = await fixtureWithTemplates("policy-v1\n");
   const prepared = await prepareCoordinatorWorkspace(fixture.options);
   assert.equal(await readFile(join(prepared.root, "AGENTS.md"), "utf8"), "policy-v1\n");
   assert.equal((await readFile(join(prepared.root, ".codex-bot-agents.sha256"), "utf8")).trim(), sha256("policy-v1\n"));
-  assert.deepEqual(prepared.notebook.snapshot(), { version: 1, sessions: {} });
+  assert.equal(prepared.dashboardPath, join(prepared.root, "session-status.json"));
+  await assert.rejects(readFile(prepared.dashboardPath), (error: unknown) => (error as NodeJS.ErrnoException).code === "ENOENT");
 });
 
 test("upgrades an unmodified managed policy", async () => {
@@ -87,13 +86,13 @@ test("does not inspect or alter AGENTS.override.md", async () => {
   assert.equal(await readlink(join(fixture.workdir, "AGENTS.override.md")), "missing-user-owned-target");
 });
 
-test("preserves an existing valid manager notebook", async () => {
+test("workspace preparation preserves an existing dashboard for later migration", async () => {
   const fixture = await fixtureWithTemplates("policy-v1\n");
   await mkdir(fixture.workdir, { recursive: true });
-  const notebook = '{"version":1,"sessions":{"project":{"thread_id":"t1","project_status":"working","updated_at":"now"}}}\n';
-  await writeFile(join(fixture.workdir, "session-status.json"), notebook);
+  const dashboard = '{"version":1,"sessions":{"project":{"thread_id":"t1","project_status":"working","updated_at":"now"}}}\n';
+  await writeFile(join(fixture.workdir, "session-status.json"), dashboard);
   await prepareCoordinatorWorkspace(fixture.options);
-  assert.equal(await readFile(join(fixture.workdir, "session-status.json"), "utf8"), notebook);
+  assert.equal(await readFile(join(fixture.workdir, "session-status.json"), "utf8"), dashboard);
 });
 
 test("warns when the workspace has a Git ancestor", async () => {

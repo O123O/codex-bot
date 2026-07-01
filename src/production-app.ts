@@ -11,7 +11,7 @@ import { composeApp, TerminalInbox, type AppPhase, type BotApp } from "./app.ts"
 import type { BotConfig } from "./config.ts";
 import { AppError } from "./core/errors.ts";
 import { runBackground } from "./core/background.ts";
-import { CoordinatorNotebook } from "./coordinator/notebook.ts";
+import { SessionDashboard } from "./coordinator/session-dashboard.ts";
 import { resumeCoordinatorIdentity } from "./coordinator/identity.ts";
 import { CoordinatorRuntime } from "./coordinator/runtime.ts";
 import { CoordinatorScheduler, type CoordinatorJob } from "./coordinator/scheduler.ts";
@@ -29,6 +29,7 @@ import { inTransaction, openDatabase, type Database } from "./storage/database.t
 import { DeliveryStore, type DeliveryRecord } from "./storage/delivery-store.ts";
 import { OperationStore } from "./storage/operation-store.ts";
 import { RuntimeStore } from "./storage/runtime-store.ts";
+import { SessionDashboardStore } from "./storage/session-dashboard-store.ts";
 import { TelegramChatAdapter } from "./telegram/chat-adapter.ts";
 import { DeliveryWorker } from "./telegram/delivery-worker.ts";
 
@@ -40,10 +41,12 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
   let coordinatorDir = config.coordinatorWorkdir;
   let dataDir = config.dataDir;
   let registryPath = config.sessionRegistryPath;
+  let dashboardPath = join(coordinatorDir, "session-status.json");
   let coordinatorWarnings: string[] = [];
   let db!: Database;
   let registry!: SessionRegistry;
-  let notebook!: CoordinatorNotebook;
+  let dashboardStore!: SessionDashboardStore;
+  let dashboard!: SessionDashboard;
   let attachments!: AttachmentStore;
   let operations!: OperationStore;
   let deliveries!: DeliveryStore;
@@ -86,12 +89,11 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
           dataDir: config.dataDir,
           registryPath: config.sessionRegistryPath,
           policyTemplatePath: join(coordinatorAssetRoot, "AGENTS.md"),
-          notebookTemplatePath: join(coordinatorAssetRoot, "session-status.example.json"),
         });
         coordinatorDir = prepared.root;
         dataDir = prepared.dataRoot;
         registryPath = prepared.registryPath;
-        notebook = prepared.notebook;
+        dashboardPath = prepared.dashboardPath;
         coordinatorWarnings = prepared.warnings;
       },
       stop: async () => undefined,
@@ -101,6 +103,7 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
       start: async () => {
         db = openDatabase(join(dataDir, "bot.sqlite3"));
         operations = new OperationStore(db); deliveries = new DeliveryStore(db); runtime = new RuntimeStore(db); finals = new FinalMessageStore(db);
+        dashboardStore = new SessionDashboardStore(db);
       },
       stop: async () => { db.close(); },
     },
@@ -119,6 +122,15 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
           deliveries.prepare({ id: `coordinator-workspace-warning:${index}`, kind: "system_warning", destination: String(config.telegramDestinationChatId), body: `[system] ${warning}`, mandatory: true });
         }
       }, stop: async () => undefined,
+    },
+    {
+      name: "dashboard",
+      start: async () => {
+        dashboard = new SessionDashboard(dashboardStore, registry, runtime, { root: coordinatorDir, path: dashboardPath, now: () => Date.now() });
+        try { await dashboard.initializeAndRender(); }
+        catch (error) { queueDashboardWarning(); throw error; }
+      },
+      stop: async () => { await dashboard.idle(); },
     },
     {
       name: "attachments",
@@ -197,7 +209,7 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
     {
       name: "coordinator",
       start: async () => {
-        await reconcileNotebook();
+        await reconcileDashboard(true);
         await startOrResumeCoordinator();
         await reconcileOperations();
         await reconcileCoordinatorAttempts();
@@ -250,7 +262,7 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
         const projectDir = args.project_dir ?? String((await pool.request<any>(endpointId, "thread/read", { threadId: args.thread_id, includeTurns: false })).thread.cwd);
         await lifecycle.adopt(args.nickname, endpointId, args.thread_id, projectDir); return { nickname: args.nickname };
       },
-      rename_session: async (args) => { await registry.rename(args.old_nickname, args.new_nickname); await reconcileNotebook(); return { nickname: args.new_nickname }; },
+      rename_session: async (args) => { await registry.rename(args.old_nickname, args.new_nickname); await reconcileDashboard(); return { nickname: args.new_nickname }; },
       detach_session: async (args) => { await lifecycle.detach(args.nickname); return { nickname: args.nickname }; },
       attach_session: async (args) => { await lifecycle.attach(args.nickname); return { nickname: args.nickname }; },
       archive_session: async (args) => { await lifecycle.archive(args.nickname); return { nickname: args.nickname }; },
@@ -337,9 +349,25 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
     };
   }
 
-  async function reconcileNotebook(): Promise<void> {
-    const map = new Map(Object.entries(registry.snapshot().sessions).map(([name, session]) => [session.thread_id, name]));
-    await notebook.reconcileNicknames(map);
+  async function reconcileDashboard(required = false): Promise<void> {
+    dashboardStore.markDirty();
+    try { await dashboard.renderIfDirty(); }
+    catch (error) {
+      queueDashboardWarning();
+      if (required) throw error;
+    }
+  }
+
+  function queueDashboardWarning(): void {
+    const state = dashboardStore.renderState();
+    if (!state.lastError) return;
+    deliveries.prepare({
+      id: `dashboard-render-warning:${state.failureGeneration}`,
+      kind: "system_warning",
+      destination: String(config.telegramDestinationChatId),
+      body: "[system] session dashboard rendering failed; durable state is safe and rendering will retry",
+      mandatory: true,
+    });
   }
 
   function projectEndpoint(requested?: string): string {
@@ -913,7 +941,7 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
     }
     registryInvalid = false;
     await initializeNewRegistryMappings();
-    await reconcileNotebook();
+    await reconcileDashboard();
   }
 
   async function validateRegistryDocument(document: RegistryDocument): Promise<void> {

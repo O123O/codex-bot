@@ -2,7 +2,6 @@ import { createHash, randomUUID } from "node:crypto";
 import { lstat, mkdir, readFile, realpath, rename, unlink, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
 import { AppError } from "../core/errors.ts";
-import { CoordinatorNotebook } from "./notebook.ts";
 
 const POLICY_FILE = "AGENTS.md";
 const DIGEST_FILE = ".codex-bot-agents.sha256";
@@ -12,14 +11,13 @@ export interface CoordinatorWorkspaceOptions {
   dataDir: string;
   registryPath: string;
   policyTemplatePath: string;
-  notebookTemplatePath: string;
 }
 
 export interface PreparedCoordinatorWorkspace {
   root: string;
   dataRoot: string;
   registryPath: string;
-  notebook: CoordinatorNotebook;
+  dashboardPath: string;
   warnings: string[];
 }
 
@@ -73,10 +71,9 @@ export async function prepareCoordinatorWorkspace(options: CoordinatorWorkspaceO
       }
     }
 
-    const notebook = await CoordinatorNotebook.bootstrap(join(root, "session-status.json"), options.notebookTemplatePath);
     const gitRoot = await findGitAncestor(root);
     const warnings = gitRoot ? [`Coordinator workdir ${root} is inside Git worktree ${gitRoot}; Codex may inherit parent instructions.`] : [];
-    return { root, dataRoot, registryPath, notebook, warnings };
+    return { root, dataRoot, registryPath, dashboardPath: join(root, "session-status.json"), warnings };
   } catch (error) {
     if (error instanceof AppError) throw error;
     throw managedError(`cannot prepare coordinator workdir ${options.workdir}`);

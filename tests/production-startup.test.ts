@@ -35,6 +35,6 @@ test("production prepares the configured coordinator workdir before endpoint sta
 
   assert.equal(await readFile(join(workdir, "AGENTS.md"), "utf8"), await readFile(policyAsset, "utf8"));
   assert.match(await readFile(join(workdir, ".codex-bot-agents.sha256"), "utf8"), /^[a-f0-9]{64}\n$/u);
-  assert.deepEqual(JSON.parse(await readFile(join(workdir, "session-status.json"), "utf8")), { version: 1, sessions: {} });
+  assert.deepEqual(JSON.parse(await readFile(join(workdir, "session-status.json"), "utf8")), { version: 2, sessions: {} });
   assert.equal(JSON.parse(await readFile(registryPath, "utf8")).coordinator.project_dir, await realpath(workdir));
 });
