@@ -94,8 +94,8 @@ test("packaged coordinator policy is concise and reserves examples for exact dir
 
   const exampleSection = policy.split(/^## Exact directive examples$/mu)[1]?.split(/^## Tool catalog$/mu)[0];
   assert.ok(exampleSection, "missing exact directive examples section");
-  assert.deepEqual([...exampleSection.matchAll(/^### (.+)$/gmu)].map((match) => match[1]), ["Preserve exact pass-through text", "Collect directly"]);
-  assert.equal([...exampleSection.matchAll(/^```text$/gmu)].length, 2);
+  assert.deepEqual([...policy.matchAll(/^### (.+)$/gmu)].map((match) => match[1]), ["Preserve exact pass-through text", "Collect directly"]);
+  assert.equal([...policy.matchAll(/^```text$/gmu)].length, 2);
 
   assert.doesNotMatch(policy, /^### (?:Create and name new work|Discover and adopt existing work|Read complete status|Record supervision intent)$/mu);
   assert.doesNotMatch(policy, /User: Work on \/projects\/payments|Continue my existing Codex work|What is the status of payments|Monitor payments until tests pass/iu);
