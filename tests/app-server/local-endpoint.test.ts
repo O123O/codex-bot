@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import test from "node:test";
-import { LocalEndpoint, resolveMcpClientPid } from "../../src/app-server/local-endpoint.ts";
+import { LocalEndpoint, resolveMcpClientIdentity } from "../../src/app-server/local-endpoint.ts";
 
 class FakeChild extends EventEmitter {
   constructor(readonly pid?: number) { super(); }
@@ -14,10 +14,11 @@ class FakeChild extends EventEmitter {
 }
 
 test("resolves one exact protocol process and rejects ambiguous launchers", async () => {
-  assert.equal(await resolveMcpClientPid(10, async () => []), 10);
-  assert.equal(await resolveMcpClientPid(10, async (pid) => pid === 10 ? [11] : []), 11);
-  await assert.rejects(resolveMcpClientPid(10, async (pid) => pid === 10 ? [11, 12] : []), /launcher topology/);
-  await assert.rejects(resolveMcpClientPid(10, async (pid) => pid === 10 ? [11] : [12]), /launcher topology/);
+  const identify = async (pid: number) => ({ pid, startTime: `start-${pid}` });
+  assert.deepEqual(await resolveMcpClientIdentity(10, async () => [], identify), { pid: 10, startTime: "start-10" });
+  assert.deepEqual(await resolveMcpClientIdentity(10, async (pid) => pid === 10 ? [11] : [], identify), { pid: 11, startTime: "start-11" });
+  await assert.rejects(resolveMcpClientIdentity(10, async (pid) => pid === 10 ? [11, 12] : [], identify), /launcher topology/);
+  await assert.rejects(resolveMcpClientIdentity(10, async (pid) => pid === 10 ? [11] : [12], identify), /launcher topology/);
 });
 
 test("initializes app-server before becoming ready", async () => {
@@ -77,18 +78,50 @@ test("a delayed exit from an old child cannot close a restarted endpoint", async
     });
   }
   let index = 0;
-  const endpoint = new LocalEndpoint({ codexBinary: "codex", spawn: () => children[index++] as never, resolveMcpClientPid: async (pid) => pid + 1_000 });
+  const endpoint = new LocalEndpoint({ codexBinary: "codex", spawn: () => children[index++] as never, resolveMcpClientIdentity: async (pid) => ({ pid: pid + 1_000, startTime: `start-${pid}` }) });
   await endpoint.start();
-  assert.equal(endpoint.mcpClientPid, 1_101);
+  assert.deepEqual(endpoint.mcpClientIdentity, { pid: 1_101, startTime: "start-101" });
   await endpoint.stop();
-  assert.equal(endpoint.mcpClientPid, undefined);
+  assert.equal(endpoint.mcpClientIdentity, undefined);
   await endpoint.start();
-  assert.equal(endpoint.mcpClientPid, 1_102);
+  assert.deepEqual(endpoint.mcpClientIdentity, { pid: 1_102, startTime: "start-102" });
   children[0]!.exitNow();
-  assert.equal(endpoint.mcpClientPid, 1_102);
+  assert.deepEqual(endpoint.mcpClientIdentity, { pid: 1_102, startTime: "start-102" });
   assert.deepEqual(await endpoint.request("model/list", {}), { data: [], nextCursor: null });
   assert.equal(endpoint.state, "ready");
   await endpoint.stop();
-  assert.equal(endpoint.mcpClientPid, undefined);
+  assert.equal(endpoint.mcpClientIdentity, undefined);
   children[1]!.exitNow();
+});
+
+test("exit or stop during process resolution cannot publish a stale ready generation", async () => {
+  class ControllableChild extends FakeChild {
+    exitNow() { this.emit("exit", 0, null); }
+  }
+  const run = async (action: "exit" | "stop") => {
+    const child = new ControllableChild(action === "exit" ? 201 : 202);
+    child.stdin.on("data", (chunk) => {
+      const request = JSON.parse(chunk.toString()) as Record<string, unknown>;
+      if (request.method === "initialize") child.stdout.write(`${JSON.stringify({ id: request.id, result: {} })}\n`);
+    });
+    let release!: (identity: { pid: number; startTime: string }) => void;
+    let resolving!: () => void;
+    const resolutionStarted = new Promise<void>((resolve) => { resolving = resolve; });
+    const resolution = new Promise<{ pid: number; startTime: string }>((resolve) => { release = resolve; });
+    const endpoint = new LocalEndpoint({
+      codexBinary: "codex",
+      spawn: () => child as never,
+      resolveMcpClientIdentity: async () => { resolving(); return resolution; },
+    });
+    const starting = endpoint.start();
+    await resolutionStarted;
+    if (action === "exit") child.exitNow();
+    else await endpoint.stop();
+    release({ pid: child.pid! + 1_000, startTime: `start-${child.pid}` });
+    await assert.rejects(starting, /generation changed/);
+    assert.notEqual(endpoint.state, "ready");
+    assert.equal(endpoint.mcpClientIdentity, undefined);
+  };
+  await run("exit");
+  await run("stop");
 });

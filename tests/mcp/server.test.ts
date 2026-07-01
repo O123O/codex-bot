@@ -5,6 +5,7 @@ import test from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { TOOL_NAMES, createCoordinatorTools } from "../../src/coordinator/tools.ts";
+import { readLinuxProcessIdentity } from "../../src/core/process-identity.ts";
 import { buildCodexChildEnvironment, coordinatorTurnConfig, LoopbackMcpServer, tcpConnectionInodes } from "../../src/mcp/server.ts";
 import { createTestDatabase } from "../../src/storage/database.ts";
 import { OperationStore } from "../../src/storage/operation-store.ts";
@@ -14,7 +15,8 @@ test("loopback MCP requires bearer auth, advertises instructions, lists tools, a
   operations.createSourceContext({ id: "ctx", kind: "telegram", sourceId: "1", rawText: "ordinary", attachmentIds: [] });
   let received: any;
   const tools = createCoordinatorTools(operations, { list_managed_sessions: async (_args, context) => { received = context; return []; } }, { maxCollectCount: 20 });
-  const server = new LoopbackMcpServer(tools, { current: () => ({ contextId: "ctx", attemptId: "a", turnId: "t" }) }, { host: "127.0.0.1", port: 0, token: "secret", allowedClientPid: () => process.pid });
+  const self = await readLinuxProcessIdentity(process.pid);
+  const server = new LoopbackMcpServer(tools, { current: () => ({ contextId: "ctx", attemptId: "a", turnId: "t" }) }, { host: "127.0.0.1", port: 0, token: "secret", allowedClientProcess: () => self });
   await server.start();
   t.after(() => server.stop());
   assert.equal((await fetch(server.url, { method: "POST", body: "{}" })).status, 401);
@@ -53,7 +55,7 @@ test("inactive coordinator context is rejected and non-loopback binding is refus
 test("a bearer token alone is rejected outside the authorized process tree", async (t) => {
   const operations = new OperationStore(createTestDatabase());
   const tools = createCoordinatorTools(operations, {}, { maxCollectCount: 20 });
-  const server = new LoopbackMcpServer(tools, { current: () => undefined }, { host: "127.0.0.1", port: 0, token: "secret", allowedClientPid: () => -1 });
+  const server = new LoopbackMcpServer(tools, { current: () => undefined }, { host: "127.0.0.1", port: 0, token: "secret", allowedClientProcess: () => ({ pid: -1, startTime: "0" }) });
   await server.start(); t.after(() => server.stop());
   assert.equal((await fetch(server.url, { method: "POST", headers: { authorization: "Bearer secret" }, body: "{}" })).status, 403);
 });
@@ -61,15 +63,17 @@ test("a bearer token alone is rejected outside the authorized process tree", asy
 test("a token-bearing child of the exact MCP client process is rejected", async (t) => {
   const operations = new OperationStore(createTestDatabase());
   const tools = createCoordinatorTools(operations, {}, { maxCollectCount: 20 });
-  let allowedPid: number | undefined;
-  const server = new LoopbackMcpServer(tools, { current: () => undefined }, { host: "127.0.0.1", port: 0, token: "secret", allowedClientPid: () => allowedPid });
+  let allowedProcess: { pid: number; startTime: string } | undefined;
+  const server = new LoopbackMcpServer(tools, { current: () => undefined }, {
+    host: "127.0.0.1", port: 0, token: "secret", allowedClientProcess: () => allowedProcess,
+  });
   await server.start(); t.after(() => server.stop());
 
   const requester = `setTimeout(async () => {
     const response = await fetch(process.env.MCP_URL, { method: "POST", headers: { authorization: "Bearer " + process.env.MCP_TOKEN }, body: "{}" });
     process.stdout.write(String(response.status));
   }, 50);`;
-  const run = async (nested: boolean): Promise<number> => {
+  const run = async (nested: boolean, wrongStartTime = false): Promise<number> => {
     const source = nested
       ? `const { spawnSync } = require("node:child_process"); const result = spawnSync(process.execPath, ["-e", ${JSON.stringify(requester)}], { env: process.env, encoding: "utf8" }); process.stdout.write(result.stdout); process.exitCode = result.status ?? 1;`
       : requester;
@@ -77,7 +81,8 @@ test("a token-bearing child of the exact MCP client process is rejected", async 
       env: { MCP_URL: server.url, MCP_TOKEN: "secret", PATH: process.env.PATH ?? "" },
       stdio: ["ignore", "pipe", "pipe"],
     });
-    allowedPid = child.pid;
+    allowedProcess = await readLinuxProcessIdentity(child.pid!);
+    if (wrongStartTime) allowedProcess = { ...allowedProcess, startTime: `${allowedProcess.startTime}-wrong` };
     let stdout = "";
     child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
     const [code] = await once(child, "exit");
@@ -85,7 +90,8 @@ test("a token-bearing child of the exact MCP client process is rejected", async 
     return Number(stdout);
   };
 
-  assert.notEqual(await run(false), 403, "the exact socket owner must be accepted");
+  assert.equal(await run(false), 406, "the exact live socket owner must reach the MCP transport");
+  assert.equal(await run(false, true), 403, "PID reuse must be rejected by process start time");
   assert.equal(await run(true), 403, "a descendant must be rejected even when it has the bearer token");
 });
 

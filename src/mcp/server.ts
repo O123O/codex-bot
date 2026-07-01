@@ -4,6 +4,7 @@ import { readFile, readdir, readlink } from "node:fs/promises";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
+import { readLinuxProcessIdentity, type LinuxProcessIdentity } from "../core/process-identity.ts";
 import type { CoordinatorToolName, ToolCallContext, ToolHandler } from "../coordinator/tools.ts";
 import { COORDINATOR_TOOL_SCHEMAS, TOOL_NAMES } from "../coordinator/tools.ts";
 
@@ -19,7 +20,7 @@ export class LoopbackMcpServer {
   constructor(
     private readonly tools: Record<CoordinatorToolName, ToolHandler>,
     private readonly contexts: CoordinatorContextProvider,
-    private readonly options: { host: "127.0.0.1"; port: number; token: string; allowedClientPid?: () => number | undefined },
+    private readonly options: { host: "127.0.0.1"; port: number; token: string; allowedClientProcess?: () => LinuxProcessIdentity | undefined },
   ) {
     if (options.host !== "127.0.0.1") throw new Error("MCP server must bind only to 127.0.0.1");
     if (!options.token) throw new Error("MCP bearer token is required");
@@ -39,13 +40,13 @@ export class LoopbackMcpServer {
           response.writeHead(401, { "content-type": "application/json", "www-authenticate": "Bearer" }).end(JSON.stringify({ error: "unauthorized" }));
           return;
         }
-        if (this.options.allowedClientPid && !await requestBelongsToPid({
+        if (this.options.allowedClientProcess && !await requestBelongsToProcess({
           remoteAddress: request.socket.remoteAddress,
           remotePort: request.socket.remotePort,
           localAddress: request.socket.localAddress,
           localPort: request.socket.localPort,
           family: request.socket.remoteFamily,
-        }, this.options.allowedClientPid())) {
+        }, this.options.allowedClientProcess())) {
           response.writeHead(403, { "content-type": "application/json" }).end(JSON.stringify({ error: "client process is not authorized" }));
           return;
         }
@@ -127,20 +128,26 @@ export function tcpConnectionInodes(table: string, connection: TcpConnectionTupl
   return inodes;
 }
 
-async function requestBelongsToPid(connection: TcpConnectionTuple, pid: number | undefined): Promise<boolean> {
-  if (!pid || process.platform !== "linux" || connection.family !== "IPv4") return false;
+async function requestBelongsToProcess(connection: TcpConnectionTuple, expected: LinuxProcessIdentity | undefined): Promise<boolean> {
+  if (!expected || process.platform !== "linux" || connection.family !== "IPv4") return false;
   try {
+    if (!sameProcess(await readLinuxProcessIdentity(expected.pid), expected)) return false;
     const table = await readFile("/proc/net/tcp", "utf8").catch(() => "");
     const inodes = new Set(tcpConnectionInodes(table, connection));
     if (inodes.size === 0) return false;
-    for (const fd of await readdir(`/proc/${pid}/fd`).catch(() => [])) {
-      const target = await readlink(`/proc/${pid}/fd/${fd}`).catch(() => "");
-      if (target.startsWith("socket:[") && inodes.has(target.slice(8, -1))) return true;
+    let ownsSocket = false;
+    for (const fd of await readdir(`/proc/${expected.pid}/fd`).catch(() => [])) {
+      const target = await readlink(`/proc/${expected.pid}/fd/${fd}`).catch(() => "");
+      if (target.startsWith("socket:[") && inodes.has(target.slice(8, -1))) { ownsSocket = true; break; }
     }
-    return false;
+    return ownsSocket && sameProcess(await readLinuxProcessIdentity(expected.pid), expected);
   } catch {
     return false;
   }
+}
+
+function sameProcess(left: LinuxProcessIdentity, right: LinuxProcessIdentity): boolean {
+  return left.pid === right.pid && left.startTime === right.startTime;
 }
 
 function ipv4ProcHex(address: string | undefined): string | undefined {

@@ -147,7 +147,7 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
         coordinator = new CoordinatorRuntime(db, operations, deliveries, { destination: String(config.telegramDestinationChatId) });
         const actions = buildActions();
         const tools = createCoordinatorTools(operations, actions, { maxCollectCount: config.maxCollectCount });
-        mcp = new LoopbackMcpServer(tools, { current: () => coordinator.current() }, { host: config.mcpHost, port: config.mcpPort, token, allowedClientPid: () => coordinatorEndpoint?.mcpClientPid });
+        mcp = new LoopbackMcpServer(tools, { current: () => coordinator.current() }, { host: config.mcpHost, port: config.mcpPort, token, allowedClientProcess: () => coordinatorEndpoint?.mcpClientIdentity });
         await mcp.start();
       }, stop: async () => { await mcp.stop(); },
     },

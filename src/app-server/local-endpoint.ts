@@ -2,6 +2,7 @@ import { spawn as nodeSpawn, type ChildProcessWithoutNullStreams, type SpawnOpti
 import { EventEmitter } from "node:events";
 import { readFile } from "node:fs/promises";
 import { AppError } from "../core/errors.ts";
+import { readLinuxProcessIdentity, type LinuxProcessIdentity } from "../core/process-identity.ts";
 import { JsonRpcClient } from "./json-rpc-client.ts";
 import type { RpcRequest } from "./protocol.ts";
 
@@ -14,7 +15,7 @@ export interface PermissionBlockedEvent {
 }
 
 type Spawn = (command: string, args: readonly string[], options: SpawnOptionsWithoutStdio) => ChildProcessWithoutNullStreams;
-type ResolveMcpClientPid = (rootPid: number) => Promise<number>;
+type ResolveMcpClientIdentity = (rootPid: number) => Promise<LinuxProcessIdentity>;
 
 async function readDirectChildren(pid: number): Promise<number[]> {
   let value: string;
@@ -26,14 +27,18 @@ async function readDirectChildren(pid: number): Promise<number[]> {
   return children;
 }
 
-export async function resolveMcpClientPid(rootPid: number, childrenOf: (pid: number) => Promise<readonly number[]> = readDirectChildren): Promise<number> {
+export async function resolveMcpClientIdentity(
+  rootPid: number,
+  childrenOf: (pid: number) => Promise<readonly number[]> = readDirectChildren,
+  identify: (pid: number) => Promise<LinuxProcessIdentity> = readLinuxProcessIdentity,
+): Promise<LinuxProcessIdentity> {
   if (process.platform !== "linux") throw new AppError("UNSUPPORTED_CAPABILITY", "manager MCP process verification requires Linux");
   const children = await childrenOf(rootPid);
-  if (children.length === 0) return rootPid;
+  if (children.length === 0) return identify(rootPid);
   if (children.length !== 1) throw new AppError("UNSUPPORTED_CAPABILITY", "unsupported Codex launcher topology");
   const [protocolPid] = children;
   if (!protocolPid || (await childrenOf(protocolPid)).length !== 0) throw new AppError("UNSUPPORTED_CAPABILITY", "unsupported Codex launcher topology");
-  return protocolPid;
+  return identify(protocolPid);
 }
 
 export class LocalEndpoint {
@@ -41,17 +46,17 @@ export class LocalEndpoint {
   state: "starting" | "ready" | "unavailable" | "stopped" = "stopped";
   private child?: ChildProcessWithoutNullStreams;
   private client?: JsonRpcClient;
-  private protocolPid?: number;
+  private protocolIdentity?: LinuxProcessIdentity;
   private readonly events = new EventEmitter();
 
-  constructor(private readonly options: { id?: string; codexBinary: string; spawn?: Spawn; env?: NodeJS.ProcessEnv; requestTimeoutMs?: number; expectedVersion?: string; resolveMcpClientPid?: ResolveMcpClientPid }) {
+  constructor(private readonly options: { id?: string; codexBinary: string; spawn?: Spawn; env?: NodeJS.ProcessEnv; requestTimeoutMs?: number; expectedVersion?: string; resolveMcpClientIdentity?: ResolveMcpClientIdentity }) {
     this.id = options.id ?? "local";
   }
 
   async start(): Promise<void> {
     if (this.state === "ready") return;
     this.state = "starting";
-    delete this.protocolPid;
+    delete this.protocolIdentity;
     const spawn = this.options.spawn ?? nodeSpawn;
     const child = spawn(this.options.codexBinary, ["app-server", "--listen", "stdio://"], {
       env: this.options.env ?? process.env,
@@ -67,7 +72,7 @@ export class LocalEndpoint {
       client.close(error);
       if (this.child === child) {
         delete this.child;
-        delete this.protocolPid;
+        delete this.protocolIdentity;
         if (this.client === client) delete this.client;
         if (this.state !== "stopped") {
           this.state = "unavailable";
@@ -80,7 +85,7 @@ export class LocalEndpoint {
       if (this.child === child) {
         const unexpectedly = this.state !== "stopped";
         delete this.child;
-        delete this.protocolPid;
+        delete this.protocolIdentity;
         if (this.client === client) delete this.client;
         if (unexpectedly) {
           this.state = "unavailable";
@@ -97,21 +102,26 @@ export class LocalEndpoint {
         const actual = /\/(\d+\.\d+\.\d+)(?:\s|\()/u.exec(initialized.userAgent ?? "")?.[1];
         if (actual !== this.options.expectedVersion) throw new AppError("UNSUPPORTED_CAPABILITY", `expected Codex app-server ${this.options.expectedVersion}, received ${actual ?? "unknown"}`);
       }
-      if (child.pid !== undefined) this.protocolPid = await (this.options.resolveMcpClientPid ?? resolveMcpClientPid)(child.pid);
+      const protocolIdentity = child.pid === undefined ? undefined : await (this.options.resolveMcpClientIdentity ?? resolveMcpClientIdentity)(child.pid);
+      if (this.child !== child || this.client !== client || this.state !== "starting") throw new AppError("ENDPOINT_UNAVAILABLE", "app-server generation changed during initialization");
+      if (protocolIdentity) this.protocolIdentity = protocolIdentity;
+      else delete this.protocolIdentity;
       client.notify("initialized", {});
       this.state = "ready";
       this.events.emit("ready");
     } catch (error) {
-      this.state = "unavailable";
-      await this.stop();
-      this.state = "unavailable";
+      if (this.child === child && this.client === client && this.state === "starting") {
+        this.state = "unavailable";
+        await this.stop();
+        this.state = "unavailable";
+      }
       throw error;
     }
   }
 
   async stop(): Promise<void> {
     this.state = "stopped";
-    delete this.protocolPid;
+    delete this.protocolIdentity;
     const child = this.child;
     this.client?.close();
     if (!child) return;
@@ -149,7 +159,7 @@ export class LocalEndpoint {
   }
 
   get pid(): number | undefined { return this.child?.pid; }
-  get mcpClientPid(): number | undefined { return this.protocolPid; }
+  get mcpClientIdentity(): LinuxProcessIdentity | undefined { return this.protocolIdentity ? { ...this.protocolIdentity } : undefined; }
 
   onPermissionBlocked(listener: (event: PermissionBlockedEvent) => void): () => void {
     this.events.on("permissionBlocked", listener);

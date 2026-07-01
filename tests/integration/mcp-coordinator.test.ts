@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -19,10 +19,12 @@ test("real coordinator can call its approved manager MCP while a project worker 
   let calls = 0;
   const tools = createCoordinatorTools(operations, { list_managed_sessions: async () => { calls += 1; return { sessions: [] }; } }, { maxCollectCount: 20 });
   const token = "integration-secret-token";
+  const workerCodexHome = await mkdtemp(join(tmpdir(), "codex-bot-worker-home-"));
+  t.after(() => rm(workerCodexHome, { recursive: true, force: true }));
   const endpoint = new LocalEndpoint({ id: "coordinator-local", codexBinary: "codex", env: buildCodexChildEnvironment(process.env, token), requestTimeoutMs: 30_000 });
-  const worker = new LocalEndpoint({ id: "local", codexBinary: "codex", env: buildCodexChildEnvironment(process.env), requestTimeoutMs: 30_000 });
+  const worker = new LocalEndpoint({ id: "local", codexBinary: "codex", env: buildCodexChildEnvironment({ ...process.env, CODEX_HOME: workerCodexHome }), requestTimeoutMs: 30_000 });
   let active = { contextId: "ctx", attemptId: "attempt", turnId: "pending" };
-  const mcp = new LoopbackMcpServer(tools, { current: () => active }, { host: "127.0.0.1", port: 0, token, allowedClientPid: () => endpoint.mcpClientPid });
+  const mcp = new LoopbackMcpServer(tools, { current: () => active }, { host: "127.0.0.1", port: 0, token, allowedClientProcess: () => endpoint.mcpClientIdentity });
   await mcp.start(); t.after(() => mcp.stop());
   await endpoint.start(); t.after(() => endpoint.stop());
   await worker.start(); t.after(() => worker.stop());
