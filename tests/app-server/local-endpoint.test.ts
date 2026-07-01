@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
@@ -94,6 +94,45 @@ test("attests the coordinator CODEX_HOME before publishing readiness", async (t)
     await assert.rejects(mismatching.endpoint.start(), /unexpected CODEX_HOME/);
     assert.equal(mismatching.endpoint.state, "unavailable");
   }
+});
+
+test("CODEX_HOME attestation rejects replacement of the pinned expected path", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "codex-home-replacement-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const expected = join(root, "expected");
+  const replacement = join(root, "replacement");
+  await mkdir(expected);
+  await mkdir(replacement);
+  await rm(expected, { recursive: true });
+  await symlink(replacement, expected);
+  const child = new FakeChild();
+  child.stdin.on("data", (chunk) => {
+    const request = JSON.parse(chunk.toString()) as Record<string, unknown>;
+    if (request.method === "initialize") child.stdout.write(`${JSON.stringify({ id: request.id, result: { codexHome: expected } })}\n`);
+  });
+  const endpoint = new LocalEndpoint({ codexBinary: "codex", spawn: () => child as never, expectedCodexHome: expected });
+  await assert.rejects(endpoint.start(), /unexpected CODEX_HOME/);
+  assert.equal(endpoint.state, "unavailable");
+});
+
+test("validates the pinned coordinator environment before and after initialization", async () => {
+  const child = new FakeChild();
+  child.stdin.on("data", (chunk) => {
+    const request = JSON.parse(chunk.toString()) as Record<string, unknown>;
+    if (request.method === "initialize") child.stdout.write(`${JSON.stringify({ id: request.id, result: {} })}\n`);
+  });
+  let validations = 0;
+  const endpoint = new LocalEndpoint({
+    codexBinary: "codex",
+    spawn: () => child as never,
+    validateEnvironment: async () => {
+      validations += 1;
+      if (validations === 2) throw new Error("profile changed unexpectedly");
+    },
+  });
+  await assert.rejects(endpoint.start(), /profile changed unexpectedly/);
+  assert.equal(validations, 2);
+  assert.equal(endpoint.state, "unavailable");
 });
 
 test("a delayed exit from an old child cannot close a restarted endpoint", async () => {

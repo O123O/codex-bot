@@ -88,7 +88,7 @@ export interface PreparedCoordinatorProfile {
 export async function prepareCoordinatorProfile(dataRoot: string): Promise<PreparedCoordinatorProfile>;
 ```
 
-Use `lstat` before trusting existing objects; directories must be real directories rather than symbolic links. Create/chmod profile directories to `0700`, canonicalize them, and require that they remain descendants of the canonical data root. Parse `profile.json` with a strict schema equivalent to `{ version: z.literal(1), creation_nonce: z.string().uuid(), pending_thread_id: z.string().min(1).nullable() }`. For an absent marker, generate `creationNonce` with `randomUUID()`. Every marker transition is a mode-`0600`, file-and-directory-`fsync` atomic replacement guarded by the expected current nonce/pending ID. `markActivated`, `recordPendingThread`, and `clearPendingThread` update the returned in-memory state only after the durable write and reject conflicting transitions.
+Use `lstat` before trusting existing objects; directories must be real directories rather than symbolic links. Create/chmod profile directories to `0700`, canonicalize them, pin their device/inode identities, and require that they remain descendants of the canonical data root. Expose integrity revalidation for app-server starts and marker transitions. Parse `profile.json` through a no-follow descriptor with a strict schema equivalent to `{ version: z.literal(1), creation_nonce: z.string().uuid(), pending_thread_id: z.string().min(1).nullable() }`. For an absent marker, generate `creationNonce` with `randomUUID()`. Every marker transition is a mode-`0600`, file-and-directory-`fsync` atomic replacement guarded by the expected current nonce/pending ID and revalidated parent identities. `markActivated`, `recordPendingThread`, and `clearPendingThread` update the returned in-memory state only after the durable write and reject conflicting transitions.
 
 - [ ] **Step 4: Run the profile tests and verify GREEN**
 
@@ -267,7 +267,7 @@ Expected: FAIL because `expectedCodexHome` is not accepted or enforced.
 
 - [ ] **Step 3: Implement initialization attestation**
 
-Add `expectedCodexHome?: string` to `LocalEndpoint` options, request `codexHome` in the initialization response type, and compare canonical paths after initialization but before publishing process identity or `ready`. Missing or mismatched values under this option must throw `AppError("CONFIGURATION_ERROR", ...)`. Endpoints without the option retain current compatibility.
+Add `expectedCodexHome?: string` and an optional environment-integrity callback to `LocalEndpoint` options. Request `codexHome` in the initialization response type, resolve only the reported path, and compare it with the already-canonical pinned expected path after initialization but before publishing process identity or `ready`. Run integrity validation before spawn and again after initialization so a replaced same-path inode also fails. Missing or mismatched values under this option must throw `AppError("CONFIGURATION_ERROR", ...)`. Endpoints without the options retain current compatibility.
 
 - [ ] **Step 4: Run the endpoint test and verify GREEN**
 
@@ -514,6 +514,7 @@ coordinatorEndpoint = new LocalEndpoint({
   codexBinary: config.codexBinary,
   env: buildCoordinatorChildEnvironment(process.env, coordinatorProfile, token),
   expectedCodexHome: coordinatorProfile.codexHome,
+  validateEnvironment: () => coordinatorProfile.assertIntact(),
   expectedVersion: SUPPORTED_CODEX_VERSION,
 });
 ```

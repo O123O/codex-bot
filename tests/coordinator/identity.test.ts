@@ -281,6 +281,31 @@ test("registered identity clears a matching stale creation receipt after verifie
   assert.equal(cleared, "registered-thread");
 });
 
+test("registered isolated identity always requires its nonce-tagged provenance", async () => {
+  for (const field of ["threadSource", "name"] as const) {
+    const dir = await mkdtemp(join(tmpdir(), "coordinator-registered-provenance-"));
+    const registry = await SessionRegistry.open(join(dir, "sessions.json"), {
+      version: 1, coordinator: { endpoint: "coordinator-local", thread_id: "registered-thread", project_dir: dir }, sessions: {},
+    });
+    const thread = {
+      id: "registered-thread",
+      cwd: dir,
+      threadSource: "bot-nonce",
+      name: "codex-bot-coordinator:bot-nonce",
+      status: { type: "idle" },
+    };
+    thread[field] = "attacker-value";
+    await assert.rejects(resumeCoordinatorIdentity({
+      registry,
+      endpoint: { id: "coordinator-local", request: async <T>() => ({ thread } as T) },
+      legacyEndpointId: "local", coordinatorDir: dir, sandboxMode: "workspace-write", config: {},
+      creationNonce: "bot-nonce", pendingThreadId: null,
+      recordPendingThread: async () => {}, clearPendingThread: async () => {},
+    }), field === "threadSource" ? /creation nonce/ : /creation name/);
+    assert.equal(registry.snapshot().coordinator.thread_id, "registered-thread");
+  }
+});
+
 test("only exact thread-not-loaded clears a pending receipt", async () => {
   const run = async (failure: Error) => {
     const dir = await mkdtemp(join(tmpdir(), "coordinator-receipt-error-"));

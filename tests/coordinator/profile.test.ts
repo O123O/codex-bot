@@ -57,6 +57,17 @@ test("repairs private directory modes without replacing directories", async (t) 
   for (const path of [profile.root, profile.home, profile.codexHome]) assert.equal((await stat(path)).mode & 0o777, 0o700);
 });
 
+test("detects replacement of a pinned coordinator profile directory", async (t) => {
+  const { root, dataRoot } = await fixture();
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const profile = await prepareCoordinatorProfile(dataRoot);
+  const replacement = join(root, "replacement-codex-home");
+  await mkdir(replacement);
+  await rm(profile.codexHome, { recursive: true });
+  await symlink(replacement, profile.codexHome);
+  await assert.rejects(profile.assertIntact(), /changed unexpectedly/);
+});
+
 test("rejects symlinks and non-directories anywhere in the managed profile path", async (t) => {
   for (const component of ["coordinator-profile", "coordinator-profile/home", "coordinator-profile/codex"]) {
     await t.test(component, async (st) => {

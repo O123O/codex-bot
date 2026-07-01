@@ -11,6 +11,7 @@ export async function runCoordinatorLogin(
   spawn: LoginSpawn = nodeSpawn,
 ): Promise<void> {
   const profile = await prepareCoordinatorProfile(config.dataDir);
+  await profile.assertIntact();
   const child = spawn(config.codexBinary, ["login", "--device-auth"], {
     env: buildCoordinatorChildEnvironment(host, profile),
     stdio: "inherit",

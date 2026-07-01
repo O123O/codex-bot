@@ -32,6 +32,10 @@ export async function resumeCoordinatorIdentity(input: {
   } else {
     response = await input.endpoint.request<ThreadResponse>("thread/resume", { threadId: identity.thread_id, cwd: input.coordinatorDir, approvalPolicy: "never", sandbox: input.sandboxMode, config: input.config });
     await verifyThread(response.thread, { id: identity.thread_id, cwd: configuredDir });
+    if (input.creationNonce !== undefined) {
+      const creation = requireCreationMetadata(input.creationNonce);
+      await verifyThread(response.thread, { id: identity.thread_id, cwd: configuredDir, nonce: creation.nonce, name: creation.name });
+    }
     if (input.pendingThreadId !== undefined && input.pendingThreadId !== null) {
       const creation = requireCreationState(input);
       if (input.pendingThreadId !== identity.thread_id) throw new AppError("CONFIGURATION_ERROR", "coordinator registry and pending creation receipt disagree");
@@ -71,7 +75,12 @@ function requireCreationState(input: {
   if (!input.creationNonce || !input.recordPendingThread || !input.clearPendingThread) {
     throw new AppError("CONFIGURATION_ERROR", "pending coordinator identity has incomplete creation state");
   }
-  return { nonce: input.creationNonce, name: `codex-bot-coordinator:${input.creationNonce}`, record: input.recordPendingThread, clear: input.clearPendingThread };
+  return { ...requireCreationMetadata(input.creationNonce), record: input.recordPendingThread, clear: input.clearPendingThread };
+}
+
+function requireCreationMetadata(nonce: string) {
+  if (!nonce) throw new AppError("CONFIGURATION_ERROR", "coordinator identity has no creation nonce");
+  return { nonce, name: `codex-bot-coordinator:${nonce}` };
 }
 
 async function createOrRecoverPendingThread(

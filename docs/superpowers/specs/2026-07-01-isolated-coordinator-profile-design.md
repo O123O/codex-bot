@@ -28,7 +28,7 @@ The backend owns a fixed profile root beneath the canonical data directory:
     sessions/
 ```
 
-`prepareCoordinatorProfile` creates `coordinator-profile`, `home`, and `codex` with mode `0700`, rejects non-directory or symbolic-link replacements, and returns canonical paths. The coordinator app-server receives these exact overrides:
+`prepareCoordinatorProfile` creates `coordinator-profile`, `home`, and `codex` with mode `0700`, rejects non-directory or symbolic-link replacements, and returns canonical paths with pinned device/inode identities. Profile integrity is revalidated before and after every coordinator app-server start and before marker transitions. Marker reads use a no-follow descriptor and verify that the opened inode is still the named regular file. The coordinator app-server receives these exact overrides:
 
 ```text
 HOME=<DATA_DIR>/coordinator-profile/home
@@ -65,7 +65,7 @@ Threads are stored under one app-server's `CODEX_HOME`; consequently, the existi
 6. Atomically write `profile.json` with a new `creation_nonce` and null `pending_thread_id`, then start a new in-memory coordinator with `threadSource` set to that nonce. A zero-turn Codex thread is not durable, listable, or resumable after its app-server exits.
 7. Immediately after `thread/start` returns, atomically record its ID as `pending_thread_id`, then call `thread/name/set` with the exact name `codex-bot-coordinator:<nonce>`. This metadata operation materializes the thread without a model turn. Only after its success does the bot atomically store the registry identity and clear the matching pending receipt.
 
-When the marker exists and the registry remains pending, `pending_thread_id` is the durable creation receipt. Recovery reads that exact ID after a new app-server generation. Exact structured JSON-RPC `-32600` “thread not loaded” means the crash occurred before materialization, so the bot clears only that matching receipt and starts again. Every other error preserves the receipt and fails closed. A recovered thread must match the ID, canonical cwd, `threadSource` nonce, and nonce-tagged name before resume and registry commit. A successful registry resume clears any matching stale receipt left by a crash after registry commit.
+When the marker exists and the registry remains pending, `pending_thread_id` is the durable creation receipt. Recovery reads that exact ID after a new app-server generation. Exact structured JSON-RPC `-32600` “thread not loaded” from that initial read means the crash occurred before materialization, so the bot clears only that matching receipt and starts again. Every later resume error and every other read error preserves the receipt and fails closed. Every isolated resume, including ordinary restarts after the receipt is cleared, must match the ID, canonical cwd, `threadSource` nonce, and nonce-tagged name. A successful registry resume clears any matching stale receipt left by a crash after registry commit.
 
 This ordering closes every creation window: a crash before the receipt leaves no durable Codex thread; a crash before metadata materialization leaves a safely replaceable receipt; a crash after materialization recovers by exact ID and provenance; and a crash after registry commit resumes the registered thread. A missing, malformed, unsupported, symbolic-link, or non-regular marker fails closed except that a genuinely absent marker selects first activation. Deleting the entire profile deliberately causes a new isolated coordinator identity on the next successful authenticated startup.
 

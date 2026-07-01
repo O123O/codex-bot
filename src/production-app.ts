@@ -165,6 +165,7 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
           codexBinary: config.codexBinary,
           env: buildCoordinatorChildEnvironment(process.env, coordinatorProfile, token),
           expectedCodexHome: coordinatorProfile.codexHome,
+          validateEnvironment: () => coordinatorProfile.assertIntact(),
           expectedVersion: SUPPORTED_CODEX_VERSION,
         });
         pool = new AppServerPool([endpoint, coordinatorEndpoint], { maxConcurrentTurns: config.maxConcurrentTurns });

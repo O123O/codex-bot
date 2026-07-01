@@ -49,12 +49,13 @@ export class LocalEndpoint {
   private protocolIdentity?: LinuxProcessIdentity;
   private readonly events = new EventEmitter();
 
-  constructor(private readonly options: { id?: string; codexBinary: string; spawn?: Spawn; env?: NodeJS.ProcessEnv; requestTimeoutMs?: number; expectedVersion?: string; expectedCodexHome?: string; resolveMcpClientIdentity?: ResolveMcpClientIdentity }) {
+  constructor(private readonly options: { id?: string; codexBinary: string; spawn?: Spawn; env?: NodeJS.ProcessEnv; requestTimeoutMs?: number; expectedVersion?: string; expectedCodexHome?: string; validateEnvironment?: () => Promise<void>; resolveMcpClientIdentity?: ResolveMcpClientIdentity }) {
     this.id = options.id ?? "local";
   }
 
   async start(): Promise<void> {
     if (this.state === "ready") return;
+    await this.options.validateEnvironment?.();
     this.state = "starting";
     delete this.protocolIdentity;
     const spawn = this.options.spawn ?? nodeSpawn;
@@ -104,9 +105,10 @@ export class LocalEndpoint {
       }
       if (this.options.expectedCodexHome) {
         const matches = initialized.codexHome !== undefined
-          && await realpath(initialized.codexHome).catch(() => undefined) === await realpath(this.options.expectedCodexHome);
+          && await realpath(initialized.codexHome).catch(() => undefined) === this.options.expectedCodexHome;
         if (!matches) throw new AppError("CONFIGURATION_ERROR", "coordinator app-server reported an unexpected CODEX_HOME");
       }
+      await this.options.validateEnvironment?.();
       const protocolIdentity = child.pid === undefined ? undefined : await (this.options.resolveMcpClientIdentity ?? resolveMcpClientIdentity)(child.pid);
       if (this.child !== child || this.client !== client || this.state !== "starting") throw new AppError("ENDPOINT_UNAVAILABLE", "app-server generation changed during initialization");
       if (protocolIdentity) this.protocolIdentity = protocolIdentity;
