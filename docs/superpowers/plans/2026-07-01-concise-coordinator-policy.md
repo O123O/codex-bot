@@ -51,9 +51,9 @@ test("packaged coordinator policy is concise and reserves examples for exact dir
   assert.ok(catalogSection, "missing tool catalog section");
   const catalogued: string[] = [];
   for (const [label, expected] of catalog) {
-    const line = catalogSection.split("\n").find((candidate) => candidate.startsWith(`${label}: `));
+    const line: string | undefined = catalogSection.split("\n").find((candidate) => candidate.startsWith(`${label}: `));
     assert.ok(line, `missing tool catalog category: ${label}`);
-    const actual = [...line.matchAll(/`([^`]+)`/gu)].map((match) => match[1]!);
+    const actual: string[] = [...line.matchAll(/`([^`]+)`/gu)].map((match) => match[1]!);
     assert.deepEqual(actual, [...expected]);
     catalogued.push(...actual);
   }

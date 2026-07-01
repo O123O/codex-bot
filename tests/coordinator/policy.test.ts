@@ -6,41 +6,71 @@ import { TOOL_NAMES } from "../../src/coordinator/tools.ts";
 import { SessionDashboardDocumentSchema } from "../../src/coordinator/dashboard-schema.ts";
 
 const policyPath = fileURLToPath(new URL("../../assets/coordinator/AGENTS.md", import.meta.url));
+const catalog = [
+  ["Session discovery and lifecycle", ["list_managed_sessions", "discover_sessions", "get_session_status", "create_session", "register_session", "adopt_session", "rename_session", "detach_session", "attach_session", "archive_session"]],
+  ["Work and results", ["send_to_session", "read_worker_message", "collect_messages", "interrupt_session"]],
+  ["Model, goal, and management memory", ["list_models", "set_session_model", "set_reasoning_effort", "get_goal", "set_goal", "pause_goal", "resume_goal", "cancel_goal", "update_session_notes"]],
+  ["User output and attachments", ["send_chat_message", "prepare_chat_attachment", "send_chat_attachment"]],
+] as const;
 
-test("packaged coordinator policy is a complete manager playbook without marker noise", async () => {
+test("packaged coordinator policy is concise and reserves examples for exact directives", async () => {
   const policy = await readFile(policyPath, "utf8");
   for (const heading of [
-    "## Routing",
-    "## Live state and lifecycle",
-    "## Worker results and supervision",
-    "## Exact directives",
-    "## Models, effort, goals, and interruption",
-    "## Attachments and failures",
+    "## Routing and state",
+    "## Results and supervision",
     "## Session dashboard",
-    "## Worked examples",
-  ]) assert.match(policy, new RegExp(`^${heading.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")}$`, "mu"));
-  for (const name of TOOL_NAMES) assert.match(policy, new RegExp(`\\b${name}\\b`, "u"));
+    "## Exact directives",
+    "## Exact directive examples",
+    "## Tool catalog",
+  ]) assert.match(policy, new RegExp(`^${heading}$`, "mu"));
+
+  const catalogSection = policy.split(/^## Tool catalog$/mu)[1];
+  assert.ok(catalogSection, "missing tool catalog section");
+  const catalogued: string[] = [];
+  for (const [label, expected] of catalog) {
+    const line: string | undefined = catalogSection.split("\n").find((candidate) => candidate.startsWith(`${label}: `));
+    assert.ok(line, `missing tool catalog category: ${label}`);
+    const actual: string[] = [...line.matchAll(/`([^`]+)`/gu)].map((match) => match[1]!);
+    assert.deepEqual(actual, [...expected]);
+    catalogued.push(...actual);
+  }
+  assert.deepEqual(new Set(catalogued), new Set(TOOL_NAMES));
+
   assert.match(policy, /worker final messages are automatically delivered/iu);
-  assert.match(policy, /\/pass.*payload and attachment IDs exactly/isu);
-  assert.match(policy, /\/collect.*backend delivers.*directly/isu);
+  assert.match(policy, /do not repeat, paraphrase, acknowledge, or announce an automatically delivered result/iu);
+  assert.match(policy, /read a worker body only when the user asks, a supervision decision needs it, or compacted context must be recovered/iu);
+  assert.match(policy, /for monitoring.*follow up until the requested outcome is genuinely resolved/isu);
+  assert.match(policy, /worker notification wakes you.*does not itself justify another user message/isu);
+  assert.match(policy, /ask when more than one target remains plausible/iu);
+  assert.match(policy, /never silently repoint a nickname/iu);
+  assert.match(policy, /state change happened only when its tool receipt proves it/iu);
+  assert.match(policy, /interrupt only on explicit user intent or an already-authorized supervision objective/iu);
+  assert.match(policy, /permission blocks.*worker failures are real states.*never fabricate/isu);
+  assert.match(policy, /worker notifications contain metadata, not bodies/iu);
+  assert.match(policy, /model and effort changes are pending.*next new turn.*steer/isu);
   assert.match(policy, /set_goal.*replaces the current goal/isu);
   assert.match(policy, /never declare or mark a worker goal complete/iu);
-  assert.match(policy, /state change happened only when its tool receipt proves it/iu);
   assert.match(policy, /never (?:edit|patch|replace|delete|regenerate)[^\n]*session-status\.json/iu);
   assert.match(policy, /never (?:edit|patch|replace|delete|regenerate)[^\n]*data\/sessions\.json/iu);
-  assert.match(policy, /update_session_notes.*manager_notes/isu);
-  assert.match(policy, /auto_session_info.*automatic/isu);
+  assert.match(policy, /manager_notes.*update_session_notes/isu);
+  assert.match(policy, /automatically maintained `auto_session_info`/iu);
+  assert.match(policy, /automatic values may be `null`.*do not invent/isu);
   assert.match(policy, /thread context usage.*not.*(?:billing|account usage|credits|rate limits)/isu);
   assert.match(policy, /no `?watch_session`? tool/iu);
-  assert.match(policy, /User: Work on \/projects\/payments/iu);
-  assert.match(policy, /discover_sessions\(\{"cwd":"\/projects\/payments"\}\)/u);
-  assert.match(policy, /get_session_status\(\{"nickname":"payments"\}\)/u);
-  assert.match(policy, /update_session_notes\(\{/u);
+  assert.match(policy, /preserve attachment IDs deliberately.*never invent backend paths.*never expose tokens, hidden bodies/isu);
+
+  assert.match(policy, /\/pass.*every character.*attachment IDs in original order exactly/isu);
+  assert.match(policy, /one required ASCII separator/iu);
+  assert.match(policy, /\/pass.*choose the target and `start` or `steer`/isu);
+  assert.match(policy, /\/collect.*exact count.*backend delivers.*directly/isu);
+  assert.match(policy, /do not repeat, summarize, or acknowledge directly collected bodies/iu);
   assert.match(policy, /User: tell payments \/pass  preserve this leading space/u);
   assert.match(policy, /"content":" preserve this leading space"/u);
   assert.match(policy, /collect_messages\(\{"nickname":"payments","count":3\}\)/u);
+
+  assert.doesNotMatch(policy, /^### (?:Create and name new work|Discover and adopt existing work|Read complete status|Record supervision intent)$/mu);
+  assert.doesNotMatch(policy, /User: Work on \/projects\/payments|Continue my existing Codex work|What is the status of payments|Monitor payments until tests pass/iu);
   assert.doesNotMatch(policy, /codex-bot:(?:managed|user)/u);
-  assert.ok(Buffer.byteLength(policy, "utf8") >= 4_000);
 
   const examplePath = fileURLToPath(new URL("../../assets/coordinator/session-status.example.json", import.meta.url));
   assert.deepEqual(SessionDashboardDocumentSchema.parse(JSON.parse(await readFile(examplePath, "utf8"))), { version: 2, sessions: {} });
