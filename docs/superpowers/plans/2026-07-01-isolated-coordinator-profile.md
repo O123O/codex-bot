@@ -14,16 +14,23 @@
 
 - Create `src/coordinator/profile.ts`: private profile directory preparation, marker parsing/writing, child-environment override, authentication preflight, and login guidance.
 - Create `tests/coordinator/profile.test.ts`: filesystem, environment, authentication, marker, and fail-closed tests.
+- Create `src/coordinator/login.ts`: safely launch device authentication through the installed binary.
+- Create `tests/coordinator/login.test.ts`: command environment, inherited stdio, exit handling, and pre-spawn filesystem rejection.
+- Modify `src/cli.ts`, `src/config.ts`, and `src/main.ts`: dispatch `coordinator-login` without requiring Telegram configuration.
+- Modify `tests/cli.test.ts` and `tests/config.test.ts`: command parsing and login-only configuration coverage.
 - Modify `src/app-server/local-endpoint.ts`: optionally attest the `codexHome` returned by app-server initialization.
 - Modify `tests/app-server/local-endpoint.test.ts`: expected/mismatched Codex-home initialization tests.
 - Modify `src/coordinator/identity.ts`: first-profile activation with existing identity validation and crash-safe registry/marker ordering.
 - Modify `tests/coordinator/identity.test.ts`: activation, ordering, retry, and project-mapping preservation tests.
 - Create `src/coordinator/profile-migration.ts`: reconcile and terminalize legacy coordinator attempts before identity replacement.
 - Create `tests/coordinator/profile-migration.test.ts`: real SQLite recovery behavior for no-effect and dispatched-effect attempts.
+- Create `src/coordinator/auth-recovery.ts`: deduplicate actionable coordinator-authentication warnings by endpoint incident.
+- Create `tests/coordinator/auth-recovery.test.ts`: warning idempotency and incident separation.
 - Modify `src/production-app.ts`: prepare the profile, isolate only `coordinator-local`, preflight authentication, and recover legacy active attempts before activation.
 - Modify `tests/production-startup.test.ts`: prove profile preparation occurs before endpoint failure.
 - Modify `tests/mcp/server.test.ts`: prove worker and coordinator environment behavior remains secret-safe.
 - Modify `tests/integration/mcp-coordinator.test.ts`: real app-server skill/config isolation and manager-MCP regression coverage.
+- Modify `src/coordinator/workspace.ts` and `tests/coordinator/workspace.test.ts`: accurately warn about nested repository instructions, configuration, and skills.
 - Modify `README.md`: setup/login/migration/skills/backup/troubleshooting documentation.
 
 ### Task 1: Private coordinator profile and isolated environment
@@ -150,7 +157,78 @@ git commit -m "feat: prepare isolated coordinator profile"
 
 Expected: focused tests PASS and commit succeeds.
 
-### Task 2: App-server Codex-home attestation and authentication preflight
+### Task 2: Safe installed coordinator login command
+
+**Files:**
+- Create: `src/coordinator/login.ts`
+- Create: `tests/coordinator/login.test.ts`
+- Modify: `src/cli.ts`
+- Modify: `tests/cli.test.ts`
+- Modify: `src/config.ts`
+- Modify: `tests/config.test.ts`
+- Modify: `src/main.ts`
+
+- [ ] **Step 1: Write failing command/config tests**
+
+Specify a discriminated CLI result:
+
+```ts
+assert.deepEqual(parseCliArgs([]), { command: "run" });
+assert.deepEqual(parseCliArgs(["--workdir", "./manager"]), { command: "run", coordinatorWorkdir: "./manager" });
+assert.deepEqual(parseCliArgs(["coordinator-login"]), { command: "coordinator-login" });
+assert.throws(() => parseCliArgs(["coordinator-login", "--workdir", "x"]), /unknown argument/);
+```
+
+Add `loadCoordinatorLoginConfig` tests proving it resolves only `DATA_DIR` and `CODEX_BINARY` and does not require or inspect Telegram variables.
+
+- [ ] **Step 2: Write the failing safe-login launcher tests**
+
+Inject a fake spawn and assert `runCoordinatorLogin` first prepares the profile and then invokes exactly:
+
+```ts
+spawn(codexBinary, ["login", "--device-auth"], {
+  env: expectedIsolatedEnvironment,
+  stdio: "inherit",
+});
+```
+
+Prove `HOME` and `CODEX_HOME` use the prepared profile, Telegram secrets are absent, no MCP token is present, and a nonzero child exit rejects. Add a pre-existing profile-directory symlink fixture and assert the launcher rejects before spawn is called.
+
+- [ ] **Step 3: Run login tests and verify RED**
+
+Run:
+
+```bash
+npm test -- tests/cli.test.ts tests/config.test.ts tests/coordinator/login.test.ts
+```
+
+Expected: FAIL because the command variant, login configuration, and launcher do not exist.
+
+- [ ] **Step 4: Implement command parsing, login configuration, and launcher**
+
+Make `parseCliArgs` return:
+
+```ts
+type CliCommand =
+  | { command: "run"; coordinatorWorkdir?: string }
+  | { command: "coordinator-login" };
+```
+
+`loadCoordinatorLoginConfig` resolves `DATA_DIR` with the same default and resolution rules as bot startup plus `CODEX_BINARY` with the same default. `runCoordinatorLogin` calls `prepareCoordinatorProfile`, builds a sanitized child environment with the isolated home paths but no manager token, spawns Codex with an argument array and inherited stdio, and rejects a nonzero/signal exit without exposing child output. `main` dispatches this command before loading Telegram configuration or creating the app.
+
+- [ ] **Step 5: Run focused tests and commit**
+
+Run:
+
+```bash
+npm test -- tests/cli.test.ts tests/config.test.ts tests/coordinator/login.test.ts
+git add src/cli.ts src/config.ts src/main.ts src/coordinator/login.ts tests/cli.test.ts tests/config.test.ts tests/coordinator/login.test.ts
+git commit -m "feat: add safe coordinator login command"
+```
+
+Expected: focused tests PASS and commit succeeds.
+
+### Task 3: App-server Codex-home attestation and authentication preflight
 
 **Files:**
 - Modify: `src/app-server/local-endpoint.ts`
@@ -215,6 +293,7 @@ await assert.doesNotReject(assertCoordinatorAuthenticated(externalProviderEndpoi
 ```
 
 The no-account fixture returns `{ account: null, requiresOpenaiAuth: true }`; the external-provider fixture returns `{ account: null, requiresOpenaiAuth: false }`.
+Also test `startAuthenticatedCoordinatorEndpoint`: authentication failure after `start()` must call `stop()` and rethrow the actionable configuration error; success leaves the endpoint ready. This helper is the single path used by initial startup and reconnect.
 
 - [ ] **Step 6: Run authentication tests and verify RED**
 
@@ -228,7 +307,7 @@ Expected: FAIL because `assertCoordinatorAuthenticated` does not exist.
 
 - [ ] **Step 7: Implement authentication preflight and safe login guidance**
 
-Implement `assertCoordinatorAuthenticated`. It must call `account/read` without token refresh, accept any returned account, accept providers that do not require OpenAI authentication, and otherwise throw an actionable configuration error. Render the command with a small POSIX single-quote helper so spaces, quotes, dollar signs, and shell metacharacters in paths or `CODEX_BINARY` cannot alter the displayed command.
+Implement `assertCoordinatorAuthenticated`. It must call `account/read` without token refresh, accept any returned account, accept providers that do not require OpenAI authentication, and otherwise throw an actionable configuration error directing the user to `codex-bot coordinator-login` with the resolved data directory. Implement `startAuthenticatedCoordinatorEndpoint` to start, preflight, and stop on preflight failure. Do not render or execute shell command text.
 
 - [ ] **Step 8: Run focused tests and commit**
 
@@ -242,7 +321,7 @@ git commit -m "feat: verify coordinator profile authentication"
 
 Expected: focused tests PASS and commit succeeds.
 
-### Task 3: Crash-safe first-profile coordinator identity migration
+### Task 4: Crash-safe first-profile coordinator identity migration
 
 **Files:**
 - Modify: `src/coordinator/identity.ts`
@@ -269,6 +348,14 @@ assert.deepEqual(registry.snapshot().sessions, originalSessions);
 ```
 
 Intercept the registry write or read the file after each callback to prove the durable order is `beforeReset` → registry pending → marker. Add tests that no activation work happens when `activationRequired` is false; endpoint/workdir mismatch fails before `beforeReset`; and marker failure leaves the registry pending so retry is safe.
+
+Add pending-identity discovery tests. The fake endpoint returns paginated `thread/list` rows for `sourceKinds: ["appServer"]`, `archived: false`, `useStateDbOnly: false`, and the exact coordinator `cwd`. Prove:
+
+- no eligible candidate calls `thread/start`;
+- one exact, persistent, top-level candidate calls `thread/resume` and stores that ID;
+- two eligible candidates fail with `CONFIGURATION_ERROR` before starting or resuming either;
+- ephemeral, child, archived, and mismatched-cwd rows are ignored;
+- all pages are exhausted before the choice is made.
 
 - [ ] **Step 2: Run identity tests and verify RED**
 
@@ -298,6 +385,8 @@ export async function activateCoordinatorProfileIdentity(input: {
 
 If activation is required, validate first, await `beforeReset`, atomically set only the coordinator to `{ endpoint: endpointId, thread_id: "pending", project_dir: coordinatorDir }`, then await `markActivated`. Do not catch failures and do not mutate project mappings.
 
+When `resumeCoordinatorIdentity` sees `thread_id: "pending"`, exhaust `thread/list` for non-archived app-server threads in the exact canonical workdir. Filter ephemeral and child rows. Start only when there are no candidates, resume the sole candidate, and fail closed on ambiguity. Apply the same returned-thread ID and cwd verification to both start and recovered resume paths. This makes `profile marker exists + registry pending` a durable creation-recovery state across a crash after app-server persisted a new thread but before the registry write.
+
 - [ ] **Step 4: Run identity tests and verify GREEN**
 
 Run:
@@ -315,11 +404,13 @@ git add src/coordinator/identity.ts tests/coordinator/identity.test.ts
 git commit -m "feat: migrate coordinator identity to isolated profile"
 ```
 
-### Task 4: Wire isolation and recovery into production startup
+### Task 5: Wire isolation and recovery into production startup
 
 **Files:**
 - Create: `src/coordinator/profile-migration.ts`
 - Create: `tests/coordinator/profile-migration.test.ts`
+- Create: `src/coordinator/auth-recovery.ts`
+- Create: `tests/coordinator/auth-recovery.test.ts`
 - Modify: `src/production-app.ts`
 - Modify: `tests/production-startup.test.ts`
 
@@ -345,16 +436,32 @@ Expected: FAIL because the profile directories are not created.
 
 - [ ] **Step 3: Write the failing legacy-attempt recovery tests**
 
-Create real SQLite fixtures with `CoordinatorRuntime`, `OperationStore`, and `DeliveryStore`. One fixture has an active attempt with no dispatched effects. The second has an active attempt with a dispatched `send_to_session` operation. Call the desired helper and assert:
+Create real SQLite fixtures with `CoordinatorRuntime`, `OperationStore`, `DeliveryStore`, and `FinalMessageStore`. Cover three attempts:
+
+1. SQLite still says active, but the old coordinator rollout contains the completed turn and final answer.
+2. The old rollout has no matching turn and the attempt has no dispatched effect.
+3. The old rollout has no matching turn and the attempt has a dispatched `send_to_session` effect.
+
+Call the desired helper and assert:
 
 ```ts
-await recoverCoordinatorProfileAttempts(runtime, async () => { reconciliations += 1; });
+await recoverCoordinatorProfileAttempts({
+  runtime,
+  legacyThreadId: "old-coordinator",
+  readLegacyThread,
+  reconcileOperations: async () => { reconciliations += 1; },
+  completeTurn,
+});
 assert.equal(reconciliations, 1);
 assert.deepEqual(runtime.activeAttempts(), []);
+assert.equal(sourceState(completedContext), "completed");
+assert.deepEqual(deliveries.listReady().map((row) => row.body), ["[coordinator] already finished"]);
 assert.equal(sourceState(noEffectContext), "pending");
 assert.equal(sourceState(effectContext), "superseded");
 assert.equal(recoveryContextsFor(effectContext).length, 1);
 ```
+
+The completed fixture begins with a provisional `pending:<attempt>` turn ID and is matched through its persisted user message `clientId`, proving the helper binds the real turn before terminalization. Add a test that failure to read a non-pending legacy thread while active attempts exist aborts migration without failing/requeueing any attempt; this avoids duplicate replay when terminal state cannot be established.
 
 - [ ] **Step 4: Run recovery tests and verify RED**
 
@@ -368,21 +475,19 @@ Expected: FAIL because `recoverCoordinatorProfileAttempts` does not exist.
 
 - [ ] **Step 5: Implement the focused recovery helper**
 
-Implement:
+Implement this callback-oriented helper:
 
 ```ts
-export async function recoverCoordinatorProfileAttempts(
-  runtime: CoordinatorRuntime,
-  reconcileOperations: () => Promise<void>,
-): Promise<void> {
-  await reconcileOperations();
-  for (const attempt of runtime.activeAttempts()) {
-    runtime.failAttempt(attempt.turnId, new Error("coordinator profile migration replaced the previous app-server thread"));
-  }
-}
+export async function recoverCoordinatorProfileAttempts(input: {
+  runtime: CoordinatorRuntime;
+  legacyThreadId: string;
+  readLegacyThread(): Promise<{ turns: LegacyTurn[] }>;
+  reconcileOperations(): Promise<void>;
+  completeTurn(turn: LegacyTurn): Promise<void>;
+}): Promise<void>;
 ```
 
-Do not enqueue directly: the scheduler is still disabled, and its normal startup scan will select the pending original or recovery source after coordinator activation.
+Reconcile operations first. If no active attempts exist, return without reading legacy history. Otherwise require a successful legacy read when the old ID is not `pending`. Match provisional attempts to turns by the source context's persisted user-message `clientId`, bind the real turn ID, and pass completed turns to `completeTurn`. Failed/interrupted terminal turns and genuinely unresolved attempts go through `runtime.failAttempt` after operation reconciliation. Do not enqueue directly: the scheduler is still disabled, and its normal startup scan will select pending original or recovery sources after coordinator activation.
 
 - [ ] **Step 6: Run recovery tests and verify GREEN**
 
@@ -418,23 +523,33 @@ Do not change the worker endpoint configuration.
 
 - [ ] **Step 8: Add authentication and first-activation recovery in production**
 
-After `coordinatorEndpoint.start()` and before committing endpoint startup, call `assertCoordinatorAuthenticated`. In the coordinator phase, before starting/resuming identity, call `activateCoordinatorProfileIdentity`. Its `beforeReset` callback must call:
+Use `startAuthenticatedCoordinatorEndpoint` for the initial coordinator start and for every reconnect; never call `coordinatorEndpoint.start()` directly. In the coordinator phase, before starting/resuming identity, call `activateCoordinatorProfileIdentity`. Its `beforeReset` callback must call:
 
 ```ts
-await recoverCoordinatorProfileAttempts(
-  coordinator,
-  () => reconcileOperations({ includeActiveAttempt: true }),
-);
+await recoverCoordinatorProfileAttempts({
+  runtime: coordinator,
+  legacyThreadId: registry.snapshot().coordinator.thread_id,
+  readLegacyThread: async () => (await endpoint.request("thread/read", {
+    threadId: registry.snapshot().coordinator.thread_id,
+    includeTurns: true,
+  })).thread,
+  reconcileOperations: () => reconcileOperations({ includeActiveAttempt: true }),
+  completeTurn: completeLegacyCoordinatorTurn,
+});
 ```
 
-Then start/resume the coordinator with the existing manager MCP config. Leave scheduler and polling disabled until this completes. The existing post-start operation and attempt reconciliation remains in place for ordinary restarts.
+`completeLegacyCoordinatorTurn` persists terminal agent messages under the semantic `coordinator-local` identity, then calls `CoordinatorRuntime.handleTerminal` so an already-produced user answer is queued exactly once. Then start/resume the coordinator with the existing manager MCP config. Leave scheduler and polling disabled until this completes. The existing post-start operation and attempt reconciliation remains in place for ordinary restarts.
+
+On reconnect, authentication failure must leave the coordinator endpoint stopped/unavailable, keep scheduling disabled, and call `recordCoordinatorAuthenticationFailure(deliveries, destination, endpointIncident, error)`. Implement that function in `src/coordinator/auth-recovery.ts`; it prepares `id: coordinator-auth-required:<incident>` as a mandatory `system_warning` containing only the actionable `coordinator-login` instruction and structural error text. `DeliveryStore.prepare` provides same-incident idempotency. Bounded reconnect continues without accepting coordinator turns.
+
+Write `tests/coordinator/auth-recovery.test.ts` first, verify it fails without the helper, implement the helper, and prove two calls in one incident produce one outbox row while a later incident produces a second row. Include this test in the focused run below.
 
 - [ ] **Step 9: Run focused tests and verify GREEN**
 
 Run:
 
 ```bash
-npm test -- tests/production-startup.test.ts tests/coordinator/identity.test.ts tests/coordinator/profile-migration.test.ts tests/mcp/server.test.ts
+npm test -- tests/production-startup.test.ts tests/coordinator/identity.test.ts tests/coordinator/profile-migration.test.ts tests/coordinator/auth-recovery.test.ts tests/mcp/server.test.ts
 ```
 
 Expected: all focused tests PASS.
@@ -442,11 +557,11 @@ Expected: all focused tests PASS.
 - [ ] **Step 10: Commit production wiring**
 
 ```bash
-git add src/coordinator/profile-migration.ts src/production-app.ts tests/coordinator/profile-migration.test.ts tests/production-startup.test.ts
+git add src/coordinator/profile-migration.ts src/coordinator/auth-recovery.ts src/production-app.ts tests/coordinator/profile-migration.test.ts tests/coordinator/auth-recovery.test.ts tests/production-startup.test.ts
 git commit -m "feat: isolate coordinator app-server profile"
 ```
 
-### Task 5: Real skill isolation and operator documentation
+### Task 6: Real skill isolation and operator documentation
 
 **Files:**
 - Modify: `tests/integration/mcp-coordinator.test.ts`
@@ -465,6 +580,8 @@ coordinator-codex-home/
 
 Start a `LocalEndpoint` with `HOME=coordinator-home`, `CODEX_HOME=coordinator-codex-home`, and `expectedCodexHome=coordinator-codex-home`. Call `skills/list` with `cwds: [coordinatorWorkdir]` and `forceReload: true`. Assert that `coordinator-only` and `coordinator-workdir` are present and `normal-user-only` is absent. This test does not make a model request and must not read or copy real credentials.
 
+Add a second workdir nested beneath a temporary `.git` root containing `.agents/skills/repository-parent/SKILL.md`. Assert Codex discovers `repository-parent`, while still excluding `normal-user-only`. This defines the promised boundary precisely: real-home skills are isolated, but repository skills intentionally follow Codex project discovery.
+
 - [ ] **Step 2: Run the protocol isolation test**
 
 Run:
@@ -475,9 +592,9 @@ RUN_CODEX_INTEGRATION=1 npm test -- tests/integration/mcp-coordinator.test.ts
 
 Expected: the real app-server reports the isolated Codex home, discovers both coordinator-only skill roots, excludes the normal-user fixture skill, and preserves the existing real manager-MCP model test. This is a protocol/integration confirmation of the already test-driven environment and endpoint code, so it need not manufacture a new production failure.
 
-- [ ] **Step 3: Complete integration wiring and verify GREEN**
+- [ ] **Step 3: Re-run the complete real coordinator integration file**
 
-Make only the minimal test/production adjustments required by the real protocol. Re-run:
+Re-run without changing production behavior merely to satisfy the fixture:
 
 ```bash
 RUN_CODEX_INTEGRATION=1 npm test -- tests/integration/mcp-coordinator.test.ts
@@ -487,32 +604,30 @@ Expected: both real app-server tests PASS; the worker still cannot enumerate or 
 
 - [ ] **Step 4: Update README**
 
-Document the profile layout and one-time login command using the configured absolute data directory:
+Document the profile layout and one-time login command:
 
 ```bash
-mkdir -p "$DATA_DIR/coordinator-profile/home" "$DATA_DIR/coordinator-profile/codex"
-HOME="$DATA_DIR/coordinator-profile/home" \
-CODEX_HOME="$DATA_DIR/coordinator-profile/codex" \
-codex login --device-auth
+DATA_DIR="$HOME/.codex-bot/data" codex-bot coordinator-login
 ```
 
-State that the coordinator uses only isolated user configuration/skills, while workers continue using the real home and `~/.codex`. Document `<COORDINATOR_WORKDIR>/.agents/skills` and `<DATA_DIR>/coordinator-profile/home/.agents/skills`, fresh coordinator thread creation on first upgrade, preserved worker/backend state, and backup sensitivity of the isolated auth/session data. Update troubleshooting for the authentication error.
+State that the coordinator excludes real-home user configuration/skills, while workers continue using the real home and `~/.codex`. Document `<COORDINATOR_WORKDIR>/.agents/skills` and `<DATA_DIR>/coordinator-profile/home/.agents/skills`, and explain that a coordinator workdir nested in Git still inherits that repository's guidance, project config, and repo skills. Update the existing workspace warning and its unit test accordingly. Document fresh coordinator thread creation on first upgrade, persisted-thread discovery after a creation crash, preserved worker/backend state, reconnect authentication warnings, and backup sensitivity of isolated auth/session data. Update troubleshooting for the authentication error.
 
 - [ ] **Step 5: Run docs/package checks and commit**
 
 Run:
 
 ```bash
+npm test -- tests/coordinator/workspace.test.ts
 npm run build
 npm pack --dry-run
 git diff --check
-git add README.md tests/integration/mcp-coordinator.test.ts
+git add README.md src/coordinator/workspace.ts tests/coordinator/workspace.test.ts tests/integration/mcp-coordinator.test.ts
 git commit -m "docs: explain coordinator profile isolation"
 ```
 
 Expected: build succeeds, package still contains only intended distributable files, diff check is clean, and commit succeeds.
 
-### Task 6: Review, full verification, merge, install, and live migration
+### Task 7: Review, full verification, merge, install, and live migration
 
 **Files:**
 - Review all files changed since the implementation base.
@@ -560,16 +675,13 @@ Verify the installed binary contains the coordinator-profile logic and remains i
 
 - [ ] **Step 7: Authenticate the isolated profile**
 
-Use the live deployment's resolved `DATA_DIR` without printing credentials:
+Use the installed profile initializer with the live deployment's resolved `DATA_DIR` without printing credentials:
 
 ```bash
-mkdir -p "$DATA_DIR/coordinator-profile/home" "$DATA_DIR/coordinator-profile/codex"
-HOME="$DATA_DIR/coordinator-profile/home" \
-CODEX_HOME="$DATA_DIR/coordinator-profile/codex" \
-codex login --device-auth
+DATA_DIR="$DATA_DIR" CODEX_BINARY="$CODEX_BINARY" codex-bot coordinator-login
 ```
 
-Complete the device flow, then verify with the same isolated environment and `codex login status`. Do not inspect or print `auth.json` contents.
+Complete the device flow, then verify through `account/read` on a temporary isolated app-server or a secret-free login-status helper. Do not create directories manually and do not inspect or print `auth.json` contents.
 
 - [ ] **Step 8: Restart and verify the live topology**
 

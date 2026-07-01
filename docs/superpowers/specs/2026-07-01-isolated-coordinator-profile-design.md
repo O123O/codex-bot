@@ -37,15 +37,19 @@ CODEX_HOME=<DATA_DIR>/coordinator-profile/codex
 
 All other existing child-environment filtering remains in force: Telegram secrets are removed, proxy and supported provider credentials may pass through, and the manager MCP token exists only in the coordinator endpoint and remains excluded from model-launched shells. The worker environment is byte-for-byte unchanged by this feature.
 
-The managed coordinator policy remains in `<COORDINATOR_WORKDIR>/AGENTS.md`; `AGENTS.override.md` remains user-owned. Coordinator-specific project skills may be placed in `<COORDINATOR_WORKDIR>/.agents/skills`. Home-scoped coordinator skills may instead be placed in `<DATA_DIR>/coordinator-profile/home/.agents/skills`. Normal user skills outside these isolated roots are not discovered by the coordinator. Codex-bundled or administrator-provided system capabilities are outside this user-profile boundary.
+The managed coordinator policy remains in `<COORDINATOR_WORKDIR>/AGENTS.md`; `AGENTS.override.md` remains user-owned. Coordinator-specific project skills may be placed in `<COORDINATOR_WORKDIR>/.agents/skills`. Home-scoped coordinator skills may instead be placed in `<DATA_DIR>/coordinator-profile/home/.agents/skills`. The user's real home-scoped configuration and skills are not discovered by the coordinator. Codex-bundled or administrator-provided system capabilities are outside this user-profile boundary.
+
+Project discovery remains rooted in the configured coordinator workdir. A standalone workdir sees only its own project guidance and skills. If the user intentionally places it inside a Git worktree, Codex may also discover that repository's parent `AGENTS.md`, `.codex/config.toml`, and `.agents/skills`; startup retains the existing warning and names all three inherited surfaces. This does not reintroduce the user's real home-scoped configuration.
 
 ## Authentication
 
 The isolated profile has independent Codex authentication. The bot does not copy, hard-link, symlink, parse, or expose the user's normal `~/.codex/auth.json`; doing so could create refresh-token races or silently weaken the profile boundary.
 
-After both app-servers initialize, startup calls `account/read` on `coordinator-local` before changing coordinator identity. If Codex reports that OpenAI authentication is required and no account is present, startup fails with `CONFIGURATION_ERROR` and prints the isolated `HOME` and `CODEX_HOME` paths plus an actionable `codex login --device-auth` command. The created directories remain available for that command. Authentication supplied by a supported inherited provider environment remains valid when app-server reports that OpenAI authentication is not required.
+After both app-servers initialize, startup calls `account/read` on `coordinator-local` before changing coordinator identity. If Codex reports that OpenAI authentication is required and no account is present, startup fails with `CONFIGURATION_ERROR`, identifies the isolated profile paths, and directs the user to the safe `codex-bot coordinator-login` command. Authentication supplied by a supported inherited provider environment remains valid when app-server reports that OpenAI authentication is not required.
 
-Documentation includes the one-time login procedure. Logging out of the user's normal profile does not log out the isolated file-backed profile, and vice versa.
+The distributable binary provides `codex-bot coordinator-login`. This command needs only `DATA_DIR` and `CODEX_BINARY`, calls the same fail-closed profile preparation code, and then launches `codex login --device-auth` with the isolated environment and inherited terminal. It does not require Telegram secrets, start either app-server, write the activation marker, or use shell-interpreted command text. Documentation never asks the user to create profile directories with `mkdir -p` or to copy credentials manually.
+
+Logging out of the user's normal profile does not log out the isolated file-backed profile, and vice versa.
 
 ## Coordinator thread migration
 
@@ -55,12 +59,13 @@ Threads are stored under one app-server's `CODEX_HOME`; consequently, the existi
 
 1. Validate that the registry's coordinator endpoint and canonical workdir still match the configured coordinator. This preserves the current fail-closed path checks.
 2. Reconcile every recoverable manager operation using durable backend and worker state.
-3. Fail any remaining active coordinator attempts through the existing recovery rules. Attempts without dispatched effects return their source context to the pending queue; attempts with proven or uncertain effects create one recovery context and are not blindly replayed.
-4. Atomically replace only the coordinator registry identity with `thread_id: "pending"`; preserve every project-session mapping exactly.
-5. Atomically write `profile.json` before starting the new thread. This ordering makes a crash before thread creation resume the pending creation path rather than repeatedly resetting a successfully registered isolated identity.
-6. Create a new persistent coordinator thread in the existing coordinator workdir and atomically store its returned identity through the existing identity verifier.
+3. Read the old coordinator thread through the normal-profile worker endpoint. For each active SQLite attempt, bind a provisional attempt to its persisted turn by client message ID when possible. Apply already-terminal turns through the normal final-message and attempt-completion path so a completed answer is delivered rather than replayed.
+4. Fail only the remaining unresolved active coordinator attempts through the existing recovery rules. Attempts without dispatched effects return their source context to the pending queue; attempts with proven or uncertain effects create one recovery context and are not blindly replayed.
+5. Atomically replace only the coordinator registry identity with `thread_id: "pending"`; preserve every project-session mapping exactly.
+6. Atomically write `profile.json` before starting the new thread. This ordering makes a crash before thread creation resume the pending creation path rather than repeatedly resetting a successfully registered isolated identity.
+7. Query all non-archived, top-level, persistent app-server threads in the isolated profile for the exact coordinator workdir. Resume the sole candidate left by a prior interrupted creation, create a new thread when none exists, and fail closed on ambiguity. Atomically store the verified identity.
 
-When the marker already exists, startup resumes the stored isolated coordinator normally. A missing, malformed, unsupported, symbolic-link, or non-regular marker fails closed except that a genuinely absent marker selects the first-activation path. Deleting the entire profile deliberately causes a new isolated coordinator identity on the next successful authenticated startup.
+When the marker already exists, startup resumes the stored isolated coordinator normally. The `marker exists + registry pending` state is the durable creation-recovery state: discovery recovers a thread persisted immediately before a process crash instead of orphaning it and creating another. A missing, malformed, unsupported, symbolic-link, or non-regular marker fails closed except that a genuinely absent marker selects the first-activation path. Deleting the entire profile deliberately causes a new isolated coordinator identity on the next successful authenticated startup.
 
 The coordinator's durable knowledge does not depend solely on its old transcript: the authoritative session registry, SQLite operation/outbox/runtime state, generated session dashboard, and managed policy survive the migration. The first new coordinator turn therefore sees current management state without copying the old rollout into the isolated profile.
 
@@ -70,7 +75,7 @@ Workspace/profile preparation happens before storage and endpoint startup. The i
 
 The first-profile attempt reconciliation happens after worker lifecycle and delivery reconciliation, because manager operations may need authoritative worker histories and durable delivery state. It happens before starting the isolated coordinator. Scheduler and Telegram polling remain disabled until the migration and coordinator identity are complete.
 
-Ordinary restarts do not execute migration recovery again because `profile.json` is durable. Endpoint restarts during a running bot retain the same isolated environment and resume the same coordinator thread.
+Ordinary restarts do not execute migration recovery again because `profile.json` is durable. Endpoint restarts during a running bot retain the same isolated environment and resume the same coordinator thread. Every initial start and reconnect of `coordinator-local` repeats Codex-home attestation and `account/read` before resuming or accepting coordinator work. Authentication failure keeps the endpoint unavailable and creates one actionable system warning per endpoint incident for the Telegram outbox while bounded reconnect continues.
 
 ## User-visible behavior and documentation
 
@@ -78,7 +83,7 @@ README setup and troubleshooting document:
 
 - the two distinct app-server profiles;
 - the exact isolated profile paths;
-- one-time coordinator login;
+- the safe `codex-bot coordinator-login` command;
 - where coordinator-only configuration and skills belong;
 - that the first upgraded startup creates a new coordinator conversation but preserves worker sessions and backend management state;
 - that backups must include `coordinator-profile`, especially its credentials and coordinator rollout state.
@@ -94,9 +99,12 @@ Automated tests prove:
 - Telegram secrets remain stripped and only the coordinator receives the manager capability;
 - missing coordinator authentication stops startup before identity migration and reports the login paths;
 - first activation validates the existing identity, reconciles active attempts, resets only the coordinator identity, persists the marker in crash-safe order, and creates a new coordinator thread;
+- a completed legacy turn recorded only in the old rollout is terminalized and delivered rather than replayed;
+- `marker exists + registry pending` discovers and adopts one already-created isolated thread and rejects ambiguous candidates;
 - subsequent startup resumes the isolated thread without resetting it;
+- coordinator endpoint reconnect repeats authentication preflight and surfaces one actionable warning for an unauthenticated incident;
 - project registry entries and worker endpoint/session discovery remain unchanged;
-- coordinator skill discovery can see its own workdir/home skill roots but cannot see a fixture skill from the user's normal home;
+- coordinator skill discovery can see its own workdir/home skill roots but cannot see a fixture skill from the user's normal home; a nested Git fixture explicitly demonstrates and documents inherited repository skills;
 - package/build checks and the real app-server manager-MCP integration continue to pass.
 
 The live upgrade is performed only after a stopped-state backup. The installed bundle is restarted after the isolated profile has been authenticated, then verified structurally through app-server process environments, registry identity, dashboard parsing, and a real coordinator response.
