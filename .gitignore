@@ -3,3 +3,5 @@ node_modules/
 .env
 .tmp/
 data/
+coordinator/session-status.json
+coordinator/session-status.json.invalid-*
