@@ -42,11 +42,14 @@ Add a focused Telegram transport factory that returns:
 - a delivery `TelegramApi` that continues to use the normal global fetch transport;
 - an idempotent close operation for the polling agent.
 
-The factory preserves Node's effective opt-in environment-proxy policy. It creates
-an `EnvHttpProxyAgent` when proxy support is enabled by `NODE_USE_ENV_PROXY=1`,
-`--use-env-proxy`, or the corresponding `NODE_OPTIONS` flag, honoring an explicit
-`--no-use-env-proxy` override. Otherwise it creates a normal `Agent`. Both choices
-still provide a pool independent from the delivery transport.
+The factory preserves Node's effective opt-in environment-proxy policy without
+reimplementing Node's CLI parser. At process startup, Node records the resolved policy
+on the HTTPS global agent's `options.proxyEnv`; this already accounts for
+`NODE_USE_ENV_PROXY`, `NODE_OPTIONS`, command-line boolean forms, and precedence. The
+factory creates an `EnvHttpProxyAgent` from that effective environment when present,
+or a normal `Agent` otherwise. Both choices still provide a pool independent from the
+delivery transport. Lowercase proxy variables retain Undici's documented precedence
+over uppercase variants.
 
 `TelegramChatAdapter` will expose the delivery API as it does today, give the
 polling API to `TelegramPoller`, and own the polling transport lifecycle. On stop,
@@ -87,8 +90,9 @@ The regression tests will prove the transport boundary without wall-clock timing
 
 - hold `getUpdates` at a synchronization barrier, initiate delivery, and prove the
   independent delivery fetch is invoked and completes before releasing polling;
-- verify normal, environment-enabled, `NODE_OPTIONS`-enabled, and explicitly disabled
-  proxy modes select the expected independent dispatcher type;
+- verify Node-resolved direct and proxy modes select the expected independent
+  dispatcher type and preserve lowercase-over-uppercase values for `http_proxy`,
+  `https_proxy`, and `no_proxy`;
 - hold a polling-owned file download, stop the adapter, and prove the dispatcher
   closes only after that work settles;
 - call stop repeatedly and concurrently, proving the dispatcher closes exactly once

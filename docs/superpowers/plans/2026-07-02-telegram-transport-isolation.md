@@ -4,7 +4,7 @@
 
 **Goal:** Prevent Telegram long polling from delaying outgoing messages by giving `getUpdates` an independently managed HTTP dispatcher.
 
-**Architecture:** A focused transport factory creates a polling `TelegramApi` backed by a dedicated Undici dispatcher and a delivery `TelegramApi` backed by the existing global fetch transport. The factory mirrors Node's opt-in environment-proxy policy and owns an idempotent polling-dispatcher close operation; `TelegramChatAdapter` awaits the entire poller loop before closing it.
+**Architecture:** A focused transport factory creates a polling `TelegramApi` backed by a dedicated Undici dispatcher and a delivery `TelegramApi` backed by the existing global fetch transport. The factory reads Node's already-resolved proxy environment from the HTTPS global agent instead of reparsing CLI flags, and owns an idempotent polling-dispatcher close operation; `TelegramChatAdapter` awaits the entire poller loop before closing it.
 
 **Tech Stack:** TypeScript, Node.js 24+, Undici 8.5, `node:test`, esbuild, Telegram Bot API
 
@@ -25,7 +25,7 @@ Create `tests/telegram/transport.test.ts`:
 ```typescript
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createTelegramTransports, envProxyEnabled } from "../../src/telegram/transport.ts";
+import { createTelegramTransports, effectiveProxyEnvironment } from "../../src/telegram/transport.ts";
 
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -62,25 +62,37 @@ test("delivery completes while long polling remains pending on its dedicated dis
   await polling;
 });
 
-test("polling dispatcher selection mirrors Node environment proxy policy", async () => {
-  assert.equal(envProxyEnabled({}, []), false);
-  assert.equal(envProxyEnabled({ NODE_USE_ENV_PROXY: "1" }, []), true);
-  assert.equal(envProxyEnabled({ NODE_OPTIONS: "--use-env-proxy" }, []), true);
-  assert.equal(envProxyEnabled({ NODE_USE_ENV_PROXY: "1", NODE_OPTIONS: "--no-use-env-proxy" }, []), false);
-  assert.equal(envProxyEnabled({ NODE_OPTIONS: "--no-use-env-proxy" }, ["--use-env-proxy"]), true);
+test("polling dispatcher mirrors Node-resolved proxy mode and Undici variable precedence", async () => {
+  const proxyEnv = {
+    http_proxy: "http://lower-http.example",
+    HTTP_PROXY: "http://upper-http.example",
+    https_proxy: "http://lower-https.example",
+    HTTPS_PROXY: "http://upper-https.example",
+    no_proxy: "lower.example",
+    NO_PROXY: "upper.example",
+  };
+  assert.equal(effectiveProxyEnvironment({ options: {} }), undefined);
+  assert.equal(effectiveProxyEnvironment({ options: { proxyEnv } }), proxyEnv);
 
-  const kinds: string[] = [];
-  for (const env of [{}, { NODE_USE_ENV_PROXY: "1" }]) {
+  const configurations: unknown[] = [];
+  for (const resolved of [undefined, proxyEnv]) {
     const transports = createTelegramTransports("token", {
-      env,
-      execArgv: [],
-      createDispatcher: (kind) => { kinds.push(kind); return { close: async () => undefined }; },
+      proxyEnvironment: () => resolved,
+      createDispatcher: (configuration) => { configurations.push(configuration); return { close: async () => undefined }; },
       pollingFetch: async () => new Response(JSON.stringify({ ok: true, result: [] })),
       deliveryFetch: async () => new Response(JSON.stringify({ ok: true, result: { message_id: 1 } })),
     });
     await transports.closePolling();
   }
-  assert.deepEqual(kinds, ["direct", "env-proxy"]);
+  assert.deepEqual(configurations, [
+    { kind: "direct" },
+    {
+      kind: "env-proxy",
+      httpProxy: "http://lower-http.example",
+      httpsProxy: "http://lower-https.example",
+      noProxy: "lower.example",
+    },
+  ]);
 });
 
 test("concurrent polling transport closes share one dispatcher close", async () => {
@@ -128,14 +140,21 @@ Expected: `package.json` and `package-lock.json` list `undici` under `devDepende
 Create `src/telegram/transport.ts`:
 
 ```typescript
+import { globalAgent as httpsGlobalAgent } from "node:https";
 import { Agent, EnvHttpProxyAgent, fetch as undiciFetch } from "undici";
 import type { ChatDeliveryAdapter } from "../chat/contracts.ts";
 import { TelegramApi } from "./api.ts";
 
-export type PollingDispatcherKind = "direct" | "env-proxy";
+export type PollingDispatcherConfiguration =
+  | { kind: "direct" }
+  | { kind: "env-proxy"; httpProxy?: string; httpsProxy?: string; noProxy?: string };
 
 export interface PollingDispatcher {
   close(): Promise<void>;
+}
+
+interface ProxyAwareAgent {
+  options: { proxyEnv?: NodeJS.ProcessEnv };
 }
 
 type DispatcherFetch = (
@@ -150,28 +169,20 @@ export interface TelegramTransports {
 }
 
 interface TelegramTransportDependencies {
-  env?: NodeJS.ProcessEnv;
-  execArgv?: readonly string[];
-  createDispatcher?: (kind: PollingDispatcherKind) => PollingDispatcher;
+  proxyEnvironment?: () => NodeJS.ProcessEnv | undefined;
+  createDispatcher?: (configuration: PollingDispatcherConfiguration) => PollingDispatcher;
   pollingFetch?: DispatcherFetch;
   deliveryFetch?: typeof globalThis.fetch;
 }
 
-export function envProxyEnabled(env: NodeJS.ProcessEnv = process.env, execArgv: readonly string[] = process.execArgv): boolean {
-  let enabled = env.NODE_USE_ENV_PROXY === "1";
-  const nodeOptions = env.NODE_OPTIONS ?? "";
-  for (const match of nodeOptions.matchAll(/(?:^|[\s'"])--(no-)?use-env-proxy(?=$|[\s'"])/gu)) enabled = match[1] === undefined;
-  for (const argument of execArgv) {
-    if (argument === "--use-env-proxy") enabled = true;
-    else if (argument === "--no-use-env-proxy") enabled = false;
-  }
-  return enabled;
+export function effectiveProxyEnvironment(agent: ProxyAwareAgent = httpsGlobalAgent as ProxyAwareAgent): NodeJS.ProcessEnv | undefined {
+  return agent.options.proxyEnv;
 }
 
 export function createTelegramTransports(token: string, dependencies: TelegramTransportDependencies = {}): TelegramTransports {
-  const env = dependencies.env ?? process.env;
-  const kind: PollingDispatcherKind = envProxyEnabled(env, dependencies.execArgv ?? process.execArgv) ? "env-proxy" : "direct";
-  const dispatcher = dependencies.createDispatcher?.(kind) ?? createDispatcher(kind, env);
+  const proxyEnv = dependencies.proxyEnvironment ? dependencies.proxyEnvironment() : effectiveProxyEnvironment();
+  const configuration = dispatcherConfiguration(proxyEnv);
+  const dispatcher = dependencies.createDispatcher?.(configuration) ?? createDispatcher(configuration);
   const pollingFetch = dependencies.pollingFetch ?? (undiciFetch as unknown as DispatcherFetch);
   const deliveryFetch = dependencies.deliveryFetch ?? globalThis.fetch;
   const fetchWithDispatcher: typeof globalThis.fetch = (input, init) => pollingFetch(input, { ...init, dispatcher });
@@ -184,16 +195,26 @@ export function createTelegramTransports(token: string, dependencies: TelegramTr
   };
 }
 
-function createDispatcher(kind: PollingDispatcherKind, env: NodeJS.ProcessEnv): PollingDispatcher {
-  if (kind === "direct") return new Agent();
+function dispatcherConfiguration(env: NodeJS.ProcessEnv | undefined): PollingDispatcherConfiguration {
+  if (!env) return { kind: "direct" };
   const read = (lower: string, upper: string) => env[lower] ?? env[upper];
   const httpProxy = read("http_proxy", "HTTP_PROXY");
   const httpsProxy = read("https_proxy", "HTTPS_PROXY");
   const noProxy = read("no_proxy", "NO_PROXY");
-  return new EnvHttpProxyAgent({
+  return {
+    kind: "env-proxy",
     ...(httpProxy === undefined ? {} : { httpProxy }),
     ...(httpsProxy === undefined ? {} : { httpsProxy }),
     ...(noProxy === undefined ? {} : { noProxy }),
+  };
+}
+
+function createDispatcher(configuration: PollingDispatcherConfiguration): PollingDispatcher {
+  if (configuration.kind === "direct") return new Agent();
+  return new EnvHttpProxyAgent({
+    ...(configuration.httpProxy === undefined ? {} : { httpProxy: configuration.httpProxy }),
+    ...(configuration.httpsProxy === undefined ? {} : { httpsProxy: configuration.httpsProxy }),
+    ...(configuration.noProxy === undefined ? {} : { noProxy: configuration.noProxy }),
   });
 }
 ```
@@ -207,7 +228,7 @@ npm test -- tests/telegram/transport.test.ts
 npm run typecheck
 ```
 
-Expected: all transport tests pass and TypeScript reports no errors. If Undici's concrete fetch input type requires a narrow adapter cast, keep that cast inside `createTelegramTransports`; do not weaken `TelegramApi` or public chat contracts.
+Expected: all transport tests pass and TypeScript reports no errors.
 
 - [ ] **Step 6: Commit the transport factory**
 
@@ -245,6 +266,35 @@ function deferred<T>() {
   const promise = new Promise<T>((done) => { resolve = done; });
   return { promise, resolve };
 }
+
+test("adapter uses supplied transports without touching real Telegram", async (context) => {
+  const root = await mkdtemp(join(tmpdir(), "telegram-adapter-seam-"));
+  context.after(() => rm(root, { recursive: true, force: true }));
+  const db = createTestDatabase();
+  context.after(() => db.close());
+  const delivery = { sendMessage: async () => ({ message_id: 1 }) };
+  let closes = 0;
+  const adapter = new TelegramChatAdapter(
+    db,
+    new OperationStore(db),
+    new AttachmentStore(db, root, { maxFileBytes: 100, maxStoreBytes: 1_000 }),
+    { token: "token", ownerId: 42, maxMessageBytes: 100, onAccepted: async () => undefined },
+    {
+      createTransports: () => ({
+        polling: {
+          getUpdates: async () => [],
+          downloadFile: async () => ({ stream: Readable.from([]) }),
+        },
+        delivery,
+        closePolling: async () => { closes += 1; },
+      }),
+    },
+  );
+
+  assert.equal(adapter.delivery, delivery);
+  await adapter.stop();
+  assert.equal(closes, 1);
+});
 
 test("adapter waits for polling-owned work and closes its dispatcher exactly once", async (context) => {
   const root = await mkdtemp(join(tmpdir(), "telegram-adapter-"));
@@ -301,10 +351,10 @@ test("adapter waits for polling-owned work and closes its dispatcher exactly onc
 Run:
 
 ```bash
-npm test -- tests/telegram/chat-adapter.test.ts
+node --import tsx --test --test-name-pattern="adapter uses supplied transports" tests/telegram/chat-adapter.test.ts
 ```
 
-Expected: FAIL because `TelegramChatAdapter` does not accept a transport factory and does not close a polling dispatcher.
+Expected: FAIL deterministically at `assert.equal(adapter.delivery, delivery)`. The current constructor ignores the extra dependency argument at runtime, but this test never starts its poller, so RED cannot contact Telegram or hang on network I/O.
 
 - [ ] **Step 3: Integrate the transport factory and idempotent stop**
 
@@ -436,6 +486,8 @@ Run:
 ```bash
 git status --short --branch
 ps -eo pid,ppid,args | rg "codex-bot|codex app-server"
+bot_pid=$(ps -eo pid,args | awk '$2 == "node" && $3 ~ /codex-bot$/ { print $1; exit }')
+if tr '\0' '\n' < "/proc/$bot_pid/environ" | rg -q '^NODE_OPTIONS=.*codex-bot-telegram-diag'; then exit 1; fi
 ```
 
-Expected: `main` is clean; exactly one bot process and its two expected app-server trees are running; no process includes the temporary diagnostic preload.
+Expected: `main` is clean; exactly one bot process and its two expected app-server trees are running; neither process arguments nor the bot's `NODE_OPTIONS` contains the temporary diagnostic preload.
