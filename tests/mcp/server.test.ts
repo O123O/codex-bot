@@ -79,6 +79,8 @@ test("child environment keeps Codex auth but strips Telegram secrets and hides t
   assert.equal(env.CODEX_BOT_MCP_TOKEN, "mcp-secret");
   assert.equal(buildCodexChildEnvironment({ PATH: "/bin" }).CODEX_BOT_MCP_TOKEN, undefined);
   const config = coordinatorTurnConfig("http://127.0.0.1:1/mcp", "mcp-secret");
+  const manager = (config.mcp_servers as { codex_bot_manager: Record<string, unknown> }).codex_bot_manager;
+  assert.equal(manager.default_tools_approval_mode, "approve");
   assert.deepEqual((config["shell_environment_policy.exclude"] as any).includes("CODEX_BOT_MCP_TOKEN"), true);
   assert.equal(config.allow_login_shell, false);
   assert.equal(JSON.stringify(config).includes("mcp-secret"), false);

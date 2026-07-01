@@ -29,7 +29,7 @@ test("real coordinator can call manager MCP while its shell cannot read the bear
   assert.equal((await fetch(mcp.url, { method: "POST", headers: { authorization: `Bearer ${token}` }, body: "{}" })).status, 403, "a valid token is insufficient outside the coordinator app-server process");
   const cwd = await mkdtemp(join(tmpdir(), "codex-bot-real-mcp-"));
   const thread = await endpoint.request<any>("thread/start", {
-    cwd, approvalPolicy: "never", sandbox: "danger-full-access", ephemeral: false,
+    cwd, approvalPolicy: "never", sandbox: "workspace-write", ephemeral: false,
     config: coordinatorTurnConfig(mcp.url, token),
   });
   const terminal = new Promise<any>((resolve, reject) => {

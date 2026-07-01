@@ -195,7 +195,7 @@ export function buildCodexChildEnvironment(host: NodeJS.ProcessEnv, mcpToken?: s
 
 export function coordinatorTurnConfig(mcpUrl: string, _mcpToken: string): Record<string, unknown> {
   return {
-    mcp_servers: { codex_bot_manager: { url: mcpUrl, bearer_token_env_var: "CODEX_BOT_MCP_TOKEN" } },
+    mcp_servers: { codex_bot_manager: { url: mcpUrl, bearer_token_env_var: "CODEX_BOT_MCP_TOKEN", default_tools_approval_mode: "approve" } },
     ...secureShellConfig(),
   };
 }
