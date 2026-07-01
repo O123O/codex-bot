@@ -40,17 +40,18 @@ export class SessionLifecycle {
     });
   }
 
-  register(nickname: string, endpointId: string, threadId: string, projectDir: string): Promise<void> {
-    return this.adopt(nickname, endpointId, threadId, projectDir);
+  register(nickname: string, endpointId: string, threadId: string, projectDir: string, onThreadRead?: (thread: ThreadView) => void): Promise<void> {
+    return this.adopt(nickname, endpointId, threadId, projectDir, onThreadRead);
   }
 
-  async adopt(nickname: string, endpointId: string, threadId: string, projectDir: string): Promise<void> {
+  async adopt(nickname: string, endpointId: string, threadId: string, projectDir: string, onThreadRead?: (thread: ThreadView) => void): Promise<void> {
     await this.lock(`${endpointId}:${threadId}`, async () => {
       if (this.registry.get(nickname)) throw new AppError("OPERATION_CONFLICT", `nickname already exists: ${nickname}`);
       const canonical = await realpath(projectDir);
       const response = await this.read(endpointId, threadId);
       await this.verifyCwd(response.thread.cwd, canonical);
       this.requireIdle(response.thread);
+      onThreadRead?.(response.thread);
       await this.registry.register(nickname, { endpoint: endpointId, thread_id: threadId, project_dir: canonical });
       this.runtime.setSession(endpointId, threadId, "managed", response.thread.status.type);
       this.runtime.beginEpoch(endpointId, threadId, this.baseline(response.thread), this.clock.now());
@@ -70,7 +71,7 @@ export class SessionLifecycle {
     });
   }
 
-  async attach(nickname: string): Promise<CurrentSessionSettings> {
+  async attach(nickname: string, onThreadRead?: (thread: ThreadView) => void): Promise<CurrentSessionSettings> {
     const session = this.required(nickname);
     return this.lock(`${session.endpoint}:${session.thread_id}`, async () => {
       this.requireManagementState(session.endpoint, session.thread_id, ["detached", "unavailable"]);
@@ -86,6 +87,7 @@ export class SessionLifecycle {
         await this.verifyCwd(response.thread.cwd, session.project_dir);
         const after = await this.read(session.endpoint, session.thread_id);
         this.requireIdle(after.thread);
+        onThreadRead?.(after.thread);
         this.runtime.beginEpoch(session.endpoint, session.thread_id, this.baseline(after.thread), this.clock.now());
         this.runtime.setSession(session.endpoint, session.thread_id, "managed", "idle");
         return this.responseSettings(response);

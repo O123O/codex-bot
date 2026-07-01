@@ -100,15 +100,19 @@ export class SessionService {
 
   async status(nickname: string): Promise<unknown> {
     const session = this.required(nickname);
-    const native = await this.pool.request<any>(session.endpoint, "thread/read", { threadId: session.thread_id, includeTurns: false });
+    const native = await this.pool.request<any>(session.endpoint, "thread/read", { threadId: session.thread_id, includeTurns: true });
     const runtime = this.runtime.getSession(session.endpoint, session.thread_id);
     const goal = await this.getGoal(nickname);
+    const nativeStatus = native.thread.status?.type ?? "unknown";
+    const activeTurnId = nativeStatus === "active"
+      ? [...(native.thread.turns ?? [])].reverse().find((turn: any) => !isTerminalStatus(turn.status))?.id ?? null
+      : null;
     return {
       nickname,
       identity: { endpoint: session.endpoint, threadId: session.thread_id, projectDir: session.project_dir },
       managementState: runtime?.managementState ?? "unavailable",
-      nativeStatus: native.thread.status?.type ?? "unknown",
-      activeTurnId: this.runtime.activeTurn(session.endpoint, session.thread_id) ?? null,
+      nativeStatus,
+      activeTurnId,
       goal: goal && typeof goal === "object" && "goal" in goal ? (goal as any).goal : goal ?? null,
     };
   }
@@ -196,4 +200,9 @@ export class SessionService {
     if (this.runtime.getSession(session.endpoint, session.thread_id)?.managementState !== "managed") throw new AppError("SESSION_DETACHED", `${nickname} is not managed`);
     return session;
   }
+}
+
+function isTerminalStatus(status: unknown): boolean {
+  const type = typeof status === "string" ? status : String((status as any)?.type ?? "");
+  return new Set(["completed", "failed", "interrupted"]).has(type);
 }

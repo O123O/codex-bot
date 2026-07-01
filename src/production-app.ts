@@ -292,6 +292,7 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
         const endpointId = projectEndpoint(args.endpoint);
         let settingsObservationSequence: number | undefined;
         const settings = await lifecycle.create(args.nickname, endpointId, args.project_dir, (thread, currentSettings) => {
+          hydrateThreadOrder(endpointId, thread);
           settingsObservationSequence = dashboardStore.allocateObservationSequence();
           context.checkpoint({ endpoint: endpointId, threadId: thread.id, projectDir: thread.cwd, currentSettings, settingsObservationSequence });
         });
@@ -302,7 +303,8 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
         return { nickname: args.nickname };
       },
       register_session: async (args) => {
-        await lifecycle.register(args.nickname, projectEndpoint(args.endpoint), args.thread_id, args.project_dir);
+        const endpointId = projectEndpoint(args.endpoint);
+        await lifecycle.register(args.nickname, endpointId, args.thread_id, args.project_dir, (thread) => hydrateThreadOrder(endpointId, thread));
         advanceNativeWatermark(args.nickname);
         observeLifecycle(args.nickname);
         await renderDashboardSafely();
@@ -311,7 +313,7 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
       adopt_session: async (args) => {
         const endpointId = projectEndpoint(args.endpoint);
         const projectDir = args.project_dir ?? String((await pool.request<any>(endpointId, "thread/read", { threadId: args.thread_id, includeTurns: false })).thread.cwd);
-        await lifecycle.adopt(args.nickname, endpointId, args.thread_id, projectDir);
+        await lifecycle.adopt(args.nickname, endpointId, args.thread_id, projectDir, (thread) => hydrateThreadOrder(endpointId, thread));
         advanceNativeWatermark(args.nickname);
         observeLifecycle(args.nickname);
         await renderDashboardSafely();
@@ -320,7 +322,9 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
       rename_session: async (args) => { await registry.rename(args.old_nickname, args.new_nickname); await reconcileDashboard(); return { nickname: args.new_nickname }; },
       detach_session: async (args) => { await lifecycle.detach(args.nickname); observeLifecycle(args.nickname); await renderDashboardSafely(); return { nickname: args.nickname }; },
       attach_session: async (args) => {
-        const settings = await lifecycle.attach(args.nickname);
+        const session = registry.get(args.nickname);
+        if (!session) throw new AppError("UNKNOWN_SESSION", `unknown session: ${args.nickname}`);
+        const settings = await lifecycle.attach(args.nickname, (thread) => hydrateThreadOrder(session.endpoint, thread));
         advanceNativeWatermark(args.nickname);
         observeLifecycle(args.nickname);
         observeCurrentSettings(args.nickname, settings);
@@ -527,6 +531,13 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
       status: String(goal.status ?? "unknown"),
       token_budget: typeof goal.tokenBudget === "number" ? goal.tokenBudget : typeof goal.token_budget === "number" ? goal.token_budget : null,
     }, updatedAt, sequence, updatedAt);
+  }
+
+  function hydrateThreadOrder(endpointId: string, thread: { id: string; turns?: Array<{ id: string; startedAt?: number | null }> }): void {
+    dashboardStore.hydrateTurnOrder({ endpointId, threadId: thread.id }, (thread.turns ?? []).map((turn) => ({
+      id: turn.id,
+      startedAt: typeof turn.startedAt === "number" && Number.isFinite(turn.startedAt) ? turn.startedAt : null,
+    })));
   }
 
   function observeLastSent(nickname: string, args: any, result: { mode: "start" | "steer"; turnId: string }, operationSequence: number, observedAt = Date.now()): void {
@@ -862,12 +873,14 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
           const expectedThread = args.thread_id as string | undefined ?? (operation.kind === "create_session" ? checkpoint?.threadId : undefined);
           const expectedDir = args.project_dir ? await realpath(args.project_dir) : undefined;
           if (!session && operation.kind === "create_session" && checkpoint?.threadId && expectedDir) {
-            await lifecycle.adopt(args.nickname, projectEndpoint(checkpoint.endpoint ?? args.endpoint), checkpoint.threadId, expectedDir);
+            const endpointId = projectEndpoint(checkpoint.endpoint ?? args.endpoint);
+            await lifecycle.adopt(args.nickname, endpointId, checkpoint.threadId, expectedDir, (thread) => hydrateThreadOrder(endpointId, thread));
             session = registry.get(args.nickname);
           }
           if (session && (!expectedThread || session.thread_id === expectedThread) && (!expectedDir || session.project_dir === expectedDir)) {
             const native = await pool.request<any>(session.endpoint, "thread/read", { threadId: session.thread_id, includeTurns: true });
             await verifySessionCwd(native.thread.cwd, session.project_dir);
+            hydrateThreadOrder(session.endpoint, native.thread);
             if (!runtime.getSession(session.endpoint, session.thread_id) && native.thread.status?.type === "idle") {
               runtime.setSession(session.endpoint, session.thread_id, "managed", "idle");
               runtime.beginEpoch(session.endpoint, session.thread_id, native.thread.turns?.at(-1)?.id, Date.now());
@@ -957,6 +970,13 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
   }
 
   async function resumeManagedSessions(): Promise<void> {
+    for (const session of Object.values(registry.snapshot().sessions)) {
+      if (session.endpoint !== endpoint.id) continue;
+      const state = runtime.getSession(session.endpoint, session.thread_id);
+      if (state?.managementState === "managed") {
+        runtime.setSession(session.endpoint, session.thread_id, "unavailable", state.nativeStatus);
+      }
+    }
     for (const [nickname, session] of Object.entries(registry.snapshot().sessions)) {
       if (session.endpoint !== endpoint.id) continue;
       const state = runtime.getSession(session.endpoint, session.thread_id);
@@ -984,6 +1004,7 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
         });
         await verifySessionCwd(response.thread.cwd, session.project_dir);
         const authoritative = await endpoint.request<any>("thread/read", { threadId: session.thread_id, includeTurns: true });
+        hydrateThreadOrder(session.endpoint, authoritative.thread);
         const activeTurn = [...(authoritative.thread.turns ?? [])].reverse().find((turn: any) => !isTerminalStatus(turn.status));
         const nativeStatus = authoritative.thread.status?.type ?? response.thread.status?.type ?? "idle";
         runtime.setSession(session.endpoint, session.thread_id, "managed", nativeStatus);

@@ -101,6 +101,36 @@ test("idle waits for a blocked handler and leaves endpoint failures pending for 
   assert.equal(value.errors.length, 1);
 });
 
+test("defers observations for an unavailable session that will be restored as managed", async () => {
+  const value = fixture();
+  value.runtime.setSession("local", "thread-1", "unavailable", "notLoaded");
+  value.processor.accept("local", "thread/settings/updated", { threadId: "thread-1", threadSettings: { model: "gpt-5", effort: "high" } });
+  await value.processor.idle();
+
+  assert.equal(value.store.pendingNotifications().length, 1);
+  assert.equal(value.store.facts({ endpointId: "local", threadId: "thread-1" }).currentSettings.model, null);
+  value.runtime.setSession("local", "thread-1", "managed", "idle");
+  await value.processor.drain("local");
+  assert.equal(value.store.pendingNotifications().length, 0);
+  assert.equal(value.store.facts({ endpointId: "local", threadId: "thread-1" }).currentSettings.model, "gpt-5");
+});
+
+test("quarantines an invalid durable observation without starving later rows", async () => {
+  const value = fixture();
+  assert.equal(value.processor.accept("local", "thread/tokenUsage/updated", {
+    threadId: "thread-1", turnId: "turn-1", tokenUsage: { total: { totalTokens: -1 } },
+  }), true);
+  value.processor.accept("local", "thread/settings/updated", { threadId: "thread-1", threadSettings: { model: "gpt-5", effort: "high" } });
+  await value.processor.idle();
+
+  assert.equal(value.store.pendingNotifications().length, 0);
+  assert.equal(value.store.facts({ endpointId: "local", threadId: "thread-1" }).currentSettings.model, "gpt-5");
+  assert.equal(value.errors.length, 1);
+  const invalid = value.db.prepare("SELECT state, error_json FROM session_dashboard_notifications WHERE sequence = 1").get() as { state: string; error_json: string };
+  assert.equal(invalid.state, "failed");
+  assert.deepEqual(JSON.parse(invalid.error_json), { message: "invalid thread/tokenUsage/updated notification" });
+});
+
 test("terminal observation stores only metadata and cannot clear a newer active turn", async () => {
   const value = fixture({ readThread: async () => ({ turns: [{ id: "old", startedAt: 1 }, { id: "new", startedAt: 2 }] }) });
   value.runtime.setActiveTurn("local", "thread-1", "new");

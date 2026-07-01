@@ -63,6 +63,29 @@ test("orders sends, terminal events, token usage, and goals monotonically", () =
   assert.equal(store.facts(identity).goal, null);
 });
 
+test("authoritative history atomically remaps provisional turn ordinals and dependent facts", () => {
+  const store = new SessionDashboardStore(createTestDatabase());
+  const newOrdinal = store.observeTurnStarted(identity, { id: "new", startedAt: 3 });
+  assert.equal(newOrdinal, 1);
+  const usage = { total: { total_tokens: 10, input_tokens: 7, cached_input_tokens: 2, output_tokens: 3, reasoning_output_tokens: 1 }, last_turn: { total_tokens: 2, input_tokens: 1, cached_input_tokens: 0, output_tokens: 1, reasoning_output_tokens: 0 }, model_context_window: 100, context_remaining: 90, context_used_percent: 10, observed_at: "1970-01-01T00:00:03.000Z" };
+  store.observeLastWorkerEvent(identity, { message_id: "new-message", turn_id: "new", status: "completed", at: "1970-01-01T00:00:03.000Z" }, newOrdinal);
+  store.observeTokenUsage(identity, "new", usage, newOrdinal, 1);
+
+  store.hydrateTurnOrder(identity, [
+    { id: "old-1", startedAt: 1 },
+    { id: "old-2", startedAt: 2 },
+    { id: "new", startedAt: 3 },
+  ]);
+
+  assert.equal(store.turnOrdinal(identity, "old-1"), 1);
+  assert.equal(store.turnOrdinal(identity, "old-2"), 2);
+  assert.equal(store.turnOrdinal(identity, "new"), 3);
+  store.observeLastWorkerEvent(identity, { message_id: "old-message", turn_id: "old-2", status: "completed", at: "1970-01-01T00:00:04.000Z" }, 2);
+  store.observeTokenUsage(identity, "old-2", { ...usage, observed_at: "1970-01-01T00:00:04.000Z" }, 2, 2);
+  assert.equal(store.facts(identity).lastWorkerEvent?.turn_id, "new");
+  assert.equal(store.facts(identity).tokenUsage?.observed_at, "1970-01-01T00:00:03.000Z");
+});
+
 test("notification receipt and completion are durable and sequence ordered", () => {
   const db = createTestDatabase();
   const store = new SessionDashboardStore(db);

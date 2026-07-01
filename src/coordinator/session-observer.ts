@@ -3,6 +3,7 @@ import type { RuntimeStore } from "../storage/runtime-store.ts";
 import { SessionDashboardStore, type DashboardIdentity, type DashboardNotification } from "../storage/session-dashboard-store.ts";
 import { normalizeTokenUsage, toIsoTimestamp, type DashboardGoal } from "./dashboard-schema.ts";
 import type { TerminalObservation } from "../events/relay.ts";
+import { ZodError } from "zod";
 
 interface RegistryView { snapshot(): RegistryDocument }
 interface ObserverOptions {
@@ -116,16 +117,28 @@ export class SessionObservationProcessor {
 
   private async processPending(endpointId: string): Promise<void> {
     for (const notification of this.store.pendingNotifications(endpointId)) {
-      const changed = await this.process(notification);
+      let result: boolean | "deferred";
+      try {
+        result = await this.process(notification);
+      } catch (error) {
+        if (!(error instanceof ZodError)) throw error;
+        const safeError = { message: `invalid ${notification.method} notification` };
+        this.store.failNotification(notification.sequence, safeError);
+        this.options.onError(new Error(safeError.message));
+        continue;
+      }
+      if (result === "deferred") continue;
       this.store.completeNotification(notification.sequence);
-      if (changed) this.options.onChanged();
+      if (result) this.options.onChanged();
     }
   }
 
-  private async process(notification: DashboardNotification): Promise<boolean> {
+  private async process(notification: DashboardNotification): Promise<boolean | "deferred"> {
     const params = notification.params as any;
-    const identity = this.managedIdentity(notification.endpointId, String(params.threadId));
-    if (!identity) return false;
+    const target = this.observationTarget(notification.endpointId, String(params.threadId));
+    if (target.kind === "deferred") return "deferred";
+    if (target.kind === "discarded") return false;
+    const identity = target.identity;
     if (notification.method === "turn/started") {
       const ordinal = this.store.observeTurnStarted(identity, { id: params.turn.id, startedAt: params.turn.startedAt });
       void ordinal;
@@ -152,6 +165,7 @@ export class SessionObservationProcessor {
       }, notification.sequence).valueChanged;
     }
     if (notification.method === "thread/tokenUsage/updated") {
+      const tokenUsage = normalizeTokenUsage(params.tokenUsage, notification.receivedAt);
       let ordinal = this.store.turnOrdinal(identity, params.turnId);
       if (ordinal === undefined) {
         const history = await this.options.readThread(notification.endpointId, identity.threadId);
@@ -159,7 +173,7 @@ export class SessionObservationProcessor {
         ordinal = this.store.turnOrdinal(identity, params.turnId);
       }
       if (ordinal === undefined) throw new Error(`cannot order token usage for turn ${params.turnId}`);
-      return this.store.observeTokenUsage(identity, params.turnId, normalizeTokenUsage(params.tokenUsage, notification.receivedAt), ordinal, notification.sequence);
+      return this.store.observeTokenUsage(identity, params.turnId, tokenUsage, ordinal, notification.sequence);
     }
     if (notification.method === "thread/goal/updated") {
       const normalized = normalizeGoal(params.goal);
@@ -179,9 +193,22 @@ export class SessionObservationProcessor {
   }
 
   private managedIdentity(endpointId: string, threadId: string): DashboardIdentity | undefined {
+    const target = this.observationTarget(endpointId, threadId);
+    return target.kind === "managed" ? target.identity : undefined;
+  }
+
+  private observationTarget(endpointId: string, threadId: string):
+    | { kind: "managed"; identity: DashboardIdentity }
+    | { kind: "deferred" }
+    | { kind: "discarded" } {
     const session = Object.values(this.registry.snapshot().sessions).find((candidate) => candidate.endpoint === endpointId && candidate.thread_id === threadId);
-    if (!session || this.runtime.getSession(endpointId, threadId)?.managementState !== "managed") return undefined;
-    return { endpointId, threadId };
+    if (!session) return { kind: "discarded" };
+    const state = this.runtime.getSession(endpointId, threadId);
+    if (state?.managementState === "managed") return { kind: "managed", identity: { endpointId, threadId } };
+    if (state?.managementState === "attaching" || (state?.managementState === "unavailable" && state.restoreState === "managed")) {
+      return { kind: "deferred" };
+    }
+    return { kind: "discarded" };
   }
 
   private visibleRuntime(identity: DashboardIdentity): { nativeStatus: string; activeTurnId: string | null } {

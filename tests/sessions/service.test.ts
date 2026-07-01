@@ -21,6 +21,7 @@ class ServiceEndpoint implements AppServerEndpoint {
   activeTurnId = "active-1";
   lastClientId: string | undefined;
   historyTurnStatus: string | undefined;
+  threadTurns: any[] | undefined;
   failNextStart = false;
   goal: any = null;
   loseNextGoalResponse = false;
@@ -32,7 +33,7 @@ class ServiceEndpoint implements AppServerEndpoint {
       return { turn: { id: "started-1" } } as T;
     }
     if (method === "turn/steer") return { turnId: params.expectedTurnId } as T;
-    if (method === "thread/read") return { thread: { id: "thread", cwd: params.cwd, status: { type: this.status }, turns: this.lastClientId ? [{ id: "started-1", ...(this.historyTurnStatus ? { status: this.historyTurnStatus } : {}), items: [{ type: "userMessage", clientId: this.lastClientId }] }] : [] } } as T;
+    if (method === "thread/read") return { thread: { id: "thread", cwd: params.cwd, status: { type: this.status }, turns: this.threadTurns ?? (this.lastClientId ? [{ id: "started-1", ...(this.historyTurnStatus ? { status: this.historyTurnStatus } : {}), items: [{ type: "userMessage", clientId: this.lastClientId }] }] : []) } } as T;
     if (method === "thread/goal/get") return { goal: this.goal } as T;
     if (method === "model/list") return { data: [{ id: "gpt-5" }], nextCursor: null } as T;
     if (method === "thread/goal/set") {
@@ -101,6 +102,20 @@ test("status composes registry, runtime, native state, settings, and goal", asyn
   assert.equal("pendingSettings" in status, false);
   assert.equal("configuredSettings" in status, false);
   assert.equal(status.goal, null);
+});
+
+test("status derives the active turn from authoritative history instead of cached runtime", async () => {
+  const { endpoint, runtime, service } = await fixture();
+  runtime.setActiveTurn("local", "thread", "stale-turn");
+  endpoint.status = "active";
+  endpoint.threadTurns = [
+    { id: "finished", status: "completed", items: [] },
+    { id: "active-turn", status: "inProgress", items: [] },
+  ];
+
+  const status = await service.status("payments") as any;
+  assert.equal(status.activeTurnId, "active-turn");
+  assert.equal(endpoint.calls.find((call) => call.method === "thread/read")?.params.includeTurns, true);
 });
 
 test("a failed start retains pending settings and steer never consumes them", async () => {

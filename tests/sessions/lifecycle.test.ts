@@ -58,9 +58,11 @@ test("create and adopt verify canonical cwd and establish a managed epoch baseli
   assert.equal(runtime.currentEpoch("local", "thread-1")?.baselineTurnId, "historical");
 
   endpoint.threadId = "thread-2";
-  await lifecycle.adopt("billing", "local", "thread-2", dir);
+  let adoptedTurns: Array<{ id: string }> | undefined;
+  await lifecycle.adopt("billing", "local", "thread-2", dir, (thread) => { adoptedTurns = thread.turns; });
   assert.equal(registry.get("billing")?.thread_id, "thread-2");
   assert.equal(runtime.currentEpoch("local", "thread-2")?.baselineTurnId, "historical");
+  assert.deepEqual(adoptedTurns, [{ id: "historical" }]);
 });
 
 test("adoption rejects active or cwd-mismatched sessions", async () => {

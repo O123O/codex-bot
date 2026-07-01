@@ -81,14 +81,51 @@ export class SessionDashboardStore {
 
   hydrateTurnOrder(identity: DashboardIdentity, turns: ReadonlyArray<{ id: string; startedAt: number | null }>): void {
     inTransaction(this.db, () => {
-      for (const [index, turn] of turns.entries()) {
-        const existing = this.db.prepare(`SELECT turn_ordinal FROM session_turn_order
-          WHERE endpoint_id = ? AND thread_id = ? AND turn_id = ?`).get(identity.endpointId, identity.threadId, turn.id);
-        if (existing) continue;
-        this.db.prepare(`INSERT INTO session_turn_order(endpoint_id, thread_id, turn_id, started_at, turn_ordinal)
-          VALUES (?, ?, ?, ?, ?)`)
-          .run(identity.endpointId, identity.threadId, turn.id, turn.startedAt, index + 1);
+      const existing = this.db.prepare(`SELECT turn_id, started_at, turn_ordinal FROM session_turn_order
+        WHERE endpoint_id = ? AND thread_id = ? ORDER BY turn_ordinal`).all(identity.endpointId, identity.threadId) as Array<{
+          turn_id: string;
+          started_at: number | null;
+          turn_ordinal: number;
+        }>;
+      const existingById = new Map(existing.map((row) => [String(row.turn_id), row]));
+      const ordered: Array<{ id: string; startedAt: number | null }> = [];
+      const seen = new Set<string>();
+      for (const turn of turns) {
+        if (seen.has(turn.id)) continue;
+        seen.add(turn.id);
+        ordered.push({ id: turn.id, startedAt: turn.startedAt ?? existingById.get(turn.id)?.started_at ?? null });
       }
+      for (const row of existing) {
+        if (seen.has(row.turn_id)) continue;
+        seen.add(row.turn_id);
+        ordered.push({ id: row.turn_id, startedAt: row.started_at });
+      }
+
+      this.db.prepare("DELETE FROM session_turn_order WHERE endpoint_id = ? AND thread_id = ?")
+        .run(identity.endpointId, identity.threadId);
+      const insert = this.db.prepare(`INSERT INTO session_turn_order(endpoint_id, thread_id, turn_id, started_at, turn_ordinal)
+        VALUES (?, ?, ?, ?, ?)`);
+      const ordinalById = new Map<string, number>();
+      ordered.forEach((turn, index) => {
+        const ordinal = index + 1;
+        insert.run(identity.endpointId, identity.threadId, turn.id, turn.startedAt, ordinal);
+        ordinalById.set(turn.id, ordinal);
+      });
+
+      const facts = this.rawFacts(identity);
+      if (!facts) return;
+      const tokenTurnId = facts.token_turn_id === null ? undefined : String(facts.token_turn_id);
+      const tokenOrdinal = tokenTurnId ? ordinalById.get(tokenTurnId) : undefined;
+      let workerOrdinal: number | undefined;
+      if (facts.last_worker_event_json !== null) {
+        const worker = LastWorkerEventSchema.parse(JSON.parse(String(facts.last_worker_event_json)));
+        workerOrdinal = ordinalById.get(worker.turn_id);
+      }
+      this.db.prepare(`UPDATE session_dashboard_facts SET
+        token_turn_ordinal = CASE WHEN ? IS NULL THEN token_turn_ordinal ELSE ? END,
+        last_worker_turn_ordinal = CASE WHEN ? IS NULL THEN last_worker_turn_ordinal ELSE ? END
+        WHERE endpoint_id = ? AND thread_id = ?`)
+        .run(tokenOrdinal ?? null, tokenOrdinal ?? null, workerOrdinal ?? null, workerOrdinal ?? null, identity.endpointId, identity.threadId);
     });
   }
 
