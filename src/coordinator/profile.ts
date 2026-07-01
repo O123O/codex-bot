@@ -79,7 +79,7 @@ export function buildCoordinatorChildEnvironment(
 }
 
 interface AccountEndpoint {
-  request(method: string, params: unknown): Promise<unknown>;
+  request<T>(method: string, params: unknown): Promise<T>;
 }
 
 interface StartableAccountEndpoint extends AccountEndpoint {
@@ -91,9 +91,13 @@ export async function assertCoordinatorAuthenticated(
   endpoint: AccountEndpoint,
   profile: Pick<PreparedCoordinatorProfile, "root" | "home" | "codexHome">,
 ): Promise<void> {
-  const response = await endpoint.request("account/read", { refreshToken: false }) as { account: unknown | null; requiresOpenaiAuth: boolean };
+  const response = await endpoint.request<{ account: unknown | null; requiresOpenaiAuth: boolean }>("account/read", { refreshToken: false });
   if (response.account !== null || !response.requiresOpenaiAuth) return;
-  throw managedError(`coordinator Codex profile is not authenticated (HOME ${profile.home}, CODEX_HOME ${profile.codexHome}); run codex-bot coordinator-login with DATA_DIR set to ${dirname(profile.root)}`);
+  throw new AppError(
+    "CONFIGURATION_ERROR",
+    `coordinator Codex profile is not authenticated (HOME ${profile.home}, CODEX_HOME ${profile.codexHome}); run codex-bot coordinator-login with DATA_DIR set to ${dirname(profile.root)}`,
+    { reason: "coordinator_auth_required" },
+  );
 }
 
 export async function startAuthenticatedCoordinatorEndpoint(

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, realpath } from "node:fs/promises";
+import { mkdtemp, readFile, realpath, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -37,4 +37,9 @@ test("production prepares the configured coordinator workdir before endpoint sta
   assert.match(await readFile(join(workdir, ".codex-bot-agents.sha256"), "utf8"), /^[a-f0-9]{64}\n$/u);
   assert.deepEqual(JSON.parse(await readFile(join(workdir, "session-status.json"), "utf8")), { version: 2, sessions: {} });
   assert.equal(JSON.parse(await readFile(registryPath, "utf8")).coordinator.project_dir, await realpath(workdir));
+  for (const path of [
+    join(dataDir, "coordinator-profile"),
+    join(dataDir, "coordinator-profile/home"),
+    join(dataDir, "coordinator-profile/codex"),
+  ]) assert.equal((await stat(path)).mode & 0o777, 0o700);
 });

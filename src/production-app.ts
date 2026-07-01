@@ -12,7 +12,10 @@ import type { BotConfig } from "./config.ts";
 import { AppError } from "./core/errors.ts";
 import { runBackground } from "./core/background.ts";
 import { SessionDashboard } from "./coordinator/session-dashboard.ts";
-import { resumeCoordinatorIdentity } from "./coordinator/identity.ts";
+import { activateCoordinatorProfileIdentity, listCoordinatorThreadCandidates, resumeCoordinatorIdentity } from "./coordinator/identity.ts";
+import { recordCoordinatorAuthenticationFailure } from "./coordinator/auth-recovery.ts";
+import { buildCoordinatorChildEnvironment, prepareCoordinatorProfile, startAuthenticatedCoordinatorEndpoint, type PreparedCoordinatorProfile } from "./coordinator/profile.ts";
+import { recoverCoordinatorProfileAttempts, type LegacyCoordinatorTurn } from "./coordinator/profile-migration.ts";
 import { CoordinatorRuntime } from "./coordinator/runtime.ts";
 import { CoordinatorScheduler, type CoordinatorJob } from "./coordinator/scheduler.ts";
 import { SessionObservationProcessor } from "./coordinator/session-observer.ts";
@@ -44,6 +47,7 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
   let registryPath = config.sessionRegistryPath;
   let dashboardPath = join(coordinatorDir, "session-status.json");
   let coordinatorWarnings: string[] = [];
+  let coordinatorProfile!: PreparedCoordinatorProfile;
   let db!: Database;
   let registry!: SessionRegistry;
   let dashboardStore!: SessionDashboardStore;
@@ -97,6 +101,7 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
         registryPath = prepared.registryPath;
         dashboardPath = prepared.dashboardPath;
         coordinatorWarnings = prepared.warnings;
+        coordinatorProfile = await prepareCoordinatorProfile(dataDir);
       },
       stop: async () => undefined,
     },
@@ -155,7 +160,13 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
       name: "subscriptions",
       start: async () => {
         endpoint = new LocalEndpoint({ id: "local", codexBinary: config.codexBinary, env: buildCodexChildEnvironment(process.env), expectedVersion: SUPPORTED_CODEX_VERSION });
-        coordinatorEndpoint = new LocalEndpoint({ id: "coordinator-local", codexBinary: config.codexBinary, env: buildCodexChildEnvironment(process.env, token), expectedVersion: SUPPORTED_CODEX_VERSION });
+        coordinatorEndpoint = new LocalEndpoint({
+          id: "coordinator-local",
+          codexBinary: config.codexBinary,
+          env: buildCoordinatorChildEnvironment(process.env, coordinatorProfile, token),
+          expectedCodexHome: coordinatorProfile.codexHome,
+          expectedVersion: SUPPORTED_CODEX_VERSION,
+        });
         pool = new AppServerPool([endpoint, coordinatorEndpoint], { maxConcurrentTurns: config.maxConcurrentTurns });
         discovery = new SessionDiscovery(db, pool);
         lifecycle = new SessionLifecycle(pool, registry, runtime, { now: () => Date.now() }, { sandboxMode: config.sandboxMode });
@@ -200,7 +211,7 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
         endpointsCommitted = false;
         try {
           await endpoint.start();
-          await coordinatorEndpoint.start();
+          await startAuthenticatedCoordinatorEndpoint(coordinatorEndpoint, coordinatorProfile);
           if (endpoint.state !== "ready" || coordinatorEndpoint.state !== "ready") throw new AppError("ENDPOINT_UNAVAILABLE", "an app-server became unavailable during initial startup");
           endpointsCommitted = true;
         } catch (error) {
@@ -235,6 +246,16 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
       name: "coordinator",
       start: async () => {
         await reconcileDashboard(true);
+        await activateCoordinatorProfileIdentity({
+          registry,
+          endpointId: coordinatorEndpoint.id,
+          legacyEndpointId: endpoint.id,
+          coordinatorDir,
+          activationRequired: coordinatorProfile.activationRequired,
+          beforeReset: recoverLegacyCoordinatorAttempts,
+          captureCreationBaseline: async () => (await listCoordinatorThreadCandidates(coordinatorEndpoint, coordinatorDir)).map((candidate) => candidate.id),
+          markActivated: (baseline) => coordinatorProfile.markActivated(baseline),
+        });
         await startOrResumeCoordinator();
         await reconcileOperations();
         await reconcileCoordinatorAttempts();
@@ -765,8 +786,25 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
       coordinatorDir,
       sandboxMode: config.sandboxMode,
       config: coordinatorTurnConfig(mcp.url, token),
+      creationNonce: coordinatorProfile.creationNonce,
+      creationBaseline: coordinatorProfile.creationBaseline,
     });
     runtime.setSession(coordinatorEndpoint.id, resumed.threadId, "managed", resumed.nativeStatus);
+  }
+
+  async function recoverLegacyCoordinatorAttempts(): Promise<void> {
+    const legacy = registry.snapshot().coordinator;
+    await recoverCoordinatorProfileAttempts({
+      runtime: coordinator,
+      legacyThreadId: legacy.thread_id,
+      coordinatorDir,
+      readLegacyThread: async () => (await endpoint.request<any>("thread/read", { threadId: legacy.thread_id, includeTurns: true })).thread,
+      reconcileOperations: () => reconcileOperations({ includeActiveAttempt: true }),
+      completeTurn: async (turn: LegacyCoordinatorTurn) => {
+        const messages = finals.persistTerminalTurn(coordinatorEndpoint.id, legacy.thread_id, turn as any, Date.now());
+        coordinator.handleTerminal(turn.id, messages.map((message) => message.body).join("\n") || undefined);
+      },
+    });
   }
 
   async function reconcileCoordinatorAttempts(): Promise<void> {
@@ -1131,14 +1169,22 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
 
   async function recoverEndpoint(target: LocalEndpoint): Promise<void> {
     if (stopping) return;
-    await target.start();
     if (target.id === endpoint.id) {
+      await target.start();
       await resumeManagedSessions();
       await observations.drain(endpoint.id);
       await relay.reconcileEndpoint(endpoint.id);
       await reconcileOperations();
       await renderDashboardSafely();
     } else {
+      try {
+        await startAuthenticatedCoordinatorEndpoint(coordinatorEndpoint, coordinatorProfile);
+      } catch (error) {
+        if (error instanceof AppError && error.details?.reason === "coordinator_auth_required") {
+          recordCoordinatorAuthenticationFailure(deliveries, String(config.telegramDestinationChatId), endpointIncident);
+        }
+        throw error;
+      }
       await startOrResumeCoordinator();
       await reconcileOperations();
       await reconcileCoordinatorAttempts();

@@ -103,7 +103,7 @@ test("coordinator authentication preflight accepts authenticated and external-pr
   const profile = { root: "/private/profile", home: "/private/profile/home", codexHome: "/private/profile/codex" };
   const requests: Array<{ method: string; params: unknown }> = [];
   const endpoint = (result: unknown) => ({
-    request: async (method: string, params: unknown) => { requests.push({ method, params }); return result; },
+    request: async <T>(method: string, params: unknown) => { requests.push({ method, params }); return result as T; },
   });
   await assertCoordinatorAuthenticated(endpoint({ account: { type: "chatgpt" }, requiresOpenaiAuth: true }), profile);
   await assertCoordinatorAuthenticated(endpoint({ account: null, requiresOpenaiAuth: false }), profile);
@@ -120,7 +120,7 @@ test("coordinator authentication failure is actionable and stops a newly started
     stops: 0,
     async start() { this.starts += 1; },
     async stop() { this.stops += 1; },
-    async request() { return { account: null, requiresOpenaiAuth: true }; },
+    async request<T>() { return { account: null, requiresOpenaiAuth: true } as T; },
   };
   await assert.rejects(
     startAuthenticatedCoordinatorEndpoint(endpoint, profile),
