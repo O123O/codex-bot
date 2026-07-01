@@ -38,9 +38,15 @@ semantics, delivery recovery, or message contents.
 
 Add a focused Telegram transport factory that returns:
 
-- a polling `TelegramApi` whose fetch function uses a dedicated Undici `Agent`;
+- a polling `TelegramApi` whose fetch function uses a dedicated Undici dispatcher;
 - a delivery `TelegramApi` that continues to use the normal global fetch transport;
 - an idempotent close operation for the polling agent.
+
+The factory preserves Node's effective opt-in environment-proxy policy. It creates
+an `EnvHttpProxyAgent` when proxy support is enabled by `NODE_USE_ENV_PROXY=1`,
+`--use-env-proxy`, or the corresponding `NODE_OPTIONS` flag, honoring an explicit
+`--no-use-env-proxy` override. Otherwise it creates a normal `Agent`. Both choices
+still provide a pool independent from the delivery transport.
 
 `TelegramChatAdapter` will expose the delivery API as it does today, give the
 polling API to `TelegramPoller`, and own the polling transport lifecycle. On stop,
@@ -69,17 +75,24 @@ contract.
 
 Telegram API parsing, 429 retry handling, delivery uncertainty, and attachment
 streaming remain unchanged. If polling startup or polling itself fails, the existing
-poll loop behavior remains authoritative. The dedicated agent close is idempotent;
-shutdown aborts the poll before closing the agent so an expected abort is not treated
-as an operational failure.
+poll loop behavior remains authoritative. Shutdown awaits `TelegramPoller.stop()` in
+full before closing the dispatcher. This covers an active long poll, attachment
+download, or `onAccepted` callback rather than closing transport resources while any
+polling-owned work is still running. Repeated or concurrent stops share one close
+operation, and the dispatcher closes exactly once.
 
 ## Testing
 
-The regression test will prove the transport boundary rather than relying on timing:
+The regression tests will prove the transport boundary without wall-clock timing:
 
-- polling requests receive the dedicated dispatcher;
-- delivery requests do not receive that dispatcher;
-- stopping the adapter closes the polling dispatcher after the poll is aborted;
+- hold `getUpdates` at a synchronization barrier, initiate delivery, and prove the
+  independent delivery fetch is invoked and completes before releasing polling;
+- verify normal, environment-enabled, `NODE_OPTIONS`-enabled, and explicitly disabled
+  proxy modes select the expected independent dispatcher type;
+- hold a polling-owned file download, stop the adapter, and prove the dispatcher
+  closes only after that work settles;
+- call stop repeatedly and concurrently, proving the dispatcher closes exactly once
+  and every caller settles;
 - all existing Telegram API, poller, delivery, production, and packaging tests remain
   green.
 
