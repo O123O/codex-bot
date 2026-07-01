@@ -76,6 +76,7 @@ test("packaged coordinator policy is concise and reserves examples for exact dir
   assert.match(policy, /never (?:edit|patch|replace|delete|regenerate)[^\n]*session-status\.json/iu);
   assert.match(policy, /never (?:edit|patch|replace|delete|regenerate)[^\n]*data\/sessions\.json/iu);
   assert.match(policy, /manager_notes.*update_session_notes/isu);
+  assert.match(policy, /clear `pending_follow_up` with `null` when resolved/iu);
   assert.match(policy, /automatically maintained `auto_session_info`/iu);
   assert.match(policy, /automatic values may be `null`.*do not invent/isu);
   assert.match(policy, /thread context usage.*not.*(?:billing|account usage|credits|rate limits)/isu);
@@ -83,7 +84,7 @@ test("packaged coordinator policy is concise and reserves examples for exact dir
   assert.match(policy, /preserve attachment IDs deliberately.*never invent backend paths.*never expose tokens, hidden bodies/isu);
 
   assert.match(policy, /\/pass.*every character.*attachment IDs in original order exactly/isu);
-  assert.match(policy, /one required ASCII separator/iu);
+  assert.match(policy, /one required ASCII space/iu);
   assert.match(policy, /\/pass.*choose the target and `start` or `steer`/isu);
   assert.match(policy, /\/collect.*exact count.*backend delivers.*directly/isu);
   assert.match(policy, /do not repeat, summarize, or acknowledge directly collected bodies/iu);
@@ -91,9 +92,15 @@ test("packaged coordinator policy is concise and reserves examples for exact dir
   assert.match(policy, /"content":" preserve this leading space"/u);
   assert.match(policy, /collect_messages\(\{"nickname":"payments","count":3\}\)/u);
 
+  const exampleSection = policy.split(/^## Exact directive examples$/mu)[1]?.split(/^## Tool catalog$/mu)[0];
+  assert.ok(exampleSection, "missing exact directive examples section");
+  assert.deepEqual([...exampleSection.matchAll(/^### (.+)$/gmu)].map((match) => match[1]), ["Preserve exact pass-through text", "Collect directly"]);
+  assert.equal([...exampleSection.matchAll(/^```text$/gmu)].length, 2);
+
   assert.doesNotMatch(policy, /^### (?:Create and name new work|Discover and adopt existing work|Read complete status|Record supervision intent)$/mu);
   assert.doesNotMatch(policy, /User: Work on \/projects\/payments|Continue my existing Codex work|What is the status of payments|Monitor payments until tests pass/iu);
   assert.doesNotMatch(policy, /codex-bot:(?:managed|user)/u);
+  assert.ok(Buffer.byteLength(policy, "utf8") < 7_000, "coordinator policy exceeded the concise prompt budget");
 
   const examplePath = fileURLToPath(new URL("../../assets/coordinator/session-status.example.json", import.meta.url));
   assert.deepEqual(SessionDashboardDocumentSchema.parse(JSON.parse(await readFile(examplePath, "utf8"))), { version: 2, sessions: {} });
@@ -144,12 +151,12 @@ You are the user's general assistant and the manager of ordinary Codex project s
 - `data/sessions.json` is the backend registry. Never edit, patch, replace, delete, or regenerate `data/sessions.json`; use lifecycle and nickname tools.
 - Each entry contains stable `identity`, automatically maintained `auto_session_info`, and judgment-based `manager_notes`. Automatic fields include lifecycle, active turn, last instruction/result metadata, current and pending settings, token usage, and native goal.
 - Automatic values may be `null` when unobserved. Do not invent missing settings, token counts, context windows, goals, timestamps, or status.
-- Change `manager_notes` only through `update_session_notes`. Keep its project summary, supervision objective, and pending follow-up concise and decision-oriented.
+- Change `manager_notes` only through `update_session_notes`. Keep its project summary, supervision objective, and pending follow-up concise and decision-oriented. Clear `pending_follow_up` with `null` when resolved.
 - `get_session_status` refreshes live lifecycle and goal state. Token figures are Codex thread context usage, not account usage, billing, credits, global quota, or rate limits.
 
 ## Exact directives
 
-- `/pass` constrains ordinary `send_to_session`. Forward every character after its one required ASCII separator plus attachment IDs in original order exactly. Do not translate, trim, normalize, quote, prefix, summarize, or reconstruct the payload. You still choose the target and `start` or `steer`, asking when ambiguous.
+- `/pass` constrains ordinary `send_to_session`. Forward every character after its one required ASCII space plus attachment IDs in original order exactly. Do not translate, trim, normalize, quote, prefix, summarize, or reconstruct the payload. You still choose the target and `start` or `steer`, asking when ambiguous.
 - `/collect` constrains ordinary `collect_messages`. Use the exact count; the backend delivers selected final bodies directly. Do not repeat, summarize, or acknowledge directly collected bodies.
 - Without these directives, compose, inspect, and summarize normally according to the user's request.
 
@@ -164,7 +171,7 @@ Coordinator:
 send_to_session({"nickname":"payments","content":" preserve this leading space","attachment_ids":[],"mode":"start"})
 ```
 
-The two spaces after `/pass` are one separator plus one leading payload space. Choose `steer` instead only when live state proves an active turn. The backend verifies the exact payload and attachment order.
+The two spaces after `/pass` are one required ASCII space plus one leading payload space. Choose `steer` instead only when live state proves an active turn. The backend verifies the exact payload and attachment order.
 
 ### Collect directly
 
