@@ -17,6 +17,7 @@
 - A confirmed external mutation remains successful when rendering fails. Do not let a render exception escape a successful tool action.
 - A proven-no-effect action does not update the dashboard. An uncertain send is projected only when reconciliation proves its exact target turn.
 - Older notifications cannot overwrite newer settings, token use, goals, sends, or worker events. Replaying the same event is idempotent.
+- Lossy app-server observations are accepted into a durable SQLite inbox before asynchronous processing; graceful shutdown drains notification work before rendering and closing storage.
 - Recovery applies its idempotent durable projection before marking an operation succeeded; a succeeded operation may never disappear from recovery without its dashboard fact already present.
 - Unknown facts are `null`; no model, effort, token usage, context window, goal, or lifecycle fact is inferred.
 - The dashboard stores the complete most-recent instruction and attachment identifiers, but no attachment bytes and no worker message bodies.
@@ -70,9 +71,11 @@ Create database fixtures and prove:
 - notes survive nickname-independent reads and nullable partial clearing;
 - repeated use of the same note operation ID returns the original complete receipt and does not apply a changed patch;
 - last sent, terminal worker metadata, current settings, token usage, and goal accept a newer source order and ignore an older one;
+- a newer equal-valued settings/goal/lifecycle observation advances its watermark without dirtying an unchanged rendered value; replay of that same sequence does nothing;
 - a known goal clear is persisted distinctly from an unobserved goal;
 - dirty state is set in the same transaction as every accepted fact/note change and cleared only after a successful render;
 - turn ordinals are stable across replay and authoritative history hydration preserves chronological order even when timestamps tie;
+- notification acceptance atomically consumes a sequence and persists the normalized payload, while completion occurs only after its projection is durable;
 - invalid persisted JSON in a facts/notes row is rejected rather than silently discarded.
 
 - [ ] **Step 3: Run the focused tests to confirm the red state**
@@ -150,9 +153,19 @@ CREATE TABLE session_dashboard_meta (
   last_render_error TEXT,
   render_failure_generation INTEGER NOT NULL DEFAULT 0
 );
+
+CREATE TABLE session_dashboard_notifications (
+  sequence INTEGER PRIMARY KEY,
+  endpoint_id TEXT NOT NULL,
+  method TEXT NOT NULL,
+  params_json TEXT NOT NULL,
+  state TEXT NOT NULL DEFAULT 'pending',
+  received_at INTEGER NOT NULL,
+  error_json TEXT
+);
 ```
 
-Insert the singleton row. Dashboard observations allocate a durable monotonic sequence synchronously when a notification/receipt is accepted, before launching asynchronous work. Later focused tasks add the native-runtime and operation sequence columns with their consumers, keeping each migration change paired with its behavioral tests.
+Insert the singleton row. Dashboard notifications allocate a durable monotonic sequence and insert a normalized, body-free payload into the inbox in one transaction before launching asynchronous work. Receipt/response observations allocate their sequence immediately before their synchronous projection update. Later focused tasks add the native-runtime and operation sequence columns with their consumers, keeping each migration change paired with its behavioral tests.
 
 Keep order components in typed columns instead of comparing timestamp strings or JSON. Settings compare observation sequence. Goals prefer authoritative `goal.updatedAt` and use observation sequence for clear/ties. Turns use a durable ordinal hydrated from authoritative `thread/read(... includeTurns: true)` order; live `turn/started` appends the next ordinal and replay of the same turn reuses it. Token and terminal observations compare turn ordinal, so a delayed older-turn event cannot replace a newer turn.
 
@@ -178,6 +191,10 @@ Provide focused methods rather than exposing SQL:
 hydrateTurnOrder(identity, turns): void;
 observeTurnStarted(identity, turn): number;
 allocateObservationSequence(): number;
+acceptNotification(endpointId, method, normalizedParams, receivedAt): number;
+pendingNotifications(endpointId?): DashboardNotification[];
+completeNotification(sequence): void;
+failNotification(sequence, safeError): void;
 observeLifecycle(identity, observedAt): boolean;
 observeLastSent(identity, value, operationSequence): boolean;
 observeLastWorkerEvent(identity, value, turnOrdinal): boolean;
@@ -198,7 +215,9 @@ markRenderFailed(safeMessage): { warningRequired: boolean; generation: number };
 
 Before migration, compare the prepared canonical coordinator root with the already-open registry coordinator identity. A mismatch is `CONFIGURATION_ERROR` before reading or changing the dashboard/marker. `claimCoordinatorRoot` persists that same root in the meta row and rejects a later different root, scoping the singleton migration marker to the coordinator identity.
 
-`importLegacy` requires exactly one registry identity for every legacy entry and at most one legacy entry for an identity. Any unmatched entry, cross-endpoint ambiguity, or duplicate stable-thread mapping fails the whole transaction before setting the marker or replacing bytes. It maps only `project_status`, `current_objective`, and `pending_follow_up`, ignores old `last_sent`/`last_worker_event`, and marks migration complete in the same transaction. Missing legacy files also complete migration. Use operation ID plus canonical patch JSON for idempotent note updates; a reused ID with different identity/patch throws `OPERATION_CONFLICT`. Identical observation replay is a no-op and must not increment the render revision.
+`importLegacy` requires exactly one registry identity for every legacy entry and at most one legacy entry for an identity. Any unmatched entry, cross-endpoint ambiguity, or duplicate stable-thread mapping fails the whole transaction before setting the marker or replacing bytes. It maps only `project_status`, `current_objective`, and `pending_follow_up`, ignores old `last_sent`/`last_worker_event`, and marks migration complete in the same transaction. Missing legacy files also complete migration. Use operation ID plus canonical patch JSON for idempotent note updates; a reused ID with different identity/patch throws `OPERATION_CONFLICT`.
+
+Observation methods distinguish public-value changes from ordering-watermark changes. Replay of the same assigned sequence is a true no-op. A newer sequence with the same value must still advance the stored watermark, but does not dirty/increment the render revision unless a rendered value or rendered observation timestamp changes. This prevents an older delayed handler from winning after a fresh equal-valued confirmation without causing pointless file rewrites.
 
 - [ ] **Step 7: Run focused tests and commit**
 
@@ -352,7 +371,13 @@ Cover generated-protocol payloads for:
 - `turn/completed`: record terminal status/time and the last persisted logical final message ID (or `null`), never its body;
 - events for coordinator/unknown/detached sessions do not create project dashboard facts.
 
-Also prove terminal replay via `reconcileEndpoint()` does not regress or duplicate the worker event. Add a concurrency case where notification A is received first but its asynchronous work finishes after notification B: the durable sequence and serialized project-notification queue must leave B's settings/lifecycle state current. Add a reconnect case showing an old queued observation cannot overwrite the newer resume observation.
+Also prove terminal replay via `reconcileEndpoint()` does not regress or duplicate the worker event. Add these queue/recovery cases:
+
+- notification A is received first but its asynchronous work finishes after notification B: the durable sequence and serialized project-notification queue leave B's settings/lifecycle state current;
+- settings A is stored at sequence 1, old queued B has sequence 2, and a fresh resume confirms equal-valued A at sequence 3: A advances the watermark without dirtying the unchanged view and delayed B is rejected;
+- crash after accepting a token-usage notification but before processing: restart replays its pending inbox row and preserves the otherwise unrecoverable token data;
+- crash after projection but before marking the inbox row complete: replay is idempotent and completes the row;
+- shutdown with a blocked notification handler does not close SQLite underneath it; work either finishes before close or remains pending for restart.
 
 - [ ] **Step 2: Run event tests to confirm failure**
 
@@ -376,13 +401,17 @@ Invoke it after `persistTerminalTurn` and the terminal event are durable. The ca
 
 - [ ] **Step 4: Add typed project-notification observation in production**
 
-Before/alongside relay handling, dispatch only the known generated notification methods into dashboard/store methods. Allocate a durable observation sequence synchronously at receipt, then process project notifications through one non-poisoning per-endpoint promise tail. This preserves JSON-RPC receive order even when a handler awaits history, while the persisted sequence prevents a late older handler or reconnect boundary from overwriting a newer observation. Apply the same conditional sequence to runtime native status/active-turn updates, not only the rendered facts.
+Before/alongside relay handling, accept each supported project observation by atomically allocating a sequence and inserting a normalized inbox row, then process pending rows through one non-poisoning per-endpoint promise tail. Mark a row complete only after its runtime/dashboard projection commits. This preserves JSON-RPC receive order even when a handler awaits history, survives a crash before processing, and lets a projection-before-completion crash replay safely. The persisted sequence prevents a late older handler or reconnect boundary from overwriting a newer observation. Apply the same conditional sequence to runtime native status/active-turn updates, not only the rendered facts.
+
+Persist only the fields needed for dashboard observation. In particular, never copy terminal turn items or worker bodies into the inbox. `turn/completed` remains recoverable through the existing authoritative `EventRelay.reconcileEndpoint()` path; settings, status, goal, turn-order, and token payloads are normalized and safe to retain. Invalid inbox payloads are marked failed with a structural warning and cannot mutate automatic state.
 
 Normalize protocol seconds/milliseconds in one helper. Hydrate turn ordinals from authoritative history on startup/reconnect. For token usage, use the stored turn ordinal; when a notification references an unknown turn, read authoritative thread history to establish its order before allowing it to replace a known newer turn. If ordering still cannot be proved, do not promote it over a known newer token row.
 
 There is no app-server settings-read method: `thread/read` contains neither model nor effort. Current settings come only from top-level thread start/resume responses and receive-ordered `thread/settings/updated` notifications. Goal updates use `goal.updatedAt`; goal-clear/tool reconciliation may use the existing goal get endpoint. Identical payload replay remains a no-op.
 
 Runtime lifecycle updates and durable fact writes happen before scheduling the safe renderer. Notification handlers remain idempotent and must not generate chat messages solely for routine dashboard changes.
+
+On startup, after the endpoint is ready and managed sessions are resumed, drain all pending observation rows before final dashboard rendering and coordinator startup. During graceful stop, stop accepting callbacks, await the notification tail, then await the render tail before SQLite closes. If endpoint-dependent processing can no longer finish after endpoint shutdown, leave the row pending for the next startup rather than touching a closed database.
 
 - [ ] **Step 5: Run tests and commit**
 
@@ -479,12 +508,13 @@ After storage and registry are open, construct the store/dashboard in a dedicate
 
 1. validate registry coordinator root, claim that root in SQLite, and only then migrate version 1;
 2. reconcile lifecycle/runtime and resume managed sessions;
-3. seed current model/effort from thread start/resume responses and settings notifications, while fresh thread reads seed lifecycle and turn order only;
-4. reconcile terminal events and uncertain operations;
-5. render the complete version-2 view successfully;
-6. only then start/resume the coordinator so it cannot read stale version-1 content.
+3. seed current model/effort from thread start/resume responses, while fresh thread reads seed lifecycle and turn order only;
+4. drain the durable notification inbox, including token/settings/goal/status observations accepted before a crash;
+5. reconcile terminal events and uncertain operations;
+6. render the complete version-2 view successfully;
+7. only then start/resume the coordinator so it cannot read stale version-1 content.
 
-On endpoint resume, record fresh current settings/status before rendering. On shutdown, await the render tail before closing SQLite.
+On endpoint resume, record fresh current settings/status before draining/rendering. On shutdown, stop notification acceptance, drain the notification tail, and then await the render tail before closing SQLite.
 
 - [ ] **Step 7: Run focused tests, typecheck, and commit**
 
