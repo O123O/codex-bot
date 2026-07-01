@@ -78,13 +78,14 @@ export interface PreparedCoordinatorProfile {
   codexHome: string;
   markerPath: string;
   activationRequired: boolean;
-  markActivated(): Promise<void>;
+  creationBaseline: readonly string[];
+  markActivated(creationBaseline: readonly string[]): Promise<void>;
 }
 
 export async function prepareCoordinatorProfile(dataRoot: string): Promise<PreparedCoordinatorProfile>;
 ```
 
-Use `lstat` before trusting existing objects; directories must be real directories rather than symbolic links. Create/chmod profile directories to `0700`, canonicalize them, and require that they remain descendants of the canonical data root. Parse `profile.json` with a strict schema equivalent to `{ version: z.literal(1) }`. `markActivated()` must create a mode-`0600` temporary regular file, `fsync` it, rename it to `profile.json`, and `fsync` the parent directory. It may idempotently accept an already-valid marker but must never replace an invalid or symbolic-link marker.
+Use `lstat` before trusting existing objects; directories must be real directories rather than symbolic links. Create/chmod profile directories to `0700`, canonicalize them, and require that they remain descendants of the canonical data root. Parse `profile.json` with a strict schema equivalent to `{ version: z.literal(1), creation_baseline: z.array(z.string().min(1)) }`; reject duplicates and non-sorted representations. `markActivated(creationBaseline)` sorts/deduplicates its input, creates a mode-`0600` temporary regular file, `fsync`s it, renames it to `profile.json`, `fsync`s the parent directory, and updates the returned object's in-memory `activationRequired`/`creationBaseline` state for the same startup. It may idempotently accept an already-valid identical marker but must never replace a different valid marker, an invalid marker, or a symbolic-link marker.
 
 - [ ] **Step 4: Run the profile tests and verify GREEN**
 
@@ -339,21 +340,23 @@ assert.equal(await activateCoordinatorProfileIdentity({
   coordinatorDir: dir,
   activationRequired: true,
   beforeReset: async () => { order.push("reconcile"); },
-  markActivated: async () => { order.push("marker"); },
+  captureCreationBaseline: async () => { order.push("baseline"); return ["pre-existing-thread"]; },
+  markActivated: async (baseline) => { order.push(`marker:${baseline.join(",")}`); },
 }), true);
-assert.deepEqual(order, ["reconcile", "marker"]);
+assert.deepEqual(order, ["reconcile", "baseline", "marker:pre-existing-thread"]);
 assert.equal(registry.snapshot().coordinator.thread_id, "pending");
 assert.equal(registry.snapshot().coordinator.endpoint, "coordinator-local");
 assert.deepEqual(registry.snapshot().sessions, originalSessions);
 ```
 
-Intercept the registry write or read the file after each callback to prove the durable order is `beforeReset` → registry pending → marker. Add tests that no activation work happens when `activationRequired` is false; endpoint/workdir mismatch fails before `beforeReset`; and marker failure leaves the registry pending so retry is safe.
+Intercept the registry write or read the file after each callback to prove the durable order is `beforeReset` → exhaustive baseline capture → registry pending → marker. Add tests that no activation work happens when `activationRequired` is false; endpoint/workdir mismatch fails before `beforeReset`; baseline capture failure leaves the registry unchanged; and marker failure leaves the registry pending so retry is safe.
 
 Add pending-identity discovery tests. The fake endpoint returns paginated `thread/list` rows for `sourceKinds: ["appServer"]`, `archived: false`, `useStateDbOnly: false`, and the exact coordinator `cwd`. Prove:
 
-- no eligible candidate calls `thread/start`;
-- one exact, persistent, top-level candidate calls `thread/resume` and stores that ID;
-- two eligible candidates fail with `CONFIGURATION_ERROR` before starting or resuming either;
+- no post-baseline eligible candidate calls `thread/start`;
+- a sole pre-existing baseline candidate is ignored and a new thread is started;
+- one exact, persistent, top-level candidate absent from the baseline calls `thread/resume` and stores that ID;
+- two post-baseline eligible candidates fail with `CONFIGURATION_ERROR` before starting or resuming either;
 - ephemeral, child, archived, and mismatched-cwd rows are ignored;
 - all pages are exhausted before the choice is made.
 
@@ -379,13 +382,16 @@ export async function activateCoordinatorProfileIdentity(input: {
   coordinatorDir: string;
   activationRequired: boolean;
   beforeReset(): Promise<void>;
-  markActivated(): Promise<void>;
+  captureCreationBaseline(): Promise<readonly string[]>;
+  markActivated(creationBaseline: readonly string[]): Promise<void>;
 }): Promise<boolean>;
 ```
 
-If activation is required, validate first, await `beforeReset`, atomically set only the coordinator to `{ endpoint: endpointId, thread_id: "pending", project_dir: coordinatorDir }`, then await `markActivated`. Do not catch failures and do not mutate project mappings.
+If activation is required, validate first, await `beforeReset`, exhaustively capture the isolated endpoint's eligible pre-creation thread IDs, atomically set only the coordinator to `{ endpoint: endpointId, thread_id: "pending", project_dir: coordinatorDir }`, then persist that exact baseline through `markActivated`. Do not catch failures and do not mutate project mappings.
 
-When `resumeCoordinatorIdentity` sees `thread_id: "pending"`, exhaust `thread/list` for non-archived app-server threads in the exact canonical workdir. Filter ephemeral and child rows. Start only when there are no candidates, resume the sole candidate, and fail closed on ambiguity. Apply the same returned-thread ID and cwd verification to both start and recovered resume paths. This makes `profile marker exists + registry pending` a durable creation-recovery state across a crash after app-server persisted a new thread but before the registry write.
+When `resumeCoordinatorIdentity` sees `thread_id: "pending"`, exhaust `thread/list` for non-archived app-server threads in the exact canonical workdir. Filter ephemeral and child rows, then subtract `creationBaseline`. Start only when there are no post-baseline candidates, resume the sole post-baseline candidate, and fail closed on post-baseline ambiguity. Never adopt a baseline candidate. Apply the same returned-thread ID and cwd verification to both start and recovered resume paths. This makes `profile marker exists + registry pending` a durable, provenance-preserving creation-recovery state across a crash after app-server persisted a new thread but before the registry write.
+
+Export the exhaustive `listCoordinatorThreadCandidates(endpoint, coordinatorDir)` helper so first activation and pending recovery use identical pagination and filtering. Add `creationBaseline: readonly string[]` to `resumeCoordinatorIdentity` input; ordinary non-pending resume ignores it.
 
 - [ ] **Step 4: Run identity tests and verify GREEN**
 
@@ -481,13 +487,14 @@ Implement this callback-oriented helper:
 export async function recoverCoordinatorProfileAttempts(input: {
   runtime: CoordinatorRuntime;
   legacyThreadId: string;
-  readLegacyThread(): Promise<{ turns: LegacyTurn[] }>;
+  coordinatorDir: string;
+  readLegacyThread(): Promise<{ id: string; cwd: string; turns: LegacyTurn[] }>;
   reconcileOperations(): Promise<void>;
   completeTurn(turn: LegacyTurn): Promise<void>;
 }): Promise<void>;
 ```
 
-Reconcile operations first. If no active attempts exist, return without reading legacy history. Otherwise require a successful legacy read when the old ID is not `pending`. Match provisional attempts to turns by the source context's persisted user-message `clientId`, bind the real turn ID, and pass completed turns to `completeTurn`. Failed/interrupted terminal turns and genuinely unresolved attempts go through `runtime.failAttempt` after operation reconciliation. Do not enqueue directly: the scheduler is still disabled, and its normal startup scan will select pending original or recovery sources after coordinator activation.
+Reconcile operations first. If no active attempts exist, return without reading legacy history. Otherwise require a successful legacy read when the old ID is not `pending`, require `thread.id === legacyThreadId`, and require `realpath(thread.cwd) === realpath(coordinatorDir)` before matching any attempt. Any read, identity, or cwd failure aborts migration without completing, failing, or requeueing attempts. Match provisional attempts to turns by the source context's persisted user-message `clientId`, bind the real turn ID, and pass completed turns to `completeTurn`. Failed/interrupted terminal turns and genuinely unresolved attempts go through `runtime.failAttempt` after operation reconciliation. Do not enqueue directly: the scheduler is still disabled, and its normal startup scan will select pending original or recovery sources after coordinator activation.
 
 - [ ] **Step 6: Run recovery tests and verify GREEN**
 
@@ -529,6 +536,7 @@ Use `startAuthenticatedCoordinatorEndpoint` for the initial coordinator start an
 await recoverCoordinatorProfileAttempts({
   runtime: coordinator,
   legacyThreadId: registry.snapshot().coordinator.thread_id,
+  coordinatorDir,
   readLegacyThread: async () => (await endpoint.request("thread/read", {
     threadId: registry.snapshot().coordinator.thread_id,
     includeTurns: true,
@@ -539,6 +547,8 @@ await recoverCoordinatorProfileAttempts({
 ```
 
 `completeLegacyCoordinatorTurn` persists terminal agent messages under the semantic `coordinator-local` identity, then calls `CoordinatorRuntime.handleTerminal` so an already-produced user answer is queued exactly once. Then start/resume the coordinator with the existing manager MCP config. Leave scheduler and polling disabled until this completes. The existing post-start operation and attempt reconciliation remains in place for ordinary restarts.
+
+The activation call supplies `captureCreationBaseline: () => listCoordinatorThreadCandidates(coordinatorEndpoint, coordinatorDir)` and `markActivated: (baseline) => coordinatorProfile.markActivated(baseline)`. Every call to `resumeCoordinatorIdentity` supplies `creationBaseline: coordinatorProfile.creationBaseline`, including reconnect. Thus a pre-existing isolated-profile thread can never become the manager merely because it shares the coordinator cwd.
 
 On reconnect, authentication failure must leave the coordinator endpoint stopped/unavailable, keep scheduling disabled, and call `recordCoordinatorAuthenticationFailure(deliveries, destination, endpointIncident, error)`. Implement that function in `src/coordinator/auth-recovery.ts`; it prepares `id: coordinator-auth-required:<incident>` as a mandatory `system_warning` containing only the actionable `coordinator-login` instruction and structural error text. `DeliveryStore.prepare` provides same-incident idempotency. Bounded reconnect continues without accepting coordinator turns.
 
