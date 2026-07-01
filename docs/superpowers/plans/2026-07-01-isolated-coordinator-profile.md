@@ -78,6 +78,7 @@ export interface PreparedCoordinatorProfile {
   codexHome: string;
   markerPath: string;
   activationRequired: boolean;
+  creationNonce: string;
   creationBaseline: readonly string[];
   markActivated(creationBaseline: readonly string[]): Promise<void>;
 }
@@ -85,7 +86,7 @@ export interface PreparedCoordinatorProfile {
 export async function prepareCoordinatorProfile(dataRoot: string): Promise<PreparedCoordinatorProfile>;
 ```
 
-Use `lstat` before trusting existing objects; directories must be real directories rather than symbolic links. Create/chmod profile directories to `0700`, canonicalize them, and require that they remain descendants of the canonical data root. Parse `profile.json` with a strict schema equivalent to `{ version: z.literal(1), creation_baseline: z.array(z.string().min(1)) }`; reject duplicates and non-sorted representations. `markActivated(creationBaseline)` sorts/deduplicates its input, creates a mode-`0600` temporary regular file, `fsync`s it, renames it to `profile.json`, `fsync`s the parent directory, and updates the returned object's in-memory `activationRequired`/`creationBaseline` state for the same startup. It may idempotently accept an already-valid identical marker but must never replace a different valid marker, an invalid marker, or a symbolic-link marker.
+Use `lstat` before trusting existing objects; directories must be real directories rather than symbolic links. Create/chmod profile directories to `0700`, canonicalize them, and require that they remain descendants of the canonical data root. Parse `profile.json` with a strict schema equivalent to `{ version: z.literal(1), creation_nonce: z.string().uuid(), creation_baseline: z.array(z.string().min(1)) }`; reject duplicates and non-sorted baselines. For an absent marker, generate `creationNonce` with `randomUUID()`. `markActivated(creationBaseline)` sorts/deduplicates its input, writes that nonce, creates a mode-`0600` temporary regular file, `fsync`s it, renames it to `profile.json`, `fsync`s the parent directory, and updates the returned object's in-memory `activationRequired`/`creationBaseline` state for the same startup. It may idempotently accept an already-valid identical marker but must never replace a different valid marker, an invalid marker, or a symbolic-link marker.
 
 - [ ] **Step 4: Run the profile tests and verify GREEN**
 
@@ -353,10 +354,11 @@ Intercept the registry write or read the file after each callback to prove the d
 
 Add pending-identity discovery tests. The fake endpoint returns paginated `thread/list` rows for `sourceKinds: ["appServer"]`, `archived: false`, `useStateDbOnly: false`, and the exact coordinator `cwd`. Prove:
 
-- no post-baseline eligible candidate calls `thread/start`;
-- a sole pre-existing baseline candidate is ignored and a new thread is started;
-- one exact, persistent, top-level candidate absent from the baseline calls `thread/resume` and stores that ID;
-- two post-baseline eligible candidates fail with `CONFIGURATION_ERROR` before starting or resuming either;
+- no matching post-baseline candidate calls `thread/start` with `threadSource: creationNonce`;
+- a sole pre-existing baseline candidate with the nonce is ignored and a new thread is started;
+- a sole post-baseline candidate with a different or null `threadSource` is ignored and a new nonce-tagged thread is started;
+- one exact, persistent, top-level candidate absent from the baseline with `threadSource === creationNonce` calls `thread/resume` and stores that ID;
+- two matching post-baseline candidates fail with `CONFIGURATION_ERROR` before starting or resuming either;
 - ephemeral, child, archived, and mismatched-cwd rows are ignored;
 - all pages are exhausted before the choice is made.
 
@@ -389,9 +391,9 @@ export async function activateCoordinatorProfileIdentity(input: {
 
 If activation is required, validate first, await `beforeReset`, exhaustively capture the isolated endpoint's eligible pre-creation thread IDs, atomically set only the coordinator to `{ endpoint: endpointId, thread_id: "pending", project_dir: coordinatorDir }`, then persist that exact baseline through `markActivated`. Do not catch failures and do not mutate project mappings.
 
-When `resumeCoordinatorIdentity` sees `thread_id: "pending"`, exhaust `thread/list` for non-archived app-server threads in the exact canonical workdir. Filter ephemeral and child rows, then subtract `creationBaseline`. Start only when there are no post-baseline candidates, resume the sole post-baseline candidate, and fail closed on post-baseline ambiguity. Never adopt a baseline candidate. Apply the same returned-thread ID and cwd verification to both start and recovered resume paths. This makes `profile marker exists + registry pending` a durable, provenance-preserving creation-recovery state across a crash after app-server persisted a new thread but before the registry write.
+When `resumeCoordinatorIdentity` sees `thread_id: "pending"`, exhaust `thread/list` for non-archived app-server threads in the exact canonical workdir. Filter ephemeral and child rows, require `threadSource === creationNonce`, then subtract `creationBaseline`. Start with `threadSource: creationNonce` only when there are no matching post-baseline candidates, resume the sole match, and fail closed on matching ambiguity. Never adopt a baseline or nonce-mismatched candidate. Apply returned thread ID, cwd, and nonce verification to both start and recovered resume paths. This makes `profile marker exists + registry pending` a durable, provenance-preserving creation-recovery state across a crash after app-server persisted a new thread but before the registry write.
 
-Export the exhaustive `listCoordinatorThreadCandidates(endpoint, coordinatorDir)` helper so first activation and pending recovery use identical pagination and filtering. Add `creationBaseline: readonly string[]` to `resumeCoordinatorIdentity` input; ordinary non-pending resume ignores it.
+Export the exhaustive `listCoordinatorThreadCandidates(endpoint, coordinatorDir)` helper so first activation and pending recovery use identical pagination and structural filtering. Add `creationNonce: string` and `creationBaseline: readonly string[]` to `resumeCoordinatorIdentity` input; ordinary non-pending resume ignores them.
 
 - [ ] **Step 4: Run identity tests and verify GREEN**
 
@@ -548,7 +550,7 @@ await recoverCoordinatorProfileAttempts({
 
 `completeLegacyCoordinatorTurn` persists terminal agent messages under the semantic `coordinator-local` identity, then calls `CoordinatorRuntime.handleTerminal` so an already-produced user answer is queued exactly once. Then start/resume the coordinator with the existing manager MCP config. Leave scheduler and polling disabled until this completes. The existing post-start operation and attempt reconciliation remains in place for ordinary restarts.
 
-The activation call supplies `captureCreationBaseline: () => listCoordinatorThreadCandidates(coordinatorEndpoint, coordinatorDir)` and `markActivated: (baseline) => coordinatorProfile.markActivated(baseline)`. Every call to `resumeCoordinatorIdentity` supplies `creationBaseline: coordinatorProfile.creationBaseline`, including reconnect. Thus a pre-existing isolated-profile thread can never become the manager merely because it shares the coordinator cwd.
+The activation call supplies `captureCreationBaseline: () => listCoordinatorThreadCandidates(coordinatorEndpoint, coordinatorDir)` and `markActivated: (baseline) => coordinatorProfile.markActivated(baseline)`. Every call to `resumeCoordinatorIdentity` supplies `creationNonce: coordinatorProfile.creationNonce` and `creationBaseline: coordinatorProfile.creationBaseline`, including reconnect. Thus a foreign isolated-profile thread can never become the manager merely because it was created after activation and shares the coordinator cwd.
 
 On reconnect, authentication failure must leave the coordinator endpoint stopped/unavailable, keep scheduling disabled, and call `recordCoordinatorAuthenticationFailure(deliveries, destination, endpointIncident, error)`. Implement that function in `src/coordinator/auth-recovery.ts`; it prepares `id: coordinator-auth-required:<incident>` as a mandatory `system_warning` containing only the actionable `coordinator-login` instruction and structural error text. `DeliveryStore.prepare` provides same-incident idempotency. Bounded reconnect continues without accepting coordinator turns.
 
@@ -589,6 +591,8 @@ coordinator-codex-home/
 ```
 
 Start a `LocalEndpoint` with `HOME=coordinator-home`, `CODEX_HOME=coordinator-codex-home`, and `expectedCodexHome=coordinator-codex-home`. Call `skills/list` with `cwds: [coordinatorWorkdir]` and `forceReload: true`. Assert that `coordinator-only` and `coordinator-workdir` are present and `normal-user-only` is absent. This test does not make a model request and must not read or copy real credentials.
+
+On the same isolated app-server, call `thread/start` with a random `threadSource` nonce, `ephemeral: false`, and the coordinator workdir. Exhaust `thread/list` and assert the returned thread preserves that exact `threadSource`; call `thread/read` and assert it again. This protocol check proves the provenance field used by crash recovery is durable and discoverable without a model turn.
 
 Add a second workdir nested beneath a temporary `.git` root containing `.agents/skills/repository-parent/SKILL.md`. Assert Codex discovers `repository-parent`, while still excluding `normal-user-only`. This defines the promised boundary precisely: real-home skills are isolated, but repository skills intentionally follow Codex project discovery.
 

@@ -19,7 +19,7 @@ The backend owns a fixed profile root beneath the canonical data directory:
 
 ```text
 <DATA_DIR>/coordinator-profile/
-  profile.json                 # version plus pre-creation thread baseline
+  profile.json                 # version, creation nonce, and thread baseline
   home/
     .agents/skills/          # optional coordinator-only user skills
   codex/
@@ -55,17 +55,17 @@ Logging out of the user's normal profile does not log out the isolated file-back
 
 Threads are stored under one app-server's `CODEX_HOME`; consequently, the existing coordinator thread in the user's normal Codex home cannot be resumed by the isolated endpoint. Project threads must never be moved or rewritten.
 
-`profile.json` is a bot-managed activation marker with schema version 1 and the sorted IDs of all eligible coordinator-workdir threads observed before bot creation begins. On the first isolated-profile startup:
+`profile.json` is a bot-managed activation marker with schema version 1, a cryptographically random bot creation nonce, and the sorted IDs of all eligible coordinator-workdir threads observed before bot creation begins. On the first isolated-profile startup:
 
 1. Validate that the registry's coordinator endpoint and canonical workdir still match the configured coordinator. This preserves the current fail-closed path checks.
 2. Reconcile every recoverable manager operation using durable backend and worker state.
 3. Read the old coordinator thread through the normal-profile worker endpoint. Require the returned thread ID to equal the registered legacy ID and its canonical cwd to equal the configured coordinator workdir before inspecting any turn. For each active SQLite attempt, bind a provisional attempt to its persisted turn by client message ID when possible. Apply already-terminal turns through the normal final-message and attempt-completion path so a completed answer is delivered rather than replayed.
 4. Fail only the remaining unresolved active coordinator attempts through the existing recovery rules. Attempts without dispatched effects return their source context to the pending queue; attempts with proven or uncertain effects create one recovery context and are not blindly replayed.
 5. Atomically replace only the coordinator registry identity with `thread_id: "pending"`; preserve every project-session mapping exactly.
-6. Exhaustively query all non-archived, top-level, persistent app-server threads already in the isolated profile for the exact coordinator workdir. Atomically write their sorted IDs as `creation_baseline` in `profile.json` before starting bot creation. This ordering makes a crash before thread creation resume the pending creation path rather than repeatedly resetting a successfully registered isolated identity.
-7. Query the same candidate set again and subtract the durable baseline. Resume the sole post-baseline candidate left by a prior interrupted bot creation, create a new thread when none exists, and fail closed when multiple post-baseline candidates make provenance ambiguous. Never adopt a baseline thread. Atomically store the verified identity.
+6. Exhaustively query all non-archived, top-level, persistent app-server threads already in the isolated profile for the exact coordinator workdir. Atomically write their sorted IDs as `creation_baseline` and a new `creation_nonce` in `profile.json` before starting bot creation. This ordering makes a crash before thread creation resume the pending creation path rather than repeatedly resetting a successfully registered isolated identity.
+7. Start a new coordinator with `threadSource` set to the durable nonce. During pending recovery, query the same candidate set, require an exact `threadSource` nonce match, and subtract the durable baseline. Resume the sole matching post-baseline candidate left by a prior interrupted bot creation, create a new thread when none exists, and fail closed when multiple matching candidates make provenance ambiguous. Never adopt a baseline or nonce-mismatched thread. Atomically store the verified identity.
 
-When the marker already exists, startup resumes the stored isolated coordinator normally. The `marker exists + registry pending` state is the durable creation-recovery state: baseline-difference discovery recovers a thread persisted immediately before a process crash instead of orphaning it, adopting a pre-existing thread, or creating another. A missing, malformed, unsupported, symbolic-link, or non-regular marker fails closed except that a genuinely absent marker selects the first-activation path. Deleting the entire profile deliberately causes a new isolated coordinator identity on the next successful authenticated startup.
+When the marker already exists, startup resumes the stored isolated coordinator normally. The `marker exists + registry pending` state is the durable creation-recovery state: nonce-plus-baseline discovery recovers a bot-created thread persisted immediately before a process crash instead of orphaning it, adopting a foreign thread, or creating another. A missing, malformed, unsupported, symbolic-link, or non-regular marker fails closed except that a genuinely absent marker selects the first-activation path. Deleting the entire profile deliberately causes a new isolated coordinator identity on the next successful authenticated startup.
 
 The coordinator's durable knowledge does not depend solely on its old transcript: the authoritative session registry, SQLite operation/outbox/runtime state, generated session dashboard, and managed policy survive the migration. The first new coordinator turn therefore sees current management state without copying the old rollout into the isolated profile.
 
@@ -100,7 +100,7 @@ Automated tests prove:
 - missing coordinator authentication stops startup before identity migration and reports the login paths;
 - first activation validates the existing identity, reconciles active attempts, resets only the coordinator identity, persists the marker in crash-safe order, and creates a new coordinator thread;
 - a completed legacy turn recorded only in the old rollout is terminalized and delivered rather than replayed;
-- `marker exists + registry pending` ignores every pre-activation baseline thread, adopts one already-created post-baseline thread, and rejects ambiguous post-baseline candidates;
+- `marker exists + registry pending` ignores every baseline or nonce-mismatched thread, adopts one bot-nonce post-baseline thread, and rejects ambiguous matching candidates;
 - subsequent startup resumes the isolated thread without resetting it;
 - coordinator endpoint reconnect repeats authentication preflight and surfaces one actionable warning for an unauthenticated incident;
 - project registry entries and worker endpoint/session discovery remain unchanged;
