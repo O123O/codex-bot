@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -38,12 +38,13 @@ test("nickname reconciliation reloads coordinator edits instead of overwriting t
   assert.equal(notebook.snapshot().sessions.new?.project_status, "new coordinator edit");
 });
 
-test("invalid live JSON is quarantined and recreated", async () => {
+test("invalid live JSON stops startup without replacing supervision memory", async () => {
   const dir = await mkdtemp(join(tmpdir(), "codex-bot-notebook-"));
   const example = join(dir, "example.json");
   const live = join(dir, "session-status.json");
   await writeFile(example, '{"version":1,"sessions":{}}');
   await writeFile(live, "invalid");
-  const notebook = await CoordinatorNotebook.bootstrap(live, example);
-  assert.deepEqual(notebook.snapshot().sessions, {});
+  await assert.rejects(CoordinatorNotebook.bootstrap(live, example), /invalid coordinator notebook.*session-status\.json/);
+  assert.equal(await readFile(live, "utf8"), "invalid");
+  assert.deepEqual((await readdir(dir)).filter((name) => name.includes(".invalid-")), []);
 });

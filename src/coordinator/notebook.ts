@@ -1,6 +1,7 @@
-import { copyFile, mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { z } from "zod";
+import { AppError } from "../core/errors.ts";
 
 const entrySchema = z.object({
   thread_id: z.string().min(1),
@@ -26,17 +27,16 @@ export class CoordinatorNotebook {
 
   static async bootstrap(path: string, examplePath: string): Promise<CoordinatorNotebook> {
     await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+    let source: string;
     try {
-      const document = notebookSchema.parse(JSON.parse(await readFile(path, "utf8")));
-      return new CoordinatorNotebook(path, document);
+      source = await readFile(path, "utf8");
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-        try { await rename(path, `${path}.invalid-${Date.now()}`); } catch { /* already absent */ }
-      }
-      await copyFile(examplePath, path);
-      const document = notebookSchema.parse(JSON.parse(await readFile(path, "utf8")));
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw new AppError("CONFIGURATION_ERROR", `invalid coordinator notebook ${path}`);
+      const document = parseNotebook(await readFile(examplePath, "utf8"), path);
+      await writeAtomic(path, document);
       return new CoordinatorNotebook(path, document);
     }
+    return new CoordinatorNotebook(path, parseNotebook(source, path));
   }
 
   snapshot(): NotebookDocument {
@@ -59,5 +59,13 @@ export class CoordinatorNotebook {
     } finally {
       release();
     }
+  }
+}
+
+function parseNotebook(source: string, path: string): NotebookDocument {
+  try {
+    return notebookSchema.parse(JSON.parse(source));
+  } catch {
+    throw new AppError("CONFIGURATION_ERROR", `invalid coordinator notebook ${path}`);
   }
 }
