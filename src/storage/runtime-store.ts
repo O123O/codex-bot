@@ -1,12 +1,13 @@
 import type { ManagementState } from "../core/types.ts";
 import type { Database } from "./database.ts";
+import { inTransaction } from "./database.ts";
 
 export class RuntimeStore {
   constructor(private readonly db: Database) {}
 
-  setSession(endpointId: string, threadId: string, managementState: ManagementState, nativeStatus = "notLoaded"): void {
-    this.db.prepare(`INSERT INTO session_runtime(endpoint_id, thread_id, management_state, native_status)
-      VALUES (?, ?, ?, ?)
+  setSession(endpointId: string, threadId: string, managementState: ManagementState, nativeStatus = "notLoaded", observationSequence?: number): void {
+    this.db.prepare(`INSERT INTO session_runtime(endpoint_id, thread_id, management_state, native_status, native_observation_sequence)
+      VALUES (?, ?, ?, ?, ?)
       ON CONFLICT(endpoint_id, thread_id) DO UPDATE SET
         restore_state = CASE
           WHEN excluded.management_state = 'unavailable' AND session_runtime.management_state <> 'unavailable' THEN session_runtime.management_state
@@ -14,35 +15,54 @@ export class RuntimeStore {
           ELSE NULL
         END,
         management_state = excluded.management_state,
-        native_status = excluded.native_status`)
-      .run(endpointId, threadId, managementState, nativeStatus);
+        native_status = CASE WHEN ? IS NULL OR ? > session_runtime.native_observation_sequence THEN excluded.native_status ELSE session_runtime.native_status END,
+        native_observation_sequence = CASE WHEN ? IS NOT NULL AND ? > session_runtime.native_observation_sequence THEN ? ELSE session_runtime.native_observation_sequence END`)
+      .run(endpointId, threadId, managementState, nativeStatus, observationSequence ?? 0,
+        observationSequence ?? null, observationSequence ?? null,
+        observationSequence ?? null, observationSequence ?? null, observationSequence ?? null);
   }
 
-  getSession(endpointId: string, threadId: string): { managementState: ManagementState; restoreState?: ManagementState; nativeStatus: string; deliveryCursor?: string } | undefined {
+  getSession(endpointId: string, threadId: string): { managementState: ManagementState; restoreState?: ManagementState; nativeStatus: string; nativeObservationSequence: number; deliveryCursor?: string } | undefined {
     const row = this.db.prepare("SELECT * FROM session_runtime WHERE endpoint_id = ? AND thread_id = ?").get(endpointId, threadId) as Record<string, unknown> | undefined;
     if (!row) return undefined;
     return {
       managementState: String(row.management_state) as ManagementState,
       ...(row.restore_state ? { restoreState: String(row.restore_state) as ManagementState } : {}),
       nativeStatus: String(row.native_status),
+      nativeObservationSequence: Number(row.native_observation_sequence ?? 0),
       ...(row.delivery_cursor ? { deliveryCursor: String(row.delivery_cursor) } : {}),
     };
   }
 
-  setActiveTurn(endpointId: string, threadId: string, turnId: string | undefined): void {
-    this.db.prepare("UPDATE session_runtime SET active_turn_id = ?, native_status = ? WHERE endpoint_id = ? AND thread_id = ?")
-      .run(turnId ?? null, turnId ? "active" : "idle", endpointId, threadId);
+  setActiveTurn(endpointId: string, threadId: string, turnId: string | undefined, observationSequence?: number): boolean {
+    if (observationSequence === undefined) {
+      return this.db.prepare("UPDATE session_runtime SET active_turn_id = ?, native_status = ? WHERE endpoint_id = ? AND thread_id = ?")
+        .run(turnId ?? null, turnId ? "active" : "idle", endpointId, threadId).changes === 1;
+    }
+    return this.db.prepare(`UPDATE session_runtime SET active_turn_id = ?, native_status = ?, native_observation_sequence = ?
+      WHERE endpoint_id = ? AND thread_id = ? AND native_observation_sequence < ?`)
+      .run(turnId ?? null, turnId ? "active" : "idle", observationSequence, endpointId, threadId, observationSequence).changes === 1;
   }
 
-  clearActiveTurn(endpointId: string, threadId: string, turnId: string): boolean {
-    return this.db.prepare(`UPDATE session_runtime SET active_turn_id = NULL, native_status = 'idle'
-      WHERE endpoint_id = ? AND thread_id = ? AND active_turn_id = ?`)
-      .run(endpointId, threadId, turnId).changes === 1;
+  clearActiveTurn(endpointId: string, threadId: string, turnId: string, observationSequence?: number): boolean {
+    if (observationSequence === undefined) {
+      return this.db.prepare(`UPDATE session_runtime SET active_turn_id = NULL, native_status = 'idle'
+        WHERE endpoint_id = ? AND thread_id = ? AND active_turn_id = ?`)
+        .run(endpointId, threadId, turnId).changes === 1;
+    }
+    return this.db.prepare(`UPDATE session_runtime SET active_turn_id = NULL, native_status = 'idle', native_observation_sequence = ?
+      WHERE endpoint_id = ? AND thread_id = ? AND active_turn_id = ? AND native_observation_sequence < ?`)
+      .run(observationSequence, endpointId, threadId, turnId, observationSequence).changes === 1;
   }
 
-  reconcileNativeState(endpointId: string, threadId: string, nativeStatus: string, activeTurnId?: string): void {
-    this.db.prepare("UPDATE session_runtime SET native_status = ?, active_turn_id = ? WHERE endpoint_id = ? AND thread_id = ?")
-      .run(nativeStatus, activeTurnId ?? null, endpointId, threadId);
+  reconcileNativeState(endpointId: string, threadId: string, nativeStatus: string, activeTurnId?: string, observationSequence?: number): boolean {
+    if (observationSequence === undefined) {
+      return this.db.prepare("UPDATE session_runtime SET native_status = ?, active_turn_id = ? WHERE endpoint_id = ? AND thread_id = ?")
+        .run(nativeStatus, activeTurnId ?? null, endpointId, threadId).changes === 1;
+    }
+    return this.db.prepare(`UPDATE session_runtime SET native_status = ?, active_turn_id = ?, native_observation_sequence = ?
+      WHERE endpoint_id = ? AND thread_id = ? AND native_observation_sequence < ?`)
+      .run(nativeStatus, activeTurnId ?? null, observationSequence, endpointId, threadId, observationSequence).changes === 1;
   }
 
   activeTurn(endpointId: string, threadId: string): string | undefined {
@@ -67,8 +87,18 @@ export class RuntimeStore {
     return row ? { ...(row.model ? { model: row.model } : {}), ...(row.effort ? { effort: row.effort } : {}) } : {};
   }
 
-  consumeSettings(endpointId: string, threadId: string): { model?: string; effort?: string } {
-    return this.settings(endpointId, threadId);
+  consumeSettings(endpointId: string, threadId: string, expected: { model?: string; effort?: string } = this.settings(endpointId, threadId)): { model?: string; effort?: string } {
+    return inTransaction(this.db, () => {
+      if (Object.hasOwn(expected, "model")) {
+        this.db.prepare("UPDATE session_runtime SET model = NULL WHERE endpoint_id = ? AND thread_id = ? AND model = ?")
+          .run(endpointId, threadId, expected.model ?? null);
+      }
+      if (Object.hasOwn(expected, "effort")) {
+        this.db.prepare("UPDATE session_runtime SET effort = NULL WHERE endpoint_id = ? AND thread_id = ? AND effort = ?")
+          .run(endpointId, threadId, expected.effort ?? null);
+      }
+      return { ...expected };
+    });
   }
 
   listSessions(): Array<{ endpointId: string; threadId: string; managementState: ManagementState; restoreState?: ManagementState; nativeStatus: string }> {

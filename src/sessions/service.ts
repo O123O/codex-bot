@@ -14,7 +14,7 @@ export class SessionService {
     private readonly deliveries: DeliveryStore,
   ) {}
 
-  async send(nickname: string, text: string, options: { mode?: "auto" | "start" | "steer"; clientUserMessageId?: string; input?: unknown[] } = {}): Promise<{ mode: "start" | "steer"; turnId: string; terminal?: boolean }> {
+  async send(nickname: string, text: string, options: { mode?: "auto" | "start" | "steer"; clientUserMessageId?: string; input?: unknown[]; settings?: { model?: string; effort?: string } } = {}): Promise<{ mode: "start" | "steer"; turnId: string; terminal?: boolean; appliedSettings?: { model?: string; effort?: string } }> {
     const session = this.required(nickname);
     const state = this.runtime.getSession(session.endpoint, session.thread_id);
     if (!state || state.managementState !== "managed") throw new AppError("SESSION_DETACHED", `${nickname} is not managed`);
@@ -37,16 +37,16 @@ export class SessionService {
       }
     }
     if (mode === "steer") throw new AppError("SESSION_IDLE", `${nickname} has no active turn`);
-    const settings = this.runtime.settings(session.endpoint, session.thread_id);
+    const settings = options.settings ?? this.runtime.settings(session.endpoint, session.thread_id);
     const response = await this.pool.startTurn<{ turn: { id: string; status?: string } }>(session.endpoint, {
       threadId: session.thread_id, ...(options.clientUserMessageId ? { clientUserMessageId: options.clientUserMessageId } : {}), input, ...settings,
     });
-    this.runtime.consumeSettings(session.endpoint, session.thread_id);
+    this.runtime.consumeSettings(session.endpoint, session.thread_id, settings);
     const terminal = new Set(["completed", "failed", "interrupted"]).has(response.turn.status ?? "");
     if (!terminal) {
       this.runtime.setActiveTurn(session.endpoint, session.thread_id, response.turn.id);
     }
-    return { mode: "start", turnId: response.turn.id, terminal };
+    return { mode: "start", turnId: response.turn.id, terminal, appliedSettings: settings };
   }
 
   async interrupt(nickname: string, turnId?: string): Promise<void> {
@@ -105,19 +105,10 @@ export class SessionService {
     const goal = await this.getGoal(nickname).catch(() => undefined);
     return {
       nickname,
-      endpoint: session.endpoint,
-      threadId: session.thread_id,
-      projectDir: session.project_dir,
+      identity: { endpoint: session.endpoint, threadId: session.thread_id, projectDir: session.project_dir },
       managementState: runtime?.managementState ?? "unavailable",
-      nativeStatus: native.thread.status,
+      nativeStatus: native.thread.status?.type ?? "unknown",
       activeTurnId: this.runtime.activeTurn(session.endpoint, session.thread_id) ?? null,
-      pendingSettings: this.runtime.settings(session.endpoint, session.thread_id),
-      configuredSettings: {
-        ...this.runtime.settings(session.endpoint, session.thread_id),
-        ...(native.thread.model ? { model: native.thread.model } : {}),
-        ...(native.thread.reasoningEffort ?? native.thread.effort ? { effort: native.thread.reasoningEffort ?? native.thread.effort } : {}),
-      },
-      deliveryCursor: runtime?.deliveryCursor ?? null,
       goal: goal && typeof goal === "object" && "goal" in goal ? (goal as any).goal : goal ?? null,
     };
   }

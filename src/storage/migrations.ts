@@ -248,4 +248,8 @@ export const migrations: readonly Migration[] = [
   CREATE INDEX IF NOT EXISTS session_dashboard_notifications_state_idx
     ON session_dashboard_notifications(state, sequence);
   `,
+  (db) => {
+    const columns = new Set((db.prepare("PRAGMA table_info(session_runtime)").all() as Array<{ name: string }>).map((row) => row.name));
+    if (!columns.has("native_observation_sequence")) db.exec("ALTER TABLE session_runtime ADD COLUMN native_observation_sequence INTEGER NOT NULL DEFAULT 0");
+  },
 ];

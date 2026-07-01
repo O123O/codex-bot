@@ -21,11 +21,16 @@ class ServiceEndpoint implements AppServerEndpoint {
   activeTurnId = "active-1";
   lastClientId: string | undefined;
   historyTurnStatus: string | undefined;
+  failNextStart = false;
   goal: any = null;
   loseNextGoalResponse = false;
   async request<T>(method: string, params: any): Promise<T> {
     this.calls.push({ method, params });
-    if (method === "turn/start") { this.lastClientId = params.clientUserMessageId; return { turn: { id: "started-1" } } as T; }
+    if (method === "turn/start") {
+      if (this.failNextStart) { this.failNextStart = false; throw new Error("start failed"); }
+      this.lastClientId = params.clientUserMessageId;
+      return { turn: { id: "started-1" } } as T;
+    }
     if (method === "turn/steer") return { turnId: params.expectedTurnId } as T;
     if (method === "thread/read") return { thread: { id: "thread", cwd: params.cwd, status: { type: this.status }, turns: this.lastClientId ? [{ id: "started-1", ...(this.historyTurnStatus ? { status: this.historyTurnStatus } : {}), items: [{ type: "userMessage", clientId: this.lastClientId }] }] : [] } } as T;
     if (method === "thread/goal/get") return { goal: this.goal } as T;
@@ -66,7 +71,8 @@ test("starts idle sessions, steers active sessions, and interrupts the exact tur
   assert.deepEqual(endpoint.calls.find((call) => call.method === "turn/start")?.params, {
     threadId: "thread", clientUserMessageId: "msg-1", input: [{ type: "text", text: "hello", text_elements: [] }], model: "gpt-5", effort: "high",
   });
-  assert.deepEqual(runtime.settings("local", "thread"), { model: "gpt-5", effort: "high" });
+  assert.deepEqual(started.appliedSettings, { model: "gpt-5", effort: "high" });
+  assert.deepEqual(runtime.settings("local", "thread"), {});
 
   runtime.setActiveTurn("local", "thread", "active-1");
   assert.equal((await service.send("payments", "more")).mode, "steer");
@@ -90,9 +96,34 @@ test("status composes registry, runtime, native state, settings, and goal", asyn
   const status = await service.status("payments") as any;
   assert.equal(status.nickname, "payments");
   assert.equal(status.managementState, "managed");
-  assert.equal(status.nativeStatus.type, "idle");
-  assert.deepEqual(status.pendingSettings, { model: "gpt-5" });
+  assert.equal(status.nativeStatus, "idle");
+  assert.deepEqual(status.identity, { endpoint: "local", threadId: "thread", projectDir: status.identity.projectDir });
+  assert.equal("pendingSettings" in status, false);
+  assert.equal("configuredSettings" in status, false);
   assert.equal(status.goal, null);
+});
+
+test("a failed start retains pending settings and steer never consumes them", async () => {
+  const { endpoint, runtime, service } = await fixture();
+  runtime.setModel("local", "thread", "gpt-5");
+  endpoint.failNextStart = true;
+  await assert.rejects(service.send("payments", "first", { mode: "start" }), /start failed/);
+  assert.deepEqual(runtime.settings("local", "thread"), { model: "gpt-5" });
+  runtime.setActiveTurn("local", "thread", "active-1");
+  const steered = await service.send("payments", "more", { mode: "steer", settings: { model: "ignored" } });
+  assert.equal("appliedSettings" in steered, false);
+  assert.deepEqual(runtime.settings("local", "thread"), { model: "gpt-5" });
+});
+
+test("uses the exact supplied settings snapshot and leaves a concurrent replacement pending", async () => {
+  const { endpoint, runtime, service } = await fixture();
+  runtime.setModel("local", "thread", "old-model");
+  const dispatched = runtime.settings("local", "thread");
+  runtime.setModel("local", "thread", "next-model");
+  const result = await service.send("payments", "work", { mode: "start", settings: dispatched });
+  assert.equal(endpoint.calls.find((call) => call.method === "turn/start")?.params.model, "old-model");
+  assert.deepEqual(result.appliedSettings, { model: "old-model" });
+  assert.deepEqual(runtime.settings("local", "thread"), { model: "next-model" });
 });
 
 test("a turn already terminal when turn/start resolves is not recorded as active", async () => {
