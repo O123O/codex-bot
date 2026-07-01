@@ -1,4 +1,5 @@
 export type ErrorCode =
+  | "CONFIGURATION_ERROR"
   | "UNKNOWN_SESSION"
   | "AMBIGUOUS_SESSION"
   | "SESSION_DETACHED"

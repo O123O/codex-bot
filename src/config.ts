@@ -1,5 +1,6 @@
 import { resolve } from "node:path";
 import { z } from "zod";
+import { AppError } from "./core/errors.ts";
 
 const positiveInt = z.coerce.number().int().positive();
 
@@ -7,6 +8,7 @@ const configSchema = z.object({
   TELEGRAM_BOT_TOKEN: z.string().min(1),
   TELEGRAM_OWNER_ID: z.coerce.number().int(),
   TELEGRAM_DESTINATION_CHAT_ID: z.coerce.number().int(),
+  COORDINATOR_WORKDIR: z.string().min(1).optional(),
   DATA_DIR: z.string().default("data"),
   SESSION_REGISTRY_PATH: z.string().default("data/sessions.json"),
   CODEX_BINARY: z.string().default("codex"),
@@ -26,6 +28,7 @@ export interface BotConfig {
   telegramBotToken: string;
   telegramOwnerId: number;
   telegramDestinationChatId: number;
+  coordinatorWorkdir: string;
   dataDir: string;
   sessionRegistryPath: string;
   codexBinary: string;
@@ -38,12 +41,17 @@ export interface BotConfig {
   sandboxMode: "read-only" | "workspace-write" | "danger-full-access";
 }
 
-export function loadConfig(env: Record<string, string | undefined>): BotConfig {
+export interface ConfigOverrides { coordinatorWorkdir?: string }
+
+export function loadConfig(env: Record<string, string | undefined>, overrides: ConfigOverrides = {}): BotConfig {
   const parsed = configSchema.parse(env);
+  const workdir = overrides.coordinatorWorkdir ?? parsed.COORDINATOR_WORKDIR;
+  if (!workdir) throw new AppError("CONFIGURATION_ERROR", "COORDINATOR_WORKDIR or --workdir is required");
   return {
     telegramBotToken: parsed.TELEGRAM_BOT_TOKEN,
     telegramOwnerId: parsed.TELEGRAM_OWNER_ID,
     telegramDestinationChatId: parsed.TELEGRAM_DESTINATION_CHAT_ID,
+    coordinatorWorkdir: resolve(workdir),
     dataDir: resolve(parsed.DATA_DIR),
     sessionRegistryPath: resolve(parsed.SESSION_REGISTRY_PATH),
     codexBinary: parsed.CODEX_BINARY,
