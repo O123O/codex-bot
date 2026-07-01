@@ -3,7 +3,9 @@ import { mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { formatStartupError } from "../../src/cli.ts";
 import { resumeCoordinatorIdentity } from "../../src/coordinator/identity.ts";
+import { AppError } from "../../src/core/errors.ts";
 import { SessionRegistry } from "../../src/registry/session-registry.ts";
 
 test("a legacy local coordinator mapping migrates atomically after exact resume verification", async () => {
@@ -51,4 +53,33 @@ test("legacy coordinator migration does not rewrite identity when resumed cwd di
     config: {},
   }), /working directory/);
   assert.equal(JSON.parse(await readFile(path, "utf8")).coordinator.endpoint, "local");
+});
+
+test("configured coordinator directory mismatch is a safe startup error before app-server access", async () => {
+  const registered = await mkdtemp(join(tmpdir(), "coordinator-identity-registered-"));
+  const configured = await mkdtemp(join(tmpdir(), "coordinator-identity-configured-"));
+  const path = join(registered, "sessions.json");
+  const registry = await SessionRegistry.open(path, {
+    version: 1,
+    coordinator: { endpoint: "coordinator-local", thread_id: "thread", project_dir: registered },
+    sessions: {},
+  });
+  let requests = 0;
+  let failure: unknown;
+  try {
+    await resumeCoordinatorIdentity({
+      registry,
+      endpoint: { id: "coordinator-local", request: async <T>() => { requests += 1; return {} as T; } },
+      legacyEndpointId: "local",
+      coordinatorDir: configured,
+      sandboxMode: "workspace-write",
+      config: {},
+    });
+  } catch (error) {
+    failure = error;
+  }
+  assert.ok(failure instanceof AppError);
+  assert.equal(failure.code, "CONFIGURATION_ERROR");
+  assert.match(formatStartupError(failure), new RegExp(configured.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"), "u"));
+  assert.equal(requests, 0);
 });

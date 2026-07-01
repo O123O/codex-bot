@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { mkdir, realpath } from "node:fs/promises";
+import { realpath } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { AttachmentStore, type FileHandleId } from "./attachments/store.ts";
@@ -16,6 +16,7 @@ import { resumeCoordinatorIdentity } from "./coordinator/identity.ts";
 import { CoordinatorRuntime } from "./coordinator/runtime.ts";
 import { CoordinatorScheduler, type CoordinatorJob } from "./coordinator/scheduler.ts";
 import { createCoordinatorTools, type CoordinatorToolName } from "./coordinator/tools.ts";
+import { prepareCoordinatorWorkspace } from "./coordinator/workspace.ts";
 import { EventRelay } from "./events/relay.ts";
 import { persistDeliveryStateEvent, reconcileDeliveryStateEvents } from "./events/delivery-status.ts";
 import { buildCodexChildEnvironment, coordinatorTurnConfig, LoopbackMcpServer, secureShellConfig } from "./mcp/server.ts";
@@ -31,14 +32,15 @@ import { RuntimeStore } from "./storage/runtime-store.ts";
 import { TelegramChatAdapter } from "./telegram/chat-adapter.ts";
 import { DeliveryWorker } from "./telegram/delivery-worker.ts";
 
-const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const coordinatorAssetRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../assets/coordinator");
 
 export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
-  const coordinatorDir = join(repositoryRoot, "coordinator");
-  const notebookPath = join(coordinatorDir, "session-status.json");
-  const notebookExample = join(coordinatorDir, "session-status.example.json");
   const token = randomBytes(32).toString("base64url");
 
+  let coordinatorDir = config.coordinatorWorkdir;
+  let dataDir = config.dataDir;
+  let registryPath = config.sessionRegistryPath;
+  let coordinatorWarnings: string[] = [];
   let db!: Database;
   let registry!: SessionRegistry;
   let notebook!: CoordinatorNotebook;
@@ -77,11 +79,27 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
 
   const phases: AppPhase[] = [
     {
+      name: "coordinator-workspace",
+      start: async () => {
+        const prepared = await prepareCoordinatorWorkspace({
+          workdir: config.coordinatorWorkdir,
+          dataDir: config.dataDir,
+          registryPath: config.sessionRegistryPath,
+          policyTemplatePath: join(coordinatorAssetRoot, "AGENTS.md"),
+          notebookTemplatePath: join(coordinatorAssetRoot, "session-status.example.json"),
+        });
+        coordinatorDir = prepared.root;
+        dataDir = prepared.dataRoot;
+        registryPath = prepared.registryPath;
+        notebook = prepared.notebook;
+        coordinatorWarnings = prepared.warnings;
+      },
+      stop: async () => undefined,
+    },
+    {
       name: "storage",
       start: async () => {
-        await mkdir(config.dataDir, { recursive: true, mode: 0o700 });
-        await mkdir(coordinatorDir, { recursive: true, mode: 0o700 });
-        db = openDatabase(join(config.dataDir, "bot.sqlite3"));
+        db = openDatabase(join(dataDir, "bot.sqlite3"));
         operations = new OperationStore(db); deliveries = new DeliveryStore(db); runtime = new RuntimeStore(db); finals = new FinalMessageStore(db);
       },
       stop: async () => { db.close(); },
@@ -89,7 +107,7 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
     {
       name: "registry",
       start: async () => {
-        registry = await SessionRegistry.open(config.sessionRegistryPath, {
+        registry = await SessionRegistry.open(registryPath, {
           version: 1,
           coordinator: { endpoint: "coordinator-local", thread_id: "pending", project_dir: coordinatorDir },
           sessions: {},
@@ -97,13 +115,15 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
         for (const [index, warning] of registry.warnings().entries()) {
           deliveries.prepare({ id: `registry-startup-warning:${index}`, kind: "system_warning", destination: String(config.telegramDestinationChatId), body: `[system] ${warning}`, mandatory: true });
         }
-        notebook = await CoordinatorNotebook.bootstrap(notebookPath, notebookExample);
+        for (const [index, warning] of coordinatorWarnings.entries()) {
+          deliveries.prepare({ id: `coordinator-workspace-warning:${index}`, kind: "system_warning", destination: String(config.telegramDestinationChatId), body: `[system] ${warning}`, mandatory: true });
+        }
       }, stop: async () => undefined,
     },
     {
       name: "attachments",
       start: async () => {
-        attachments = new AttachmentStore(db, join(config.dataDir, "attachments"), { maxFileBytes: config.attachmentMaxBytes, maxStoreBytes: config.attachmentStoreMaxBytes });
+        attachments = new AttachmentStore(db, join(dataDir, "attachments"), { maxFileBytes: config.attachmentMaxBytes, maxStoreBytes: config.attachmentStoreMaxBytes });
         await attachments.initialize();
       }, stop: async () => undefined,
     },
