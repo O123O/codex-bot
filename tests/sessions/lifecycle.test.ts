@@ -90,8 +90,13 @@ test("detach ends the epoch and attach requires idle both before and after resum
 
   endpoint.status = "idle";
   endpoint.afterResume = undefined;
-  await lifecycle.attach("payments");
+  const callbacks: string[] = [];
+  await lifecycle.attach("payments", {
+    onResumed: (settings) => { callbacks.push(`resumed:${settings.model}`); },
+    onThreadRead: (thread) => { callbacks.push(`read:${thread.turns.at(-1)?.id}`); },
+  });
   assert.equal(runtime.currentEpoch("local", "thread-1")?.baselineTurnId, "detached-turn");
+  assert.deepEqual(callbacks, ["resumed:gpt-5", "read:detached-turn"]);
 });
 
 test("archive requires idle and startup reconciliation completes intermediate states", async () => {

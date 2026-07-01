@@ -55,10 +55,9 @@ export class SessionObservationProcessor {
     await Promise.all([...this.tails.values()]);
   }
 
-  observeResume(endpointId: string, threadId: string, response: any, observedAt: number): void {
+  observeResume(endpointId: string, threadId: string, response: any, observedAt: number, observationSequence = this.store.allocateObservationSequence()): void {
     const identity = this.managedIdentity(endpointId, threadId);
     if (!identity) return;
-    const sequence = this.store.allocateObservationSequence();
     const turns = Array.isArray(response?.thread?.turns) ? response.thread.turns : [];
     this.store.hydrateTurnOrder(identity, turns.map((turn: any) => ({ id: String(turn.id), startedAt: finiteOrNull(turn.startedAt) })));
     const nativeStatus = String(response?.thread?.status?.type ?? "notLoaded");
@@ -66,14 +65,14 @@ export class SessionObservationProcessor {
       ? [...turns].reverse().find((turn: any) => !isTerminalStatus(turn.status))?.id ?? this.runtime.activeTurn(endpointId, threadId)
       : undefined;
     const before = this.visibleRuntime(identity);
-    this.runtime.reconcileNativeState(endpointId, threadId, nativeStatus, activeTurn, sequence);
+    this.runtime.reconcileNativeState(endpointId, threadId, nativeStatus, activeTurn, observationSequence);
     const visibleChanged = before.nativeStatus !== nativeStatus || before.activeTurnId !== (activeTurn ?? null);
     if (visibleChanged) this.store.observeLifecycle(identity, observedAt);
     const settings = this.store.observeCurrentSettings(identity, {
       ...(typeof response?.model === "string" ? { model: response.model } : {}),
       ...(typeof response?.reasoningEffort === "string" || response?.reasoningEffort === null ? { effort: response.reasoningEffort } : {}),
       observedAt,
-    }, sequence);
+    }, observationSequence);
     if (visibleChanged || settings.valueChanged) this.options.onChanged();
   }
 

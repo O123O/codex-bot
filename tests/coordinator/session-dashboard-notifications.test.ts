@@ -86,6 +86,26 @@ test("a fresh equal resume watermark rejects an older delayed settings observati
   assert.ok(current.observationSequence > old);
 });
 
+test("a resume response keeps its receipt order so a later settings notification wins", async () => {
+  const value = fixture();
+  value.runtime.setSession("local", "thread-1", "unavailable", "notLoaded");
+  const resumeSequence = value.store.allocateObservationSequence();
+  value.processor.accept("local", "thread/settings/updated", { threadId: "thread-1", threadSettings: { model: "new", effort: "high" } });
+  await value.processor.idle();
+  value.runtime.setSession("local", "thread-1", "managed", "idle");
+
+  value.processor.observeResume("local", "thread-1", {
+    model: "old",
+    reasoningEffort: "low",
+    thread: { status: { type: "idle" }, turns: [] },
+  }, 300, resumeSequence);
+  await value.processor.drain("local");
+
+  const current = value.store.facts({ endpointId: "local", threadId: "thread-1" }).currentSettings;
+  assert.equal(current.model, "new");
+  assert.equal(current.effort, "high");
+});
+
 test("idle waits for a blocked handler and leaves endpoint failures pending for retry", async () => {
   let reject!: (error: Error) => void;
   const blocked = new Promise<any>((_resolve, rejectPromise) => { reject = rejectPromise; });

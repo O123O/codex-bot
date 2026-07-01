@@ -10,6 +10,10 @@ import { secureShellConfig } from "../mcp/server.ts";
 interface ThreadView { id: string; cwd: string; status: { type: string }; turns: Array<{ id: string }> }
 interface ThreadResponse { thread: ThreadView; cwd?: string; model?: string; reasoningEffort?: string | null }
 export interface CurrentSessionSettings { model?: string; effort?: string | null }
+interface AttachObservers {
+  onResumed?(settings: CurrentSessionSettings): void;
+  onThreadRead?(thread: ThreadView): void;
+}
 
 export class SessionLifecycle {
   private readonly tails = new Map<string, Promise<void>>();
@@ -71,7 +75,7 @@ export class SessionLifecycle {
     });
   }
 
-  async attach(nickname: string, onThreadRead?: (thread: ThreadView) => void): Promise<CurrentSessionSettings> {
+  async attach(nickname: string, observers: AttachObservers = {}): Promise<CurrentSessionSettings> {
     const session = this.required(nickname);
     return this.lock(`${session.endpoint}:${session.thread_id}`, async () => {
       this.requireManagementState(session.endpoint, session.thread_id, ["detached", "unavailable"]);
@@ -84,13 +88,15 @@ export class SessionLifecycle {
           threadId: session.thread_id, cwd: session.project_dir, approvalPolicy: "never", sandbox: this.execution.sandboxMode, config: secureShellConfig(),
         });
         resumed = true;
+        const settings = this.responseSettings(response);
+        observers.onResumed?.(settings);
         await this.verifyCwd(response.thread.cwd, session.project_dir);
         const after = await this.read(session.endpoint, session.thread_id);
         this.requireIdle(after.thread);
-        onThreadRead?.(after.thread);
+        observers.onThreadRead?.(after.thread);
         this.runtime.beginEpoch(session.endpoint, session.thread_id, this.baseline(after.thread), this.clock.now());
         this.runtime.setSession(session.endpoint, session.thread_id, "managed", "idle");
-        return this.responseSettings(response);
+        return settings;
       } catch (error) {
         if (resumed) {
           try { await this.pool.request(session.endpoint, "thread/unsubscribe", { threadId: session.thread_id }); }

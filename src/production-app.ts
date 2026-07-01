@@ -325,10 +325,14 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
       attach_session: async (args) => {
         const session = registry.get(args.nickname);
         if (!session) throw new AppError("UNKNOWN_SESSION", `unknown session: ${args.nickname}`);
-        const settings = await lifecycle.attach(args.nickname, (thread) => hydrateThreadOrder(session.endpoint, thread));
+        let settingsObservationSequence: number | undefined;
+        const settings = await lifecycle.attach(args.nickname, {
+          onResumed: () => { settingsObservationSequence = dashboardStore.allocateObservationSequence(); },
+          onThreadRead: (thread) => hydrateThreadOrder(session.endpoint, thread),
+        });
         advanceNativeWatermark(args.nickname);
         observeLifecycle(args.nickname);
-        observeCurrentSettings(args.nickname, settings);
+        observeCurrentSettings(args.nickname, settings, Date.now(), settingsObservationSequence);
         await renderDashboardSafely();
         return { nickname: args.nickname };
       },
@@ -1003,6 +1007,7 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
           sandbox: config.sandboxMode,
           config: secureShellConfig(),
         });
+        const resumeObservationSequence = dashboardStore.allocateObservationSequence();
         await verifySessionCwd(response.thread.cwd, session.project_dir);
         const authoritative = await endpoint.request<any>("thread/read", { threadId: session.thread_id, includeTurns: true });
         hydrateThreadOrder(session.endpoint, authoritative.thread);
@@ -1010,7 +1015,7 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
         const nativeStatus = authoritative.thread.status?.type ?? response.thread.status?.type ?? "idle";
         runtime.setSession(session.endpoint, session.thread_id, "managed", nativeStatus);
         runtime.reconcileNativeState(session.endpoint, session.thread_id, nativeStatus, nativeStatus === "active" ? activeTurn?.id : undefined);
-        observations.observeResume(session.endpoint, session.thread_id, { ...response, thread: authoritative.thread }, Date.now());
+        observations.observeResume(session.endpoint, session.thread_id, { ...response, thread: authoritative.thread }, Date.now(), resumeObservationSequence);
         dashboardStore.observeLifecycle({ endpointId: session.endpoint, threadId: session.thread_id }, Date.now());
         if (!runtime.currentEpoch(session.endpoint, session.thread_id)) {
           const baseline = [...(authoritative.thread.turns ?? [])].reverse().find((turn: any) => isTerminalStatus(turn.status))?.id;
