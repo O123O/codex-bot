@@ -1,0 +1,102 @@
+# Isolated Coordinator Profile Design
+
+## Goal
+
+Run the coordinator app-server with its own operating-system home and Codex home so it cannot inherit the user's normal `~/.codex` configuration, global instructions, plugins, session history, or home-scoped skills. Keep the shared local worker app-server unchanged so every managed project session continues to use the user's real home, normal `CODEX_HOME`, project configuration, and project skills.
+
+## Process topology
+
+The existing two-endpoint pool remains the security boundary:
+
+- `local` is the shared worker endpoint. It keeps the current sanitized child environment derived from the bot process and therefore retains the user's real `HOME`, `CODEX_HOME`, authentication, and project discovery behavior.
+- `coordinator-local` is the coordinator-only endpoint. It receives the manager MCP capability and an isolated profile environment. The existing backend guard continues to reject project sessions on this endpoint.
+
+No app-server is added per project. Remote worker endpoints remain a later extension of the same pool.
+
+## Profile layout and environment
+
+The backend owns a fixed profile root beneath the canonical data directory:
+
+```text
+<DATA_DIR>/coordinator-profile/
+  profile.json
+  home/
+    .agents/skills/          # optional coordinator-only user skills
+  codex/
+    auth.json                # when Codex uses file credential storage
+    config.toml              # optional coordinator-only Codex configuration
+    sessions/
+```
+
+`prepareCoordinatorProfile` creates `coordinator-profile`, `home`, and `codex` with mode `0700`, rejects non-directory or symbolic-link replacements, and returns canonical paths. The coordinator app-server receives these exact overrides:
+
+```text
+HOME=<DATA_DIR>/coordinator-profile/home
+CODEX_HOME=<DATA_DIR>/coordinator-profile/codex
+```
+
+All other existing child-environment filtering remains in force: Telegram secrets are removed, proxy and supported provider credentials may pass through, and the manager MCP token exists only in the coordinator endpoint and remains excluded from model-launched shells. The worker environment is byte-for-byte unchanged by this feature.
+
+The managed coordinator policy remains in `<COORDINATOR_WORKDIR>/AGENTS.md`; `AGENTS.override.md` remains user-owned. Coordinator-specific project skills may be placed in `<COORDINATOR_WORKDIR>/.agents/skills`. Home-scoped coordinator skills may instead be placed in `<DATA_DIR>/coordinator-profile/home/.agents/skills`. Normal user skills outside these isolated roots are not discovered by the coordinator. Codex-bundled or administrator-provided system capabilities are outside this user-profile boundary.
+
+## Authentication
+
+The isolated profile has independent Codex authentication. The bot does not copy, hard-link, symlink, parse, or expose the user's normal `~/.codex/auth.json`; doing so could create refresh-token races or silently weaken the profile boundary.
+
+After both app-servers initialize, startup calls `account/read` on `coordinator-local` before changing coordinator identity. If Codex reports that OpenAI authentication is required and no account is present, startup fails with `CONFIGURATION_ERROR` and prints the isolated `HOME` and `CODEX_HOME` paths plus an actionable `codex login --device-auth` command. The created directories remain available for that command. Authentication supplied by a supported inherited provider environment remains valid when app-server reports that OpenAI authentication is not required.
+
+Documentation includes the one-time login procedure. Logging out of the user's normal profile does not log out the isolated file-backed profile, and vice versa.
+
+## Coordinator thread migration
+
+Threads are stored under one app-server's `CODEX_HOME`; consequently, the existing coordinator thread in the user's normal Codex home cannot be resumed by the isolated endpoint. Project threads must never be moved or rewritten.
+
+`profile.json` is a bot-managed activation marker with schema version 1. On the first isolated-profile startup:
+
+1. Validate that the registry's coordinator endpoint and canonical workdir still match the configured coordinator. This preserves the current fail-closed path checks.
+2. Reconcile every recoverable manager operation using durable backend and worker state.
+3. Fail any remaining active coordinator attempts through the existing recovery rules. Attempts without dispatched effects return their source context to the pending queue; attempts with proven or uncertain effects create one recovery context and are not blindly replayed.
+4. Atomically replace only the coordinator registry identity with `thread_id: "pending"`; preserve every project-session mapping exactly.
+5. Atomically write `profile.json` before starting the new thread. This ordering makes a crash before thread creation resume the pending creation path rather than repeatedly resetting a successfully registered isolated identity.
+6. Create a new persistent coordinator thread in the existing coordinator workdir and atomically store its returned identity through the existing identity verifier.
+
+When the marker already exists, startup resumes the stored isolated coordinator normally. A missing, malformed, unsupported, symbolic-link, or non-regular marker fails closed except that a genuinely absent marker selects the first-activation path. Deleting the entire profile deliberately causes a new isolated coordinator identity on the next successful authenticated startup.
+
+The coordinator's durable knowledge does not depend solely on its old transcript: the authoritative session registry, SQLite operation/outbox/runtime state, generated session dashboard, and managed policy survive the migration. The first new coordinator turn therefore sees current management state without copying the old rollout into the isolated profile.
+
+## Startup and recovery ordering
+
+Workspace/profile preparation happens before storage and endpoint startup. The isolated directories are therefore available even when authentication is missing. Endpoint initialization and coordinator authentication verification happen before profile activation, registry reset, or scheduler/polling startup.
+
+The first-profile attempt reconciliation happens after worker lifecycle and delivery reconciliation, because manager operations may need authoritative worker histories and durable delivery state. It happens before starting the isolated coordinator. Scheduler and Telegram polling remain disabled until the migration and coordinator identity are complete.
+
+Ordinary restarts do not execute migration recovery again because `profile.json` is durable. Endpoint restarts during a running bot retain the same isolated environment and resume the same coordinator thread.
+
+## User-visible behavior and documentation
+
+README setup and troubleshooting document:
+
+- the two distinct app-server profiles;
+- the exact isolated profile paths;
+- one-time coordinator login;
+- where coordinator-only configuration and skills belong;
+- that the first upgraded startup creates a new coordinator conversation but preserves worker sessions and backend management state;
+- that backups must include `coordinator-profile`, especially its credentials and coordinator rollout state.
+
+No Telegram command, manager tool, registry field, or worker-session behavior changes.
+
+## Verification
+
+Automated tests prove:
+
+- profile directories and marker are private regular filesystem objects and symbolic-link substitutions fail closed;
+- the coordinator child receives isolated `HOME` and `CODEX_HOME`, while the worker child retains the original values;
+- Telegram secrets remain stripped and only the coordinator receives the manager capability;
+- missing coordinator authentication stops startup before identity migration and reports the login paths;
+- first activation validates the existing identity, reconciles active attempts, resets only the coordinator identity, persists the marker in crash-safe order, and creates a new coordinator thread;
+- subsequent startup resumes the isolated thread without resetting it;
+- project registry entries and worker endpoint/session discovery remain unchanged;
+- coordinator skill discovery can see its own workdir/home skill roots but cannot see a fixture skill from the user's normal home;
+- package/build checks and the real app-server manager-MCP integration continue to pass.
+
+The live upgrade is performed only after a stopped-state backup. The installed bundle is restarted after the isolated profile has been authenticated, then verified structurally through app-server process environments, registry identity, dashboard parsing, and a real coordinator response.
