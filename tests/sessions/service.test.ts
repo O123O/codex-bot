@@ -24,6 +24,8 @@ class ServiceEndpoint implements AppServerEndpoint {
   lastClientId: string | undefined;
   historyTurnStatus: string | undefined;
   threadTurns: any[] | undefined;
+  threadReadBarrier: Promise<void> | undefined;
+  onThreadReadRequest: (() => void) | undefined;
   failNextStart = false;
   goal: any = null;
   goalBarrier: Promise<void> | undefined;
@@ -37,7 +39,11 @@ class ServiceEndpoint implements AppServerEndpoint {
       return { turn: { id: "started-1" } } as T;
     }
     if (method === "turn/steer") return { turnId: params.expectedTurnId } as T;
-    if (method === "thread/read") return { thread: { id: "thread", cwd: params.cwd, status: { type: this.status }, turns: this.threadTurns ?? (this.lastClientId ? [{ id: "started-1", ...(this.historyTurnStatus ? { status: this.historyTurnStatus } : {}), items: [{ type: "userMessage", clientId: this.lastClientId }] }] : []) } } as T;
+    if (method === "thread/read") {
+      this.onThreadReadRequest?.();
+      await this.threadReadBarrier;
+      return { thread: { id: "thread", cwd: params.cwd, status: { type: this.status }, turns: this.threadTurns ?? (this.lastClientId ? [{ id: "started-1", ...(this.historyTurnStatus ? { status: this.historyTurnStatus } : {}), items: [{ type: "userMessage", clientId: this.lastClientId }] }] : []) } } as T;
+    }
     if (method === "thread/goal/get") {
       this.onGoalRequest?.();
       await this.goalBarrier;
@@ -143,12 +149,12 @@ test("status binds its native snapshot before a blocked goal read so a newer not
     onChanged: () => undefined,
     onError: (error) => { throw error; },
   });
-  const statusSequence = dashboardStore.allocateObservationSequence();
   let nativeObserved = false;
 
   const status = service.status("payments", {
     observeNative: ({ nativeStatus, activeTurnId }) => {
       nativeObserved = true;
+      const statusSequence = dashboardStore.allocateObservationSequence();
       runtime.reconcileNativeState("local", "thread", nativeStatus, activeTurnId ?? undefined, statusSequence);
     },
   });
@@ -160,6 +166,41 @@ test("status binds its native snapshot before a blocked goal read so a newer not
 
   assert.equal(nativeObserved, true);
   assert.equal(runtime.activeTurn("local", "thread"), "new-turn");
+});
+
+test("status orders a notification received during thread read before the response snapshot", async () => {
+  const { db, endpoint, registry, runtime, service } = await fixture();
+  endpoint.status = "active";
+  endpoint.threadTurns = [{ id: "response-turn", status: "inProgress", items: [] }];
+  let releaseRead!: () => void;
+  endpoint.threadReadBarrier = new Promise<void>((resolve) => { releaseRead = resolve; });
+  let readRequested!: () => void;
+  const waitingForRead = new Promise<void>((resolve) => { readRequested = resolve; });
+  endpoint.onThreadReadRequest = readRequested;
+  const dashboardStore = new SessionDashboardStore(db);
+  const processor = new SessionObservationProcessor(dashboardStore, registry, runtime, {
+    now: () => 1_000,
+    readThread: async () => ({ turns: endpoint.threadTurns ?? [] }),
+    readGoal: async () => ({ goal: null }),
+    onChanged: () => undefined,
+    onError: (error) => { throw error; },
+  });
+
+  const status = service.status("payments", {
+    observeNative: ({ nativeStatus, activeTurnId }) => {
+      const statusSequence = dashboardStore.allocateObservationSequence();
+      runtime.reconcileNativeState("local", "thread", nativeStatus, activeTurnId ?? undefined, statusSequence);
+    },
+  });
+  await waitingForRead;
+  processor.accept("local", "thread/status/changed", { threadId: "thread", status: { type: "idle" } });
+  await processor.idle();
+  assert.equal(runtime.getSession("local", "thread")?.nativeStatus, "idle");
+  releaseRead();
+  await status;
+
+  assert.equal(runtime.getSession("local", "thread")?.nativeStatus, "active");
+  assert.equal(runtime.activeTurn("local", "thread"), "response-turn");
 });
 
 test("a failed start retains pending settings and steer never consumes them", async () => {

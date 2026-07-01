@@ -277,10 +277,10 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
       discover_sessions: async (args) => discovery.list({ endpointId: projectEndpoint(args.endpoint), ...(args.search ? { search: args.search } : {}), ...(args.cwd ? { cwd: args.cwd } : {}), ...(args.limit ? { limit: args.limit } : {}), ...(args.cursor ? { cursor: args.cursor } : {}) }),
       get_session_status: async (args) => {
         const identity = dashboardIdentity(args.nickname);
-        const before = runtime.getSession(identity.endpointId, identity.threadId);
-        const beforeTurn = runtime.activeTurn(identity.endpointId, identity.threadId) ?? null;
-        const sequence = dashboardStore.allocateObservationSequence();
         const live = await sessions.status(args.nickname, { observeNative: ({ nativeStatus, activeTurnId }) => {
+          const before = runtime.getSession(identity.endpointId, identity.threadId);
+          const beforeTurn = runtime.activeTurn(identity.endpointId, identity.threadId) ?? null;
+          const sequence = dashboardStore.allocateObservationSequence();
           const activeTurn = nativeStatus === "active" ? activeTurnId ?? undefined : undefined;
           const applied = runtime.reconcileNativeState(identity.endpointId, identity.threadId, nativeStatus, activeTurn, sequence);
           if (applied && (before?.nativeStatus !== nativeStatus || beforeTurn !== (activeTurn ?? null))) observeLifecycle(args.nickname);
