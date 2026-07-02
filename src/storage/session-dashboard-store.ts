@@ -16,7 +16,7 @@ import {
   type LegacyNotebookDocument,
   type ManagerNotes,
   type SessionNotesPatch,
-} from "../coordinator/dashboard-schema.ts";
+} from "../assistant/dashboard-schema.ts";
 import type { Database } from "./database.ts";
 import { inTransaction } from "./database.ts";
 
@@ -323,13 +323,13 @@ export class SessionDashboardStore {
     });
   }
 
-  claimCoordinatorRoot(canonicalRoot: string): void {
+  claimAssistantRoot(canonicalRoot: string): void {
     inTransaction(this.db, () => {
       const row = this.meta();
-      if (row.coordinator_root !== null && String(row.coordinator_root) !== canonicalRoot) {
-        throw new AppError("CONFIGURATION_ERROR", "dashboard database is claimed by a different coordinator root");
+      if (row.assistant_root !== null && String(row.assistant_root) !== canonicalRoot) {
+        throw new AppError("CONFIGURATION_ERROR", "dashboard database is claimed by a different assistant root");
       }
-      if (row.coordinator_root === null) this.db.prepare("UPDATE session_dashboard_meta SET coordinator_root = ? WHERE singleton = 1").run(canonicalRoot);
+      if (row.assistant_root === null) this.db.prepare("UPDATE session_dashboard_meta SET assistant_root = ? WHERE singleton = 1").run(canonicalRoot);
     });
   }
 

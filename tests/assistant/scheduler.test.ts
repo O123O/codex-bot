@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { CoordinatorScheduler } from "../../src/coordinator/scheduler.ts";
+import { AssistantScheduler } from "../../src/assistant/scheduler.ts";
 
 test("scheduler serializes turns, prioritizes users, then services events after five users", async () => {
   const order: string[] = [];
   let release!: () => void;
   const first = new Promise<void>((resolve) => { release = resolve; });
-  const scheduler = new CoordinatorScheduler(async (job) => { order.push(job.id); if (job.id === "u1") await first; });
+  const scheduler = new AssistantScheduler(async (job) => { order.push(job.id); if (job.id === "u1") await first; });
   scheduler.enqueueUser({ id: "u1", payload: {} });
   scheduler.enqueueEvent({ id: "e1", sessionKey: "s", payload: {} });
   for (let index = 2; index <= 7; index += 1) scheduler.enqueueUser({ id: `u${index}`, payload: {} });
@@ -19,7 +19,7 @@ test("scheduler serializes turns, prioritizes users, then services events after 
 
 test("event batches preserve per-session order and enforce item and byte caps", async () => {
   const seen: any[] = [];
-  const scheduler = new CoordinatorScheduler(async (job) => { seen.push(job); }, { maxBatchEvents: 2, maxBatchBytes: 80, batchWindowMs: 0 });
+  const scheduler = new AssistantScheduler(async (job) => { seen.push(job); }, { maxBatchEvents: 2, maxBatchBytes: 80, batchWindowMs: 0 });
   scheduler.enqueueEvent({ id: "a", sessionKey: "one", payload: { status: "active" } });
   scheduler.enqueueEvent({ id: "b", sessionKey: "one", payload: { final: true } });
   scheduler.enqueueEvent({ id: "c", sessionKey: "two", payload: { final: true } });
@@ -32,7 +32,7 @@ test("events wait for the batch window but a 30-second-old event cannot starve",
   let now = 0;
   const timers: Array<() => void> = [];
   const seen: string[] = [];
-  const scheduler = new CoordinatorScheduler(async (job) => { seen.push(job.id); }, {
+  const scheduler = new AssistantScheduler(async (job) => { seen.push(job.id); }, {
     now: () => now,
     setTimeout: ((callback: () => void) => { timers.push(callback); return { unref() {} }; }) as any,
     clearTimeout: (() => undefined) as any,
@@ -49,7 +49,7 @@ test("events wait for the batch window but a 30-second-old event cannot starve",
 test("a failed job is reported and does not stop later durable jobs", async () => {
   const executed: string[] = [];
   const failed: string[] = [];
-  const scheduler = new CoordinatorScheduler(async (job) => {
+  const scheduler = new AssistantScheduler(async (job) => {
     executed.push(job.id);
     if (job.id === "bad") throw new Error("pre-dispatch failure");
   }, { onError: (job) => { failed.push(job.id); } });

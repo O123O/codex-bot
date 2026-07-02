@@ -11,19 +11,19 @@ import { composeApp, TerminalInbox, type AppPhase, type BotApp } from "./app.ts"
 import type { BotConfig } from "./config.ts";
 import { AppError } from "./core/errors.ts";
 import { runBackground } from "./core/background.ts";
-import { SessionDashboard } from "./coordinator/session-dashboard.ts";
-import { activateCoordinatorProfileIdentity, resumeCoordinatorIdentity } from "./coordinator/identity.ts";
-import { recordCoordinatorAuthenticationFailure } from "./coordinator/auth-recovery.ts";
-import { buildCoordinatorChildEnvironment, prepareCoordinatorProfile, startAuthenticatedCoordinatorEndpoint, type PreparedCoordinatorProfile } from "./coordinator/profile.ts";
-import { recoverCoordinatorProfileAttempts, type LegacyCoordinatorTurn } from "./coordinator/profile-migration.ts";
-import { CoordinatorRuntime } from "./coordinator/runtime.ts";
-import { CoordinatorScheduler, type CoordinatorJob } from "./coordinator/scheduler.ts";
-import { SessionObservationProcessor } from "./coordinator/session-observer.ts";
-import { createCoordinatorTools, type CoordinatorToolName } from "./coordinator/tools.ts";
-import { prepareCoordinatorWorkspace } from "./coordinator/workspace.ts";
+import { SessionDashboard } from "./assistant/session-dashboard.ts";
+import { activateAssistantProfileIdentity, resumeAssistantIdentity } from "./assistant/identity.ts";
+import { recordAssistantAuthenticationFailure } from "./assistant/auth-recovery.ts";
+import { buildAssistantChildEnvironment, prepareAssistantProfile, startAuthenticatedAssistantEndpoint, type PreparedAssistantProfile } from "./assistant/profile.ts";
+import { recoverAssistantProfileAttempts, type LegacyAssistantTurn } from "./assistant/profile-migration.ts";
+import { AssistantRuntime } from "./assistant/runtime.ts";
+import { AssistantScheduler, type AssistantJob } from "./assistant/scheduler.ts";
+import { SessionObservationProcessor } from "./assistant/session-observer.ts";
+import { createAssistantTools, type AssistantToolName } from "./assistant/tools.ts";
+import { prepareAssistantWorkspace } from "./assistant/workspace.ts";
 import { EventRelay } from "./events/relay.ts";
 import { persistDeliveryStateEvent, reconcileDeliveryStateEvents } from "./events/delivery-status.ts";
-import { buildCodexChildEnvironment, coordinatorTurnConfig, LoopbackMcpServer, secureShellConfig } from "./mcp/server.ts";
+import { buildCodexChildEnvironment, assistantTurnConfig, LoopbackMcpServer, secureShellConfig } from "./mcp/server.ts";
 import { SessionRegistry, type RegistryDocument } from "./registry/session-registry.ts";
 import { SessionDiscovery } from "./sessions/discovery.ts";
 import { FinalMessageStore } from "./sessions/final-messages.ts";
@@ -37,17 +37,17 @@ import { SessionDashboardStore } from "./storage/session-dashboard-store.ts";
 import { TelegramChatAdapter } from "./telegram/chat-adapter.ts";
 import { DeliveryWorker } from "./telegram/delivery-worker.ts";
 
-const coordinatorAssetRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../assets/coordinator");
+const assistantAssetRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../assets/assistant");
 
 export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
   const token = randomBytes(32).toString("base64url");
 
-  let coordinatorDir = config.coordinatorWorkdir;
+  let assistantDir = config.assistantWorkdir;
   let dataDir = config.dataDir;
   let registryPath = config.sessionRegistryPath;
-  let dashboardPath = join(coordinatorDir, "session-status.json");
-  let coordinatorWarnings: string[] = [];
-  let coordinatorProfile!: PreparedCoordinatorProfile;
+  let dashboardPath = join(assistantDir, "session-status.json");
+  let assistantWarnings: string[] = [];
+  let assistantProfile!: PreparedAssistantProfile;
   let db!: Database;
   let registry!: SessionRegistry;
   let dashboardStore!: SessionDashboardStore;
@@ -59,14 +59,14 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
   let runtime!: RuntimeStore;
   let finals!: FinalMessageStore;
   let endpoint!: LocalEndpoint;
-  let coordinatorEndpoint!: LocalEndpoint;
+  let assistantEndpoint!: LocalEndpoint;
   let pool!: AppServerPool;
   let discovery!: SessionDiscovery;
   let lifecycle!: SessionLifecycle;
   let sessions!: SessionService;
   let relay!: EventRelay;
-  let coordinator!: CoordinatorRuntime;
-  let scheduler!: CoordinatorScheduler;
+  let assistant!: AssistantRuntime;
+  let scheduler!: AssistantScheduler;
   let mcp!: LoopbackMcpServer;
   let chat!: ChatAdapter;
   let deliveryWorker!: DeliveryWorker;
@@ -74,7 +74,7 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
   let schedulerAccepting = false;
   const unsubscribers: Array<() => void> = [];
   const terminalWaiters = new Map<string, { resolve(): void; reject(error: unknown): void; eventIds: string[] }>();
-  const earlyCoordinatorTerminals = new TerminalInbox<any>();
+  const earlyAssistantTerminals = new TerminalInbox<any>();
   const enqueuedEvents = new Set<string>();
   const enqueuedSources = new Set<string>();
   const reconnectTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -88,20 +88,20 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
 
   const phases: AppPhase[] = [
     {
-      name: "coordinator-workspace",
+      name: "assistant-workspace",
       start: async () => {
-        const prepared = await prepareCoordinatorWorkspace({
-          workdir: config.coordinatorWorkdir,
+        const prepared = await prepareAssistantWorkspace({
+          workdir: config.assistantWorkdir,
           dataDir: config.dataDir,
           registryPath: config.sessionRegistryPath,
-          policyTemplatePath: join(coordinatorAssetRoot, "AGENTS.md"),
+          policyTemplatePath: join(assistantAssetRoot, "AGENTS.md"),
         });
-        coordinatorDir = prepared.root;
+        assistantDir = prepared.root;
         dataDir = prepared.dataRoot;
         registryPath = prepared.registryPath;
         dashboardPath = prepared.dashboardPath;
-        coordinatorWarnings = prepared.warnings;
-        coordinatorProfile = await prepareCoordinatorProfile(dataDir);
+        assistantWarnings = prepared.warnings;
+        assistantProfile = await prepareAssistantProfile(dataDir);
       },
       stop: async () => undefined,
     },
@@ -119,21 +119,21 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
       start: async () => {
         registry = await SessionRegistry.open(registryPath, {
           version: 1,
-          coordinator: { endpoint: "coordinator-local", thread_id: "pending", project_dir: coordinatorDir },
+          assistant: { endpoint: "assistant-local", thread_id: "pending", project_dir: assistantDir },
           sessions: {},
         });
         for (const [index, warning] of registry.warnings().entries()) {
           deliveries.prepare({ id: `registry-startup-warning:${index}`, kind: "system_warning", destination: String(config.telegramDestinationChatId), body: `[system] ${warning}`, mandatory: true });
         }
-        for (const [index, warning] of coordinatorWarnings.entries()) {
-          deliveries.prepare({ id: `coordinator-workspace-warning:${index}`, kind: "system_warning", destination: String(config.telegramDestinationChatId), body: `[system] ${warning}`, mandatory: true });
+        for (const [index, warning] of assistantWarnings.entries()) {
+          deliveries.prepare({ id: `assistant-workspace-warning:${index}`, kind: "system_warning", destination: String(config.telegramDestinationChatId), body: `[system] ${warning}`, mandatory: true });
         }
       }, stop: async () => undefined,
     },
     {
       name: "dashboard",
       start: async () => {
-        dashboard = new SessionDashboard(dashboardStore, registry, runtime, { root: coordinatorDir, path: dashboardPath, now: () => Date.now() });
+        dashboard = new SessionDashboard(dashboardStore, registry, runtime, { root: assistantDir, path: dashboardPath, now: () => Date.now() });
         try { await dashboard.initializeAndRender(); }
         catch (error) { queueDashboardWarning(); throw error; }
       },
@@ -149,10 +149,10 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
     {
       name: "mcp",
       start: async () => {
-        coordinator = new CoordinatorRuntime(db, operations, deliveries, { destination: String(config.telegramDestinationChatId) });
+        assistant = new AssistantRuntime(db, operations, deliveries, { destination: String(config.telegramDestinationChatId) });
         const actions = buildActions();
-        const tools = createCoordinatorTools(operations, actions, { maxCollectCount: config.maxCollectCount });
-        mcp = new LoopbackMcpServer(tools, { current: () => coordinator.current() }, { host: config.mcpHost, port: config.mcpPort, token, allowedClientProcess: () => coordinatorEndpoint?.mcpClientIdentity });
+        const tools = createAssistantTools(operations, actions, { maxCollectCount: config.maxCollectCount });
+        mcp = new LoopbackMcpServer(tools, { current: () => assistant.current() }, { host: config.mcpHost, port: config.mcpPort, token, allowedClientProcess: () => assistantEndpoint?.mcpClientIdentity });
         await mcp.start();
       }, stop: async () => { await mcp.stop(); },
     },
@@ -160,15 +160,15 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
       name: "subscriptions",
       start: async () => {
         endpoint = new LocalEndpoint({ id: "local", codexBinary: config.codexBinary, env: buildCodexChildEnvironment(process.env), expectedVersion: SUPPORTED_CODEX_VERSION });
-        coordinatorEndpoint = new LocalEndpoint({
-          id: "coordinator-local",
+        assistantEndpoint = new LocalEndpoint({
+          id: "assistant-local",
           codexBinary: config.codexBinary,
-          env: buildCoordinatorChildEnvironment(process.env, coordinatorProfile, token),
-          expectedCodexHome: coordinatorProfile.codexHome,
-          validateEnvironment: () => coordinatorProfile.assertIntact(),
+          env: buildAssistantChildEnvironment(process.env, assistantProfile, token),
+          expectedCodexHome: assistantProfile.codexHome,
+          validateEnvironment: () => assistantProfile.assertIntact(),
           expectedVersion: SUPPORTED_CODEX_VERSION,
         });
-        pool = new AppServerPool([endpoint, coordinatorEndpoint], { maxConcurrentTurns: config.maxConcurrentTurns });
+        pool = new AppServerPool([endpoint, assistantEndpoint], { maxConcurrentTurns: config.maxConcurrentTurns });
         discovery = new SessionDiscovery(db, pool);
         lifecycle = new SessionLifecycle(pool, registry, runtime, { now: () => Date.now() }, { sandboxMode: config.sandboxMode });
         sessions = new SessionService(pool, registry, runtime, finals, deliveries);
@@ -184,11 +184,11 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
           clock: { now: () => Date.now() },
           onTerminal: (event) => observations.observeTerminal(event),
         }, attachments);
-        scheduler = new CoordinatorScheduler(runCoordinatorJob, { onError: handleSchedulerFailure });
+        scheduler = new AssistantScheduler(runAssistantJob, { onError: handleSchedulerFailure });
         unsubscribers.push(endpoint.onNotification((method, params) => {
           if (!observations.accept(endpoint.id, method, params)) runBackground(() => onNotification(endpoint.id, method, params), () => recordBackgroundFailure("project notification"));
         }));
-        unsubscribers.push(coordinatorEndpoint.onNotification((method, params) => runBackground(() => onNotification(coordinatorEndpoint.id, method, params), () => recordBackgroundFailure("coordinator notification"))));
+        unsubscribers.push(assistantEndpoint.onNotification((method, params) => runBackground(() => onNotification(assistantEndpoint.id, method, params), () => recordBackgroundFailure("assistant notification"))));
         unsubscribers.push(endpoint.onPermissionBlocked((event) => runBackground(async () => {
           await relay.handlePermissionBlocked(endpoint.id, event);
           if (event.threadId && runtime.getSession(endpoint.id, event.threadId)?.managementState === "managed") {
@@ -200,9 +200,9 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
           enqueuePendingEvents();
         }, () => recordBackgroundFailure("permission notification"))));
         unsubscribers.push(endpoint.onReady(() => { if (acceptingReadyEvents) runBackground(() => relay.reconcileEndpoint(endpoint.id), () => recordBackgroundFailure("project ready reconciliation")); }));
-        unsubscribers.push(coordinatorEndpoint.onReady(() => { if (acceptingReadyEvents) runBackground(() => reconcileCoordinatorAttempts(), () => recordBackgroundFailure("coordinator ready reconciliation")); }));
+        unsubscribers.push(assistantEndpoint.onReady(() => { if (acceptingReadyEvents) runBackground(() => reconcileAssistantAttempts(), () => recordBackgroundFailure("assistant ready reconciliation")); }));
         unsubscribers.push(endpoint.onUnavailable(() => runBackground(() => handleEndpointUnavailable(endpoint), () => recordBackgroundFailure("project unavailable handling"))));
-        unsubscribers.push(coordinatorEndpoint.onUnavailable(() => runBackground(() => handleEndpointUnavailable(coordinatorEndpoint), () => recordBackgroundFailure("coordinator unavailable handling"))));
+        unsubscribers.push(assistantEndpoint.onUnavailable(() => runBackground(() => handleEndpointUnavailable(assistantEndpoint), () => recordBackgroundFailure("assistant unavailable handling"))));
       }, stop: async () => { for (const unsubscribe of unsubscribers.splice(0)) unsubscribe(); await observations.idle(); },
     },
     {
@@ -212,14 +212,14 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
         endpointsCommitted = false;
         try {
           await endpoint.start();
-          await startAuthenticatedCoordinatorEndpoint(coordinatorEndpoint, coordinatorProfile);
-          if (endpoint.state !== "ready" || coordinatorEndpoint.state !== "ready") throw new AppError("ENDPOINT_UNAVAILABLE", "an app-server became unavailable during initial startup");
+          await startAuthenticatedAssistantEndpoint(assistantEndpoint, assistantProfile);
+          if (endpoint.state !== "ready" || assistantEndpoint.state !== "ready") throw new AppError("ENDPOINT_UNAVAILABLE", "an app-server became unavailable during initial startup");
           endpointsCommitted = true;
         } catch (error) {
           stopping = true;
           for (const timer of reconnectTimers.values()) clearTimeout(timer);
           reconnectTimers.clear();
-          await Promise.all([coordinatorEndpoint.stop(), endpoint.stop()]).catch(() => undefined);
+          await Promise.all([assistantEndpoint.stop(), endpoint.stop()]).catch(() => undefined);
           throw error;
         }
       },
@@ -228,7 +228,7 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
         endpointsCommitted = false;
         for (const timer of reconnectTimers.values()) clearTimeout(timer);
         reconnectTimers.clear();
-        await Promise.all([coordinatorEndpoint.stop(), endpoint.stop()]);
+        await Promise.all([assistantEndpoint.stop(), endpoint.stop()]);
       },
     },
     {
@@ -244,21 +244,21 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
       }, stop: async () => { acceptingReadyEvents = false; await observations.idle(); await renderDashboardSafely(); },
     },
     {
-      name: "coordinator",
+      name: "assistant",
       start: async () => {
         await reconcileDashboard(true);
-        await activateCoordinatorProfileIdentity({
+        await activateAssistantProfileIdentity({
           registry,
-          endpointId: coordinatorEndpoint.id,
+          endpointId: assistantEndpoint.id,
           legacyEndpointId: endpoint.id,
-          coordinatorDir,
-          activationRequired: coordinatorProfile.activationRequired,
-          beforeReset: recoverLegacyCoordinatorAttempts,
-          markActivated: () => coordinatorProfile.markActivated(),
+          assistantDir,
+          activationRequired: assistantProfile.activationRequired,
+          beforeReset: recoverLegacyAssistantAttempts,
+          markActivated: () => assistantProfile.markActivated(),
         });
-        await startOrResumeCoordinator();
+        await startOrResumeAssistant();
         await reconcileOperations();
-        await reconcileCoordinatorAttempts();
+        await reconcileAssistantAttempts();
       }, stop: async () => undefined,
     },
     {
@@ -267,11 +267,11 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
       stop: async () => {
         stopping = true;
         schedulerAccepting = false;
-        const active = coordinator.current();
-        if (active && !active.turnId.startsWith("pending:")) await pool.interrupt(coordinatorEndpoint.id, registry.snapshot().coordinator.thread_id, active.turnId).catch(() => undefined);
+        const active = assistant.current();
+        if (active && !active.turnId.startsWith("pending:")) await pool.interrupt(assistantEndpoint.id, registry.snapshot().assistant.thread_id, active.turnId).catch(() => undefined);
         for (const [turnId, waiter] of terminalWaiters) {
           terminalWaiters.delete(turnId);
-          waiter.reject(new AppError("OPERATION_UNCERTAIN", "bot stopped before the coordinator turn reached a proven terminal state"));
+          waiter.reject(new AppError("OPERATION_UNCERTAIN", "bot stopped before the assistant turn reached a proven terminal state"));
         }
         await scheduler.idle();
       },
@@ -292,7 +292,7 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
     },
   ];
 
-  function buildActions(): Partial<Record<CoordinatorToolName, (args: any, context: any) => Promise<any>>> {
+  function buildActions(): Partial<Record<AssistantToolName, (args: any, context: any) => Promise<any>>> {
     return {
       list_managed_sessions: async () => registry.snapshot(),
       discover_sessions: async (args) => discovery.list({ endpointId: projectEndpoint(args.endpoint), ...(args.search ? { search: args.search } : {}), ...(args.cwd ? { cwd: args.cwd } : {}), ...(args.limit ? { limit: args.limit } : {}), ...(args.cursor ? { cursor: args.cursor } : {}) }),
@@ -498,7 +498,7 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
       },
       send_chat_message: async (args, context) => ({ deliveryId: deliveries.prepare({ id: `chat:${context.sourceContextId}:${context.attemptId}:${context.callId}`, kind: "chat", destination: String(config.telegramDestinationChatId), body: args.content, mandatory: false, replyTo: args.reply_to }).id }),
       prepare_chat_attachment: async (args, context) => {
-        const ownerRoot = args.owner === "coordinator" ? coordinatorDir : sessions.managedProjectRoot(args.owner);
+        const ownerRoot = args.owner === "assistant" ? assistantDir : sessions.managedProjectRoot(args.owner);
         const prepared = await attachments.prepareOutbound(context.sourceContextId, ownerRoot, args.relative_path, undefined, undefined, operationFileHandle(context.sourceContextId, context.attemptId, context.callId));
         return { file_handle: prepared.id, display_name: prepared.displayName, media_type: prepared.mediaType, size: prepared.size, sha256: prepared.sha256 };
       },
@@ -597,15 +597,15 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
 
   function projectEndpoint(requested?: string): string {
     const endpointId = requested ?? endpoint.id;
-    if (endpointId === coordinatorEndpoint.id) throw new AppError("UNSUPPORTED_CAPABILITY", "the coordinator-only endpoint cannot host project sessions");
+    if (endpointId === assistantEndpoint.id) throw new AppError("UNSUPPORTED_CAPABILITY", "the assistant-only endpoint cannot host project sessions");
     return endpointId;
   }
 
-  async function runCoordinatorJob(job: CoordinatorJob): Promise<void> {
+  async function runAssistantJob(job: AssistantJob): Promise<void> {
     const isEventBatch = "events" in job;
     const eventIds = isEventBatch ? job.events.map((event) => event.id) : [];
     const contextId = isEventBatch ? `batch:${eventIds.join(",")}` : String((job.payload as any).contextId);
-    if (!schedulerAccepting || stopping || hasOrphanCoordinatorAttempt()) {
+    if (!schedulerAccepting || stopping || hasOrphanAssistantAttempt()) {
       enqueuedSources.delete(contextId);
       for (const id of eventIds) enqueuedEvents.delete(id);
       return;
@@ -625,80 +625,80 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
       return;
     }
     const isInternal = source.kind !== "telegram";
-    const identity = registry.snapshot().coordinator;
-    const internalLabel = source.kind === "recovery" ? "Recovery metadata for a previous coordinator attempt" : "Project session event metadata";
+    const identity = registry.snapshot().assistant;
+    const internalLabel = source.kind === "recovery" ? "Recovery metadata for a previous assistant attempt" : "Project session event metadata";
     const input: any[] = [{ type: "text", text: isInternal ? `${internalLabel}:\n${source.rawText}` : source.rawText, text_elements: [] }];
     if (!isInternal && source.attachmentIds.length > 0) {
       input.push({ type: "text", text: `Backend attachment handles in source order: ${JSON.stringify(source.attachmentIds)}`, text_elements: [] });
       input.push(...source.attachmentIds.map((id) => attachments.toUserInput(contextId, id as any)));
     }
     const attemptId = `attempt_${crypto.randomUUID()}`;
-    coordinator.prepareAttempt(contextId, attemptId, isInternal ? "internal" : "user");
+    assistant.prepareAttempt(contextId, attemptId, isInternal ? "internal" : "user");
     try {
       const response = await pool.startTurn<any>(identity.endpoint, { threadId: identity.thread_id, clientUserMessageId: contextId, input });
       const turnId = String(response.turn.id);
-      coordinator.bindTurn(attemptId, turnId);
+      assistant.bindTurn(attemptId, turnId);
       if (stopping || !schedulerAccepting) {
         await pool.interrupt(identity.endpoint, identity.thread_id, turnId).catch(() => undefined);
-        throw new AppError("OPERATION_UNCERTAIN", "bot stopped after the coordinator turn started and before its terminal state was observed");
+        throw new AppError("OPERATION_UNCERTAIN", "bot stopped after the assistant turn started and before its terminal state was observed");
       }
       const terminal = new Promise<void>((resolvePromise, rejectPromise) => terminalWaiters.set(turnId, { resolve: resolvePromise, reject: rejectPromise, eventIds }));
-      const early = earlyCoordinatorTerminals.take(turnId);
-      if (early) await processCoordinatorTerminal(early);
-      else if (isTerminalStatus(response.turn.status)) await processCoordinatorTerminal({ threadId: identity.thread_id, turn: response.turn });
+      const early = earlyAssistantTerminals.take(turnId);
+      if (early) await processAssistantTerminal(early);
+      else if (isTerminalStatus(response.turn.status)) await processAssistantTerminal({ threadId: identity.thread_id, turn: response.turn });
       await terminal;
     } catch (error) {
       await reconcileOperations();
-      const active = coordinator.current();
+      const active = assistant.current();
       if (active?.attemptId === attemptId) terminalWaiters.delete(active.turnId);
-      const uncertainTransport = isUncertainCoordinatorTransportFailure(error, coordinatorEndpoint.state);
+      const uncertainTransport = isUncertainAssistantTransportFailure(error, assistantEndpoint.state);
       if (uncertainTransport && active?.attemptId === attemptId) {
-        coordinator.abandonActive(active.turnId);
+        assistant.abandonActive(active.turnId);
         enqueuedSources.delete(contextId);
         for (const id of eventIds) enqueuedEvents.delete(id);
         return;
       }
-      const recovery = active?.attemptId === attemptId ? coordinator.failAttempt(active.turnId, error) : undefined;
+      const recovery = active?.attemptId === attemptId ? assistant.failAttempt(active.turnId, error) : undefined;
       await requeueFailedContext(contextId, eventIds, recovery);
     }
   }
 
-  async function handleSchedulerFailure(job: CoordinatorJob, _error: unknown): Promise<void> {
+  async function handleSchedulerFailure(job: AssistantJob, _error: unknown): Promise<void> {
     const eventIds = "events" in job ? job.events.map((event) => event.id) : [];
     const contextId = "events" in job ? `batch:${eventIds.join(",")}` : String((job.payload as any).contextId);
     enqueuedSources.delete(contextId);
     for (const id of eventIds) enqueuedEvents.delete(id);
-    recordBackgroundFailure("coordinator job before dispatch");
+    recordBackgroundFailure("assistant job before dispatch");
     await requeueFailedContext(contextId, eventIds, undefined);
   }
 
   async function onNotification(endpointId: string, method: string, params: any): Promise<void> {
-    const identity = registry.snapshot().coordinator;
+    const identity = registry.snapshot().assistant;
     if (endpointId === identity.endpoint && method === "turn/completed" && params.threadId === identity.thread_id) {
       pool.markTurnTerminal(endpointId, identity.thread_id, params.turn.id);
-      if (terminalWaiters.has(params.turn.id) || coordinator.activeAttempts().some((attempt) => attempt.turnId === params.turn.id)) await processCoordinatorTerminal(params);
-      else earlyCoordinatorTerminals.publish(params.turn.id, params);
+      if (terminalWaiters.has(params.turn.id) || assistant.activeAttempts().some((attempt) => attempt.turnId === params.turn.id)) await processAssistantTerminal(params);
+      else earlyAssistantTerminals.publish(params.turn.id, params);
       return;
     }
     await relay.handleNotification(endpointId, method, params);
     await enqueuePendingEvents();
   }
 
-  async function processCoordinatorTerminal(params: any): Promise<void> {
-    const identity = registry.snapshot().coordinator;
+  async function processAssistantTerminal(params: any): Promise<void> {
+    const identity = registry.snapshot().assistant;
     const history = await pool.request<any>(identity.endpoint, "thread/read", { threadId: identity.thread_id, includeTurns: true });
     const turn = history.thread.turns.find((candidate: any) => candidate.id === params.turn.id) ?? params.turn;
     const messages = finals.persistTerminalTurn(identity.endpoint, identity.thread_id, turn, Date.now());
-    const attempt = coordinator.contextForTurn(turn.id);
-    let recovery: ReturnType<CoordinatorRuntime["failAttempt"]>;
+    const attempt = assistant.contextForTurn(turn.id);
+    let recovery: ReturnType<AssistantRuntime["failAttempt"]>;
     if (turn.status === "completed") {
-      coordinator.handleTerminal(turn.id, messages.map((message) => message.body).join("\n") || undefined);
+      assistant.handleTerminal(turn.id, messages.map((message) => message.body).join("\n") || undefined);
       if (attempt) {
         enqueuedSources.delete(attempt.contextId);
       }
     } else {
       await reconcileOperations({ includeActiveAttempt: true });
-      recovery = coordinator.failAttempt(turn.id, turn.error);
+      recovery = assistant.failAttempt(turn.id, turn.error);
     }
     const waiter = terminalWaiters.get(turn.id);
     const durableEventIds = attempt ? eventIdsForContext(attempt.contextId) : [];
@@ -716,7 +716,7 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
   }
 
   function enqueuePendingEvents(): void {
-    if (!schedulerAccepting || stopping || hasOrphanCoordinatorAttempt()) return;
+    if (!schedulerAccepting || stopping || hasOrphanAssistantAttempt()) return;
     const rows = db.prepare("SELECT id, endpoint_id, thread_id, payload_json FROM events WHERE state = 'pending' ORDER BY created_at, id").all() as Array<Record<string, unknown>>;
     const latestTransient = new Map<string, string>();
     for (const row of rows) {
@@ -739,18 +739,18 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
   }
 
   function enqueuePendingSources(): void {
-    if (!schedulerAccepting || stopping || hasOrphanCoordinatorAttempt()) return;
+    if (!schedulerAccepting || stopping || hasOrphanAssistantAttempt()) return;
     for (const source of operations.listPendingSourceContexts(["telegram", "recovery"])) enqueueSource(source.id);
   }
 
   function enqueueSource(contextId: string): void {
-    if (!schedulerAccepting || stopping || hasOrphanCoordinatorAttempt()) return;
+    if (!schedulerAccepting || stopping || hasOrphanAssistantAttempt()) return;
     if (enqueuedSources.has(contextId)) return;
     enqueuedSources.add(contextId);
     scheduler.enqueueUser({ id: contextId, payload: { contextId } });
   }
 
-  async function requeueFailedContext(contextId: string, eventIds: readonly string[], recovery: ReturnType<CoordinatorRuntime["failAttempt"]>): Promise<void> {
+  async function requeueFailedContext(contextId: string, eventIds: readonly string[], recovery: ReturnType<AssistantRuntime["failAttempt"]>): Promise<void> {
     enqueuedSources.delete(contextId);
     for (const id of eventIds) enqueuedEvents.delete(id);
     if (recovery) {
@@ -774,53 +774,53 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
     return row ? JSON.parse(row.event_ids_json) as string[] : [];
   }
 
-  function hasOrphanCoordinatorAttempt(): boolean {
-    return coordinator.activeAttempts().length > 0 && coordinator.current() === undefined;
+  function hasOrphanAssistantAttempt(): boolean {
+    return assistant.activeAttempts().length > 0 && assistant.current() === undefined;
   }
 
-  async function startOrResumeCoordinator(): Promise<void> {
-    const resumed = await resumeCoordinatorIdentity({
+  async function startOrResumeAssistant(): Promise<void> {
+    const resumed = await resumeAssistantIdentity({
       registry,
-      endpoint: coordinatorEndpoint,
+      endpoint: assistantEndpoint,
       legacyEndpointId: endpoint.id,
-      coordinatorDir,
+      assistantDir,
       sandboxMode: config.sandboxMode,
-      config: coordinatorTurnConfig(mcp.url, token),
-      creationNonce: coordinatorProfile.creationNonce,
-      pendingThreadId: coordinatorProfile.pendingThreadId,
-      recordPendingThread: (threadId) => coordinatorProfile.recordPendingThread(threadId),
-      clearPendingThread: (threadId) => coordinatorProfile.clearPendingThread(threadId),
+      config: assistantTurnConfig(mcp.url, token),
+      creationNonce: assistantProfile.creationNonce,
+      pendingThreadId: assistantProfile.pendingThreadId,
+      recordPendingThread: (threadId) => assistantProfile.recordPendingThread(threadId),
+      clearPendingThread: (threadId) => assistantProfile.clearPendingThread(threadId),
     });
-    runtime.setSession(coordinatorEndpoint.id, resumed.threadId, "managed", resumed.nativeStatus);
+    runtime.setSession(assistantEndpoint.id, resumed.threadId, "managed", resumed.nativeStatus);
   }
 
-  async function recoverLegacyCoordinatorAttempts(): Promise<void> {
-    const legacy = registry.snapshot().coordinator;
-    await recoverCoordinatorProfileAttempts({
-      runtime: coordinator,
+  async function recoverLegacyAssistantAttempts(): Promise<void> {
+    const legacy = registry.snapshot().assistant;
+    await recoverAssistantProfileAttempts({
+      runtime: assistant,
       legacyThreadId: legacy.thread_id,
-      coordinatorDir,
+      assistantDir,
       readLegacyThread: async () => (await endpoint.request<any>("thread/read", { threadId: legacy.thread_id, includeTurns: true })).thread,
       reconcileOperations: () => reconcileOperations({ includeActiveAttempt: true }),
-      completeTurn: async (turn: LegacyCoordinatorTurn) => {
-        const messages = finals.persistTerminalTurn(coordinatorEndpoint.id, legacy.thread_id, turn as any, Date.now());
-        coordinator.handleTerminal(turn.id, messages.map((message) => message.body).join("\n") || undefined);
+      completeTurn: async (turn: LegacyAssistantTurn) => {
+        const messages = finals.persistTerminalTurn(assistantEndpoint.id, legacy.thread_id, turn as any, Date.now());
+        assistant.handleTerminal(turn.id, messages.map((message) => message.body).join("\n") || undefined);
       },
     });
   }
 
-  async function reconcileCoordinatorAttempts(): Promise<void> {
-    const identity = registry.snapshot().coordinator;
-    for (const attempt of coordinator.activeAttempts()) {
+  async function reconcileAssistantAttempts(): Promise<void> {
+    const identity = registry.snapshot().assistant;
+    for (const attempt of assistant.activeAttempts()) {
       let turnId = attempt.turnId;
       if (attempt.turnId.startsWith("pending:")) {
         const pendingHistory = await pool.request<any>(identity.endpoint, "thread/read", { threadId: identity.thread_id, includeTurns: true });
         const matched = [...pendingHistory.thread.turns].reverse().find((candidate: any) => candidate.items.some((item: any) => item.type === "userMessage" && item.clientId === attempt.contextId));
         if (matched) {
-          coordinator.bindTurn(attempt.attemptId, matched.id);
+          assistant.bindTurn(attempt.attemptId, matched.id);
           turnId = matched.id;
         } else if (pendingHistory.thread.status?.type === "idle") {
-          await requeueFailedContext(attempt.contextId, [], coordinator.failAttempt(attempt.turnId, "restart proved that the unbound turn was never created"));
+          await requeueFailedContext(attempt.contextId, [], assistant.failAttempt(attempt.turnId, "restart proved that the unbound turn was never created"));
           continue;
         } else {
           continue;
@@ -838,7 +838,7 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
           await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
         } while (Date.now() < deadline);
       }
-      if (turn && isTerminalStatus(turn.status)) await processCoordinatorTerminal({ threadId: identity.thread_id, turn });
+      if (turn && isTerminalStatus(turn.status)) await processAssistantTerminal({ threadId: identity.thread_id, turn });
       // If the exact turn is still not terminal, leave its source and attempt active.
       // A later terminal notification or maintenance pass will reconcile it; rerunning
       // the source now could let the old turn perform effects after the replay starts.
@@ -855,7 +855,7 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
   }
 
   async function reconcileOperationsOnce(options: { includeActiveAttempt?: boolean }): Promise<void> {
-    const liveAttemptId = coordinator.current()?.attemptId;
+    const liveAttemptId = assistant.current()?.attemptId;
     for (const operation of operations.listRecoverable()) {
       if (!options.includeActiveAttempt && operation.attemptId === liveAttemptId) continue;
       const args = operation.args as any;
@@ -876,7 +876,7 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
           const id = operationFileHandle(operation.contextId, operation.attemptId, operation.callId);
           let prepared = attachments.get(operation.contextId, id);
           if (!prepared) {
-            const ownerRoot = args.owner === "coordinator" ? coordinatorDir : sessions.managedProjectRoot(args.owner);
+            const ownerRoot = args.owner === "assistant" ? assistantDir : sessions.managedProjectRoot(args.owner);
             prepared = await attachments.prepareOutbound(operation.contextId, ownerRoot, args.relative_path, undefined, undefined, id);
           }
           operations.succeed(operation.id, { file_handle: prepared.id, display_name: prepared.displayName, media_type: prepared.mediaType, size: prepared.size, sha256: prepared.sha256 });
@@ -1134,14 +1134,14 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
         dashboardStore.observeLifecycle({ endpointId: session.endpointId, threadId: session.threadId }, Date.now());
       }
     }
-    if (target.id === coordinatorEndpoint.id) {
+    if (target.id === assistantEndpoint.id) {
       schedulerAccepting = false;
       for (const [turnId, waiter] of terminalWaiters) {
         terminalWaiters.delete(turnId);
-        waiter.reject(new AppError("ENDPOINT_UNAVAILABLE", "coordinator app-server became unavailable"));
+        waiter.reject(new AppError("ENDPOINT_UNAVAILABLE", "assistant app-server became unavailable"));
       }
     }
-    const identity = registry.snapshot().coordinator;
+    const identity = registry.snapshot().assistant;
     deliveries.prepare({
       id: `endpoint-unavailable:${target.id}:${endpointIncident}`,
       kind: "system_warning",
@@ -1180,16 +1180,16 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
       await renderDashboardSafely();
     } else {
       try {
-        await startAuthenticatedCoordinatorEndpoint(coordinatorEndpoint, coordinatorProfile);
+        await startAuthenticatedAssistantEndpoint(assistantEndpoint, assistantProfile);
       } catch (error) {
-        if (error instanceof AppError && error.details?.reason === "coordinator_auth_required") {
-          recordCoordinatorAuthenticationFailure(deliveries, String(config.telegramDestinationChatId), endpointIncident);
+        if (error instanceof AppError && error.details?.reason === "assistant_auth_required") {
+          recordAssistantAuthenticationFailure(deliveries, String(config.telegramDestinationChatId), endpointIncident);
         }
         throw error;
       }
-      await startOrResumeCoordinator();
+      await startOrResumeAssistant();
       await reconcileOperations();
-      await reconcileCoordinatorAttempts();
+      await reconcileAssistantAttempts();
       schedulerAccepting = true;
     }
     acceptingReadyEvents = true;
@@ -1237,7 +1237,7 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
       backgroundIncident += 1;
       const id = `background-failure:${backgroundIncident}`;
       deliveries.prepare({ id, kind: "system_warning", destination: String(config.telegramDestinationChatId), body: `[system] ${label} failed; durable reconciliation will retry`, mandatory: true });
-      const identity = registry.snapshot().coordinator;
+      const identity = registry.snapshot().assistant;
       db.prepare(`INSERT OR IGNORE INTO events(id, endpoint_id, thread_id, kind, payload_json, state, created_at)
         VALUES (?, ?, ?, 'background_failure', ?, 'pending', ?)`)
         .run(id, identity.endpoint, identity.thread_id, JSON.stringify({ label, incident: backgroundIncident }), Date.now());
@@ -1258,9 +1258,9 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
       catch { recordBackgroundFailure("periodic project reconciliation"); }
     }
     await renderDashboardSafely();
-    if (coordinatorEndpoint.state === "ready") {
-      await reconcileCoordinatorAttempts();
-      if (!hasOrphanCoordinatorAttempt()) {
+    if (assistantEndpoint.state === "ready") {
+      await reconcileAssistantAttempts();
+      if (!hasOrphanAssistantAttempt()) {
         await enqueuePendingEvents();
         await enqueuePendingSources();
       }
@@ -1286,9 +1286,9 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
   }
 
   async function validateRegistryDocument(document: RegistryDocument): Promise<void> {
-    const currentCoordinator = registry.snapshot().coordinator;
-    if (document.coordinator.endpoint !== currentCoordinator.endpoint || document.coordinator.thread_id !== currentCoordinator.thread_id || document.coordinator.project_dir !== currentCoordinator.project_dir) {
-      throw new Error("the live coordinator mapping cannot be externally repointed");
+    const currentAssistant = registry.snapshot().assistant;
+    if (document.assistant.endpoint !== currentAssistant.endpoint || document.assistant.thread_id !== currentAssistant.thread_id || document.assistant.project_dir !== currentAssistant.project_dir) {
+      throw new Error("the live assistant mapping cannot be externally repointed");
     }
     for (const session of Object.values(document.sessions)) {
       if (session.endpoint !== endpoint.id) throw new Error(`unknown endpoint: ${session.endpoint}`);
@@ -1308,7 +1308,7 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
   }
 }
 
-export function isUncertainCoordinatorTransportFailure(error: unknown, endpointState: LocalEndpoint["state"]): boolean {
+export function isUncertainAssistantTransportFailure(error: unknown, endpointState: LocalEndpoint["state"]): boolean {
   return endpointState !== "ready" || (error instanceof AppError && new Set(["ENDPOINT_UNAVAILABLE", "OPERATION_UNCERTAIN"]).has(error.code));
 }
 

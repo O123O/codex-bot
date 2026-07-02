@@ -36,10 +36,10 @@ class LifecycleEndpoint implements AppServerEndpoint {
 }
 
 async function fixture() {
-  const dir = await realpath(await mkdtemp(join(tmpdir(), "codex-bot-life-")));
+  const dir = await realpath(await mkdtemp(join(tmpdir(), "qiyan-bot-life-")));
   const registry = await SessionRegistry.open(join(dir, "sessions.json"), {
     version: 1,
-    coordinator: { endpoint: "local", thread_id: "coordinator", project_dir: dir },
+    assistant: { endpoint: "local", thread_id: "assistant", project_dir: dir },
     sessions: {},
   });
   const endpoint = new LifecycleEndpoint();

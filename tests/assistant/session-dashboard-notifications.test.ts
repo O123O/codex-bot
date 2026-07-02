@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { SessionObservationProcessor } from "../../src/coordinator/session-observer.ts";
+import { SessionObservationProcessor } from "../../src/assistant/session-observer.ts";
 import { createTestDatabase } from "../../src/storage/database.ts";
 import { RuntimeStore } from "../../src/storage/runtime-store.ts";
 import { SessionDashboardStore } from "../../src/storage/session-dashboard-store.ts";
@@ -12,7 +12,7 @@ function fixture(options: { readThread?: () => Promise<any>; readGoal?: () => Pr
   runtime.setSession("local", "thread-1", "managed", "idle");
   const registry = { snapshot: () => ({
     version: 1 as const,
-    coordinator: { endpoint: "coordinator-local", thread_id: "manager", project_dir: "/manager" },
+    assistant: { endpoint: "assistant-local", thread_id: "manager", project_dir: "/manager" },
     sessions: { payments: { endpoint: "local", thread_id: "thread-1", project_dir: "/projects/payments" } },
   }) };
   let changes = 0;

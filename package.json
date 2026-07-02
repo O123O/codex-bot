@@ -1,14 +1,14 @@
 {
-  "name": "codex-chat-bot",
-  "version": "0.1.0",
+  "name": "qiyan-bot",
+  "version": "0.2.0",
   "type": "module",
   "bin": {
-    "codex-bot": "dist/codex-bot"
+    "qiyan-bot": "dist/qiyan-bot"
   },
   "files": [
-    "dist/codex-bot",
-    "assets/coordinator/AGENTS.md",
-    "assets/coordinator/session-status.example.json"
+    "dist/qiyan-bot",
+    "assets/assistant/AGENTS.md",
+    "assets/assistant/session-status.example.json"
   ],
   "engines": {
     "node": ">=24"

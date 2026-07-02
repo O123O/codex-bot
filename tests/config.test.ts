@@ -1,14 +1,14 @@
 import assert from "node:assert/strict";
 import { resolve } from "node:path";
 import test from "node:test";
-import { loadConfig, loadCoordinatorLoginConfig } from "../src/config.ts";
+import { loadConfig, loadAssistantLoginConfig } from "../src/config.ts";
 
 function baseEnv(overrides: Record<string, string | undefined> = {}): Record<string, string | undefined> {
   return {
     TELEGRAM_BOT_TOKEN: "secret",
     TELEGRAM_OWNER_ID: "42",
     TELEGRAM_DESTINATION_CHAT_ID: "42",
-    COORDINATOR_WORKDIR: "coordinator-home",
+    ASSISTANT_WORKDIR: "assistant-home",
     ...overrides,
   };
 }
@@ -26,7 +26,7 @@ test("loadConfig applies bounded defaults", () => {
 });
 
 test("loadConfig accepts an explicit execution sandbox", () => {
-  const config = loadConfig(baseEnv({ SANDBOX_MODE: "read-only" }));
+  const config = loadConfig(baseEnv({ ASSISTANT_SANDBOX_MODE: "read-only" }));
   assert.equal(config.sandboxMode, "read-only");
 });
 
@@ -38,24 +38,24 @@ test("loadConfig rejects an outbound chat other than the authorized owner's priv
   assert.throws(() => loadConfig(baseEnv({ TELEGRAM_DESTINATION_CHAT_ID: "99" })), /TELEGRAM_DESTINATION_CHAT_ID/);
 });
 
-test("loadConfig requires a coordinator workdir", () => {
-  assert.throws(() => loadConfig(baseEnv({ COORDINATOR_WORKDIR: undefined })), /COORDINATOR_WORKDIR/);
+test("loadConfig requires a assistant workdir", () => {
+  assert.throws(() => loadConfig(baseEnv({ ASSISTANT_WORKDIR: undefined })), /ASSISTANT_WORKDIR/);
 });
 
 test("CLI workdir overrides the environment and resolves from the launch directory", () => {
-  const config = loadConfig(baseEnv({ COORDINATOR_WORKDIR: "from-env" }), { coordinatorWorkdir: "from-cli" });
-  assert.equal(config.coordinatorWorkdir, resolve("from-cli"));
+  const config = loadConfig(baseEnv({ ASSISTANT_WORKDIR: "from-env" }), { assistantWorkdir: "from-cli" });
+  assert.equal(config.assistantWorkdir, resolve("from-cli"));
 });
 
 test("CLI workdir takes precedence before an invalid environment workdir is validated", () => {
-  const config = loadConfig(baseEnv({ COORDINATOR_WORKDIR: "" }), { coordinatorWorkdir: "from-cli" });
-  assert.equal(config.coordinatorWorkdir, resolve("from-cli"));
+  const config = loadConfig(baseEnv({ ASSISTANT_WORKDIR: "" }), { assistantWorkdir: "from-cli" });
+  assert.equal(config.assistantWorkdir, resolve("from-cli"));
 });
 
-test("coordinator login configuration needs only data and Codex paths", () => {
-  assert.deepEqual(loadCoordinatorLoginConfig({ DATA_DIR: "private-data", CODEX_BINARY: "/opt/codex" }), {
+test("assistant login configuration needs only data and Codex paths", () => {
+  assert.deepEqual(loadAssistantLoginConfig({ DATA_DIR: "private-data", CODEX_BINARY: "/opt/codex" }), {
     dataDir: resolve("private-data"),
     codexBinary: "/opt/codex",
   });
-  assert.deepEqual(loadCoordinatorLoginConfig({}), { dataDir: resolve("data"), codexBinary: "codex" });
+  assert.deepEqual(loadAssistantLoginConfig({}), { dataDir: resolve("data"), codexBinary: "codex" });
 });

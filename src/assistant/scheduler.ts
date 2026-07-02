@@ -1,10 +1,10 @@
 export interface UserJob { id: string; payload: unknown }
 export interface EventJob { id: string; sessionKey: string; payload: unknown }
-export type CoordinatorJob = UserJob | { id: string; events: EventJob[]; payload: unknown };
+export type AssistantJob = UserJob | { id: string; events: EventJob[]; payload: unknown };
 
 interface QueuedEvent { job: EventJob; queuedAt: number }
 
-export class CoordinatorScheduler {
+export class AssistantScheduler {
   private readonly users: UserJob[] = [];
   private readonly events: QueuedEvent[] = [];
   private running = false;
@@ -13,7 +13,7 @@ export class CoordinatorScheduler {
   private eventTimer: ReturnType<typeof setTimeout> | undefined;
 
   constructor(
-    private readonly execute: (job: CoordinatorJob) => Promise<void>,
+    private readonly execute: (job: AssistantJob) => Promise<void>,
     private readonly options: {
       maxBatchEvents?: number;
       maxBatchBytes?: number;
@@ -22,7 +22,7 @@ export class CoordinatorScheduler {
       now?: () => number;
       setTimeout?: typeof setTimeout;
       clearTimeout?: typeof clearTimeout;
-      onError?: (job: CoordinatorJob, error: unknown) => Promise<void> | void;
+      onError?: (job: AssistantJob, error: unknown) => Promise<void> | void;
     } = {},
   ) {}
 
@@ -84,7 +84,7 @@ export class CoordinatorScheduler {
     }
   }
 
-  private async executeSafely(job: CoordinatorJob): Promise<void> {
+  private async executeSafely(job: AssistantJob): Promise<void> {
     try { await this.execute(job); }
     catch (error) {
       try { await this.options.onError?.(job, error); }

@@ -4,7 +4,7 @@ import { composeApp, TerminalInbox, type AppPhase } from "../src/app.ts";
 
 test("composition starts in order, starts each worker once, and stops in reverse", async () => {
   const events: string[] = [];
-  const phases: AppPhase[] = ["storage", "registry", "attachments", "mcp", "subscriptions", "endpoint", "reconciliation", "coordinator", "scheduler", "delivery", "maintenance", "polling"].map((name) => ({
+  const phases: AppPhase[] = ["storage", "registry", "attachments", "mcp", "subscriptions", "endpoint", "reconciliation", "assistant", "scheduler", "delivery", "maintenance", "polling"].map((name) => ({
     name, start: async () => { events.push(`start:${name}`); }, stop: async () => { events.push(`stop:${name}`); },
   }));
   const app = composeApp(phases);

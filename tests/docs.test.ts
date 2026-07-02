@@ -21,8 +21,8 @@ test("README links to all focused guides and every local guide target exists", a
 test("installation guide covers Release install, no-Git source build, version, and update", async () => {
   const guide = await readFile(resolve("docs/installation.md"), "utf8");
   for (const required of [
-    "releases/latest/download/codex-bot.tgz", "$HOME/.local", "main.tar.gz", "npm ci", "npm pack",
-    "codex-bot --version", "codex-bot --update", "Release must exist", "does not restart",
+    "releases/latest/download/qiyan-bot.tgz", "$HOME/.local", "main.tar.gz", "npm ci", "npm pack",
+    "qiyan-bot --version", "qiyan-bot --update", "Release must exist", "does not restart",
   ]) {
     assert.equal(guide.includes(required), true, `installation guide is missing: ${required}`);
   }
@@ -33,7 +33,7 @@ test("Telegram guide is actionable for the implemented private single-user adapt
   const guide = await readFile(resolve("docs/chat-apps/telegram.md"), "utf8");
   for (const required of [
     "Status: Implemented", "@BotFather", "numeric Telegram user ID", "TELEGRAM_BOT_TOKEN",
-    "TELEGRAM_OWNER_ID", "TELEGRAM_DESTINATION_CHAT_ID", "coordinator-login", "codex-bot --workdir",
+    "TELEGRAM_OWNER_ID", "TELEGRAM_DESTINATION_CHAT_ID", "assistant-login", "qiyan-bot --workdir",
     "private chat", "Smoke test", "attachment",
   ]) {
     assert.equal(guide.includes(required), true, `Telegram guide is missing: ${required}`);

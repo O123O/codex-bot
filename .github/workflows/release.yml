@@ -45,14 +45,14 @@ jobs:
         shell: bash
         run: |
           archive=$(npm pack --silent)
-          mv -- "$archive" codex-bot.tgz
-          tar -tzf codex-bot.tgz | sort > package-files.txt
+          mv -- "$archive" qiyan-bot.tgz
+          tar -tzf qiyan-bot.tgz | sort > package-files.txt
           for required in \
             package/package.json \
             package/README.md \
-            package/dist/codex-bot \
-            package/assets/coordinator/AGENTS.md \
-            package/assets/coordinator/session-status.example.json
+            package/dist/qiyan-bot \
+            package/assets/assistant/AGENTS.md \
+            package/assets/assistant/session-status.example.json
           do
             grep -Fxq "$required" package-files.txt
           done
@@ -69,4 +69,4 @@ jobs:
           if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes
           fi
-          gh release upload "$GITHUB_REF_NAME" codex-bot.tgz --clobber
+          gh release upload "$GITHUB_REF_NAME" qiyan-bot.tgz --clobber

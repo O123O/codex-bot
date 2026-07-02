@@ -1,8 +1,8 @@
 import { realpath } from "node:fs/promises";
-import type { CoordinatorRuntime } from "./runtime.ts";
+import type { AssistantRuntime } from "./runtime.ts";
 import { AppError } from "../core/errors.ts";
 
-export interface LegacyCoordinatorTurn {
+export interface LegacyAssistantTurn {
   id: string;
   status: string;
   completedAt?: number | null;
@@ -10,22 +10,22 @@ export interface LegacyCoordinatorTurn {
   items: Array<{ type: string; id?: string; clientId?: string; phase?: string | null; text?: string }>;
 }
 
-export async function recoverCoordinatorProfileAttempts(input: {
-  runtime: CoordinatorRuntime;
+export async function recoverAssistantProfileAttempts(input: {
+  runtime: AssistantRuntime;
   legacyThreadId: string;
-  coordinatorDir: string;
-  readLegacyThread(): Promise<{ id: string; cwd: string; turns: LegacyCoordinatorTurn[] }>;
+  assistantDir: string;
+  readLegacyThread(): Promise<{ id: string; cwd: string; turns: LegacyAssistantTurn[] }>;
   reconcileOperations(): Promise<void>;
-  completeTurn(turn: LegacyCoordinatorTurn): Promise<void>;
+  completeTurn(turn: LegacyAssistantTurn): Promise<void>;
 }): Promise<void> {
   await input.reconcileOperations();
   const active = input.runtime.activeAttempts();
   if (active.length === 0) return;
-  let turns: LegacyCoordinatorTurn[] = [];
+  let turns: LegacyAssistantTurn[] = [];
   if (input.legacyThreadId !== "pending") {
     const thread = await input.readLegacyThread();
-    if (thread.id !== input.legacyThreadId) throw new AppError("CONFIGURATION_ERROR", "legacy coordinator history returned a different thread identity");
-    if (!await sameDirectory(thread.cwd, input.coordinatorDir)) throw new AppError("CONFIGURATION_ERROR", "legacy coordinator history returned a different working directory");
+    if (thread.id !== input.legacyThreadId) throw new AppError("CONFIGURATION_ERROR", "legacy assistant history returned a different thread identity");
+    if (!await sameDirectory(thread.cwd, input.assistantDir)) throw new AppError("CONFIGURATION_ERROR", "legacy assistant history returned a different working directory");
     turns = thread.turns;
   }
 
@@ -39,11 +39,11 @@ export async function recoverCoordinatorProfileAttempts(input: {
       turnId = turn.id;
     }
     if (turn?.status === "completed") await input.completeTurn(turn);
-    else if (turn && isTerminal(turn.status)) input.runtime.failAttempt(turnId, turn.error ?? `legacy coordinator turn ${turn.status}`);
+    else if (turn && isTerminal(turn.status)) input.runtime.failAttempt(turnId, turn.error ?? `legacy assistant turn ${turn.status}`);
   }
 
   for (const unresolved of input.runtime.activeAttempts()) {
-    input.runtime.failAttempt(unresolved.turnId, new Error("coordinator profile migration replaced the previous app-server thread"));
+    input.runtime.failAttempt(unresolved.turnId, new Error("assistant profile migration replaced the previous app-server thread"));
   }
 }
 

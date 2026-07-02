@@ -4,16 +4,16 @@ import { basename, dirname, isAbsolute, join, parse, relative, resolve, sep } fr
 import { AppError } from "../core/errors.ts";
 
 const POLICY_FILE = "AGENTS.md";
-const DIGEST_FILE = ".codex-bot-agents.sha256";
+const DIGEST_FILE = ".qiyan-bot-agents.sha256";
 
-export interface CoordinatorWorkspaceOptions {
+export interface AssistantWorkspaceOptions {
   workdir: string;
   dataDir: string;
   registryPath: string;
   policyTemplatePath: string;
 }
 
-export interface PreparedCoordinatorWorkspace {
+export interface PreparedAssistantWorkspace {
   root: string;
   dataRoot: string;
   registryPath: string;
@@ -21,7 +21,7 @@ export interface PreparedCoordinatorWorkspace {
   warnings: string[];
 }
 
-export async function prepareCoordinatorWorkspace(options: CoordinatorWorkspaceOptions): Promise<PreparedCoordinatorWorkspace> {
+export async function prepareAssistantWorkspace(options: AssistantWorkspaceOptions): Promise<PreparedAssistantWorkspace> {
   try {
     const requestedRoot = resolve(options.workdir);
     const requestedDataRoot = resolve(options.dataDir);
@@ -63,7 +63,7 @@ export async function prepareCoordinatorWorkspace(options: CoordinatorWorkspaceO
       const installed = await readFile(policyPath);
       const recorded = (await readFile(digestPath, "utf8")).trim();
       if (!/^[a-f0-9]{64}$/u.test(recorded) || digest(installed) !== recorded) {
-        throw managedError(`${policyPath} is managed by codex-bot and was modified; put custom instructions in AGENTS.override.md`);
+        throw managedError(`${policyPath} is managed by qiyan-bot and was modified; put custom instructions in AGENTS.override.md`);
       }
       if (recorded !== packagedDigest) {
         await atomicWrite(policyPath, packagedPolicy);
@@ -72,11 +72,11 @@ export async function prepareCoordinatorWorkspace(options: CoordinatorWorkspaceO
     }
 
     const gitRoot = await findGitAncestor(root);
-    const warnings = gitRoot ? [`Coordinator workdir ${root} is inside Git worktree ${gitRoot}; Codex may inherit parent instructions, project configuration, and repository skills.`] : [];
+    const warnings = gitRoot ? [`Assistant workdir ${root} is inside Git worktree ${gitRoot}; Codex may inherit parent instructions, project configuration, and repository skills.`] : [];
     return { root, dataRoot, registryPath, dashboardPath: join(root, "session-status.json"), warnings };
   } catch (error) {
     if (error instanceof AppError) throw error;
-    throw managedError(`cannot prepare coordinator workdir ${options.workdir}`);
+    throw managedError(`cannot prepare assistant workdir ${options.workdir}`);
   }
 }
 
@@ -124,7 +124,7 @@ async function canonicalFilePath(path: string): Promise<string> {
 
 function assertSeparated(workdir: string, protectedPath: string, label: string): void {
   if (contains(workdir, protectedPath) || contains(protectedPath, workdir)) {
-    throw managedError(`coordinator workdir ${workdir} and backend ${label} ${protectedPath} must be separate from backend state`);
+    throw managedError(`assistant workdir ${workdir} and backend ${label} ${protectedPath} must be separate from backend state`);
   }
 }
 

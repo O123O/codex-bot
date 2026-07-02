@@ -14,11 +14,11 @@ import {
 } from "../../src/distribution/update.ts";
 
 test("derives only an exact Linux global npm prefix", () => {
-  assert.equal(globalPrefixForPackage("/home/user/.local/lib/node_modules/codex-chat-bot"), "/home/user/.local");
-  assert.throws(() => globalPrefixForPackage("/source/codex-chat-bot"), /globally installed/);
-  assert.throws(() => globalPrefixForPackage("/project/node_modules/codex-chat-bot"), /globally installed/);
+  assert.equal(globalPrefixForPackage("/home/user/.local/lib/node_modules/qiyan-bot"), "/home/user/.local");
+  assert.throws(() => globalPrefixForPackage("/source/qiyan-bot"), /globally installed/);
+  assert.throws(() => globalPrefixForPackage("/project/node_modules/qiyan-bot"), /globally installed/);
   assert.throws(() => globalPrefixForPackage("/prefix/lib/node_modules/another-package"), /globally installed/);
-  assert.throws(() => globalPrefixForPackage("/prefix/lib/node_modules/codex-chat-bot/dist"), /globally installed/);
+  assert.throws(() => globalPrefixForPackage("/prefix/lib/node_modules/qiyan-bot/dist"), /globally installed/);
 });
 
 test("builds a minimal npm environment without bot, Codex, or arbitrary secrets", () => {
@@ -29,7 +29,7 @@ test("builds a minimal npm environment without bot, Codex, or arbitrary secrets"
     SSL_CERT_FILE: "/cert.pem", SSL_CERT_DIR: "/certs", NODE_EXTRA_CA_CERTS: "/node.pem",
     TELEGRAM_BOT_TOKEN: "telegram-secret", TELEGRAM_OWNER_ID: "123", TELEGRAM_DESTINATION_CHAT_ID: "123",
     OPENAI_API_KEY: "openai-secret", CODEX_API_KEY: "codex-secret", CODEX_HOME: "/secret/codex",
-    CODEX_BOT_MCP_TOKEN: "mcp-secret", NPM_TOKEN: "npm-secret", npm_config_token: "npm-config-secret",
+    QIYAN_BOT_MCP_TOKEN: "mcp-secret", NPM_TOKEN: "npm-secret", npm_config_token: "npm-config-secret",
     GH_TOKEN: "github-secret", OTHER_SECRET: "other-secret", NODE_OPTIONS: "--require secret.js",
   });
 
@@ -42,11 +42,11 @@ test("builds a minimal npm environment without bot, Codex, or arbitrary secrets"
 });
 
 test("updates the detected prefix with exact safe npm arguments and re-reads the version", async (context) => {
-  const temp = await mkdtemp(join(tmpdir(), "codex-bot-update-"));
+  const temp = await mkdtemp(join(tmpdir(), "qiyan-bot-update-"));
   context.after(() => rm(temp, { recursive: true, force: true }));
   const prefix = join(temp, "prefix");
-  const packageRoot = join(prefix, "lib", "node_modules", "codex-chat-bot");
-  const modulePath = join(packageRoot, "dist", "codex-bot");
+  const packageRoot = join(prefix, "lib", "node_modules", "qiyan-bot");
+  const modulePath = join(packageRoot, "dist", "qiyan-bot");
   await mkdir(join(packageRoot, "dist"), { recursive: true });
   await writeManifest(packageRoot, "0.1.0");
   let observed: { command: string; args: readonly string[]; options: UpdateSpawnOptions } | undefined;
@@ -73,10 +73,10 @@ test("updates the detected prefix with exact safe npm arguments and re-reads the
 });
 
 test("reports child status, signal, and startup failures without leaking source errors", async (context) => {
-  const temp = await mkdtemp(join(tmpdir(), "codex-bot-update-failure-"));
+  const temp = await mkdtemp(join(tmpdir(), "qiyan-bot-update-failure-"));
   context.after(() => rm(temp, { recursive: true, force: true }));
-  const packageRoot = join(temp, "prefix", "lib", "node_modules", "codex-chat-bot");
-  const modulePath = join(packageRoot, "dist", "codex-bot");
+  const packageRoot = join(temp, "prefix", "lib", "node_modules", "qiyan-bot");
+  const modulePath = join(packageRoot, "dist", "qiyan-bot");
   await mkdir(join(packageRoot, "dist"), { recursive: true });
   await writeManifest(packageRoot, "0.1.0");
   const moduleUrl = pathToFileURL(modulePath).href;
@@ -94,5 +94,5 @@ test("reports child status, signal, and startup failures without leaking source 
 });
 
 async function writeManifest(packageRoot: string, version: string): Promise<void> {
-  await writeFile(join(packageRoot, "package.json"), `${JSON.stringify({ name: "codex-chat-bot", version })}\n`);
+  await writeFile(join(packageRoot, "package.json"), `${JSON.stringify({ name: "qiyan-bot", version })}\n`);
 }

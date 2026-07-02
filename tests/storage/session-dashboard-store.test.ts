@@ -112,14 +112,14 @@ test("render dirty acknowledgements cannot erase a concurrent revision", () => {
   assert.equal(store.renderState().dirty, false);
 });
 
-test("claims one coordinator root and migrates every legacy entry exactly once", () => {
+test("claims one assistant root and migrates every legacy entry exactly once", () => {
   const store = new SessionDashboardStore(createTestDatabase());
-  store.claimCoordinatorRoot("/manager");
-  store.claimCoordinatorRoot("/manager");
-  assert.throws(() => store.claimCoordinatorRoot("/other"), /coordinator root/);
+  store.claimAssistantRoot("/manager");
+  store.claimAssistantRoot("/manager");
+  assert.throws(() => store.claimAssistantRoot("/other"), /assistant root/);
   const registry = {
     version: 1 as const,
-    coordinator: { endpoint: "coordinator-local", thread_id: "manager", project_dir: "/manager" },
+    assistant: { endpoint: "assistant-local", thread_id: "manager", project_dir: "/manager" },
     sessions: { payments: { endpoint: "local", thread_id: "thread-1", project_dir: "/payments" } },
   };
   store.importLegacy({ version: 1, sessions: { old: { thread_id: "thread-1", project_status: "working", current_objective: "finish", pending_follow_up: "check", updated_at: "old" } } }, registry, 1_000);
@@ -138,7 +138,7 @@ test("legacy migration rejects unmatched and duplicate stable identities atomica
   const store = new SessionDashboardStore(createTestDatabase());
   const registry = {
     version: 1 as const,
-    coordinator: { endpoint: "coordinator-local", thread_id: "manager", project_dir: "/manager" },
+    assistant: { endpoint: "assistant-local", thread_id: "manager", project_dir: "/manager" },
     sessions: { payments: { endpoint: "local", thread_id: "thread-1", project_dir: "/payments" } },
   };
   assert.throws(() => store.importLegacy({ version: 1, sessions: { stale: { thread_id: "missing", project_status: "x", updated_at: "old" } } }, registry, 1), /exactly one/);

@@ -24,8 +24,8 @@ function captureNextTurn(endpoint: LocalEndpoint, threadId: string, timeoutMs = 
 }
 
 test("pinned app-server supports multiple threads, discovery, goals, turns, and restart", { skip: !enabled, timeout: 180_000 }, async (t) => {
-  const firstDir = await mkdtemp(join(tmpdir(), "codex-bot-real-one-"));
-  const secondDir = await mkdtemp(join(tmpdir(), "codex-bot-real-two-"));
+  const firstDir = await mkdtemp(join(tmpdir(), "qiyan-bot-real-one-"));
+  const secondDir = await mkdtemp(join(tmpdir(), "qiyan-bot-real-two-"));
   const endpoint = new LocalEndpoint({ codexBinary: "codex", requestTimeoutMs: 30_000 });
   t.after(() => endpoint.stop());
   await endpoint.start();
@@ -42,7 +42,7 @@ test("pinned app-server supports multiple threads, discovery, goals, turns, and 
   const terminal = captureNextTurn(endpoint, first.thread.id);
   const started = await pool.startTurn<any>(endpoint.id, {
     threadId: first.thread.id,
-    clientUserMessageId: "codex-bot-integration-1",
+    clientUserMessageId: "qiyan-bot-integration-1",
     input: [{ type: "text", text: "Reply with exactly: INTEGRATION_OK", text_elements: [] }],
   });
   const completed = await terminal.completed;
@@ -52,7 +52,7 @@ test("pinned app-server supports multiple threads, discovery, goals, turns, and 
   const read = await endpoint.request<any>("thread/read", { threadId: first.thread.id, includeTurns: true });
   const completedFromHistory = read.thread.turns.find((turn: any) => turn.id === started.turn.id);
   assert.ok(completedFromHistory.items.some((item: any) => item.type === "agentMessage" && item.text.includes("INTEGRATION_OK")));
-  const user = read.thread.turns.flatMap((turn: any) => turn.items).find((item: any) => item.type === "userMessage" && item.clientId === "codex-bot-integration-1");
+  const user = read.thread.turns.flatMap((turn: any) => turn.items).find((item: any) => item.type === "userMessage" && item.clientId === "qiyan-bot-integration-1");
   assert.ok(user, "clientUserMessageId is persisted and can reconcile a lost turn/start response");
 
   const listed = await endpoint.request<any>("thread/list", { sourceKinds: [...DISCOVERY_SOURCE_KINDS], archived: false, useStateDbOnly: false, limit: 100 });

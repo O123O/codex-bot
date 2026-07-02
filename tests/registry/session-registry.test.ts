@@ -6,11 +6,11 @@ import test from "node:test";
 import { SessionRegistry } from "../../src/registry/session-registry.ts";
 
 async function fixture() {
-  const dir = await mkdtemp(join(tmpdir(), "codex-bot-registry-"));
+  const dir = await mkdtemp(join(tmpdir(), "qiyan-bot-registry-"));
   const path = join(dir, "sessions.json");
   const registry = await SessionRegistry.open(path, {
     version: 1,
-    coordinator: { endpoint: "local", thread_id: "coordinator", project_dir: dir },
+    assistant: { endpoint: "local", thread_id: "assistant", project_dir: dir },
     sessions: {},
   });
   return { dir, path, registry };
@@ -43,7 +43,7 @@ test("invalid startup registry is quarantined and replaced without activating co
   await writeFile(path, "{broken", "utf8");
   const registry = await SessionRegistry.open(path, {
     version: 1,
-    coordinator: { endpoint: "local", thread_id: "coordinator", project_dir: dir },
+    assistant: { endpoint: "local", thread_id: "assistant", project_dir: dir },
     sessions: {},
   });
   assert.deepEqual(registry.snapshot().sessions, {});
@@ -52,12 +52,12 @@ test("invalid startup registry is quarantined and replaced without activating co
 });
 
 test("invalid startup registry without a last-known-good snapshot refuses unsafe reset", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "codex-bot-registry-corrupt-"));
+  const dir = await mkdtemp(join(tmpdir(), "qiyan-bot-registry-corrupt-"));
   const path = join(dir, "sessions.json");
   await writeFile(path, "{broken", "utf8");
   await assert.rejects(SessionRegistry.open(path, {
     version: 1,
-    coordinator: { endpoint: "local", thread_id: "coordinator", project_dir: dir },
+    assistant: { endpoint: "local", thread_id: "assistant", project_dir: dir },
     sessions: {},
   }), /no valid last-known-good/);
 });
@@ -66,7 +66,7 @@ test("external replacement is activated only after asynchronous mapping validati
   const { dir, path, registry } = await fixture();
   await writeFile(path, JSON.stringify({
     version: 1,
-    coordinator: { endpoint: "local", thread_id: "coordinator", project_dir: dir },
+    assistant: { endpoint: "local", thread_id: "assistant", project_dir: dir },
     sessions: { payments: { endpoint: "local", thread_id: "t1", project_dir: dir } },
   }));
   assert.equal(await registry.reload(async () => { throw new Error("thread cwd mismatch"); }), false);
@@ -84,9 +84,9 @@ test("concurrent writes preserve both unique registrations", async () => {
   assert.deepEqual(Object.keys(registry.snapshot().sessions).sort(), ["one", "two"]);
 });
 
-test("updates the coordinator identity atomically after first app-server start", async () => {
+test("updates the assistant identity atomically after first app-server start", async () => {
   const { dir, path, registry } = await fixture();
-  await registry.setCoordinator({ endpoint: "local", thread_id: "real-coordinator", project_dir: dir });
-  assert.equal(registry.snapshot().coordinator.thread_id, "real-coordinator");
-  assert.equal(JSON.parse(await readFile(path, "utf8")).coordinator.thread_id, "real-coordinator");
+  await registry.setAssistant({ endpoint: "local", thread_id: "real-assistant", project_dir: dir });
+  assert.equal(registry.snapshot().assistant.thread_id, "real-assistant");
+  assert.equal(JSON.parse(await readFile(path, "utf8")).assistant.thread_id, "real-assistant");
 });

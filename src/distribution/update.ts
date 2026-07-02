@@ -3,7 +3,7 @@ import { basename, dirname, resolve } from "node:path";
 import { AppError } from "../core/errors.ts";
 import { readPackageInfo } from "./package-info.ts";
 
-export const LATEST_RELEASE_URL = "https://github.com/O123O/codex-bot/releases/latest/download/codex-bot.tgz";
+export const LATEST_RELEASE_URL = "https://github.com/O123O/qiyan-bot/releases/latest/download/qiyan-bot.tgz";
 
 const inheritedEnvironmentKeys = new Set([
   "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "TMP", "TEMP", "LANG", "TERM",
@@ -39,14 +39,14 @@ export function globalPrefixForPackage(packageRoot: string): string {
   const nodeModules = dirname(root);
   const lib = dirname(nodeModules);
   const prefix = dirname(lib);
-  const valid = basename(root) === "codex-chat-bot"
+  const valid = basename(root) === "qiyan-bot"
     && basename(nodeModules) === "node_modules"
     && basename(lib) === "lib"
-    && resolve(prefix, "lib", "node_modules", "codex-chat-bot") === root;
+    && resolve(prefix, "lib", "node_modules", "qiyan-bot") === root;
   if (!valid) {
     throw new AppError(
       "CONFIGURATION_ERROR",
-      "--update requires codex-bot to be globally installed in a user-owned npm prefix",
+      "--update requires qiyan-bot to be globally installed in a user-owned npm prefix",
     );
   }
   return prefix;

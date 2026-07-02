@@ -5,7 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import type { AppServerEndpoint } from "../../src/app-server/pool.ts";
 import { AppServerPool } from "../../src/app-server/pool.ts";
-import { SessionObservationProcessor } from "../../src/coordinator/session-observer.ts";
+import { SessionObservationProcessor } from "../../src/assistant/session-observer.ts";
 import { AppError } from "../../src/core/errors.ts";
 import { SessionRegistry } from "../../src/registry/session-registry.ts";
 import { FinalMessageStore } from "../../src/sessions/final-messages.ts";
@@ -61,9 +61,9 @@ class ServiceEndpoint implements AppServerEndpoint {
 }
 
 async function fixture() {
-  const dir = await realpath(await mkdtemp(join(tmpdir(), "codex-bot-service-")));
+  const dir = await realpath(await mkdtemp(join(tmpdir(), "qiyan-bot-service-")));
   const registry = await SessionRegistry.open(join(dir, "sessions.json"), {
-    version: 1, coordinator: { endpoint: "local", thread_id: "coord", project_dir: dir },
+    version: 1, assistant: { endpoint: "local", thread_id: "coord", project_dir: dir },
     sessions: { payments: { endpoint: "local", thread_id: "thread", project_dir: dir } },
   });
   const db = createTestDatabase();
@@ -233,7 +233,7 @@ test("a turn already terminal when turn/start resolves is not recorded as active
   assert.equal(runtime.activeTurn("local", "thread"), undefined);
 });
 
-test("collect returns coordinator bodies or creates chronological direct deliveries", async () => {
+test("collect returns assistant bodies or creates chronological direct deliveries", async () => {
   const { finals, deliveries, service } = await fixture();
   finals.persistTerminalTurn("local", "thread", { id: "one", status: "completed", completedAt: 1, items: [{ type: "agentMessage", id: "i1", text: "old", phase: "final_answer" }] }, 1);
   finals.persistTerminalTurn("local", "thread", { id: "two", status: "completed", completedAt: 2, items: [{ type: "agentMessage", id: "i2", text: "new", phase: "final_answer" }] }, 2);

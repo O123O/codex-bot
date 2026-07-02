@@ -22,7 +22,7 @@ async function fixture(onTerminal?: (event: any) => void | Promise<void>) {
   const dir = await realpath(await mkdtemp(join(tmpdir(), "relay-")));
   const db = createTestDatabase();
   const registry = await SessionRegistry.open(join(dir, "sessions.json"), {
-    version: 1, coordinator: { endpoint: "local", thread_id: "coord", project_dir: dir },
+    version: 1, assistant: { endpoint: "local", thread_id: "coord", project_dir: dir },
     sessions: { payments: { endpoint: "local", thread_id: "worker", project_dir: dir } },
   });
   const endpoint = new RelayEndpoint();
@@ -57,7 +57,7 @@ test("reports terminal metadata after final persistence without copying the body
   assert.equal(JSON.stringify(observed).includes("done"), false);
 });
 
-test("managed worker finals create automatic delivery and metadata-only coordinator event exactly once", async () => {
+test("managed worker finals create automatic delivery and metadata-only assistant event exactly once", async () => {
   const { db, deliveries, relay } = await fixture();
   await relay.handleNotification("local", "turn/completed", { threadId: "worker", turn: terminal() });
   await relay.handleNotification("local", "turn/completed", { threadId: "worker", turn: terminal() });

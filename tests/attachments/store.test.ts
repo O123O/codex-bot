@@ -9,7 +9,7 @@ import { AppError } from "../../src/core/errors.ts";
 import { createTestDatabase } from "../../src/storage/database.ts";
 
 async function fixture(overrides: { maxFileBytes?: number; maxStoreBytes?: number } = {}) {
-  const root = await mkdtemp(join(tmpdir(), "codex-bot-files-"));
+  const root = await mkdtemp(join(tmpdir(), "qiyan-bot-files-"));
   let now = 1_000;
   const db = createTestDatabase();
   const store = new AttachmentStore(db, root, {

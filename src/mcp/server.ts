@@ -5,10 +5,10 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
 import { readLinuxProcessIdentity, type LinuxProcessIdentity } from "../core/process-identity.ts";
-import type { CoordinatorToolName, ToolCallContext, ToolHandler } from "../coordinator/tools.ts";
-import { COORDINATOR_TOOL_SCHEMAS, TOOL_NAMES } from "../coordinator/tools.ts";
+import type { AssistantToolName, ToolCallContext, ToolHandler } from "../assistant/tools.ts";
+import { ASSISTANT_TOOL_SCHEMAS, TOOL_NAMES } from "../assistant/tools.ts";
 
-export interface CoordinatorContextProvider {
+export interface AssistantContextProvider {
   current(): { contextId: string; attemptId: string; turnId: string } | undefined;
 }
 
@@ -18,8 +18,8 @@ export class LoopbackMcpServer {
   private actualPort = 0;
 
   constructor(
-    private readonly tools: Record<CoordinatorToolName, ToolHandler>,
-    private readonly contexts: CoordinatorContextProvider,
+    private readonly tools: Record<AssistantToolName, ToolHandler>,
+    private readonly contexts: AssistantContextProvider,
     private readonly options: { host: "127.0.0.1"; port: number; token: string; allowedClientProcess?: () => LinuxProcessIdentity | undefined },
   ) {
     if (options.host !== "127.0.0.1") throw new Error("MCP server must bind only to 127.0.0.1");
@@ -84,13 +84,13 @@ export class LoopbackMcpServer {
 
   private async createProtocolServer(): Promise<{ mcp: McpServer; transport: StreamableHTTPServerTransport }> {
     const mcp = new McpServer(
-      { name: "codex-chat-bot-manager", version: "0.1.0" },
-      { instructions: "Coordinator-only manager tools. Choose the correct managed session, ask the user when ambiguous, and use ordinary send/collect tools for /pass and /collect." },
+      { name: "qiyan-bot-manager", version: "0.1.0" },
+      { instructions: "Assistant-only manager tools. Choose the correct managed session, ask the user when ambiguous, and use ordinary send/collect tools for /pass and /collect." },
     );
     for (const name of TOOL_NAMES) {
-      mcp.registerTool(name, { description: `Codex bot coordinator operation: ${name.replaceAll("_", " ")}`, inputSchema: COORDINATOR_TOOL_SCHEMAS[name] as any }, async (args: any, extra: any) => {
+      mcp.registerTool(name, { description: `Codex bot assistant operation: ${name.replaceAll("_", " ")}`, inputSchema: ASSISTANT_TOOL_SCHEMAS[name] as any }, async (args: any, extra: any) => {
         const active = this.contexts.current();
-        if (!active) throw new Error("No active coordinator source context");
+        if (!active) throw new Error("No active assistant source context");
         const context: ToolCallContext = { sourceContextId: active.contextId, attemptId: active.attemptId, turnId: active.turnId, callId: `mcp:${String(extra.requestId)}` };
         const result = await this.tools[name](context, args);
         return { content: [{ type: "text" as const, text: JSON.stringify(result ?? null) }] };
@@ -178,13 +178,13 @@ export function buildCodexChildEnvironment(host: NodeJS.ProcessEnv, mcpToken?: s
   for (const [key, value] of Object.entries(host)) {
     if (value !== undefined && (inheritedEnvironmentKeys.has(key) || key.startsWith("LC_"))) result[key] = value;
   }
-  if (mcpToken) result.CODEX_BOT_MCP_TOKEN = mcpToken;
+  if (mcpToken) result.QIYAN_BOT_MCP_TOKEN = mcpToken;
   return result;
 }
 
-export function coordinatorTurnConfig(mcpUrl: string, _mcpToken: string): Record<string, unknown> {
+export function assistantTurnConfig(mcpUrl: string, _mcpToken: string): Record<string, unknown> {
   return {
-    mcp_servers: { codex_bot_manager: { url: mcpUrl, bearer_token_env_var: "CODEX_BOT_MCP_TOKEN", default_tools_approval_mode: "approve" } },
+    mcp_servers: { qiyan_bot_manager: { url: mcpUrl, bearer_token_env_var: "QIYAN_BOT_MCP_TOKEN", default_tools_approval_mode: "approve" } },
     ...secureShellConfig(),
   };
 }
@@ -193,6 +193,6 @@ export function secureShellConfig(): Record<string, unknown> {
   return {
     allow_login_shell: false,
     "shell_environment_policy.inherit": "core",
-    "shell_environment_policy.exclude": ["CODEX_BOT_MCP_TOKEN", "TELEGRAM_BOT_TOKEN", "TELEGRAM_OWNER_ID", "TELEGRAM_DESTINATION_CHAT_ID"],
+    "shell_environment_policy.exclude": ["QIYAN_BOT_MCP_TOKEN", "TELEGRAM_BOT_TOKEN", "TELEGRAM_OWNER_ID", "TELEGRAM_DESTINATION_CHAT_ID"],
   };
 }

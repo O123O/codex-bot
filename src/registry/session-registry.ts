@@ -11,7 +11,7 @@ const sessionSchema = z.object({
 });
 const registrySchema = z.object({
   version: z.literal(1),
-  coordinator: sessionSchema,
+  assistant: sessionSchema,
   sessions: z.record(z.string().min(1), sessionSchema),
 });
 
@@ -53,7 +53,7 @@ async function normalize(document: RegistryDocument): Promise<RegistryDocument> 
     seen.add(key);
     sessions[nickname] = normalized;
   }
-  return { version: 1, coordinator: await canonicalSession(parsed.coordinator), sessions };
+  return { version: 1, assistant: await canonicalSession(parsed.assistant), sessions };
 }
 
 export class SessionRegistry {
@@ -102,9 +102,9 @@ export class SessionRegistry {
     });
   }
 
-  async setCoordinator(session: RegistrySession): Promise<void> {
+  async setAssistant(session: RegistrySession): Promise<void> {
     await this.lock(async () => {
-      await this.replace({ ...this.document, coordinator: await canonicalSession(session) });
+      await this.replace({ ...this.document, assistant: await canonicalSession(session) });
     });
   }
 

@@ -4,7 +4,7 @@ import { build } from "esbuild";
 
 const root = resolve(import.meta.dirname, "..");
 const dist = resolve(root, "dist");
-const outfile = resolve(dist, "codex-bot");
+const outfile = resolve(dist, "qiyan-bot");
 
 await rm(dist, { recursive: true, force: true });
 await build({

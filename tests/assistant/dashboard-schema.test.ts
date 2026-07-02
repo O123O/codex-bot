@@ -5,7 +5,7 @@ import {
   SessionDashboardDocumentSchema,
   SessionNotesPatchSchema,
   normalizeTokenUsage,
-} from "../../src/coordinator/dashboard-schema.ts";
+} from "../../src/assistant/dashboard-schema.ts";
 
 test("parses a complete strict version-2 dashboard", () => {
   const document = {

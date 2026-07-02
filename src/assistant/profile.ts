@@ -18,7 +18,7 @@ interface MarkerDocument {
   pending_thread_id: string | null;
 }
 
-export interface PreparedCoordinatorProfile {
+export interface PreparedAssistantProfile {
   root: string;
   home: string;
   codexHome: string;
@@ -32,20 +32,20 @@ export interface PreparedCoordinatorProfile {
   clearPendingThread(threadId: string): Promise<void>;
 }
 
-export async function prepareCoordinatorProfile(dataRoot: string): Promise<PreparedCoordinatorProfile> {
+export async function prepareAssistantProfile(dataRoot: string): Promise<PreparedAssistantProfile> {
   try {
     await mkdir(dataRoot, { recursive: true, mode: 0o700 });
     const canonicalDataRoot = await realpath(dataRoot);
-    const root = await ensurePrivateDirectory(join(canonicalDataRoot, "coordinator-profile"));
+    const root = await ensurePrivateDirectory(join(canonicalDataRoot, "assistant-profile"));
     const home = await ensurePrivateDirectory(join(root, "home"));
     const codexHome = await ensurePrivateDirectory(join(root, "codex"));
     for (const path of [root, home, codexHome]) {
-      if (!contains(canonicalDataRoot, path)) throw managedError("coordinator profile escaped the configured data directory");
+      if (!contains(canonicalDataRoot, path)) throw managedError("assistant profile escaped the configured data directory");
     }
     const directoryPins = await Promise.all([root, home, codexHome].map(pinDirectory));
     const markerPath = join(root, "profile.json");
     const existing = await readMarker(markerPath);
-    const result: PreparedCoordinatorProfile = {
+    const result: PreparedAssistantProfile = {
       root,
       home,
       codexHome,
@@ -61,7 +61,7 @@ export async function prepareCoordinatorProfile(dataRoot: string): Promise<Prepa
         const document: MarkerDocument = { version: 1, creation_nonce: result.creationNonce, pending_thread_id: null };
         const current = await readMarker(markerPath);
         if (current) {
-          if (current.creation_nonce !== document.creation_nonce) throw managedError("coordinator profile activation marker records a different nonce");
+          if (current.creation_nonce !== document.creation_nonce) throw managedError("assistant profile activation marker records a different nonce");
         } else {
           await atomicWrite(markerPath, Buffer.from(`${JSON.stringify(document, null, 2)}\n`), result.assertIntact);
         }
@@ -70,9 +70,9 @@ export async function prepareCoordinatorProfile(dataRoot: string): Promise<Prepa
       },
       async recordPendingThread(threadId): Promise<void> {
         await result.assertIntact();
-        if (!threadId) throw managedError("coordinator pending thread identity is invalid");
+        if (!threadId) throw managedError("assistant pending thread identity is invalid");
         const current = await requireCurrentMarker(markerPath, result.creationNonce);
-        if (current.pending_thread_id && current.pending_thread_id !== threadId) throw managedError("coordinator profile records a different pending thread");
+        if (current.pending_thread_id && current.pending_thread_id !== threadId) throw managedError("assistant profile records a different pending thread");
         if (current.pending_thread_id === null) await writeMarker(markerPath, { ...current, pending_thread_id: threadId }, result.assertIntact);
         result.activationRequired = false;
         result.pendingThreadId = threadId;
@@ -84,7 +84,7 @@ export async function prepareCoordinatorProfile(dataRoot: string): Promise<Prepa
           result.pendingThreadId = null;
           return;
         }
-        if (current.pending_thread_id !== threadId) throw managedError("coordinator pending thread identity does not match the activation marker");
+        if (current.pending_thread_id !== threadId) throw managedError("assistant pending thread identity does not match the activation marker");
         await writeMarker(markerPath, { ...current, pending_thread_id: null }, result.assertIntact);
         result.pendingThreadId = null;
       },
@@ -92,13 +92,13 @@ export async function prepareCoordinatorProfile(dataRoot: string): Promise<Prepa
     return result;
   } catch (error) {
     if (error instanceof AppError) throw error;
-    throw managedError("cannot prepare isolated coordinator profile");
+    throw managedError("cannot prepare isolated assistant profile");
   }
 }
 
-export function buildCoordinatorChildEnvironment(
+export function buildAssistantChildEnvironment(
   host: NodeJS.ProcessEnv,
-  profile: Pick<PreparedCoordinatorProfile, "home" | "codexHome">,
+  profile: Pick<PreparedAssistantProfile, "home" | "codexHome">,
   mcpToken?: string,
 ): NodeJS.ProcessEnv {
   return { ...buildCodexChildEnvironment(host, mcpToken), HOME: profile.home, CODEX_HOME: profile.codexHome };
@@ -113,26 +113,26 @@ interface StartableAccountEndpoint extends AccountEndpoint {
   stop(): Promise<void>;
 }
 
-export async function assertCoordinatorAuthenticated(
+export async function assertAssistantAuthenticated(
   endpoint: AccountEndpoint,
-  profile: Pick<PreparedCoordinatorProfile, "root" | "home" | "codexHome">,
+  profile: Pick<PreparedAssistantProfile, "root" | "home" | "codexHome">,
 ): Promise<void> {
   const response = await endpoint.request<{ account: unknown | null; requiresOpenaiAuth: boolean }>("account/read", { refreshToken: false });
   if (response.account !== null || !response.requiresOpenaiAuth) return;
   throw new AppError(
     "CONFIGURATION_ERROR",
-    `coordinator Codex profile is not authenticated (HOME ${profile.home}, CODEX_HOME ${profile.codexHome}); run codex-bot coordinator-login with DATA_DIR set to ${dirname(profile.root)}`,
-    { reason: "coordinator_auth_required" },
+    `assistant Codex profile is not authenticated (HOME ${profile.home}, CODEX_HOME ${profile.codexHome}); run qiyan-bot assistant-login with DATA_DIR set to ${dirname(profile.root)}`,
+    { reason: "assistant_auth_required" },
   );
 }
 
-export async function startAuthenticatedCoordinatorEndpoint(
+export async function startAuthenticatedAssistantEndpoint(
   endpoint: StartableAccountEndpoint,
-  profile: Pick<PreparedCoordinatorProfile, "root" | "home" | "codexHome">,
+  profile: Pick<PreparedAssistantProfile, "root" | "home" | "codexHome">,
 ): Promise<void> {
   await endpoint.start();
   try {
-    await assertCoordinatorAuthenticated(endpoint, profile);
+    await assertAssistantAuthenticated(endpoint, profile);
   } catch (error) {
     await endpoint.stop().catch(() => undefined);
     throw error;
@@ -159,23 +159,23 @@ async function readMarker(path: string): Promise<MarkerDocument | undefined> {
     if (isErrno(error, "ENOENT")) return undefined;
     throw error;
   }
-  if (value.isSymbolicLink() || !value.isFile()) throw managedError("coordinator profile activation marker must be a regular file");
+  if (value.isSymbolicLink() || !value.isFile()) throw managedError("assistant profile activation marker must be a regular file");
   let file;
   try {
     file = await open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
   } catch (error) {
-    if (isErrno(error, "ELOOP")) throw managedError("coordinator profile activation marker must be a regular file");
+    if (isErrno(error, "ELOOP")) throw managedError("assistant profile activation marker must be a regular file");
     throw error;
   }
   try {
     const opened = await file.stat({ bigint: true });
-    if (!opened.isFile()) throw managedError("coordinator profile activation marker must be a regular file");
+    if (!opened.isFile()) throw managedError("assistant profile activation marker must be a regular file");
     let parsed: MarkerDocument;
     try { parsed = markerSchema.parse(JSON.parse(await file.readFile("utf8"))) as MarkerDocument; }
-    catch { throw managedError("coordinator profile activation marker is invalid"); }
+    catch { throw managedError("assistant profile activation marker is invalid"); }
     const current = await lstat(path, { bigint: true });
     if (!current.isFile() || current.isSymbolicLink() || current.dev !== opened.dev || current.ino !== opened.ino) {
-      throw managedError("coordinator profile activation marker changed unexpectedly");
+      throw managedError("assistant profile activation marker changed unexpectedly");
     }
     await file.chmod(0o600);
     return parsed;
@@ -186,7 +186,7 @@ async function readMarker(path: string): Promise<MarkerDocument | undefined> {
 
 async function requireCurrentMarker(path: string, nonce: string): Promise<MarkerDocument> {
   const marker = await readMarker(path);
-  if (!marker || marker.creation_nonce !== nonce) throw managedError("coordinator profile activation marker changed unexpectedly");
+  if (!marker || marker.creation_nonce !== nonce) throw managedError("assistant profile activation marker changed unexpectedly");
   return marker;
 }
 
@@ -224,11 +224,11 @@ async function pinDirectory(path: string): Promise<DirectoryPin> {
 async function assertPinnedDirectory(pin: DirectoryPin): Promise<void> {
   let value;
   try { value = await lstat(pin.path, { bigint: true }); }
-  catch { throw managedError(`coordinator profile directory ${pin.path} changed unexpectedly`); }
+  catch { throw managedError(`assistant profile directory ${pin.path} changed unexpectedly`); }
   if (!value.isDirectory() || value.isSymbolicLink() || value.dev !== pin.dev || value.ino !== pin.ino
     || (value.mode & 0o777n) !== 0o700n
     || await realpath(pin.path).catch(() => undefined) !== pin.path) {
-    throw managedError(`coordinator profile directory ${pin.path} changed unexpectedly`);
+    throw managedError(`assistant profile directory ${pin.path} changed unexpectedly`);
   }
 }
 

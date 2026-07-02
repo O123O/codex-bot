@@ -7,7 +7,7 @@ import test from "node:test";
 import { openDatabase } from "../../src/storage/database.ts";
 
 test("a version-1 database upgrades delivery attachment and reply columns", async () => {
-  const path = join(await mkdtemp(join(tmpdir(), "codex-bot-db-")), "bot.sqlite3");
+  const path = join(await mkdtemp(join(tmpdir(), "qiyan-bot-db-")), "bot.sqlite3");
   const old = new DatabaseSync(path);
   old.exec(`
     CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY);
@@ -46,7 +46,7 @@ test("a version-1 database upgrades delivery attachment and reply columns", asyn
 });
 
 test("a newer version-1 database with delivery columns upgrades idempotently", async () => {
-  const path = join(await mkdtemp(join(tmpdir(), "codex-bot-db-new-v1-")), "bot.sqlite3");
+  const path = join(await mkdtemp(join(tmpdir(), "qiyan-bot-db-new-v1-")), "bot.sqlite3");
   const old = new DatabaseSync(path);
   old.exec(`
     CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY);

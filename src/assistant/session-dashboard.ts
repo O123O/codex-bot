@@ -35,12 +35,12 @@ export class SessionDashboard {
 
   async initializeAndRender(): Promise<void> {
     const registry = this.registry.snapshot();
-    if (registry.coordinator.project_dir !== this.options.root) {
-      throw new AppError("CONFIGURATION_ERROR", "registry coordinator workdir does not match the prepared coordinator workdir");
+    if (registry.assistant.project_dir !== this.options.root) {
+      throw new AppError("CONFIGURATION_ERROR", "registry assistant workdir does not match the prepared assistant workdir");
     }
-    this.store.claimCoordinatorRoot(this.options.root);
+    this.store.claimAssistantRoot(this.options.root);
     const state = await dashboardFileState(this.options.path);
-    if (state === "special") throw new AppError("CONFIGURATION_ERROR", "coordinator dashboard path must be a regular file");
+    if (state === "special") throw new AppError("CONFIGURATION_ERROR", "assistant dashboard path must be a regular file");
     if (!this.store.legacyMigrationComplete()) {
       if (state === "missing") {
         this.store.completeEmptyLegacyMigration();
@@ -48,19 +48,19 @@ export class SessionDashboard {
         const source = await readFile(this.options.path, "utf8");
         let value: unknown;
         try { value = JSON.parse(source); }
-        catch { throw new AppError("CONFIGURATION_ERROR", "invalid coordinator dashboard session-status.json"); }
+        catch { throw new AppError("CONFIGURATION_ERROR", "invalid assistant dashboard session-status.json"); }
         if (isRecord(value) && value.version === 1) {
           try { this.store.importLegacy(LegacyNotebookDocumentSchema.parse(value), registry, this.options.now()); }
           catch (error) {
             if (error instanceof AppError) throw error;
-            throw new AppError("CONFIGURATION_ERROR", "invalid coordinator dashboard session-status.json");
+            throw new AppError("CONFIGURATION_ERROR", "invalid assistant dashboard session-status.json");
           }
         } else if (isRecord(value) && value.version === 2) {
           try { SessionDashboardDocumentSchema.parse(value); }
-          catch { throw new AppError("CONFIGURATION_ERROR", "invalid coordinator dashboard session-status.json"); }
+          catch { throw new AppError("CONFIGURATION_ERROR", "invalid assistant dashboard session-status.json"); }
           this.store.completeEmptyLegacyMigration();
         } else {
-          throw new AppError("CONFIGURATION_ERROR", "invalid coordinator dashboard session-status.json");
+          throw new AppError("CONFIGURATION_ERROR", "invalid assistant dashboard session-status.json");
         }
       }
     }

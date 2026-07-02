@@ -4,13 +4,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import type { RegistryDocument } from "../../src/registry/session-registry.ts";
-import { SessionDashboard, writeDashboardAtomic } from "../../src/coordinator/session-dashboard.ts";
+import { SessionDashboard, writeDashboardAtomic } from "../../src/assistant/session-dashboard.ts";
 import { createTestDatabase } from "../../src/storage/database.ts";
 import { RuntimeStore } from "../../src/storage/runtime-store.ts";
 import { SessionDashboardStore } from "../../src/storage/session-dashboard-store.ts";
 
-async function fixture(options: { existing?: string; coordinatorRoot?: string } = {}) {
-  const root = await mkdtemp(join(tmpdir(), "codex-bot-dashboard-"));
+async function fixture(options: { existing?: string; assistantRoot?: string } = {}) {
+  const root = await mkdtemp(join(tmpdir(), "qiyan-bot-dashboard-"));
   const path = join(root, "session-status.json");
   if (options.existing !== undefined) await writeFile(path, options.existing);
   const db = createTestDatabase();
@@ -19,7 +19,7 @@ async function fixture(options: { existing?: string; coordinatorRoot?: string } 
   runtime.setSession("local", "thread-1", "managed", "idle");
   let document: RegistryDocument = {
     version: 1,
-    coordinator: { endpoint: "coordinator-local", thread_id: "manager", project_dir: options.coordinatorRoot ?? root },
+    assistant: { endpoint: "assistant-local", thread_id: "manager", project_dir: options.assistantRoot ?? root },
     sessions: { payments: { endpoint: "local", thread_id: "thread-1", project_dir: "/projects/payments" } },
   };
   const registry = { snapshot: () => structuredClone(document) };
@@ -62,7 +62,7 @@ test("migrates only legacy manager fields and preserves exact bytes on invalid i
   assert.equal(entry.auto_session_info.last_worker_event, null);
 
   const invalid = await fixture({ existing: "not json" });
-  await assert.rejects(invalid.dashboard.initializeAndRender(), /invalid coordinator dashboard/);
+  await assert.rejects(invalid.dashboard.initializeAndRender(), /invalid assistant dashboard/);
   assert.equal(await readFile(invalid.path, "utf8"), "not json");
   assert.equal(invalid.store.legacyMigrationComplete(), false);
 });
@@ -75,26 +75,26 @@ test("fails unmatched legacy migration without replacing the source file", async
   assert.equal(value.store.legacyMigrationComplete(), false);
 });
 
-test("validates and claims the canonical coordinator root before inspecting migration input", async () => {
-  const value = await fixture({ existing: "not json", coordinatorRoot: "/wrong" });
-  await assert.rejects(value.dashboard.initializeAndRender(), /coordinator.*workdir/);
+test("validates and claims the canonical assistant root before inspecting migration input", async () => {
+  const value = await fixture({ existing: "not json", assistantRoot: "/wrong" });
+  await assert.rejects(value.dashboard.initializeAndRender(), /assistant.*workdir/);
   assert.equal(await readFile(value.path, "utf8"), "not json");
-  assert.equal((value.db.prepare("SELECT coordinator_root FROM session_dashboard_meta WHERE singleton = 1").get() as any).coordinator_root, null);
+  assert.equal((value.db.prepare("SELECT assistant_root FROM session_dashboard_meta WHERE singleton = 1").get() as any).assistant_root, null);
 
   const claimed = await fixture();
-  claimed.store.claimCoordinatorRoot(claimed.root);
+  claimed.store.claimAssistantRoot(claimed.root);
   (claimed.registry as any).snapshot = () => ({
     version: 1,
-    coordinator: { endpoint: "coordinator-local", thread_id: "manager", project_dir: "/different" },
+    assistant: { endpoint: "assistant-local", thread_id: "manager", project_dir: "/different" },
     sessions: {},
   });
-  await assert.rejects(claimed.dashboard.initializeAndRender(), /coordinator.*workdir/);
+  await assert.rejects(claimed.dashboard.initializeAndRender(), /assistant.*workdir/);
 });
 
 test("rebuilds after a crash between the migration marker and file replacement", async () => {
   const source = JSON.stringify({ version: 1, sessions: { old: { thread_id: "thread-1", project_status: "working", updated_at: "old" } } });
   const value = await fixture({ existing: source });
-  value.store.claimCoordinatorRoot(value.root);
+  value.store.claimAssistantRoot(value.root);
   value.store.importLegacy(JSON.parse(source), value.registry.snapshot(), 500);
   await value.dashboard.initializeAndRender();
   const document = JSON.parse(await readFile(value.path, "utf8"));

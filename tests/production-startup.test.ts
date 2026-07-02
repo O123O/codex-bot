@@ -7,17 +7,17 @@ import test from "node:test";
 import type { BotConfig } from "../src/config.ts";
 import { buildProductionApp } from "../src/production-app.ts";
 
-test("production prepares the configured coordinator workdir before endpoint startup", async () => {
-  const root = await mkdtemp(join(tmpdir(), "codex-bot-production-workdir-"));
-  const workdir = join(root, "external-coordinator");
+test("production prepares the configured assistant workdir before endpoint startup", async () => {
+  const root = await mkdtemp(join(tmpdir(), "qiyan-bot-production-workdir-"));
+  const workdir = join(root, "external-assistant");
   const dataDir = join(root, "backend-data");
   const registryPath = join(root, "backend-registry", "sessions.json");
-  const policyAsset = fileURLToPath(new URL("../assets/coordinator/AGENTS.md", import.meta.url));
+  const policyAsset = fileURLToPath(new URL("../assets/assistant/AGENTS.md", import.meta.url));
   const config: BotConfig = {
     telegramBotToken: "test-token",
     telegramOwnerId: 42,
     telegramDestinationChatId: 42,
-    coordinatorWorkdir: workdir,
+    assistantWorkdir: workdir,
     dataDir,
     sessionRegistryPath: registryPath,
     codexBinary: join(root, "missing-codex"),
@@ -34,12 +34,12 @@ test("production prepares the configured coordinator workdir before endpoint sta
   await app.stop();
 
   assert.equal(await readFile(join(workdir, "AGENTS.md"), "utf8"), await readFile(policyAsset, "utf8"));
-  assert.match(await readFile(join(workdir, ".codex-bot-agents.sha256"), "utf8"), /^[a-f0-9]{64}\n$/u);
+  assert.match(await readFile(join(workdir, ".qiyan-bot-agents.sha256"), "utf8"), /^[a-f0-9]{64}\n$/u);
   assert.deepEqual(JSON.parse(await readFile(join(workdir, "session-status.json"), "utf8")), { version: 2, sessions: {} });
-  assert.equal(JSON.parse(await readFile(registryPath, "utf8")).coordinator.project_dir, await realpath(workdir));
+  assert.equal(JSON.parse(await readFile(registryPath, "utf8")).assistant.project_dir, await realpath(workdir));
   for (const path of [
-    join(dataDir, "coordinator-profile"),
-    join(dataDir, "coordinator-profile/home"),
-    join(dataDir, "coordinator-profile/codex"),
+    join(dataDir, "assistant-profile"),
+    join(dataDir, "assistant-profile/home"),
+    join(dataDir, "assistant-profile/codex"),
   ]) assert.equal((await stat(path)).mode & 0o777, 0o700);
 });

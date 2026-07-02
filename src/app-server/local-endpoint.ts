@@ -96,7 +96,7 @@ export class LocalEndpoint {
     });
     try {
       const initialized = await client.request<{ userAgent?: string; codexHome?: string }>("initialize", {
-        clientInfo: { name: "codex_chat_bot", title: "Codex Chat Bot", version: "0.1.0" },
+        clientInfo: { name: "qiyan_bot", title: "QiYan Bot", version: "0.1.0" },
         capabilities: { experimentalApi: true },
       });
       if (this.options.expectedVersion) {
@@ -106,7 +106,7 @@ export class LocalEndpoint {
       if (this.options.expectedCodexHome) {
         const matches = initialized.codexHome !== undefined
           && await realpath(initialized.codexHome).catch(() => undefined) === this.options.expectedCodexHome;
-        if (!matches) throw new AppError("CONFIGURATION_ERROR", "coordinator app-server reported an unexpected CODEX_HOME");
+        if (!matches) throw new AppError("CONFIGURATION_ERROR", "assistant app-server reported an unexpected CODEX_HOME");
       }
       await this.options.validateEnvironment?.();
       const protocolIdentity = child.pid === undefined ? undefined : await (this.options.resolveMcpClientIdentity ?? resolveMcpClientIdentity)(child.pid);

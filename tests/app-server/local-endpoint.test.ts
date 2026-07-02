@@ -60,14 +60,14 @@ test("rejects an app-server version outside the generated protocol pin", async (
   const child = new FakeChild();
   child.stdin.on("data", (chunk) => {
     const request = JSON.parse(chunk.toString()) as Record<string, unknown>;
-    if (request.method === "initialize") child.stdout.write(`${JSON.stringify({ id: request.id, result: { userAgent: "codex_chat_bot/9.9.9 (test)" } })}\n`);
+    if (request.method === "initialize") child.stdout.write(`${JSON.stringify({ id: request.id, result: { userAgent: "qiyan_bot/9.9.9 (test)" } })}\n`);
   });
   const endpoint = new LocalEndpoint({ codexBinary: "codex", spawn: () => child as never, expectedVersion: "0.142.4" });
   await assert.rejects(endpoint.start(), /expected Codex app-server 0\.142\.4/);
   assert.equal(endpoint.state, "unavailable");
 });
 
-test("attests the coordinator CODEX_HOME before publishing readiness", async (t) => {
+test("attests the assistant CODEX_HOME before publishing readiness", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "codex-home-attestation-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const expected = join(root, "expected");
@@ -115,7 +115,7 @@ test("CODEX_HOME attestation rejects replacement of the pinned expected path", a
   assert.equal(endpoint.state, "unavailable");
 });
 
-test("validates the pinned coordinator environment before and after initialization", async () => {
+test("validates the pinned assistant environment before and after initialization", async () => {
   const child = new FakeChild();
   child.stdin.on("data", (chunk) => {
     const request = JSON.parse(chunk.toString()) as Record<string, unknown>;

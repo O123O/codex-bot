@@ -1,7 +1,7 @@
 import { createApp } from "./app.ts";
 import { parseCliArgs } from "./cli.ts";
-import { loadConfig, loadCoordinatorLoginConfig } from "./config.ts";
-import { runCoordinatorLogin } from "./coordinator/login.ts";
+import { loadConfig, loadAssistantLoginConfig } from "./config.ts";
+import { runAssistantLogin } from "./assistant/login.ts";
 import { readPackageInfo } from "./distribution/package-info.ts";
 import { updateFromLatestRelease } from "./distribution/update.ts";
 
@@ -14,15 +14,15 @@ export async function main(env = process.env, argv: readonly string[] = process.
   }
   if (command.command === "update") {
     const result = await updateFromLatestRelease({ env });
-    process.stdout.write(`Updated codex-bot to ${result.version} in ${result.prefix}.\n`);
-    process.stdout.write("Restart any running codex-bot process to use this version.\n");
+    process.stdout.write(`Updated qiyan-bot to ${result.version} in ${result.prefix}.\n`);
+    process.stdout.write("Restart any running qiyan-bot process to use this version.\n");
     return;
   }
-  if (command.command === "coordinator-login") {
-    await runCoordinatorLogin(loadCoordinatorLoginConfig(env), env);
+  if (command.command === "assistant-login") {
+    await runAssistantLogin(loadAssistantLoginConfig(env), env);
     return;
   }
-  const app = await createApp(loadConfig(env, command.coordinatorWorkdir === undefined ? {} : { coordinatorWorkdir: command.coordinatorWorkdir }));
+  const app = await createApp(loadConfig(env, command.assistantWorkdir === undefined ? {} : { assistantWorkdir: command.assistantWorkdir }));
   await app.start();
   let stopping = false;
   const stop = () => {

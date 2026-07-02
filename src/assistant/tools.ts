@@ -9,7 +9,7 @@ export type ToolHandler = (context: ToolCallContext, args: unknown) => Promise<u
 export interface ToolActionContext extends ToolCallContext { operationId: string; operationCreatedAt: number; operationSequence: number; checkpoint(receipt: unknown): void }
 
 const nickname = z.string().min(1);
-export const COORDINATOR_TOOL_SCHEMAS = {
+export const ASSISTANT_TOOL_SCHEMAS = {
   list_managed_sessions: z.object({}).strict(),
   discover_sessions: z.object({ endpoint: z.string().optional(), search: z.string().optional(), cwd: z.string().optional(), cursor: z.string().optional(), limit: z.number().int().positive().max(100).optional() }).strict(),
   get_session_status: z.object({ nickname: nickname }).strict(),
@@ -40,23 +40,23 @@ export const COORDINATOR_TOOL_SCHEMAS = {
   send_chat_attachment: z.object({ file_handle: z.string().min(1), caption: z.string().optional(), reply_to: z.number().int().optional() }).strict(),
 } as const;
 
-export const TOOL_NAMES = Object.freeze(Object.keys(COORDINATOR_TOOL_SCHEMAS)) as readonly (keyof typeof COORDINATOR_TOOL_SCHEMAS)[];
-export type CoordinatorToolName = keyof typeof COORDINATOR_TOOL_SCHEMAS;
+export const TOOL_NAMES = Object.freeze(Object.keys(ASSISTANT_TOOL_SCHEMAS)) as readonly (keyof typeof ASSISTANT_TOOL_SCHEMAS)[];
+export type AssistantToolName = keyof typeof ASSISTANT_TOOL_SCHEMAS;
 type Action = (args: any, context: ToolActionContext) => Promise<any>;
 
-export const READ_ONLY_TOOLS = new Set<CoordinatorToolName>([
+export const READ_ONLY_TOOLS = new Set<AssistantToolName>([
   "list_managed_sessions", "discover_sessions", "get_session_status", "read_worker_message", "list_models", "get_goal",
 ]);
 
-export function createCoordinatorTools(
+export function createAssistantTools(
   operations: OperationStore,
-  actions: Partial<Record<CoordinatorToolName, Action>>,
+  actions: Partial<Record<AssistantToolName, Action>>,
   options: { maxCollectCount: number },
-): Record<CoordinatorToolName, ToolHandler> {
-  const result = {} as Record<CoordinatorToolName, ToolHandler>;
+): Record<AssistantToolName, ToolHandler> {
+  const result = {} as Record<AssistantToolName, ToolHandler>;
   for (const name of TOOL_NAMES) {
     result[name] = async (context, raw) => {
-      const args = COORDINATOR_TOOL_SCHEMAS[name].parse(raw) as any;
+      const args = ASSISTANT_TOOL_SCHEMAS[name].parse(raw) as any;
       const source = operations.getSourceContext(context.sourceContextId);
       if (!source) throw new AppError("OPERATION_CONFLICT", "tool call is not bound to an active source context");
       let directive: { kind: "pass" | "collect"; binding: unknown } | undefined;

@@ -39,20 +39,20 @@ In the shell or private service environment that will start the bot:
 # TELEGRAM_BOT_TOKEN is already set by the private prompt above.
 export TELEGRAM_OWNER_ID='<your-numeric-user-id>'
 export TELEGRAM_DESTINATION_CHAT_ID="$TELEGRAM_OWNER_ID"
-export DATA_DIR="$HOME/.codex-bot/data"
-export SESSION_REGISTRY_PATH="$HOME/.codex-bot/data/sessions.json"
-export COORDINATOR_WORKDIR="$HOME/.codex-bot/coordinator"
+export DATA_DIR="$HOME/.qiyan-bot/data"
+export SESSION_REGISTRY_PATH="$HOME/.qiyan-bot/data/sessions.json"
+export ASSISTANT_WORKDIR="$HOME/.qiyan-bot/assistant"
 ```
 
-`TELEGRAM_DESTINATION_CHAT_ID` must equal `TELEGRAM_OWNER_ID`; this enforces the single-user private chat. Group, channel, callback, edited, service, and non-owner input is not accepted as a coordinator message.
+`TELEGRAM_DESTINATION_CHAT_ID` must equal `TELEGRAM_OWNER_ID`; this enforces the single-user private chat. Group, channel, callback, edited, service, and non-owner input is not accepted as a assistant message.
 
 ## 4. Authenticate and start
 
-Complete the independent coordinator login once, then start the bot:
+Complete the independent assistant login once, then start the bot:
 
 ```bash
-DATA_DIR="$DATA_DIR" codex-bot coordinator-login
-codex-bot --workdir "$COORDINATOR_WORKDIR"
+DATA_DIR="$DATA_DIR" qiyan-bot assistant-login
+qiyan-bot --workdir "$ASSISTANT_WORKDIR"
 ```
 
 Keep that process running. Long polling receives Telegram updates; outbound replies use an independent transport, so one slow poll does not delay a ready response.
@@ -61,13 +61,13 @@ Keep that process running. Long polling receives Telegram updates; outbound repl
 
 In the bot's private chat:
 
-1. Send a simple greeting and confirm the coordinator responds.
+1. Send a simple greeting and confirm the assistant responds.
 2. Ask it to list available Codex sessions, then start or adopt a harmless project session with a memorable nickname.
 3. Send `tell <nickname> /pass exact words` and verify the worker receives the text after `/pass ` unchanged.
 4. Send `report <nickname> /collect 1` and verify the newest eligible worker final is delivered directly.
 5. Send a small text attachment and ask the worker to inspect it.
-6. Ask the coordinator to send a small project file back as an attachment.
+6. Ask the assistant to send a small project file back as an attachment.
 
-Worker terminal responses are delivered automatically with their session nickname. The coordinator receives compact metadata and reads a full worker body only when management requires it.
+Worker terminal responses are delivered automatically with their session nickname. The assistant receives compact metadata and reads a full worker body only when management requires it.
 
 If there is no input, confirm you messaged the bot before startup, the numeric owner ID is correct, and no other process is calling `getUpdates` for the same token. If replies are slow, inspect bot/app-server logs separately from Telegram delivery timing; sending itself should not wait for the long-poll request to finish.

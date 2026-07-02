@@ -2,8 +2,8 @@ import { z } from "zod";
 import { AppError } from "./core/errors.ts";
 
 export type CliCommand =
-  | { command: "run"; coordinatorWorkdir?: string }
-  | { command: "coordinator-login" }
+  | { command: "run"; assistantWorkdir?: string }
+  | { command: "assistant-login" }
   | { command: "update" }
   | { command: "version" };
 
@@ -12,21 +12,21 @@ export function parseCliArgs(argv: readonly string[]): CliCommand {
     if (argv.length !== 1) throw new AppError("CONFIGURATION_ERROR", "unknown argument");
     return { command: argv[0] === "--update" ? "update" : "version" };
   }
-  if (argv[0] === "coordinator-login") {
+  if (argv[0] === "assistant-login") {
     if (argv.length !== 1) throw new AppError("CONFIGURATION_ERROR", "unknown argument");
-    return { command: "coordinator-login" };
+    return { command: "assistant-login" };
   }
-  let coordinatorWorkdir: string | undefined;
+  let assistantWorkdir: string | undefined;
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index]!;
     if (argument !== "--workdir") throw new AppError("CONFIGURATION_ERROR", "unknown argument");
-    if (coordinatorWorkdir !== undefined) throw new AppError("CONFIGURATION_ERROR", "--workdir may be specified only once");
+    if (assistantWorkdir !== undefined) throw new AppError("CONFIGURATION_ERROR", "--workdir may be specified only once");
     const value = argv[index + 1];
     if (!value || value.startsWith("--")) throw new AppError("CONFIGURATION_ERROR", "--workdir requires a path");
-    coordinatorWorkdir = value;
+    assistantWorkdir = value;
     index += 1;
   }
-  return coordinatorWorkdir === undefined ? { command: "run" } : { command: "run", coordinatorWorkdir };
+  return assistantWorkdir === undefined ? { command: "run" } : { command: "run", assistantWorkdir };
 }
 
 export function formatStartupError(error: unknown): string {

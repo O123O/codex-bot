@@ -23,7 +23,7 @@ export const migrations: readonly Migration[] = [
   );
   CREATE UNIQUE INDEX IF NOT EXISTS source_context_source_idx ON source_contexts(kind, source_id);
 
-  CREATE TABLE IF NOT EXISTS coordinator_attempts (
+  CREATE TABLE IF NOT EXISTS assistant_attempts (
     id TEXT PRIMARY KEY,
     context_id TEXT NOT NULL REFERENCES source_contexts(id),
     turn_id TEXT,
@@ -227,7 +227,7 @@ export const migrations: readonly Migration[] = [
   );
   CREATE TABLE IF NOT EXISTS session_dashboard_meta (
     singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
-    coordinator_root TEXT,
+    assistant_root TEXT,
     legacy_migration_complete INTEGER NOT NULL DEFAULT 0,
     dirty INTEGER NOT NULL DEFAULT 1,
     revision INTEGER NOT NULL DEFAULT 0,

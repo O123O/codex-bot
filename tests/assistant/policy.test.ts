@@ -2,10 +2,10 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
-import { TOOL_NAMES } from "../../src/coordinator/tools.ts";
-import { SessionDashboardDocumentSchema } from "../../src/coordinator/dashboard-schema.ts";
+import { TOOL_NAMES } from "../../src/assistant/tools.ts";
+import { SessionDashboardDocumentSchema } from "../../src/assistant/dashboard-schema.ts";
 
-const policyPath = fileURLToPath(new URL("../../assets/coordinator/AGENTS.md", import.meta.url));
+const policyPath = fileURLToPath(new URL("../../assets/assistant/AGENTS.md", import.meta.url));
 const catalog = [
   ["Session discovery and lifecycle", ["list_managed_sessions", "discover_sessions", "get_session_status", "create_session", "register_session", "adopt_session", "rename_session", "detach_session", "attach_session", "archive_session"]],
   ["Work and results", ["send_to_session", "read_worker_message", "collect_messages", "interrupt_session"]],
@@ -13,7 +13,7 @@ const catalog = [
   ["User output and attachments", ["send_chat_message", "prepare_chat_attachment", "send_chat_attachment"]],
 ] as const;
 
-test("packaged coordinator policy is concise and reserves examples for exact directives", async () => {
+test("packaged assistant policy is concise and reserves examples for exact directives", async () => {
   const policy = await readFile(policyPath, "utf8");
   for (const heading of [
     "## Routing and state",
@@ -76,9 +76,9 @@ test("packaged coordinator policy is concise and reserves examples for exact dir
 
   assert.doesNotMatch(policy, /^### (?:Create and name new work|Discover and adopt existing work|Read complete status|Record supervision intent)$/mu);
   assert.doesNotMatch(policy, /User: Work on \/projects\/payments|Continue my existing Codex work|What is the status of payments|Monitor payments until tests pass/iu);
-  assert.doesNotMatch(policy, /codex-bot:(?:managed|user)/u);
-  assert.ok(Buffer.byteLength(policy, "utf8") < 7_000, "coordinator policy exceeded the concise prompt budget");
+  assert.doesNotMatch(policy, /qiyan-bot:(?:managed|user)/u);
+  assert.ok(Buffer.byteLength(policy, "utf8") < 7_000, "assistant policy exceeded the concise prompt budget");
 
-  const examplePath = fileURLToPath(new URL("../../assets/coordinator/session-status.example.json", import.meta.url));
+  const examplePath = fileURLToPath(new URL("../../assets/assistant/session-status.example.json", import.meta.url));
   assert.deepEqual(SessionDashboardDocumentSchema.parse(JSON.parse(await readFile(examplePath, "utf8"))), { version: 2, sessions: {} });
 });
