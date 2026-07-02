@@ -111,12 +111,12 @@ OLD_HOME="$old_home" NEW_HOME="$new_home" STAGE="$stage" USER_HOME="$HOME" node 
 const fs = require("node:fs");
 const path = require("node:path");
 const uid = process.getuid();
-function privateRealDirectory(label, input) {
+function realDirectory(label, input, requirePrivate = false) {
   const resolved = path.resolve(input);
   if (input !== resolved) throw new Error(`${label} must use its exact absolute normalized path`);
   const value = fs.lstatSync(resolved);
-  if (!value.isDirectory() || value.isSymbolicLink() || value.uid !== uid || (value.mode & 0o077) !== 0) {
-    throw new Error(`${label} must be a private current-user real directory`);
+  if (!value.isDirectory() || value.isSymbolicLink() || value.uid !== uid || (requirePrivate && (value.mode & 0o077) !== 0)) {
+    throw new Error(`${label} must be a${requirePrivate ? " private" : ""} current-user real directory`);
   }
   const canonical = fs.realpathSync(resolved);
   if (canonical !== resolved) throw new Error(`${label} must use its exact canonical path without a symlink alias`);
@@ -127,13 +127,13 @@ function contains(parent, child) {
   return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
 }
 function overlaps(left, right) { return contains(left, right) || contains(right, left); }
-const home = privateRealDirectory("HOME", process.env.USER_HOME);
-const oldHome = privateRealDirectory("old_home", process.env.OLD_HOME);
-const stage = privateRealDirectory("stage", process.env.STAGE);
+const home = realDirectory("HOME", process.env.USER_HOME);
+const oldHome = realDirectory("old_home", process.env.OLD_HOME, true);
+const stage = realDirectory("stage", process.env.STAGE, true);
 const requiredNewHome = path.join(home, ".qiyan-bot");
 if (process.env.NEW_HOME !== requiredNewHome) throw new Error("new_home must be the exact $HOME/.qiyan-bot path");
 let newHome = requiredNewHome;
-if (fs.existsSync(requiredNewHome)) newHome = privateRealDirectory("new_home", requiredNewHome);
+if (fs.existsSync(requiredNewHome)) newHome = realDirectory("new_home", requiredNewHome, true);
 if (oldHome === path.parse(oldHome).root || oldHome === home || contains(oldHome, home)) {
   throw new Error("old_home cannot be a filesystem root, HOME, or an ancestor of HOME");
 }
