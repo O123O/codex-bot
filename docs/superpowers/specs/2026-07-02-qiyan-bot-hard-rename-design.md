@@ -41,6 +41,8 @@ sandbox: danger-full-access
 
 The README, setup guide, example environment, startup warning, and managed assistant policy state plainly that the default assistant can read, create, modify, execute, and delete anything accessible to the operating-system user. Separate profile directories prevent implicit configuration inheritance; they are not a filesystem security boundary once danger-full-access is enabled. The assistant must use typed QiYan management tools rather than directly editing bot-owned database, registry, dashboard, profile, or policy files.
 
+The backend materializes `<ASSISTANT_WORKDIR>/assistant-context.json` as a mode-0400, bot-owned document containing the canonical runner home and default delegated-project root. The assistant reads it at startup and after compaction alongside `session-status.json`; it never edits either file. For direct filesystem work, user-facing `~` and “my home” mean the `user_home` in this document, not the assistant process's isolated `HOME`. The managed policy requires absolute paths derived from that value and forbids passing an unexpanded bare `~` to shell commands. This keeps direct work aligned with the user's real filesystem without weakening the isolated profile.
+
 ## Project worker execution model
 
 Project app-servers run with the account runner's real `HOME` and `CODEX_HOME`. Their child environment inherits the runner environment except for a narrow denylist owned by QiYan: Telegram credentials, the QiYan management MCP bearer token, and assistant-only internal credentials. Arbitrary user variables, provider credentials, proxy/CA configuration, and user MCP variables survive. Assistant-profile environment construction remains separate.
@@ -82,11 +84,13 @@ Directory selection follows this order:
 1. If the user names an existing project or explicit path, use that path.
 2. If the task has an obvious personal file category and the user asked for a new session, use a task-specific directory such as `~/Documents/<task-slug>`.
 3. For new coding or project work, prefer a clear project-specific directory under a location selected by the user or assistant.
-4. If no location is reasonably implied, omit `project_dir`; the backend creates `~/qiyan-bot-projects/<nickname>`.
+4. If no location is reasonably implied, omit `project_dir`; the backend exclusively creates a new `~/qiyan-bot-projects/<nickname>`.
 
 The backend expands only a leading `~/` against the account runner's real home, never the assistant's isolated `HOME`. Absolute paths are accepted. Other relative paths are rejected so launch-directory changes cannot redirect a project. Nicknames become safe single path segments: lowercase ASCII letters or digits first, followed by lowercase ASCII letters, digits, `_`, or `-`, with a 64-character maximum.
 
-For `create_session`, the backend validates a projected canonical path through its nearest existing ancestor, rejects protected overlap, creates a missing directory recursively with owner-only permissions, resolves the final canonical directory, validates again, then starts the Codex thread. If directory creation succeeds but thread creation becomes uncertain, the directory remains; QiYan does not delete a path that may have acquired user data.
+For an explicit `create_session.project_dir`, the backend validates a projected canonical path through its nearest existing ancestor, rejects protected overlap, creates a missing directory recursively with owner-only permissions, resolves the final canonical directory, validates again, then starts the Codex thread. An existing explicit directory is allowed because the assistant deliberately selected it.
+
+For an omitted `project_dir`, the backend creates the default root if needed, but creates the nickname leaf exclusively and fails with proven no effect if that leaf already exists. It never silently reuses a stale or unrelated fallback directory. The operation checkpoints the newly created canonical path before thread dispatch. If directory creation succeeds but thread creation becomes uncertain, the directory and checkpoint remain for diagnosis/reconciliation; QiYan does not delete or automatically reuse a path that may have acquired user data. A later deliberate attempt may select that directory only by passing it explicitly.
 
 `register_session` and `adopt_session` require an existing canonical directory and apply the same protected-overlap rule. Discovery may show a protected thread, but it cannot be adopted as a project worker.
 
@@ -113,13 +117,14 @@ For the current development deployment:
 1. inspect the live process without printing environment values and capture its effective canonical data, registry, workdir, executable, working directory, and launch mechanism;
 2. choose a non-overlapping timestamped backup root below a mode-0700 parent;
 3. stop the old bot cleanly and confirm its app-server descendants exit; abort without installing or creating new state if shutdown fails;
-4. copy the complete old data directory, external workdir, and separately located registry without dereferencing symlinks or duplicating a registry already contained by data; preserve modes and write a structural backup manifest;
-5. verify the manifest, copied roots, and file counts before proceeding; leave that backup untouched and record it for manual rollback;
-6. rewrite the actual launcher/service environment to remove old workdir/sandbox variables and use `qiyan-bot`, `ASSISTANT_WORKDIR`, `ASSISTANT_SANDBOX_MODE`, fresh data/registry paths, and the intended working directory; disable any old autostart entry before uninstalling;
-7. create fresh `$HOME/.qiyan-bot/data` and `$HOME/.qiyan-bot/assistant` state without opening old state under the new schema;
-8. uninstall the old npm package and install the verified local `qiyan-bot` release tarball;
-9. run `qiyan-bot assistant-login` for a new isolated authentication profile;
-10. start exactly one QiYan Bot process from the rewritten launcher and verify only fresh canonical paths are active; then rediscover/adopt any desired normal Codex project threads from the user's unchanged real Codex home.
+4. copy the complete old data directory, external workdir, and separately located registry without dereferencing symlinks or duplicating a registry already contained by data; also snapshot the exact installed package tree, bin link, executable digest, launcher/service definition, working directory, command, referenced environment/credential files, and the live launch environment as mode-0600 sensitive bytes without printing values;
+5. preserve modes, link targets, ownership metadata available to the user, file counts, and hashes in a structural backup manifest; verify every manifest entry and prove the old package can still report its version from the backup before proceeding;
+6. leave that complete rollback bundle untouched and record its path; if no reproducible launcher credentials can be captured or referenced, abort and ask the user to supply a restartable secret source before cutover;
+7. rewrite the actual launcher/service environment to remove old workdir/sandbox variables and use `qiyan-bot`, `ASSISTANT_WORKDIR`, `ASSISTANT_SANDBOX_MODE`, fresh data/registry paths, and the intended working directory; disable any old autostart entry before uninstalling;
+8. create fresh `$HOME/.qiyan-bot/data` and `$HOME/.qiyan-bot/assistant` state without opening old state under the new schema;
+9. uninstall the old npm package and install the verified local `qiyan-bot` release tarball;
+10. run `qiyan-bot assistant-login` for a new isolated authentication profile;
+11. start exactly one QiYan Bot process from the rewritten launcher and verify only fresh canonical paths are active; then rediscover/adopt any desired normal Codex project threads from the user's unchanged real Codex home.
 
 Authentication is user-controlled. Implementation may launch the new login command, but it does not copy, symlink, or transform the old authentication file.
 
@@ -165,7 +170,8 @@ Automated tests must prove:
 - project thread start/resume/attach/recovery/turn calls contain no QiYan-supplied approval, sandbox, or shell-policy overrides;
 - arbitrary runner and user-MCP environment sentinels survive in workers while Telegram and assistant MCP secrets remain absent;
 - loopback-only management MCP rejects ordinary workers, bearer-only callers, token-bearing assistant descendants, stale endpoint identities, and incomplete socket-tuple matches while accepting only the exact attested assistant app-server process;
-- optional `project_dir`, real-home `~/` expansion, absolute-path enforcement, safe fallback naming, directory creation, and owner-only mode;
+- mode-0400 `assistant-context.json`, direct-work translation of user-facing home paths, and refusal to use the isolated assistant `HOME` for personal files;
+- optional `project_dir`, real-home `~/` expansion, absolute-path enforcement, safe fallback naming, exclusive fallback-leaf creation, collision rejection, checkpointing, explicit-path reuse, and owner-only mode;
 - rejection of `/`, exact real home, parents of real home, equal/parent/child protected paths, and symlink aliases before thread dispatch even when QiYan state is configured outside home;
 - register/adopt rejection for protected directories;
 - managed policy rules for general direct assistance, deliberate delegation, semantic/fallback directories, and no assistant-workdir workers;
