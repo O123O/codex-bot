@@ -7,6 +7,8 @@ test("parses an explicit coordinator workdir", () => {
   assert.deepEqual(parseCliArgs([]), { command: "run" });
   assert.deepEqual(parseCliArgs(["--workdir", "./manager"]), { command: "run", coordinatorWorkdir: "./manager" });
   assert.deepEqual(parseCliArgs(["coordinator-login"]), { command: "coordinator-login" });
+  assert.deepEqual(parseCliArgs(["--version"]), { command: "version" });
+  assert.deepEqual(parseCliArgs(["--update"]), { command: "update" });
 });
 
 test("rejects missing, repeated, and unknown CLI arguments", () => {
@@ -14,6 +16,8 @@ test("rejects missing, repeated, and unknown CLI arguments", () => {
   assert.throws(() => parseCliArgs(["--workdir", "one", "--workdir", "two"]), /only once/);
   assert.throws(() => parseCliArgs(["--unknown"]), /unknown argument/);
   assert.throws(() => parseCliArgs(["coordinator-login", "--workdir", "one"]), /unknown argument/);
+  assert.throws(() => parseCliArgs(["--version", "--workdir", "one"]), /unknown argument/);
+  assert.throws(() => parseCliArgs(["--update", "--version"]), /unknown argument/);
 });
 
 test("does not echo an unknown argument into a startup error", () => {

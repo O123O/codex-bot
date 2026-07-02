@@ -48,6 +48,15 @@ test("packed codex-bot runs without source files or installed dependencies", asy
   assert.equal((await readFile(join(packageRoot, "dist", "codex-bot"), "utf8")).startsWith("#!/usr/bin/env node\n"), true);
   assert.notEqual((await stat(executable)).mode & 0o111, 0);
 
+  const version = spawnSync(executable, ["--version"], {
+    cwd: temp,
+    encoding: "utf8",
+    env: { PATH: process.env.PATH ?? "" },
+  });
+  assert.equal(version.status, 0);
+  assert.equal(version.stdout, "0.1.0\n");
+  assert.equal(version.stderr, "");
+
   const result = spawnSync(executable, ["--definitely-invalid"], {
     cwd: temp,
     encoding: "utf8",

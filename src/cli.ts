@@ -3,9 +3,15 @@ import { AppError } from "./core/errors.ts";
 
 export type CliCommand =
   | { command: "run"; coordinatorWorkdir?: string }
-  | { command: "coordinator-login" };
+  | { command: "coordinator-login" }
+  | { command: "update" }
+  | { command: "version" };
 
 export function parseCliArgs(argv: readonly string[]): CliCommand {
+  if (argv[0] === "--update" || argv[0] === "--version") {
+    if (argv.length !== 1) throw new AppError("CONFIGURATION_ERROR", "unknown argument");
+    return { command: argv[0] === "--update" ? "update" : "version" };
+  }
   if (argv[0] === "coordinator-login") {
     if (argv.length !== 1) throw new AppError("CONFIGURATION_ERROR", "unknown argument");
     return { command: "coordinator-login" };

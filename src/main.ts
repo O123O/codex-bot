@@ -2,9 +2,18 @@ import { createApp } from "./app.ts";
 import { parseCliArgs } from "./cli.ts";
 import { loadConfig, loadCoordinatorLoginConfig } from "./config.ts";
 import { runCoordinatorLogin } from "./coordinator/login.ts";
+import { readPackageInfo } from "./distribution/package-info.ts";
 
 export async function main(env = process.env, argv: readonly string[] = process.argv.slice(2)): Promise<void> {
   const command = parseCliArgs(argv);
+  if (command.command === "version") {
+    const packageInfo = await readPackageInfo();
+    process.stdout.write(`${packageInfo.version}\n`);
+    return;
+  }
+  if (command.command === "update") {
+    throw new Error("update command is not implemented");
+  }
   if (command.command === "coordinator-login") {
     await runCoordinatorLogin(loadCoordinatorLoginConfig(env), env);
     return;
