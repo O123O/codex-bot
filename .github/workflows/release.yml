@@ -1,0 +1,67 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install locked dependencies
+        run: npm ci
+
+      - name: Match tag to package version
+        shell: bash
+        run: |
+          version=$(node -p "require('./package.json').version")
+          if [[ "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "tag $GITHUB_REF_NAME does not match package version $version" >&2
+            exit 1
+          fi
+
+      - name: Verify source
+        run: npm run check
+
+      - name: Build and inspect release asset
+        shell: bash
+        run: |
+          archive=$(npm pack --silent)
+          mv -- "$archive" codex-bot.tgz
+          tar -tzf codex-bot.tgz | sort > package-files.txt
+          for required in \
+            package/package.json \
+            package/README.md \
+            package/dist/codex-bot \
+            package/assets/coordinator/AGENTS.md \
+            package/assets/coordinator/session-status.example.json
+          do
+            grep -Fxq "$required" package-files.txt
+          done
+          if grep -Eq '^package/(src|tests|node_modules)/' package-files.txt; then
+            echo "release package contains development files" >&2
+            exit 1
+          fi
+
+      - name: Create release and upload package
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes
+          fi
+          gh release upload "$GITHUB_REF_NAME" codex-bot.tgz --clobber
