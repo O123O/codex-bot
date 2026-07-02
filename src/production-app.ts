@@ -11,7 +11,7 @@ import { DeliveryWorker } from "./chat/delivery-worker.ts";
 import { LocalEndpoint } from "./app-server/local-endpoint.ts";
 import { AppServerPool } from "./app-server/pool.ts";
 import { SUPPORTED_CODEX_VERSION } from "./app-server/protocol.ts";
-import { composeApp, TerminalInbox, type AppPhase, type BotApp } from "./app.ts";
+import { composeApp, type AppPhase, type BotApp } from "./app.ts";
 import type { BotConfig } from "./config.ts";
 import { AppError } from "./core/errors.ts";
 import { runBackground } from "./core/background.ts";
@@ -20,7 +20,9 @@ import { activateAssistantProfileIdentity, resumeAssistantIdentity } from "./ass
 import { recordAssistantAuthenticationFailure } from "./assistant/auth-recovery.ts";
 import { buildAssistantChildEnvironment, prepareAssistantProfile, startAuthenticatedAssistantEndpoint, type PreparedAssistantProfile } from "./assistant/profile.ts";
 import { AssistantRuntime } from "./assistant/runtime.ts";
-import { AssistantScheduler, type AssistantJob } from "./assistant/scheduler.ts";
+import { AssistantScheduler } from "./assistant/scheduler.ts";
+import { ConversationDispatcher, type AssistantTurnPort } from "./assistant/conversation-dispatcher.ts";
+import { AttemptScope } from "./assistant/attempt-scope.ts";
 import { SessionObservationProcessor } from "./assistant/session-observer.ts";
 import { createAssistantTools, type AssistantToolName } from "./assistant/tools.ts";
 import { prepareAssistantWorkspace } from "./assistant/workspace.ts";
@@ -34,8 +36,10 @@ import { SessionLifecycle } from "./sessions/lifecycle.ts";
 import { preparedProjectWorkspaceFromCheckpoint, ProjectWorkspacePolicy, type PreparedProjectWorkspace } from "./sessions/project-workspace.ts";
 import { SessionService } from "./sessions/service.ts";
 import { ThreadGate } from "./sessions/thread-gate.ts";
-import { inTransaction, openDatabase, type Database } from "./storage/database.ts";
+import { openDatabase, type Database } from "./storage/database.ts";
 import { DeliveryStore, type DeliveryRecord } from "./storage/delivery-store.ts";
+import { ConversationStore } from "./storage/conversation-store.ts";
+import { finalizeConversationCutover, runConversationRoutingBackfill } from "./storage/conversation-cutover.ts";
 import { OperationStore } from "./storage/operation-store.ts";
 import { RuntimeStore } from "./storage/runtime-store.ts";
 import { SessionDashboardStore } from "./storage/session-dashboard-store.ts";
@@ -112,6 +116,9 @@ export async function buildProductionApp(
   let sessions!: SessionService;
   let relay!: EventRelay;
   let assistant!: AssistantRuntime;
+  let conversations!: ConversationStore;
+  let attemptScope!: AttemptScope;
+  let dispatcher!: ConversationDispatcher;
   let scheduler!: AssistantScheduler;
   let mcp!: LoopbackMcpServer;
   let chat!: ChatAdapter;
@@ -119,10 +126,6 @@ export async function buildProductionApp(
   let acceptingReadyEvents = false;
   let schedulerAccepting = false;
   const unsubscribers: Array<() => void> = [];
-  const terminalWaiters = new Map<string, { resolve(): void; reject(error: unknown): void; eventIds: string[] }>();
-  const earlyAssistantTerminals = new TerminalInbox<any>();
-  const enqueuedEvents = new Set<string>();
-  const enqueuedSources = new Set<string>();
   const reconnectTimers = new Map<string, ReturnType<typeof setTimeout>>();
   const reconnectAttempts = new Map<string, number>();
   let endpointIncident = 0;
@@ -172,6 +175,7 @@ export async function buildProductionApp(
         db = openDatabase(join(dataDir, "bot.sqlite3"));
         operations = new OperationStore(db); deliveries = new DeliveryStore(db); runtime = new RuntimeStore(db); finals = new FinalMessageStore(db);
         dashboardStore = new SessionDashboardStore(db);
+        runConversationRoutingBackfill(db, administrativeBinding);
       },
       stop: async () => { db.close(); },
     },
@@ -220,10 +224,12 @@ export async function buildProductionApp(
     {
       name: "mcp",
       start: async () => {
+        conversations = new ConversationStore(db, deliveries, attachments);
+        attemptScope = new AttemptScope(db, operations, { maxCollectCount: config.maxCollectCount, attachments });
         assistant = new AssistantRuntime(db, operations, deliveries, { binding: administrativeBinding });
         const actions = buildActions();
-        const tools = createAssistantTools(operations, actions, { maxCollectCount: config.maxCollectCount });
-        mcp = new LoopbackMcpServer(tools, { current: () => assistant.current() }, { host: config.mcpHost, port: config.mcpPort, token, allowedClientProcess: () => assistantEndpoint?.mcpClientIdentity });
+        const tools = createAssistantTools(operations, actions, { maxCollectCount: config.maxCollectCount, attemptScope });
+        mcp = new LoopbackMcpServer(tools, assistant, { host: config.mcpHost, port: config.mcpPort, token, allowedClientProcess: () => assistantEndpoint?.mcpClientIdentity });
         await mcp.start();
       }, stop: async () => { await mcp.stop(); },
     },
@@ -240,6 +246,15 @@ export async function buildProductionApp(
           expectedVersion: SUPPORTED_CODEX_VERSION,
         });
         pool = new AppServerPool([endpoint, assistantEndpoint], { maxConcurrentTurns: config.maxConcurrentTurns });
+        const durableLease = conversations.lease();
+        if (durableLease) {
+          const identity = registry.snapshot().assistant;
+          pool.restoreTurnCapacityClaim(identity.endpoint, identity.thread_id, durableLease.capacityClaimId, {
+            phase: durableLease.turnId ? "active" : "provisional",
+            ...(durableLease.turnId ? { turnId: durableLease.turnId } : {}),
+          });
+          assistant.hydrateActive();
+        }
         discovery = new SessionDiscovery(db, pool);
         threadGate = new ThreadGate();
         lifecycle = new SessionLifecycle(pool, registry, runtime, { now: () => Date.now() }, projectWorkspaces, threadGate);
@@ -256,7 +271,7 @@ export async function buildProductionApp(
           clock: { now: () => Date.now() },
           onTerminal: (event) => observations.observeTerminal(event),
         }, attachments);
-        scheduler = new AssistantScheduler(runAssistantJob, { onError: handleSchedulerFailure });
+        scheduler = new AssistantScheduler();
         unsubscribers.push(endpoint.onNotification((method, params) => {
           if (!observations.accept(endpoint.id, method, params)) runBackground(() => onNotification(endpoint.id, method, params), () => recordBackgroundFailure("project notification"));
         }));
@@ -273,7 +288,7 @@ export async function buildProductionApp(
           enqueuePendingEvents();
         }, () => recordBackgroundFailure("permission notification"))));
         unsubscribers.push(endpoint.onReady(() => { if (acceptingReadyEvents) runBackground(() => relay.reconcileEndpoint(endpoint.id), () => recordBackgroundFailure("project ready reconciliation")); }));
-        unsubscribers.push(assistantEndpoint.onReady(() => { if (acceptingReadyEvents) runBackground(() => reconcileAssistantAttempts(), () => recordBackgroundFailure("assistant ready reconciliation")); }));
+        unsubscribers.push(assistantEndpoint.onReady(() => { if (acceptingReadyEvents) runBackground(() => dispatcher.recover(), () => recordBackgroundFailure("assistant ready reconciliation")); }));
         unsubscribers.push(endpoint.onUnavailable(() => runBackground(() => handleEndpointUnavailable(endpoint), () => recordBackgroundFailure("project unavailable handling"))));
         unsubscribers.push(assistantEndpoint.onUnavailable(() => runBackground(() => handleEndpointUnavailable(assistantEndpoint), () => recordBackgroundFailure("assistant unavailable handling"))));
       }, stop: async () => { for (const unsubscribe of unsubscribers.splice(0)) unsubscribe(); await observations.idle(); },
@@ -306,16 +321,8 @@ export async function buildProductionApp(
     },
     {
       name: "reconciliation",
-      start: async () => {
-        await lifecycle.reconcileAdopting();
-        await lifecycle.reconcileRemovals();
-        await resumeManagedSessions();
-        await observations.drain(endpoint.id);
-        await relay.reconcileEndpoint(endpoint.id);
-        deliveries.recoverAfterCrash();
-        reconcileDeliveryEvents();
-        acceptingReadyEvents = true;
-      }, stop: async () => { acceptingReadyEvents = false; await observations.idle(); await renderDashboardSafely(); },
+      start: async () => { acceptingReadyEvents = false; },
+      stop: async () => { acceptingReadyEvents = false; await observations.idle(); await renderDashboardSafely(); },
     },
     {
       name: "assistant",
@@ -329,29 +336,72 @@ export async function buildProductionApp(
           markActivated: () => assistantProfile.markActivated(),
         });
         await startOrResumeAssistant();
+        const identity = registry.snapshot().assistant;
+        const assistantHistory = await pool.request<any>(identity.endpoint, "thread/read", { threadId: identity.thread_id, includeTurns: true });
+        finalizeConversationCutover(db, {
+          threadId: identity.thread_id,
+          turns: (assistantHistory.thread.turns ?? []).map((turn: any) => ({
+            id: String(turn.id),
+            status: String(turn.status),
+            itemsView: turn.itemsView ?? "notLoaded",
+            items: turn.items ?? [],
+          })),
+        });
+        const runner: AssistantTurnPort = {
+          start: (params, claim) => pool.startTurn(identity.endpoint, { ...params }, claim),
+          steer: (params) => pool.request(identity.endpoint, "turn/steer", params),
+          readThread: async () => (await pool.request<any>(identity.endpoint, "thread/read", { threadId: identity.thread_id, includeTurns: true })).thread,
+        };
+        dispatcher = new ConversationDispatcher(conversations, pool, runner, {
+          endpointId: identity.endpoint,
+          threadId: identity.thread_id,
+          attachments,
+          membershipObserver: attemptScope,
+          runtimeObserver: assistant,
+          scheduler,
+          onDeferredTerminal: (turn) => runBackground(
+            () => processAssistantTerminal({ threadId: identity.thread_id, turn }),
+            () => recordBackgroundFailure("deferred assistant terminal"),
+          ),
+        });
+        assistant.hydrateActive();
         await reconcileOperations();
-        await reconcileAssistantAttempts();
+        conversations.repairQueueNotices();
+        await dispatcher.recover();
+        await lifecycle.reconcileAdopting();
+        await lifecycle.reconcileRemovals();
+        await resumeManagedSessions();
+        await observations.drain(endpoint.id);
+        await relay.reconcileEndpoint(endpoint.id);
+        deliveries.recoverAfterCrash();
+        reconcileDeliveryEvents();
+        acceptingReadyEvents = true;
       }, stop: async () => undefined,
     },
     {
       name: "scheduler",
-      start: async () => { schedulerAccepting = true; await enqueuePendingEvents(); await enqueuePendingSources(); },
+      start: async () => { schedulerAccepting = true; await enqueuePendingEvents(); await dispatcher.enqueueInternal("startup"); },
       stop: async () => {
         stopping = true;
         schedulerAccepting = false;
         const active = assistant.current();
-        if (active && !active.turnId.startsWith("pending:")) await pool.interrupt(assistantEndpoint.id, registry.snapshot().assistant.thread_id, active.turnId).catch(() => undefined);
-        for (const [turnId, waiter] of terminalWaiters) {
-          terminalWaiters.delete(turnId);
-          waiter.reject(new AppError("OPERATION_UNCERTAIN", "bot stopped before the assistant turn reached a proven terminal state"));
+        if (active && !active.turnId.startsWith("pending:")) {
+          assistant.beginTerminalizing(active.turnId);
+          await assistant.fenceTools(active.attemptId, 1_000);
+          await pool.interrupt(assistantEndpoint.id, registry.snapshot().assistant.thread_id, active.turnId).catch(() => undefined);
         }
-        await scheduler.idle();
+        await dispatcher.stop();
       },
     },
     {
       name: "delivery",
       start: async () => {
-        chat = new TelegramChatAdapter(db, operations, attachments, { token: config.telegramBotToken, ownerId: config.telegramOwnerId, maxMessageBytes: config.attachmentMaxBytes, onAccepted: async (contextId) => { enqueueSource(contextId); } });
+        chat = new TelegramChatAdapter(db, attachments, {
+          token: config.telegramBotToken,
+          ownerId: config.telegramOwnerId,
+          maxMessageBytes: config.attachmentMaxBytes,
+          onMessage: (source, checkpoint) => dispatcher.accept(source, checkpoint),
+        });
         deliveryWorker = new DeliveryWorker(deliveries, new ChatAdapterRegistry([chat.delivery]), attachments, undefined, (delivery) => { persistDeliveryState(delivery); });
         deliveryWorker.start();
       },
@@ -452,10 +502,15 @@ export async function buildProductionApp(
         context.checkpoint(args.mode === "steer"
           ? { turnId: sessions.activeTurnId(args.nickname) }
           : { pendingSettings, ...(settingsObservationSequence === undefined ? {} : { settingsObservationSequence }) });
-        const files = args.attachment_ids.map((id: any) => attachments.toUserInput(context.effectiveSourceContextId, id));
+        const resolvedAttachments: Array<{ contextId: string; attachmentId: FileHandleId }> = (args.attachment_ids as string[])
+          .map((id) => attemptScope.resolveAttachment(context.attemptId, id));
+        const files = resolvedAttachments.map((attachment) => attachments.toUserInput(attachment.contextId, attachment.attachmentId));
         const input = [...(args.content.length > 0 ? [{ type: "text", text: args.content, text_elements: [] }] : []), ...files];
-        const holdId = workerAttachmentHoldId(context.effectiveSourceContextId, context.attemptId, context.callId);
-        if (args.attachment_ids.length > 0) attachments.retainForOperation(holdId, context.effectiveSourceContextId, args.attachment_ids);
+        const holds = resolvedAttachments.map((attachment, index) => ({
+          ...attachment,
+          id: `${workerAttachmentHoldId(context.effectiveSourceContextId, context.attemptId, context.callId)}:${index}`,
+        }));
+        for (const hold of holds) attachments.retainForOperation(hold.id, hold.contextId, [hold.attachmentId]);
         let result: Awaited<ReturnType<SessionService["send"]>>;
         try {
           result = await sessions.send(args.nickname, args.content, {
@@ -465,12 +520,14 @@ export async function buildProductionApp(
             ...(pendingSettings ? { settings: pendingSettings } : {}),
           });
         } catch (error) {
-          if (isProvenSendNoEffect(error)) attachments.releaseOperation(holdId);
+          if (isProvenSendNoEffect(error)) for (const hold of holds) attachments.releaseOperation(hold.id);
           throw error;
         }
-        if (args.attachment_ids.length > 0) {
-          if (result.terminal) attachments.releaseOperation(holdId);
-          else attachments.transferOperationToTurn(holdId, worker.endpoint, worker.thread_id, result.turnId);
+        if (holds.length > 0) {
+          for (const hold of holds) {
+            if (result.terminal) attachments.releaseOperation(hold.id);
+            else attachments.transferOperationToTurn(hold.id, worker.endpoint, worker.thread_id, result.turnId);
+          }
         }
         if (args.attachment_ids.length > 0 && !result.terminal) {
           const history = await pool.request<any>(worker.endpoint, "thread/read", { threadId: worker.thread_id, includeTurns: true });
@@ -494,7 +551,7 @@ export async function buildProductionApp(
       collect_messages: async (args, context) => args.direct
         ? sessions.collect(args.nickname, args.count, {
           direct: true,
-          binding: assistant.current()?.binding ?? administrativeBinding,
+          binding: assistantAttemptBinding(context.attemptId),
           deliveryKey: context.operationId,
           onSelected: (messageIds) => context.checkpoint({ messageIds }),
         })
@@ -561,7 +618,7 @@ export async function buildProductionApp(
         await renderDashboardSafely();
         return result;
       },
-      send_chat_message: async (args, context) => ({ deliveryId: deliveries.prepare({ id: `chat:${context.effectiveSourceContextId}:${context.attemptId}:${context.callId}`, kind: "chat", binding: assistant.current()?.binding ?? administrativeBinding, body: args.content, mandatory: false }).id }),
+      send_chat_message: async (args, context) => ({ deliveryId: deliveries.prepare({ id: `chat:${context.effectiveSourceContextId}:${context.attemptId}:${context.callId}`, kind: "chat", binding: assistantAttemptBinding(context.attemptId), body: args.content, mandatory: false }).id }),
       prepare_chat_attachment: async (args, context) => {
         const ownerRoot = args.owner === "assistant" ? assistantDir : sessions.managedProjectRoot(args.owner);
         const prepared = await attachments.prepareOutbound(context.effectiveSourceContextId, ownerRoot, args.relative_path, undefined, undefined, operationFileHandle(context.effectiveSourceContextId, context.attemptId, context.callId));
@@ -572,11 +629,25 @@ export async function buildProductionApp(
         void attachment;
         const delivery = deliveries.prepareAttachment({
           id: `chat-attachment:${context.effectiveSourceContextId}:${context.attemptId}:${context.callId}`,
-          kind: "attachment", binding: assistant.current()?.binding ?? administrativeBinding, body: args.caption ?? "", mandatory: false,
+          kind: "attachment", binding: assistantAttemptBinding(context.attemptId), body: args.caption ?? "", mandatory: false,
           attachmentId: args.file_handle, attachmentScopeId: context.effectiveSourceContextId,
         });
         return { deliveryId: delivery.id };
       },
+    };
+  }
+
+  function assistantAttemptBinding(attemptId: string): ConversationBinding {
+    const row = db.prepare(`SELECT adapter_id, conversation_key, destination_json, native_reply_json
+      FROM assistant_attempts WHERE id = ?`).get(attemptId) as Record<string, unknown> | undefined;
+    if (!row?.adapter_id || !row.conversation_key || !row.destination_json) {
+      throw new AppError("UNSUPPORTED_CAPABILITY", "destinationless internal assistant work cannot send chat output");
+    }
+    return {
+      adapterId: String(row.adapter_id),
+      conversationKey: String(row.conversation_key),
+      destination: JSON.parse(String(row.destination_json)),
+      ...(row.native_reply_json ? { reply: JSON.parse(String(row.native_reply_json)) } : {}),
     };
   }
 
@@ -665,83 +736,10 @@ export async function buildProductionApp(
     return endpointId;
   }
 
-  async function runAssistantJob(job: AssistantJob): Promise<void> {
-    const isEventBatch = "events" in job;
-    const eventIds = isEventBatch ? job.events.map((event) => event.id) : [];
-    const contextId = isEventBatch ? `batch:${eventIds.join(",")}` : String((job.payload as any).contextId);
-    if (!schedulerAccepting || stopping || hasOrphanAssistantAttempt()) {
-      enqueuedSources.delete(contextId);
-      for (const id of eventIds) enqueuedEvents.delete(id);
-      return;
-    }
-    if (isEventBatch) {
-      inTransaction(db, () => {
-        operations.createSourceContext({ id: contextId, kind: "event_batch", sourceId: job.id, rawText: JSON.stringify(job.payload), attachmentIds: [] });
-        db.prepare("INSERT OR IGNORE INTO event_batches(id, event_ids_json, state, created_at) VALUES (?, ?, 'pending', ?)")
-          .run(contextId, JSON.stringify(eventIds), Date.now());
-      });
-    }
-    const source = operations.getSourceContext(contextId);
-    if (!source) throw new Error(`missing source context ${contextId}`);
-    if (source.state !== "pending") {
-      enqueuedSources.delete(contextId);
-      for (const id of eventIds) enqueuedEvents.delete(id);
-      return;
-    }
-    const isInternal = source.kind !== "telegram";
-    const identity = registry.snapshot().assistant;
-    const internalLabel = source.kind === "recovery" ? "Recovery metadata for a previous assistant attempt" : "Project session event metadata";
-    const input: any[] = [{ type: "text", text: isInternal ? `${internalLabel}:\n${source.rawText}` : source.rawText, text_elements: [] }];
-    if (!isInternal && source.attachmentIds.length > 0) {
-      input.push({ type: "text", text: `Backend attachment handles in source order: ${JSON.stringify(source.attachmentIds)}`, text_elements: [] });
-      input.push(...source.attachmentIds.map((id) => attachments.toUserInput(contextId, id as any)));
-    }
-    const attemptId = `attempt_${crypto.randomUUID()}`;
-    assistant.prepareAttempt(contextId, attemptId, isInternal ? "internal" : "user");
-    try {
-      const response = await pool.startTurn<any>(identity.endpoint, { threadId: identity.thread_id, clientUserMessageId: contextId, input });
-      const turnId = String(response.turn.id);
-      assistant.bindTurn(attemptId, turnId);
-      if (stopping || !schedulerAccepting) {
-        await pool.interrupt(identity.endpoint, identity.thread_id, turnId).catch(() => undefined);
-        throw new AppError("OPERATION_UNCERTAIN", "bot stopped after the assistant turn started and before its terminal state was observed");
-      }
-      const terminal = new Promise<void>((resolvePromise, rejectPromise) => terminalWaiters.set(turnId, { resolve: resolvePromise, reject: rejectPromise, eventIds }));
-      const early = earlyAssistantTerminals.take(turnId);
-      if (early) await processAssistantTerminal(early);
-      else if (isTerminalStatus(response.turn.status)) await processAssistantTerminal({ threadId: identity.thread_id, turn: response.turn });
-      await terminal;
-    } catch (error) {
-      await reconcileOperations();
-      const active = assistant.current();
-      if (active?.attemptId === attemptId) terminalWaiters.delete(active.turnId);
-      const uncertainTransport = isUncertainAssistantTransportFailure(error, assistantEndpoint.state);
-      if (uncertainTransport && active?.attemptId === attemptId) {
-        assistant.abandonActive(active.turnId);
-        enqueuedSources.delete(contextId);
-        for (const id of eventIds) enqueuedEvents.delete(id);
-        return;
-      }
-      const recovery = active?.attemptId === attemptId ? assistant.failAttempt(active.turnId, error) : undefined;
-      await requeueFailedContext(contextId, eventIds, recovery);
-    }
-  }
-
-  async function handleSchedulerFailure(job: AssistantJob, _error: unknown): Promise<void> {
-    const eventIds = "events" in job ? job.events.map((event) => event.id) : [];
-    const contextId = "events" in job ? `batch:${eventIds.join(",")}` : String((job.payload as any).contextId);
-    enqueuedSources.delete(contextId);
-    for (const id of eventIds) enqueuedEvents.delete(id);
-    recordBackgroundFailure("assistant job before dispatch");
-    await requeueFailedContext(contextId, eventIds, undefined);
-  }
-
   async function onNotification(endpointId: string, method: string, params: any): Promise<void> {
     const identity = registry.snapshot().assistant;
     if (endpointId === identity.endpoint && method === "turn/completed" && params.threadId === identity.thread_id) {
-      pool.markTurnTerminal(endpointId, identity.thread_id, params.turn.id);
-      if (terminalWaiters.has(params.turn.id) || assistant.activeAttempts().some((attempt) => attempt.turnId === params.turn.id)) await processAssistantTerminal(params);
-      else earlyAssistantTerminals.publish(params.turn.id, params);
+      await processAssistantTerminal(params);
       return;
     }
     await relay.handleNotification(endpointId, method, params);
@@ -750,38 +748,30 @@ export async function buildProductionApp(
 
   async function processAssistantTerminal(params: any): Promise<void> {
     const identity = registry.snapshot().assistant;
+    await dispatcher.terminal(params.turn);
+    const attemptBefore = assistant.contextForTurn(params.turn.id);
+    if (!attemptBefore) return;
+    assistant.beginTerminalizing(params.turn.id);
+    await assistant.fenceTools(attemptBefore.attemptId, 1_000);
     const history = await pool.request<any>(identity.endpoint, "thread/read", { threadId: identity.thread_id, includeTurns: true });
     const turn = history.thread.turns.find((candidate: any) => candidate.id === params.turn.id) ?? params.turn;
     const messages = finals.persistTerminalTurn(identity.endpoint, identity.thread_id, turn, Date.now());
-    const attempt = assistant.contextForTurn(turn.id);
-    let recovery: ReturnType<AssistantRuntime["failAttempt"]>;
-    if (turn.status === "completed") {
-      assistant.handleTerminal(turn.id, messages.map((message) => message.body).join("\n") || undefined);
-      if (attempt) {
-        enqueuedSources.delete(attempt.contextId);
-      }
-    } else {
-      await reconcileOperations({ includeActiveAttempt: true });
-      recovery = assistant.failAttempt(turn.id, turn.error);
-    }
-    const waiter = terminalWaiters.get(turn.id);
-    const durableEventIds = attempt ? eventIdsForContext(attempt.contextId) : [];
-    for (const id of durableEventIds) enqueuedEvents.delete(id);
-    if (!waiter) {
-      if (turn.status !== "completed" && attempt) await requeueFailedContext(attempt.contextId, [], recovery);
-      await enqueuePendingEvents();
-      await enqueuePendingSources();
-      return;
-    }
-    if (turn.status !== "completed" && attempt) await requeueFailedContext(attempt.contextId, durableEventIds.length > 0 ? durableEventIds : waiter.eventIds, recovery);
-    terminalWaiters.delete(turn.id); waiter.resolve();
+    if (turn.status !== "completed") await reconcileOperations({ includeActiveAttempt: true });
+    const memberIds = attemptBefore ? conversations.membersForAttempt(attemptBefore.attemptId).map((member) => member.contextId) : [];
+    assistant.handleTerminal(
+      turn.id,
+      isTerminalStatus(turn.status) ? turn.status : "failed",
+      messages.map((message) => message.body).join("\n") || undefined,
+      turn.error,
+    );
+    for (const contextId of memberIds) attemptScope.notifyMembership(contextId);
     await enqueuePendingEvents();
-    await enqueuePendingSources();
+    await dispatcher.enqueueInternal("terminal");
   }
 
   function enqueuePendingEvents(): void {
-    if (!schedulerAccepting || stopping || hasOrphanAssistantAttempt()) return;
-    const rows = db.prepare("SELECT id, endpoint_id, thread_id, payload_json FROM events WHERE state = 'pending' ORDER BY created_at, id").all() as Array<Record<string, unknown>>;
+    if (!schedulerAccepting || stopping) return;
+    const rows = db.prepare("SELECT id, endpoint_id, thread_id, payload_json, created_at FROM events WHERE state = 'pending' ORDER BY created_at, id").all() as Array<Record<string, unknown>>;
     const latestTransient = new Map<string, string>();
     for (const row of rows) {
       const payload = JSON.parse(String(row.payload_json));
@@ -793,53 +783,15 @@ export async function buildProductionApp(
       const payload = JSON.parse(String(row.payload_json));
       if (payload && typeof payload === "object" && "status" in payload && !("final" in payload) && latestTransient.get(sessionKey) !== id) {
         db.prepare("UPDATE events SET state = 'coalesced' WHERE id = ? AND state = 'pending'").run(id);
-        enqueuedEvents.delete(id);
         continue;
       }
-      if (enqueuedEvents.has(id)) continue;
-      enqueuedEvents.add(id);
-      scheduler.enqueueEvent({ id, sessionKey, payload });
+      scheduler.enqueueEvent({ id, sessionKey, payload, queuedAt: Number(row.created_at) });
     }
-  }
-
-  function enqueuePendingSources(): void {
-    if (!schedulerAccepting || stopping || hasOrphanAssistantAttempt()) return;
-    for (const source of operations.listPendingSourceContexts(["telegram", "recovery"])) enqueueSource(source.id);
-  }
-
-  function enqueueSource(contextId: string): void {
-    if (!schedulerAccepting || stopping || hasOrphanAssistantAttempt()) return;
-    if (enqueuedSources.has(contextId)) return;
-    enqueuedSources.add(contextId);
-    scheduler.enqueueUser({ id: contextId, payload: { contextId } });
-  }
-
-  async function requeueFailedContext(contextId: string, eventIds: readonly string[], recovery: ReturnType<AssistantRuntime["failAttempt"]>): Promise<void> {
-    enqueuedSources.delete(contextId);
-    for (const id of eventIds) enqueuedEvents.delete(id);
-    if (recovery) {
-      if (!stopping) enqueueSource(recovery.id);
-      return;
-    }
-    const retry = setTimeout(() => {
-      if (stopping) return;
-      if (eventIds.length > 0) enqueuePendingEvents();
-      else enqueuePendingSources();
-    }, 1_000);
-    retry.unref?.();
+    void dispatcher?.enqueueInternal("events");
   }
 
   function isTerminalStatus(status: unknown): boolean {
     return typeof status === "string" && new Set(["completed", "failed", "interrupted"]).has(status);
-  }
-
-  function eventIdsForContext(contextId: string): string[] {
-    const row = db.prepare("SELECT event_ids_json FROM event_batches WHERE id = ?").get(contextId) as { event_ids_json: string } | undefined;
-    return row ? JSON.parse(row.event_ids_json) as string[] : [];
-  }
-
-  function hasOrphanAssistantAttempt(): boolean {
-    return assistant.activeAttempts().length > 0 && assistant.current() === undefined;
   }
 
   async function startOrResumeAssistant(): Promise<void> {
@@ -855,42 +807,6 @@ export async function buildProductionApp(
       clearPendingThread: (threadId) => assistantProfile.clearPendingThread(threadId),
     });
     runtime.setSession(assistantEndpoint.id, resumed.threadId, assistantMappingId, "managed", resumed.nativeStatus);
-  }
-
-  async function reconcileAssistantAttempts(): Promise<void> {
-    const identity = registry.snapshot().assistant;
-    for (const attempt of assistant.activeAttempts()) {
-      let turnId = attempt.turnId;
-      if (attempt.turnId.startsWith("pending:")) {
-        const pendingHistory = await pool.request<any>(identity.endpoint, "thread/read", { threadId: identity.thread_id, includeTurns: true });
-        const matched = [...pendingHistory.thread.turns].reverse().find((candidate: any) => candidate.items.some((item: any) => item.type === "userMessage" && item.clientId === attempt.contextId));
-        if (matched) {
-          assistant.bindTurn(attempt.attemptId, matched.id);
-          turnId = matched.id;
-        } else if (pendingHistory.thread.status?.type === "idle") {
-          await requeueFailedContext(attempt.contextId, [], assistant.failAttempt(attempt.turnId, "restart proved that the unbound turn was never created"));
-          continue;
-        } else {
-          continue;
-        }
-      }
-      let history = await pool.request<any>(identity.endpoint, "thread/read", { threadId: identity.thread_id, includeTurns: true });
-      let turn = history.thread.turns.find((candidate: any) => candidate.id === turnId);
-      if (!turn || !isTerminalStatus(turn.status)) {
-        await pool.interrupt(identity.endpoint, identity.thread_id, turnId).catch(() => undefined);
-        const deadline = Date.now() + 30_000;
-        do {
-          history = await pool.request<any>(identity.endpoint, "thread/read", { threadId: identity.thread_id, includeTurns: true });
-          turn = history.thread.turns.find((candidate: any) => candidate.id === turnId);
-          if (turn && isTerminalStatus(turn.status)) break;
-          await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
-        } while (Date.now() < deadline);
-      }
-      if (turn && isTerminalStatus(turn.status)) await processAssistantTerminal({ threadId: identity.thread_id, turn });
-      // If the exact turn is still not terminal, leave its source and attempt active.
-      // A later terminal notification or maintenance pass will reconcile it; rerunning
-      // the source now could let the old turn perform effects after the replay starts.
-    }
   }
 
   function reconcileOperations(options: { includeActiveAttempt?: boolean } = {}): Promise<void> {
@@ -930,12 +846,13 @@ export async function buildProductionApp(
           operations.succeed(operation.id, { file_handle: prepared.id, display_name: prepared.displayName, media_type: prepared.mediaType, size: prepared.size, sha256: prepared.sha256 });
         } else if (operation.kind === "collect_messages") {
           const checkpoint = operation.receipt as { messageIds?: string[] } | undefined;
+          const binding = assistantAttemptBinding(operation.attemptId);
           const result = Array.isArray(checkpoint?.messageIds)
-            ? await sessions.collectSelected(args.nickname, checkpoint.messageIds, { binding: administrativeBinding, deliveryKey: operation.contextId })
+            ? await sessions.collectSelected(args.nickname, checkpoint.messageIds, { binding, deliveryKey: operation.id })
             : await sessions.collect(args.nickname, args.count, {
               direct: true,
-              binding: administrativeBinding,
-              deliveryKey: operation.contextId,
+              binding,
+              deliveryKey: operation.id,
               onSelected: (messageIds) => operations.checkpoint(operation.id, { messageIds }),
             });
           operations.succeed(operation.id, { deliveries: result.map((item) => item.deliveryId), count: args.count, nickname: args.nickname });
@@ -945,11 +862,13 @@ export async function buildProductionApp(
           const history = await pool.request<any>(session.endpoint, "thread/read", { threadId: session.thread_id, includeTurns: true });
           const clientId = `${operation.contextId}:${operation.callId}`;
           const turn = history.thread.turns.find((candidate: any) => candidate.items.some((item: any) => item.type === "userMessage" && item.clientId === clientId));
-          const holdId = workerAttachmentHoldId(operation.contextId, operation.attemptId, operation.callId);
+          const holds = (args.attachment_ids as string[]).map((id, index) => {
+            const attachment = attemptScope.resolveAttachment(operation.attemptId, id);
+            return { ...attachment, id: `${workerAttachmentHoldId(operation.contextId, operation.attemptId, operation.callId)}:${index}` };
+          });
           if (turn) {
-            if (args.attachment_ids.length > 0) {
-              attachments.transferOperationToTurn(holdId, session.endpoint, session.thread_id, turn.id);
-              attachments.retainForTurn(session.endpoint, session.thread_id, turn.id, operation.contextId, args.attachment_ids);
+            if (holds.length > 0) {
+              for (const hold of holds) attachments.transferOperationToTurn(hold.id, session.endpoint, session.thread_id, turn.id);
               if (isTerminalStatus(turn.status)) attachments.releaseTurn(session.endpoint, session.thread_id, turn.id);
             }
             const checkpoint = operation.receipt as { pendingSettings?: { model?: string; effort?: string }; settingsObservationSequence?: number } | undefined;
@@ -963,13 +882,13 @@ export async function buildProductionApp(
               observeLifecycle(args.nickname);
             });
           } else if (args.mode === "start" && history.thread.status?.type === "idle") {
-            attachments.releaseOperation(holdId);
+            for (const hold of holds) attachments.releaseOperation(hold.id);
             operations.failAndUnbind(operation.id, { message: "thread history proves the requested start did not create a turn" });
           } else if (args.mode === "steer") {
             const targetTurnId = (operation.receipt as { turnId?: string } | undefined)?.turnId;
             const target = targetTurnId ? history.thread.turns.find((candidate: any) => candidate.id === targetTurnId) : undefined;
             if (target && isTerminalStatus(target.status)) {
-              attachments.releaseOperation(holdId);
+              for (const hold of holds) attachments.releaseOperation(hold.id);
               operations.failAndUnbind(operation.id, { message: "terminal target history proves the requested steer was not appended" });
             }
           }
@@ -1153,10 +1072,6 @@ export async function buildProductionApp(
     }
     if (target.id === assistantEndpoint.id) {
       schedulerAccepting = false;
-      for (const [turnId, waiter] of terminalWaiters) {
-        terminalWaiters.delete(turnId);
-        waiter.reject(new AppError("ENDPOINT_UNAVAILABLE", "assistant app-server became unavailable"));
-      }
     }
     const identity = registry.snapshot().assistant;
     deliveries.prepare({
@@ -1208,13 +1123,13 @@ export async function buildProductionApp(
       }
       await startOrResumeAssistant();
       await reconcileOperations();
-      await reconcileAssistantAttempts();
+      assistant.hydrateActive();
+      await dispatcher.recover();
       schedulerAccepting = true;
     }
     acceptingReadyEvents = true;
     reconnectAttempts.set(target.id, 0);
     await enqueuePendingEvents();
-    await enqueuePendingSources();
   }
 
   async function verifySessionCwd(actual: string, expected: string): Promise<void> {
@@ -1278,11 +1193,8 @@ export async function buildProductionApp(
     }
     await renderDashboardSafely();
     if (assistantEndpoint.state === "ready") {
-      await reconcileAssistantAttempts();
-      if (!hasOrphanAssistantAttempt()) {
-        await enqueuePendingEvents();
-        await enqueuePendingSources();
-      }
+      await dispatcher.recover();
+      await enqueuePendingEvents();
     }
     if (endpoint.state !== "ready") return;
     const accepted = await registry.reload(validateRegistryDocument);

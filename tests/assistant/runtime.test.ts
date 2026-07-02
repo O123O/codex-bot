@@ -205,3 +205,32 @@ test("terminal tool fencing rejects new dispatch and prevents late success from 
   assert.equal(operation.state, "uncertain");
   assert.equal(operation.receipt, undefined);
 });
+
+test("causal finals retain the attempt binding while destinationless internal recovery stays unbound", () => {
+  const db = createTestDatabase();
+  const operations = new OperationStore(db);
+  const deliveries = new DeliveryStore(db);
+  const conversations = new ConversationStore(db, deliveries);
+  const causal = { adapterId: "slack", conversationKey: "slack:D1", destination: { channel: "D1" } } as const;
+  conversations.acceptChatSource({ id: "chat", nativeSourceId: "chat", binding: causal, rawText: "hello", attachmentIds: [], receivedAt: 1 });
+  const chatLease = conversations.acquireLease({ kind: "chat", contextId: "chat" }, "claim-chat");
+  conversations.reserveStart("chat");
+  conversations.markSubmitted(chatLease.attemptId, "chat", "chat-turn");
+  const runtime = new AssistantRuntime(db, operations, deliveries, { binding });
+  runtime.hydrateActive();
+  runtime.handleTerminal("chat-turn", "completed", "answer");
+  assert.deepEqual(deliveries.get("assistant:chat-turn")?.binding, causal);
+
+  conversations.createInternalSource({ id: "internal", kind: "event_batch", sourceId: "batch", rawText: "event", attachmentIds: [], receivedAt: 2 });
+  const internal = conversations.acquireLease({ kind: "internal", contextId: "internal" }, "claim-internal");
+  conversations.reserveStart("internal");
+  conversations.markSubmitted(internal.attemptId, "internal", "internal-turn");
+  const operation = operations.prepare({ contextId: "internal", attemptId: internal.attemptId, callId: "effect", kind: "create_session", args: {}, effectClass: "side_effecting", toolFence: 0 });
+  operations.markDispatched(operation.id, 0);
+  runtime.hydrateActive();
+  const recovery = runtime.handleTerminal("internal-turn", "failed", undefined, new Error("lost"));
+  const row = db.prepare("SELECT adapter_id, conversation_key FROM source_contexts WHERE id = ?").get(recovery.recoveryContextId!) as any;
+  assert.equal(row.adapter_id, null);
+  assert.equal(row.conversation_key, null);
+  assert.equal(deliveries.listReady().filter((delivery) => delivery.id.includes("internal-turn")).length, 0);
+});

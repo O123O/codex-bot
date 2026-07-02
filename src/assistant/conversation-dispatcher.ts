@@ -38,6 +38,8 @@ interface DispatcherOptions {
   threadId: string;
   attachments?: AttachmentStore;
   membershipObserver?: { notifyMembership(contextId: string): void };
+  runtimeObserver?: { hydrateActive(): unknown; beginTerminalizing?(turnId: string): unknown };
+  onDeferredTerminal?: (turn: TurnSnapshot) => void;
   scheduler?: AssistantScheduler;
   retryMs?: number;
 }
@@ -85,8 +87,9 @@ export class ConversationDispatcher {
       this.pumpPaused = false;
       const lease = this.store.lease();
       if (lease?.turnId === turn.id) {
-        if (lease.phase !== "terminalizing" && lease.binding) this.options.scheduler?.noteConversationPeriodCompleted();
+        this.noteConversationPeriod();
         this.store.beginTerminalizing(turn.id);
+        this.options.runtimeObserver?.beginTerminalizing?.(turn.id);
       } else {
         this.earlyTerminals.set(turn.id, turn);
       }
@@ -96,15 +99,43 @@ export class ConversationDispatcher {
 
   recover(): Promise<void> {
     return this.post(() => {
+      this.pumpPaused = false;
       const lease = this.store.lease();
       if (lease) {
-        this.pool.restoreTurnCapacityClaim(this.options.endpointId, this.options.threadId, lease.capacityClaimId, {
+        const claim = this.pool.restoreTurnCapacityClaim(this.options.endpointId, this.options.threadId, lease.capacityClaimId, {
           phase: lease.turnId ? "active" : "provisional",
           ...(lease.turnId ? { turnId: lease.turnId } : {}),
         });
+        const members = this.store.membersForAttempt(lease.attemptId);
+        const unresolved = members.find((member) => new Set(["start_submitting", "steer_submitting", "uncertain"]).has(member.state));
+        if (unresolved) {
+          if (unresolved.state !== "uncertain") this.store.markUncertain(lease.attemptId, unresolved.contextId);
+          const submission = this.store.submissionFor(lease.attemptId, unresolved.contextId)!;
+          this.launch(
+            this.runner.readThread(),
+            (thread) => this.reconcileSubmission(submission, submission.submissionKind === "start" ? claim : undefined, thread),
+            () => undefined,
+          );
+        } else if (lease.phase === "starting" && members.length === 0) {
+          this.launchStart(this.store.reserveStart(lease.primaryContextId), claim);
+        } else if (lease.turnId && (lease.phase === "active" || lease.phase === "terminalizing")) {
+          this.launch(
+            this.runner.readThread(),
+            (thread) => {
+              const turn = thread.turns.find((candidate) => candidate.id === lease.turnId);
+              if (!turn || !isTerminal(turn.status)) return;
+              this.noteConversationPeriod();
+              this.store.beginTerminalizing(turn.id);
+              this.options.runtimeObserver?.beginTerminalizing?.(turn.id);
+              this.pool.markTurnTerminal(this.options.endpointId, this.options.threadId, turn.id);
+              this.options.onDeferredTerminal?.(turn);
+            },
+            () => undefined,
+          );
+        }
       }
       this.store.repairQueueNotices();
-      this.pump();
+      if (!lease) this.pump();
     });
   }
 
@@ -190,14 +221,22 @@ export class ConversationDispatcher {
     this.launch(
       this.runner.start(params, claim),
       (response) => {
+        const early = this.earlyTerminals.get(response.turn.id);
+        try {
+          this.pool.bindTurnCapacityClaim(claim, response.turn.id);
+        } catch (error) {
+          if (!early && !isTerminal(response.turn.status)) throw error;
+        }
         this.store.markSubmitted(submission.attemptId, submission.contextId, response.turn.id);
         this.options.membershipObserver?.notifyMembership(submission.contextId);
-        this.pool.bindTurnCapacityClaim(claim, response.turn.id);
-        const early = this.earlyTerminals.get(response.turn.id);
+        this.options.runtimeObserver?.hydrateActive();
         if (early || isTerminal(response.turn.status)) {
           this.earlyTerminals.delete(response.turn.id);
+          this.noteConversationPeriod();
           this.store.beginTerminalizing(response.turn.id);
+          this.options.runtimeObserver?.beginTerminalizing?.(response.turn.id);
           this.pool.markTurnTerminal(this.options.endpointId, this.options.threadId, response.turn.id);
+          this.options.onDeferredTerminal?.(early ?? response.turn);
           return;
         }
         this.pump();
@@ -218,6 +257,7 @@ export class ConversationDispatcher {
       (response) => {
         this.store.markSubmitted(submission.attemptId, submission.contextId, response.turnId);
         this.options.membershipObserver?.notifyMembership(submission.contextId);
+        this.options.runtimeObserver?.hydrateActive();
         this.pump();
       },
       (error) => this.handleSubmissionFailure(submission, undefined, error),
@@ -245,9 +285,12 @@ export class ConversationDispatcher {
     if (positive) {
       this.store.markSubmitted(submission.attemptId, submission.contextId, positive.id);
       this.options.membershipObserver?.notifyMembership(submission.contextId);
+      this.options.runtimeObserver?.hydrateActive();
       if (claim) this.pool.bindTurnCapacityClaim(claim, positive.id);
       if (isTerminal(positive.status)) {
-        this.store.beginTerminalizing(positive.id);
+        this.noteConversationPeriod();
+      this.store.beginTerminalizing(positive.id);
+      this.options.runtimeObserver?.beginTerminalizing?.(positive.id);
         this.pool.markTurnTerminal(this.options.endpointId, this.options.threadId, positive.id);
       } else this.pump();
       return;
@@ -263,6 +306,13 @@ export class ConversationDispatcher {
 
     this.store.restorePending(submission.attemptId, submission.contextId);
     this.options.membershipObserver?.notifyMembership(submission.contextId);
+    if (submission.submissionKind === "steer" && expected && isTerminal(expected.status)) {
+      this.noteConversationPeriod();
+      this.store.beginTerminalizing(expected.id);
+      this.options.runtimeObserver?.beginTerminalizing?.(expected.id);
+      this.pool.markTurnTerminal(this.options.endpointId, this.options.threadId, expected.id);
+      this.options.onDeferredTerminal?.(expected);
+    }
     if (claim) {
       this.pumpPaused = true;
       this.store.clearLease(submission.attemptId);
@@ -332,6 +382,11 @@ export class ConversationDispatcher {
 
   private isKnownNonSteerable(error: unknown): boolean {
     return error instanceof AppError && new Set(["SESSION_IDLE", "OPERATION_CONFLICT"]).has(error.code);
+  }
+
+  private noteConversationPeriod(): void {
+    const lease = this.store.lease();
+    if (lease?.phase !== "terminalizing" && lease?.binding) this.options.scheduler?.noteConversationPeriodCompleted();
   }
 }
 

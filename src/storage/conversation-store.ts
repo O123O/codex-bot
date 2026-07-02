@@ -224,6 +224,18 @@ export class ConversationStore {
       .map((row) => this.parseMember(row));
   }
 
+  submissionFor(attemptId: string, contextId: string): ReservedSubmission | undefined {
+    const member = this.membersForAttempt(attemptId).find((candidate) => candidate.contextId === contextId);
+    if (!member) return undefined;
+    const source = this.source(contextId);
+    return {
+      ...member,
+      rawText: source.rawText,
+      attachmentIds: source.attachmentIds,
+      ...(source.binding ? { binding: source.binding } : {}),
+    };
+  }
+
   clearLease(attemptId: string): void {
     inTransaction(this.db, () => {
       const current = this.lease();

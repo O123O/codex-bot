@@ -7,6 +7,8 @@ import test from "node:test";
 import { AttachmentStore } from "../../src/attachments/store.ts";
 import { createTestDatabase } from "../../src/storage/database.ts";
 import { OperationStore } from "../../src/storage/operation-store.ts";
+import { ConversationStore } from "../../src/storage/conversation-store.ts";
+import { DeliveryStore } from "../../src/storage/delivery-store.ts";
 import { TelegramPoller } from "../../src/telegram/poller.ts";
 
 test("accepted input atomically stores source context and advances the offset after download", async () => {
@@ -14,12 +16,16 @@ test("accepted input atomically stores source context and advances the offset af
   const attachments = new AttachmentStore(db, await mkdtemp(join(tmpdir(), "poll-files-")), { maxFileBytes: 10, maxStoreBytes: 100 });
   await attachments.initialize();
   const operations = new OperationStore(db);
+  const conversations = new ConversationStore(db, new DeliveryStore(db), attachments);
   const queued: string[] = [];
   const api = {
     getUpdates: async () => [{ update_id: 4, message: { message_id: 2, date: 1, chat: { id: 10, type: "private" }, from: { id: 42 }, caption: "/pass hi", document: { file_id: "f", file_name: "a.txt", mime_type: "text/plain" } } }],
     downloadFile: async () => ({ stream: Readable.from(["abc"]) }),
   };
-  const poller = new TelegramPoller(db, api, operations, attachments, { ownerId: 42, onAccepted: async (id) => { queued.push(id); } });
+  const poller = new TelegramPoller(db, api, attachments, { ownerId: 42, onMessage: async (source, checkpoint) => {
+    conversations.acceptChatSource(source, checkpoint);
+    queued.push(source.id);
+  } });
   await poller.pollOnce();
   assert.equal((db.prepare("SELECT next_update_id FROM telegram_state").get() as any).next_update_id, 5);
   const context = operations.getSourceContext("telegram:10:2");
@@ -47,9 +53,29 @@ test("unauthorized and unsupported updates advance offset without downloads or r
     ],
     downloadFile: async () => { downloads += 1; return { stream: Readable.from([]) }; },
   };
-  const poller = new TelegramPoller(db, api, new OperationStore(db), attachments, { ownerId: 42, onAccepted: async () => undefined });
+  const poller = new TelegramPoller(db, api, attachments, { ownerId: 42, onMessage: async () => undefined });
   await poller.pollOnce();
   assert.equal((db.prepare("SELECT next_update_id FROM telegram_state").get() as any).next_update_id, 3);
   assert.equal((db.prepare("SELECT COUNT(*) AS count FROM source_contexts").get() as any).count, 0);
   assert.equal(downloads, 0);
+});
+
+test("source, retain, notice, and offset roll back together when the native checkpoint fails", async () => {
+  const db = createTestDatabase();
+  const attachments = new AttachmentStore(db, await mkdtemp(join(tmpdir(), "poll-rollback-")), { maxFileBytes: 10, maxStoreBytes: 100 });
+  await attachments.initialize();
+  const conversations = new ConversationStore(db, new DeliveryStore(db), attachments);
+  const updates = [{ update_id: 7, message: { message_id: 3, date: 1, chat: { id: 10, type: "private" }, from: { id: 42 }, text: "hello" } }];
+  const api = { getUpdates: async () => updates, downloadFile: async () => ({ stream: Readable.from([]) }) };
+  let fail = true;
+  const poller = new TelegramPoller(db, api, attachments, { ownerId: 42, onMessage: async (source, checkpoint) => {
+    conversations.acceptChatSource(source, () => { if (fail) throw new Error("offset failed"); checkpoint(); });
+  } });
+  await assert.rejects(poller.pollOnce(), /offset failed/u);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM source_contexts").get()!.n, 0);
+  assert.equal(db.prepare("SELECT next_update_id FROM telegram_state").get()!.next_update_id, 0);
+  fail = false;
+  await poller.pollOnce();
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM source_contexts").get()!.n, 1);
+  assert.equal(db.prepare("SELECT next_update_id FROM telegram_state").get()!.next_update_id, 8);
 });

@@ -1,5 +1,5 @@
 export interface UserJob { id: string; payload: unknown }
-export interface EventJob { id: string; sessionKey: string; payload: unknown }
+export interface EventJob { id: string; sessionKey: string; payload: unknown; queuedAt?: number }
 export type AssistantJob = UserJob | { id: string; events: EventJob[]; payload: unknown };
 
 interface QueuedEvent { job: EventJob; queuedAt: number }
@@ -15,6 +15,7 @@ export interface EligibleEventBatch {
 export class AssistantScheduler {
   private readonly users: UserJob[] = [];
   private readonly events: QueuedEvent[] = [];
+  private readonly eventIds = new Set<string>();
   private running = false;
   private consecutiveUsers = 0;
   private readonly waiters: Array<() => void> = [];
@@ -68,17 +69,21 @@ export class AssistantScheduler {
   enqueueUser(job: UserJob): void { this.users.push(job); if (this.execute) this.kick(); }
 
   enqueueEvent(job: EventJob): void {
+    if (this.eventIds.has(job.id)) return;
     const transient = this.isTransient(job);
     if (transient) {
       const index = this.events.findIndex((item) => item.job.sessionKey === job.sessionKey && this.isTransient(item.job));
       if (index >= 0) {
         const queuedAt = this.events[index]!.queuedAt;
+        this.eventIds.delete(this.events[index]!.job.id);
         this.events.splice(index, 1, { job, queuedAt });
+        this.eventIds.add(job.id);
         if (this.execute) this.scheduleEventWindow();
         return;
       }
     }
-    this.events.push({ job, queuedAt: this.now() });
+    this.events.push({ job, queuedAt: job.queuedAt ?? this.now() });
+    this.eventIds.add(job.id);
     if (this.execute) {
       this.scheduleEventWindow();
       if (this.users.length > 0 || this.consecutiveUsers >= 5) this.kick();
@@ -107,6 +112,7 @@ export class AssistantScheduler {
     if (!candidate || candidate.batchId !== batchId || candidate.eventIds.length !== eventIds.length
       || candidate.eventIds.some((id, index) => id !== eventIds[index])) throw new Error("event batch candidate changed before commit");
     this.events.splice(0, eventIds.length);
+    for (const id of eventIds) this.eventIds.delete(id);
     this.completedConversationPeriods = 0;
   }
 
@@ -204,7 +210,9 @@ export class AssistantScheduler {
       const next = this.events[0]!.job;
       const size = Buffer.byteLength(JSON.stringify(next.payload));
       if (batch.length > 0 && bytes + size > maxBytes) break;
-      batch.push(this.events.shift()!.job); bytes += size;
+      const shifted = this.events.shift()!.job;
+      this.eventIds.delete(shifted.id);
+      batch.push(shifted); bytes += size;
     }
     this.scheduleEventWindow();
     return batch;

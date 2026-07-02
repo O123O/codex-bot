@@ -5,7 +5,6 @@ import { join } from "node:path";
 import { Readable } from "node:stream";
 import test from "node:test";
 import { AttachmentStore } from "../../src/attachments/store.ts";
-import { OperationStore } from "../../src/storage/operation-store.ts";
 import { createTestDatabase } from "../../src/storage/database.ts";
 import { TelegramChatAdapter } from "../../src/telegram/chat-adapter.ts";
 
@@ -28,9 +27,8 @@ test("adapter uses supplied transports without touching real Telegram", async (c
   let deliveryCloses = 0;
   const adapter = new TelegramChatAdapter(
     db,
-    new OperationStore(db),
     new AttachmentStore(db, root, { maxFileBytes: 100, maxStoreBytes: 1_000 }),
-    { token: "token", ownerId: 42, maxMessageBytes: 100, onAccepted: async () => undefined },
+    { token: "token", ownerId: 42, maxMessageBytes: 100, onMessage: async () => undefined },
     {
       createTransports: () => ({
         polling: {
@@ -87,11 +85,11 @@ test("adapter waits for polling-owned work and closes its dispatcher exactly onc
     closePolling: async () => { closes += 1; },
     closeDelivery: async () => undefined,
   };
-  const adapter = new TelegramChatAdapter(db, new OperationStore(db), attachments, {
+  const adapter = new TelegramChatAdapter(db, attachments, {
     token: "token",
     ownerId: 42,
     maxMessageBytes: 100,
-    onAccepted: async () => undefined,
+    onMessage: async () => undefined,
   }, { createTransports: () => transports });
 
   adapter.start();

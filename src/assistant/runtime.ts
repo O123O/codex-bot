@@ -187,7 +187,9 @@ export class AssistantRuntime {
         this.releaseSourceAttachments(contextId);
       }
       if (this.triggerKind(attempt) === "chat" && finalText) {
-        this.deliveries.prepare({ id: `assistant:${String(attempt.turn_id)}`, kind: "assistant_final", binding: this.bindingForAttempt(attempt), body: finalText, mandatory: true });
+        const binding = this.bindingForAttempt(attempt);
+        if (!binding) throw new Error("chat assistant attempt is missing its immutable conversation binding");
+        this.deliveries.prepare({ id: `assistant:${String(attempt.turn_id)}`, kind: "assistant_final", binding, body: finalText, mandatory: true });
       }
       this.db.prepare("DELETE FROM assistant_turn_lease WHERE attempt_id = ?").run(attemptId);
     });
@@ -222,8 +224,8 @@ export class AssistantRuntime {
         (id, kind, source_id, raw_text, attachment_ids_json, state, created_at, adapter_id, conversation_key,
           destination_json, native_reply_json, arrival_sequence, source_class, queue_notice_required)
         VALUES (?, 'recovery', ?, ?, '[]', 'pending', ?, ?, ?, ?, ?, ?, 'internal', 0)`)
-        .run(recoveryId, String(attempt.context_id), JSON.stringify(receipts), Date.now(), binding.adapterId, binding.conversationKey,
-          JSON.stringify(binding.destination), binding.reply === undefined ? null : JSON.stringify(binding.reply), arrival);
+        .run(recoveryId, String(attempt.context_id), JSON.stringify(receipts), Date.now(), binding?.adapterId ?? null, binding?.conversationKey ?? null,
+          binding === undefined ? null : JSON.stringify(binding.destination), binding?.reply === undefined ? null : JSON.stringify(binding.reply), arrival);
       this.db.prepare("UPDATE assistant_attempts SET state = 'failed', accepting_tools = 0 WHERE id = ?").run(attemptId);
       this.db.prepare("UPDATE assistant_attempt_sources SET state = 'superseded', updated_at = ? WHERE attempt_id = ? AND state <> 'completed'").run(Date.now(), attemptId);
       for (const contextId of members) {
@@ -265,7 +267,7 @@ export class AssistantRuntime {
     return attempt.lease_trigger_kind === "chat" || attempt.trigger_kind === "user" ? "chat" : "internal";
   }
 
-  private bindingForAttempt(attempt: Record<string, unknown>): ConversationBinding {
+  private bindingForAttempt(attempt: Record<string, unknown>): ConversationBinding | undefined {
     if (attempt.adapter_id && attempt.conversation_key && attempt.destination_json) {
       return {
         adapterId: String(attempt.adapter_id),
@@ -274,7 +276,9 @@ export class AssistantRuntime {
         ...(attempt.native_reply_json ? { reply: JSON.parse(String(attempt.native_reply_json)) as JsonValue } : {}),
       };
     }
-    return this.operations.getSourceContext(String(attempt.context_id))?.binding ?? this.options.binding;
+    const sourceBinding = this.operations.getSourceContext(String(attempt.context_id))?.binding;
+    if (sourceBinding) return sourceBinding;
+    return this.triggerKind(attempt) === "chat" ? this.options.binding : undefined;
   }
 
   private parseActive(row: Record<string, unknown>): ActiveAssistantContext {
@@ -283,7 +287,7 @@ export class AssistantRuntime {
       contextId: String(row.context_id),
       turnId: String(row.turn_id),
       triggerKind: this.triggerKind(row),
-      ...(row.adapter_id && row.conversation_key && row.destination_json ? { binding: this.bindingForAttempt(row) } : {}),
+      ...(this.bindingForAttempt(row) ? { binding: this.bindingForAttempt(row)! } : {}),
       toolFence: Number(row.tool_fence),
     };
   }

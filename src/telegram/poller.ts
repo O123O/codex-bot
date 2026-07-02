@@ -1,8 +1,7 @@
 import type { AttachmentStore } from "../attachments/store.ts";
+import type { CanonicalChatSource } from "../core/types.ts";
 import type { Database } from "../storage/database.ts";
-import { inTransaction } from "../storage/database.ts";
-import type { OperationStore } from "../storage/operation-store.ts";
-import { classifyUpdate } from "./adapter.ts";
+import { classifyUpdate, toTelegramCanonicalSource } from "./adapter.ts";
 import type { TelegramUpdate } from "./types.ts";
 
 interface PollApi {
@@ -17,9 +16,8 @@ export class TelegramPoller {
   constructor(
     private readonly db: Database,
     private readonly api: PollApi,
-    private readonly operations: OperationStore,
     private readonly attachments: AttachmentStore,
-    private readonly options: { ownerId: number; onAccepted(contextId: string): Promise<void>; maxMessageBytes?: number },
+    private readonly options: { ownerId: number; onMessage(source: CanonicalChatSource, commitNativeCheckpoint: () => void): Promise<void>; maxMessageBytes?: number },
   ) {}
 
   async pollOnce(signal?: AbortSignal): Promise<number> {
@@ -40,21 +38,11 @@ export class TelegramPoller {
         parts.push({ stream: download.stream, displayName: pending.fileName, mediaType: pending.mediaType, ...(pending.declaredSize === undefined ? {} : { declaredSize: pending.declaredSize }) });
       }
       const saved = await this.attachments.ingestMany(contextId, parts, this.options.maxMessageBytes ?? Number.MAX_SAFE_INTEGER);
-      inTransaction(this.db, () => {
-        const created = this.operations.createSourceContext({
-          id: contextId, kind: "telegram", sourceId: String(update.update_id), rawText: classified.message.rawText, attachmentIds: saved.map((item) => item.id),
-          binding: {
-            adapterId: "telegram",
-            conversationKey: `telegram:${classified.message.chatId}`,
-            destination: { chatId: String(classified.message.chatId) },
-            reply: { messageId: Number(contextId.split(":").at(-1)) },
-          },
-        });
-        if (created) for (const attachment of saved) this.attachments.retain(contextId, attachment.id);
-        this.advance(update.update_id + 1);
-      });
+      await this.options.onMessage(
+        toTelegramCanonicalSource(classified.message, saved.map((item) => item.id)),
+        () => this.advance(update.update_id + 1),
+      );
       offset = update.update_id + 1;
-      await this.options.onAccepted(contextId);
     }
     return offset;
   }

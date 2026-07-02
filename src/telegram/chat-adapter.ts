@@ -1,7 +1,7 @@
 import type { AttachmentStore } from "../attachments/store.ts";
 import type { ChatAdapter, ChatDeliveryAdapter } from "../chat/contracts.ts";
 import type { Database } from "../storage/database.ts";
-import type { OperationStore } from "../storage/operation-store.ts";
+import type { CanonicalChatSource } from "../core/types.ts";
 import { TelegramPoller } from "./poller.ts";
 import { createTelegramTransports, type TelegramTransports } from "./transport.ts";
 import { TelegramDeliveryAdapter } from "./delivery-adapter.ts";
@@ -20,17 +20,16 @@ export class TelegramChatAdapter implements ChatAdapter {
 
   constructor(
     db: Database,
-    operations: OperationStore,
     attachments: AttachmentStore,
-    options: { token: string; ownerId: number; maxMessageBytes: number; onAccepted(contextId: string): Promise<void> },
+    options: { token: string; ownerId: number; maxMessageBytes: number; onMessage(source: CanonicalChatSource, commitNativeCheckpoint: () => void): Promise<void> },
     dependencies: TelegramChatAdapterDependencies = {},
   ) {
     this.transports = (dependencies.createTransports ?? createTelegramTransports)(options.token);
     this.delivery = new TelegramDeliveryAdapter(this.transports.delivery);
-    this.poller = new TelegramPoller(db, this.transports.polling, operations, attachments, {
+    this.poller = new TelegramPoller(db, this.transports.polling, attachments, {
       ownerId: options.ownerId,
       maxMessageBytes: options.maxMessageBytes,
-      onAccepted: options.onAccepted,
+      onMessage: options.onMessage,
     });
   }
 
