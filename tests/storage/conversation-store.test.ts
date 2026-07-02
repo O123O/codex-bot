@@ -136,3 +136,20 @@ test("chat acceptance retains attachments exactly once and rolls source/checkpoi
   assert.equal(db.prepare("SELECT id FROM source_contexts WHERE id = 'rollback'").get(), undefined);
   assert.equal(db.prepare("SELECT ref_count FROM attachments WHERE id = ?").get(rolledBack.id)!.ref_count, 0);
 });
+
+test("event materialization and lease acquisition are one CAS transaction", () => {
+  const { db, store } = fixture();
+  db.prepare("INSERT INTO events(id, endpoint_id, thread_id, kind, payload_json, state, created_at) VALUES ('e1', 'local', 'worker', 'terminal', '{}', 'pending', 1)").run();
+  const candidate = { batchId: "batch:e1", eventIds: ["e1"], payload: [{ id: "e1" }], queuedAt: 1 };
+  const lease = store.materializeAndAcquireEventBatch(candidate, "event-claim");
+  assert.equal(lease.primaryContextId, "batch:e1");
+  assert.equal(lease.binding, undefined);
+  assert.equal(db.prepare("SELECT state FROM events WHERE id = 'e1'").get()!.state, "batched");
+  assert.ok(db.prepare("SELECT id FROM event_batches WHERE id = 'batch:e1'").get());
+
+  const other = fixture();
+  other.db.prepare("INSERT INTO events(id, endpoint_id, thread_id, kind, payload_json, state, created_at) VALUES ('e2', 'local', 'worker', 'terminal', '{}', 'processed', 1)").run();
+  assert.throws(() => other.store.materializeAndAcquireEventBatch({ batchId: "batch:e2", eventIds: ["e2"], payload: [], queuedAt: 1 }, "claim"), /changed/u);
+  assert.equal(other.db.prepare("SELECT id FROM source_contexts WHERE id = 'batch:e2'").get(), undefined);
+  assert.equal(other.store.lease(), undefined);
+});

@@ -4,6 +4,14 @@ export type AssistantJob = UserJob | { id: string; events: EventJob[]; payload: 
 
 interface QueuedEvent { job: EventJob; queuedAt: number }
 
+export interface EligibleEventBatch {
+  batchId: string;
+  eventIds: string[];
+  payload: unknown;
+  queuedAt: number;
+  forced: boolean;
+}
+
 export class AssistantScheduler {
   private readonly users: UserJob[] = [];
   private readonly events: QueuedEvent[] = [];
@@ -11,10 +19,29 @@ export class AssistantScheduler {
   private consecutiveUsers = 0;
   private readonly waiters: Array<() => void> = [];
   private eventTimer: ReturnType<typeof setTimeout> | undefined;
+  private completedConversationPeriods = 0;
+  private readonly execute: ((job: AssistantJob) => Promise<void>) | undefined;
+  private readonly options: {
+    maxBatchEvents?: number;
+    maxBatchBytes?: number;
+    batchWindowMs?: number;
+    maxEventAgeMs?: number;
+    now?: () => number;
+    setTimeout?: typeof setTimeout;
+    clearTimeout?: typeof clearTimeout;
+    onError?: (job: AssistantJob, error: unknown) => Promise<void> | void;
+  };
 
-  constructor(
-    private readonly execute: (job: AssistantJob) => Promise<void>,
-    private readonly options: {
+  constructor(options?: {
+    maxBatchEvents?: number;
+    maxBatchBytes?: number;
+    batchWindowMs?: number;
+    maxEventAgeMs?: number;
+    now?: () => number;
+    setTimeout?: typeof setTimeout;
+    clearTimeout?: typeof clearTimeout;
+  });
+  constructor(execute: (job: AssistantJob) => Promise<void>, options?: {
       maxBatchEvents?: number;
       maxBatchBytes?: number;
       batchWindowMs?: number;
@@ -23,10 +50,22 @@ export class AssistantScheduler {
       setTimeout?: typeof setTimeout;
       clearTimeout?: typeof clearTimeout;
       onError?: (job: AssistantJob, error: unknown) => Promise<void> | void;
+    });
+  constructor(
+    executeOrOptions: ((job: AssistantJob) => Promise<void>) | {
+      maxBatchEvents?: number; maxBatchBytes?: number; batchWindowMs?: number; maxEventAgeMs?: number; now?: () => number;
+      setTimeout?: typeof setTimeout; clearTimeout?: typeof clearTimeout;
     } = {},
-  ) {}
+    options: {
+      maxBatchEvents?: number; maxBatchBytes?: number; batchWindowMs?: number; maxEventAgeMs?: number; now?: () => number;
+      setTimeout?: typeof setTimeout; clearTimeout?: typeof clearTimeout; onError?: (job: AssistantJob, error: unknown) => Promise<void> | void;
+    } = {},
+  ) {
+    this.execute = typeof executeOrOptions === "function" ? executeOrOptions : undefined;
+    this.options = typeof executeOrOptions === "function" ? options : executeOrOptions;
+  }
 
-  enqueueUser(job: UserJob): void { this.users.push(job); this.kick(); }
+  enqueueUser(job: UserJob): void { this.users.push(job); if (this.execute) this.kick(); }
 
   enqueueEvent(job: EventJob): void {
     const transient = this.isTransient(job);
@@ -35,13 +74,47 @@ export class AssistantScheduler {
       if (index >= 0) {
         const queuedAt = this.events[index]!.queuedAt;
         this.events.splice(index, 1, { job, queuedAt });
-        this.scheduleEventWindow();
+        if (this.execute) this.scheduleEventWindow();
         return;
       }
     }
     this.events.push({ job, queuedAt: this.now() });
-    this.scheduleEventWindow();
-    if (this.users.length > 0 || this.consecutiveUsers >= 5) this.kick();
+    if (this.execute) {
+      this.scheduleEventWindow();
+      if (this.users.length > 0 || this.consecutiveUsers >= 5) this.kick();
+    }
+  }
+
+  noteConversationPeriodCompleted(): void { this.completedConversationPeriods += 1; }
+
+  peekEligibleEventBatch(now = this.now()): EligibleEventBatch | undefined {
+    if (this.events.length === 0) return undefined;
+    const age = now - this.events[0]!.queuedAt;
+    const forced = this.completedConversationPeriods >= 5 || age >= (this.options.maxEventAgeMs ?? 30_000);
+    if (!forced && age < (this.options.batchWindowMs ?? 1_000)) return undefined;
+    const jobs = this.peekEventJobs();
+    return {
+      batchId: `batch:${jobs.map((job) => job.id).join(",")}`,
+      eventIds: jobs.map((job) => job.id),
+      payload: jobs.map((job) => job.payload),
+      queuedAt: this.events[0]!.queuedAt,
+      forced,
+    };
+  }
+
+  commitEventBatch(batchId: string, eventIds: readonly string[]): void {
+    const candidate = this.peekEligibleEventBatch();
+    if (!candidate || candidate.batchId !== batchId || candidate.eventIds.length !== eventIds.length
+      || candidate.eventIds.some((id, index) => id !== eventIds[index])) throw new Error("event batch candidate changed before commit");
+    this.events.splice(0, eventIds.length);
+    this.completedConversationPeriods = 0;
+  }
+
+  nextWakeAt(): number | undefined {
+    const first = this.events[0];
+    if (!first) return undefined;
+    if (this.completedConversationPeriods >= 5) return this.now();
+    return Math.min(first.queuedAt + (this.options.batchWindowMs ?? 1_000), first.queuedAt + (this.options.maxEventAgeMs ?? 30_000));
   }
 
   async idle(): Promise<void> {
@@ -85,6 +158,7 @@ export class AssistantScheduler {
   }
 
   private async executeSafely(job: AssistantJob): Promise<void> {
+    if (!this.execute) return;
     try { await this.execute(job); }
     catch (error) {
       try { await this.options.onError?.(job, error); }
@@ -133,6 +207,21 @@ export class AssistantScheduler {
       batch.push(this.events.shift()!.job); bytes += size;
     }
     this.scheduleEventWindow();
+    return batch;
+  }
+
+  private peekEventJobs(): EventJob[] {
+    const maxEvents = this.options.maxBatchEvents ?? 20;
+    const maxBytes = this.options.maxBatchBytes ?? 8 * 1024;
+    const batch: EventJob[] = [];
+    let bytes = 0;
+    for (const queued of this.events) {
+      if (batch.length >= maxEvents) break;
+      const size = Buffer.byteLength(JSON.stringify(queued.job.payload));
+      if (batch.length > 0 && bytes + size > maxBytes) break;
+      batch.push(queued.job);
+      bytes += size;
+    }
     return batch;
   }
 

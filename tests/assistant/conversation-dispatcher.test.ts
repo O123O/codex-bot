@@ -18,6 +18,7 @@ import type { ConversationBinding } from "../../src/chat/binding.ts";
 import { createTestDatabase } from "../../src/storage/database.ts";
 import { ConversationStore } from "../../src/storage/conversation-store.ts";
 import { DeliveryStore } from "../../src/storage/delivery-store.ts";
+import { AssistantScheduler } from "../../src/assistant/scheduler.ts";
 
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -235,6 +236,43 @@ test("a lease CAS loss releases the unused native capacity claim", async () => {
   assert.equal(runner.starts.length, 0);
   store.acquireLease = original;
   await dispatcher.stop();
+});
+
+test("a starved internal event wins only at a lease boundary and materializes once", async () => {
+  const db = createTestDatabase();
+  const deliveries = new DeliveryStore(db);
+  const store = new ConversationStore(db, deliveries);
+  const scheduler = new AssistantScheduler({ now: () => 1, batchWindowMs: 10_000 });
+  db.prepare("INSERT INTO events(id, endpoint_id, thread_id, kind, payload_json, state, created_at) VALUES ('e1', 'local', 'worker', 'terminal', '{}', 'pending', 1)").run();
+  scheduler.enqueueEvent({ id: "e1", sessionKey: "worker", payload: { final: true } });
+  for (let index = 0; index < 5; index += 1) scheduler.noteConversationPeriodCompleted();
+  const endpoint: AppServerEndpoint = { id: "assistant-local", state: "ready", request: async () => { throw new Error("unused"); } };
+  const pool = new AppServerPool([endpoint], { maxConcurrentTurns: 1 });
+  const runner = new FakeRunner();
+  const dispatcher = new ConversationDispatcher(store, pool, runner, { endpointId: "assistant-local", threadId: "assistant", scheduler });
+  await dispatcher.accept(chat("chat-pending"));
+  assert.equal(runner.starts[0]?.params.clientUserMessageId, "batch:e1");
+  assert.equal(deliveries.get("queued:chat-pending")?.body, "[system] queued");
+  assert.equal(scheduler.peekEligibleEventBatch(), undefined);
+  runner.starts[0]!.result.resolve({ turn: { id: "event-turn", status: "inProgress", itemsView: "full", items: [] } });
+  await dispatcher.idle();
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM event_batches").get()!.n, 1);
+  await dispatcher.stop();
+});
+
+test("a due event never interrupts an active conversation period", async () => {
+  const value = fixture();
+  const scheduler = new AssistantScheduler({ now: () => 40_000, batchWindowMs: 0 });
+  const dispatcher = new ConversationDispatcher(value.store, value.pool, value.runner, { endpointId: "assistant-local", threadId: "assistant", scheduler });
+  await dispatcher.accept(chat("first"));
+  value.runner.starts[0]!.result.resolve({ turn: { id: "turn", status: "inProgress", itemsView: "full", items: [] } });
+  await dispatcher.idle();
+  value.db.prepare("INSERT INTO events(id, endpoint_id, thread_id, kind, payload_json, state, created_at) VALUES ('e1', 'local', 'worker', 'terminal', '{}', 'pending', 1)").run();
+  scheduler.enqueueEvent({ id: "e1", sessionKey: "worker", payload: { final: true } });
+  await dispatcher.enqueueInternal("e1");
+  assert.equal(value.runner.starts.length, 1);
+  await dispatcher.stop();
+  await value.dispatcher.stop();
 });
 
 function storeClaim(db: ReturnType<typeof createTestDatabase>): string {

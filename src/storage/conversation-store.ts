@@ -111,41 +111,27 @@ export class ConversationStore {
   }
 
   acquireLease(candidate: { kind: "chat" | "internal"; contextId: string }, capacityClaimId: string): AssistantLease {
+    return inTransaction(this.db, () => this.acquireLeaseInTransaction(candidate, capacityClaimId));
+  }
+
+  materializeAndAcquireEventBatch(candidate: { batchId: string; eventIds: readonly string[]; payload: unknown; queuedAt: number }, capacityClaimId: string): AssistantLease {
     return inTransaction(this.db, () => {
-      if (this.lease()) this.conflict("assistant lease already exists");
-      const source = this.source(candidate.contextId);
-      if (source.state !== "pending") this.conflict("lease candidate is not pending");
-      if ((source.sourceClass === "chat") !== (candidate.kind === "chat")) this.conflict("lease candidate kind changed");
-      if (candidate.kind === "chat" && !source.binding) this.conflict("chat lease candidate has no binding");
-
-      const attemptId = `attempt_${randomUUID()}`;
-      const clientUserMessageId = source.id;
-      const now = Date.now();
-      this.db.prepare(`INSERT INTO assistant_attempts
-        (id, context_id, turn_id, trigger_kind, state, created_at, adapter_id, conversation_key, destination_json, native_reply_json)
-        VALUES (?, ?, NULL, ?, 'active', ?, ?, ?, ?, ?)`)
-        .run(attemptId, source.id, candidate.kind === "chat" ? "user" : "internal", now,
-          source.binding?.adapterId ?? null, source.binding?.conversationKey ?? null,
-          source.binding === undefined ? null : JSON.stringify(source.binding.destination),
-          source.binding?.reply === undefined ? null : JSON.stringify(source.binding.reply));
-      this.db.prepare(`INSERT INTO assistant_turn_lease
-        (singleton, phase, attempt_id, primary_context_id, adapter_id, conversation_key, destination_json, native_reply_json,
-          client_user_message_id, turn_id, trigger_kind, capacity_claim_id, steer_paused, pause_reason)
-        VALUES (1, 'starting', ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, 0, NULL)`)
-        .run(attemptId, source.id, source.binding?.adapterId ?? null, source.binding?.conversationKey ?? null,
-          source.binding === undefined ? null : JSON.stringify(source.binding.destination),
-          source.binding?.reply === undefined ? null : JSON.stringify(source.binding.reply),
-          clientUserMessageId, candidate.kind, capacityClaimId);
-
-      const pendingChats = this.db.prepare("SELECT id FROM source_contexts WHERE state = 'pending' AND source_class = 'chat' ORDER BY arrival_sequence, id")
-        .all() as Array<{ id: string }>;
-      for (const row of pendingChats) {
-        const pending = this.source(row.id);
-        if (candidate.kind === "internal" || !source.binding || !pending.binding || !sameConversation(source.binding, pending.binding)) {
-          this.ensureQueueNotice(pending);
-        }
-      }
-      return this.lease()!;
+      if (candidate.eventIds.length === 0) this.conflict("event batch is empty");
+      const placeholders = candidate.eventIds.map(() => "?").join(",");
+      const pending = Number((this.db.prepare(`SELECT COUNT(*) AS count FROM events WHERE id IN (${placeholders}) AND state = 'pending'`)
+        .get(...candidate.eventIds) as { count: number }).count);
+      if (pending !== candidate.eventIds.length) this.conflict("event batch changed before materialization");
+      const arrival = this.takeArrivalSequence();
+      this.db.prepare(`INSERT INTO source_contexts
+        (id, kind, source_id, raw_text, attachment_ids_json, state, created_at, adapter_id, conversation_key,
+          destination_json, native_reply_json, arrival_sequence, source_class, queue_notice_required)
+        VALUES (?, 'event_batch', ?, ?, '[]', 'pending', ?, NULL, NULL, NULL, NULL, ?, 'internal', 0)`)
+        .run(candidate.batchId, candidate.batchId, JSON.stringify(candidate.payload), candidate.queuedAt, arrival);
+      this.db.prepare("INSERT INTO event_batches(id, event_ids_json, state, created_at) VALUES (?, ?, 'pending', ?)")
+        .run(candidate.batchId, JSON.stringify(candidate.eventIds), candidate.queuedAt);
+      const changed = Number(this.db.prepare(`UPDATE events SET state = 'batched' WHERE id IN (${placeholders}) AND state = 'pending'`).run(...candidate.eventIds).changes);
+      if (changed !== candidate.eventIds.length) this.conflict("event batch changed while materializing");
+      return this.acquireLeaseInTransaction({ kind: "internal", contextId: candidate.batchId }, capacityClaimId);
     });
   }
 
@@ -264,6 +250,43 @@ export class ConversationStore {
     const lease = this.lease();
     if (!lease) return "pending";
     return lease.binding && source.binding && sameConversation(lease.binding, source.binding) ? "owner" : "queued";
+  }
+
+  private acquireLeaseInTransaction(candidate: { kind: "chat" | "internal"; contextId: string }, capacityClaimId: string): AssistantLease {
+    if (this.lease()) this.conflict("assistant lease already exists");
+    const source = this.source(candidate.contextId);
+    if (source.state !== "pending") this.conflict("lease candidate is not pending");
+    if ((source.sourceClass === "chat") !== (candidate.kind === "chat")) this.conflict("lease candidate kind changed");
+    if (candidate.kind === "chat" && !source.binding) this.conflict("chat lease candidate has no binding");
+
+    const attemptId = `attempt_${randomUUID()}`;
+    const clientUserMessageId = source.id;
+    const now = Date.now();
+    this.db.prepare(`INSERT INTO assistant_attempts
+      (id, context_id, turn_id, trigger_kind, state, created_at, adapter_id, conversation_key, destination_json, native_reply_json)
+      VALUES (?, ?, NULL, ?, 'active', ?, ?, ?, ?, ?)`)
+      .run(attemptId, source.id, candidate.kind === "chat" ? "user" : "internal", now,
+        source.binding?.adapterId ?? null, source.binding?.conversationKey ?? null,
+        source.binding === undefined ? null : JSON.stringify(source.binding.destination),
+        source.binding?.reply === undefined ? null : JSON.stringify(source.binding.reply));
+    this.db.prepare(`INSERT INTO assistant_turn_lease
+      (singleton, phase, attempt_id, primary_context_id, adapter_id, conversation_key, destination_json, native_reply_json,
+        client_user_message_id, turn_id, trigger_kind, capacity_claim_id, steer_paused, pause_reason)
+      VALUES (1, 'starting', ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, 0, NULL)`)
+      .run(attemptId, source.id, source.binding?.adapterId ?? null, source.binding?.conversationKey ?? null,
+        source.binding === undefined ? null : JSON.stringify(source.binding.destination),
+        source.binding?.reply === undefined ? null : JSON.stringify(source.binding.reply),
+        clientUserMessageId, candidate.kind, capacityClaimId);
+
+    const pendingChats = this.db.prepare("SELECT id FROM source_contexts WHERE state = 'pending' AND source_class = 'chat' ORDER BY arrival_sequence, id")
+      .all() as Array<{ id: string }>;
+    for (const row of pendingChats) {
+      const pendingChat = this.source(row.id);
+      if (candidate.kind === "internal" || !source.binding || !pendingChat.binding || !sameConversation(source.binding, pendingChat.binding)) {
+        this.ensureQueueNotice(pendingChat);
+      }
+    }
+    return this.lease()!;
   }
 
   private ensureQueueNotice(source: StoredSource): boolean {

@@ -3,6 +3,7 @@ import type { AppServerPool, TurnCapacityClaim } from "../app-server/pool.ts";
 import { AppError } from "../core/errors.ts";
 import type { CanonicalChatSource } from "../core/types.ts";
 import type { AssistantLease, ConversationStore, ReservedSubmission } from "../storage/conversation-store.ts";
+import type { AssistantScheduler } from "./scheduler.ts";
 
 export interface TurnSnapshot {
   id: string;
@@ -37,6 +38,7 @@ interface DispatcherOptions {
   threadId: string;
   attachments?: AttachmentStore;
   membershipObserver?: { notifyMembership(contextId: string): void };
+  scheduler?: AssistantScheduler;
   retryMs?: number;
 }
 
@@ -49,6 +51,7 @@ export class ConversationDispatcher {
   private capacityWaiting = false;
   private pumpPaused = false;
   private retryTimer: ReturnType<typeof setTimeout> | undefined;
+  private eventWakeTimer: ReturnType<typeof setTimeout> | undefined;
   private stopped = false;
 
   constructor(
@@ -82,6 +85,7 @@ export class ConversationDispatcher {
       this.pumpPaused = false;
       const lease = this.store.lease();
       if (lease?.turnId === turn.id) {
+        if (lease.phase !== "terminalizing" && lease.binding) this.options.scheduler?.noteConversationPeriodCompleted();
         this.store.beginTerminalizing(turn.id);
       } else {
         this.earlyTerminals.set(turn.id, turn);
@@ -120,6 +124,7 @@ export class ConversationDispatcher {
     this.stopped = true;
     this.unsubscribeCapacity();
     this.cancelRetry();
+    if (this.eventWakeTimer) clearTimeout(this.eventWakeTimer);
     await this.idle();
   }
 
@@ -127,8 +132,14 @@ export class ConversationDispatcher {
     if (this.stopped || this.networkCount > 0 || this.pumpPaused) return;
     const lease = this.store.lease();
     if (!lease) {
-      const candidate = this.store.nextPendingCandidate();
-      if (!candidate) return;
+      const sourceCandidate = this.store.nextPendingCandidate();
+      const eventCandidate = this.options.scheduler?.peekEligibleEventBatch();
+      const chooseEvent = !!eventCandidate && (!sourceCandidate || eventCandidate.forced);
+      const candidate = chooseEvent ? { kind: "internal" as const, contextId: eventCandidate!.batchId } : sourceCandidate;
+      if (!candidate) {
+        this.scheduleEventWake();
+        return;
+      }
       const claimId = `assistant:${candidate.contextId}`;
       let claim: TurnCapacityClaim;
       try {
@@ -140,7 +151,10 @@ export class ConversationDispatcher {
       }
       let acquired: AssistantLease;
       try {
-        acquired = this.store.acquireLease(candidate, claim.id);
+        acquired = chooseEvent
+          ? this.store.materializeAndAcquireEventBatch(eventCandidate!, claim.id)
+          : this.store.acquireLease(candidate, claim.id);
+        if (chooseEvent) this.options.scheduler!.commitEventBatch(eventCandidate!.batchId, eventCandidate!.eventIds);
       } catch (error) {
         this.pool.releaseTurnCapacityClaim(claim);
         throw error;
@@ -303,6 +317,17 @@ export class ConversationDispatcher {
   private cancelRetry(): void {
     if (this.retryTimer) clearTimeout(this.retryTimer);
     this.retryTimer = undefined;
+  }
+
+  private scheduleEventWake(): void {
+    if (this.eventWakeTimer || !this.options.scheduler || this.stopped) return;
+    const wakeAt = this.options.scheduler.nextWakeAt();
+    if (wakeAt === undefined) return;
+    this.eventWakeTimer = setTimeout(() => {
+      this.eventWakeTimer = undefined;
+      if (!this.stopped) void this.post(() => this.pump());
+    }, Math.max(0, wakeAt - Date.now()));
+    this.eventWakeTimer.unref?.();
   }
 
   private isKnownNonSteerable(error: unknown): boolean {

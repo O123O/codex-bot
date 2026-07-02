@@ -2,60 +2,51 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { AssistantScheduler } from "../../src/assistant/scheduler.ts";
 
-test("scheduler serializes turns, prioritizes users, then services events after five users", async () => {
-  const order: string[] = [];
-  let release!: () => void;
-  const first = new Promise<void>((resolve) => { release = resolve; });
-  const scheduler = new AssistantScheduler(async (job) => { order.push(job.id); if (job.id === "u1") await first; });
-  scheduler.enqueueUser({ id: "u1", payload: {} });
-  scheduler.enqueueEvent({ id: "e1", sessionKey: "s", payload: {} });
-  for (let index = 2; index <= 7; index += 1) scheduler.enqueueUser({ id: `u${index}`, payload: {} });
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(order, ["u1"]);
-  release();
-  await scheduler.idle();
-  assert.deepEqual(order, ["u1", "u2", "u3", "u4", "u5", "batch:e1", "u6", "u7"]);
+const event = (id: string, queuedStatus: "transient" | "final" = "final") => ({
+  id,
+  sessionKey: id.split(":")[0]!,
+  payload: queuedStatus === "transient" ? { status: id } : { final: true, id },
 });
 
-test("event batches preserve per-session order and enforce item and byte caps", async () => {
-  const seen: any[] = [];
-  const scheduler = new AssistantScheduler(async (job) => { seen.push(job); }, { maxBatchEvents: 2, maxBatchBytes: 80, batchWindowMs: 0 });
-  scheduler.enqueueEvent({ id: "a", sessionKey: "one", payload: { status: "active" } });
-  scheduler.enqueueEvent({ id: "b", sessionKey: "one", payload: { final: true } });
-  scheduler.enqueueEvent({ id: "c", sessionKey: "two", payload: { final: true } });
-  await scheduler.idle();
-  assert.deepEqual(seen.flatMap((job) => job.events?.map((event: any) => event.id) ?? []), ["a", "b", "c"]);
-  assert.ok(seen.every((job) => !job.events || job.events.length <= 2));
+test("events become forced after five completed conversation ownership periods", () => {
+  const scheduler = new AssistantScheduler({ now: () => 0, batchWindowMs: 10_000 });
+  scheduler.enqueueEvent(event("e1"));
+  assert.equal(scheduler.peekEligibleEventBatch(1_000), undefined);
+  for (let index = 0; index < 5; index += 1) scheduler.noteConversationPeriodCompleted();
+  assert.deepEqual(scheduler.peekEligibleEventBatch(1_000)?.eventIds, ["e1"]);
+  assert.equal(scheduler.peekEligibleEventBatch(1_000)?.forced, true);
 });
 
-test("events wait for the batch window but a 30-second-old event cannot starve", async () => {
-  let now = 0;
-  const timers: Array<() => void> = [];
-  const seen: string[] = [];
-  const scheduler = new AssistantScheduler(async (job) => { seen.push(job.id); }, {
-    now: () => now,
-    setTimeout: ((callback: () => void) => { timers.push(callback); return { unref() {} }; }) as any,
-    clearTimeout: (() => undefined) as any,
-  });
-  scheduler.enqueueEvent({ id: "e", sessionKey: "s", payload: { final: true } });
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(seen, []);
-  now = 30_000;
-  timers.shift()?.();
-  await scheduler.idle();
-  assert.deepEqual(seen, ["batch:e"]);
+test("peek is non-destructive and commit consumes exactly the frozen capped prefix", () => {
+  const scheduler = new AssistantScheduler({ now: () => 0, batchWindowMs: 0, maxBatchEvents: 2, maxBatchBytes: 1_000 });
+  scheduler.enqueueEvent(event("one:a"));
+  scheduler.enqueueEvent(event("two:b"));
+  scheduler.enqueueEvent(event("three:c"));
+  const candidate = scheduler.peekEligibleEventBatch(0)!;
+  assert.deepEqual(candidate.eventIds, ["one:a", "two:b"]);
+  assert.deepEqual(scheduler.peekEligibleEventBatch(0)?.eventIds, candidate.eventIds);
+  assert.throws(() => scheduler.commitEventBatch(candidate.batchId, ["wrong"]), /changed/u);
+  assert.deepEqual(scheduler.peekEligibleEventBatch(0)?.eventIds, candidate.eventIds);
+  scheduler.commitEventBatch(candidate.batchId, candidate.eventIds);
+  assert.deepEqual(scheduler.peekEligibleEventBatch(0)?.eventIds, ["three:c"]);
 });
 
-test("a failed job is reported and does not stop later durable jobs", async () => {
-  const executed: string[] = [];
-  const failed: string[] = [];
-  const scheduler = new AssistantScheduler(async (job) => {
-    executed.push(job.id);
-    if (job.id === "bad") throw new Error("pre-dispatch failure");
-  }, { onError: (job) => { failed.push(job.id); } });
-  scheduler.enqueueUser({ id: "bad", payload: {} });
-  scheduler.enqueueUser({ id: "next", payload: {} });
-  await scheduler.idle();
-  assert.deepEqual(executed, ["bad", "next"]);
-  assert.deepEqual(failed, ["bad"]);
+test("transient events coalesce per session without reordering the durable queue", () => {
+  const scheduler = new AssistantScheduler({ now: () => 0, batchWindowMs: 0 });
+  scheduler.enqueueEvent(event("one:old", "transient"));
+  scheduler.enqueueEvent(event("two:final"));
+  scheduler.enqueueEvent(event("one:new", "transient"));
+  const candidate = scheduler.peekEligibleEventBatch(0)!;
+  assert.deepEqual(candidate.eventIds, ["one:new", "two:final"]);
+});
+
+test("batch window and 30-second maximum age expose the next lease-boundary wake", () => {
+  let now = 5_000;
+  const scheduler = new AssistantScheduler({ now: () => now, batchWindowMs: 1_000, maxEventAgeMs: 30_000 });
+  scheduler.enqueueEvent(event("e"));
+  assert.equal(scheduler.nextWakeAt(), 6_000);
+  assert.equal(scheduler.peekEligibleEventBatch(5_999), undefined);
+  assert.ok(scheduler.peekEligibleEventBatch(6_000));
+  now = 35_000;
+  assert.equal(scheduler.peekEligibleEventBatch()?.forced, true);
 });
