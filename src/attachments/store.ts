@@ -114,6 +114,13 @@ export class AttachmentStore {
     this.db.prepare("UPDATE attachments SET ref_count = ref_count + 1 WHERE id = ?").run(id);
   }
 
+  retainAcceptedSourceInTransaction(scopeId: string, ids: readonly FileHandleId[]): void {
+    for (const id of ids) {
+      this.required(scopeId, id);
+      this.db.prepare("UPDATE attachments SET ref_count = ref_count + 1 WHERE id = ? AND scope_id = ?").run(id, scopeId);
+    }
+  }
+
   release(scopeId: string, id: FileHandleId): void {
     this.required(scopeId, id);
     this.db.prepare("UPDATE attachments SET ref_count = MAX(ref_count - 1, 0) WHERE id = ?").run(id);

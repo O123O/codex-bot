@@ -84,7 +84,7 @@ export class OperationStore {
   listPendingSourceContexts(kinds: readonly SourceContext["kind"][]): SourceContext[] {
     if (kinds.length === 0) return [];
     const placeholders = kinds.map(() => "?").join(",");
-    const rows = this.db.prepare(`SELECT id FROM source_contexts WHERE state = 'pending' AND kind IN (${placeholders}) ORDER BY created_at, id`).all(...kinds) as Array<{ id: string }>;
+    const rows = this.db.prepare(`SELECT id FROM source_contexts WHERE state = 'pending' AND kind IN (${placeholders}) ORDER BY arrival_sequence, id`).all(...kinds) as Array<{ id: string }>;
     return rows.map((row) => this.getSourceContext(row.id)!).filter(Boolean);
   }
 
