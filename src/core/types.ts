@@ -1,3 +1,5 @@
+import type { ConversationBinding } from "../chat/binding.ts";
+
 export type SessionKey = `${string}:${string}`;
 export type ManagementState =
   | "adopting"
@@ -14,6 +16,18 @@ export interface SourceContext {
   sourceId: string;
   rawText: string;
   attachmentIds: readonly string[];
+  binding?: ConversationBinding;
+  arrivalSequence?: number;
+  queueNoticeRequired?: boolean;
+}
+
+export interface CanonicalChatSource {
+  id: string;
+  nativeSourceId: string;
+  binding: ConversationBinding;
+  rawText: string;
+  attachmentIds: readonly string[];
+  receivedAt: number;
 }
 
 export interface CanonicalAttachment {
