@@ -39,6 +39,7 @@ import { DeliveryWorker } from "./telegram/delivery-worker.ts";
 
 const assistantAssetRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../assets/assistant");
 const fullAccessWarning = "QiYan assistant is running non-interactively with full filesystem access and approvals disabled.";
+const assistantMappingId = "assistant";
 
 export function assistantAccessWarning(mode: BotConfig["assistantSandboxMode"]): string | undefined {
   return mode === "danger-full-access" ? fullAccessWarning : undefined;
@@ -142,7 +143,7 @@ export async function buildProductionApp(
       name: "registry",
       start: async () => {
         registry = await SessionRegistry.open(registryPath, {
-          version: 2,
+          version: 3,
           assistant: { endpoint: "assistant-local", thread_id: "pending", project_dir: assistantDir },
           sessions: {},
         });
@@ -225,9 +226,10 @@ export async function buildProductionApp(
         unsubscribers.push(assistantEndpoint.onNotification((method, params) => runBackground(() => onNotification(assistantEndpoint.id, method, params), () => recordBackgroundFailure("assistant notification"))));
         unsubscribers.push(endpoint.onPermissionBlocked((event) => runBackground(async () => {
           await relay.handlePermissionBlocked(endpoint.id, event);
-          if (event.threadId && runtime.getSession(endpoint.id, event.threadId)?.managementState === "managed") {
-            const state = runtime.getSession(endpoint.id, event.threadId)!;
-            runtime.reconcileNativeState(endpoint.id, event.threadId, state.nativeStatus, runtime.activeTurn(endpoint.id, event.threadId), dashboardStore.allocateObservationSequence());
+          const mapping = event.threadId ? registry.getByIdentity(endpoint.id, event.threadId) : undefined;
+          if (event.threadId && mapping && runtime.getSession(endpoint.id, event.threadId, mapping.session.mapping_id)?.managementState === "managed") {
+            const state = runtime.getSession(endpoint.id, event.threadId, mapping.session.mapping_id)!;
+            runtime.reconcileNativeState(endpoint.id, event.threadId, mapping.session.mapping_id, state.nativeStatus, runtime.activeTurn(endpoint.id, event.threadId, mapping.session.mapping_id), dashboardStore.allocateObservationSequence());
             dashboardStore.observeLifecycle({ endpointId: endpoint.id, threadId: event.threadId }, Date.now());
             await renderDashboardSafely();
           }
@@ -326,16 +328,16 @@ export async function buildProductionApp(
 
   function buildActions(): Partial<Record<AssistantToolName, (args: any, context: any) => Promise<any>>> {
     return {
-      list_managed_sessions: async () => registry.snapshot(),
+      list_managed_sessions: async () => registry.managedSnapshot(),
       discover_sessions: async (args) => discovery.list({ endpointId: projectEndpoint(args.endpoint), ...(args.search ? { search: args.search } : {}), ...(args.cwd ? { cwd: args.cwd } : {}), ...(args.limit ? { limit: args.limit } : {}), ...(args.cursor ? { cursor: args.cursor } : {}) }),
       get_session_status: async (args) => {
         const identity = dashboardIdentity(args.nickname);
         const live = await sessions.status(args.nickname, { observeNative: ({ nativeStatus, activeTurnId }) => {
-          const before = runtime.getSession(identity.endpointId, identity.threadId);
-          const beforeTurn = runtime.activeTurn(identity.endpointId, identity.threadId) ?? null;
+          const before = runtime.getSession(identity.endpointId, identity.threadId, identity.mappingId);
+          const beforeTurn = runtime.activeTurn(identity.endpointId, identity.threadId, identity.mappingId) ?? null;
           const sequence = dashboardStore.allocateObservationSequence();
           const activeTurn = nativeStatus === "active" ? activeTurnId ?? undefined : undefined;
-          const applied = runtime.reconcileNativeState(identity.endpointId, identity.threadId, nativeStatus, activeTurn, sequence);
+          const applied = runtime.reconcileNativeState(identity.endpointId, identity.threadId, identity.mappingId, nativeStatus, activeTurn, sequence);
           if (applied && (before?.nativeStatus !== nativeStatus || beforeTurn !== (activeTurn ?? null))) observeLifecycle(args.nickname);
         } }) as any;
         observeGoal(args.nickname, live.goal);
@@ -361,7 +363,9 @@ export async function buildProductionApp(
         observeLifecycle(args.nickname);
         observeCurrentSettings(args.nickname, settings, Date.now(), settingsObservationSequence);
         await renderDashboardSafely();
-        return { nickname: args.nickname };
+        const mapping = registry.get(args.nickname);
+        if (!mapping) throw new AppError("OPERATION_UNCERTAIN", "created session mapping was not committed");
+        return { nickname: args.nickname, mapping_id: mapping.mapping_id };
       },
       register_session: async (args, context) => {
         const endpointId = projectEndpoint(args.endpoint);
@@ -371,7 +375,9 @@ export async function buildProductionApp(
         advanceNativeWatermark(args.nickname);
         observeLifecycle(args.nickname);
         await renderDashboardSafely();
-        return { nickname: args.nickname };
+        const mapping = registry.get(args.nickname);
+        if (!mapping) throw new AppError("OPERATION_UNCERTAIN", "registered session mapping was not committed");
+        return { nickname: args.nickname, mapping_id: mapping.mapping_id };
       },
       adopt_session: async (args, context) => {
         const endpointId = projectEndpoint(args.endpoint);
@@ -382,9 +388,17 @@ export async function buildProductionApp(
         advanceNativeWatermark(args.nickname);
         observeLifecycle(args.nickname);
         await renderDashboardSafely();
-        return { nickname: args.nickname };
+        const mapping = registry.get(args.nickname);
+        if (!mapping) throw new AppError("OPERATION_UNCERTAIN", "adopted session mapping was not committed");
+        return { nickname: args.nickname, mapping_id: mapping.mapping_id };
       },
-      rename_session: async (args) => { await registry.rename(args.old_nickname, args.new_nickname); await reconcileDashboard(); return { nickname: args.new_nickname }; },
+      rename_session: async (args) => {
+        const session = registry.get(args.old_nickname);
+        if (!session) throw new AppError("UNKNOWN_SESSION", `unknown session: ${args.old_nickname}`);
+        await registry.rename(args.old_nickname, args.new_nickname, session);
+        await reconcileDashboard();
+        return { nickname: args.new_nickname };
+      },
       detach_session: async (args) => { await lifecycle.detach(args.nickname); observeLifecycle(args.nickname); await renderDashboardSafely(); return { nickname: args.nickname }; },
       attach_session: async (args, context) => {
         const session = registry.get(args.nickname);
@@ -423,7 +437,7 @@ export async function buildProductionApp(
       send_to_session: async (args, context) => {
         const worker = registry.get(args.nickname);
         if (!worker) throw new AppError("UNKNOWN_SESSION", `unknown session: ${args.nickname}`);
-        const pendingSettings = args.mode === "start" ? runtime.settings(worker.endpoint, worker.thread_id) : undefined;
+        const pendingSettings = args.mode === "start" ? runtime.settings(worker.endpoint, worker.thread_id, worker.mapping_id) : undefined;
         const settingsObservationSequence = pendingSettings && (Object.hasOwn(pendingSettings, "model") || Object.hasOwn(pendingSettings, "effort"))
           ? dashboardStore.allocateObservationSequence()
           : undefined;
@@ -584,10 +598,10 @@ export async function buildProductionApp(
     });
   }
 
-  function dashboardIdentity(nickname: string): { endpointId: string; threadId: string } {
+  function dashboardIdentity(nickname: string): { endpointId: string; threadId: string; mappingId: string } {
     const session = registry.get(nickname);
     if (!session) throw new AppError("UNKNOWN_SESSION", `unknown session: ${nickname}`);
-    return { endpointId: session.endpoint, threadId: session.thread_id };
+    return { endpointId: session.endpoint, threadId: session.thread_id, mappingId: session.mapping_id };
   }
 
   function observeLifecycle(nickname: string, observedAt = Date.now()): void {
@@ -596,9 +610,9 @@ export async function buildProductionApp(
 
   function advanceNativeWatermark(nickname: string, observationSequence = dashboardStore.allocateObservationSequence()): void {
     const identity = dashboardIdentity(nickname);
-    const state = runtime.getSession(identity.endpointId, identity.threadId);
+    const state = runtime.getSession(identity.endpointId, identity.threadId, identity.mappingId);
     if (!state) return;
-    runtime.reconcileNativeState(identity.endpointId, identity.threadId, state.nativeStatus, runtime.activeTurn(identity.endpointId, identity.threadId), observationSequence);
+    runtime.reconcileNativeState(identity.endpointId, identity.threadId, identity.mappingId, state.nativeStatus, runtime.activeTurn(identity.endpointId, identity.threadId, identity.mappingId), observationSequence);
   }
 
   function observeCurrentSettings(nickname: string, settings: { model?: string; effort?: string | null }, observedAt = Date.now(), observationSequence = dashboardStore.allocateObservationSequence()): void {
@@ -833,7 +847,7 @@ export async function buildProductionApp(
       recordPendingThread: (threadId) => assistantProfile.recordPendingThread(threadId),
       clearPendingThread: (threadId) => assistantProfile.clearPendingThread(threadId),
     });
-    runtime.setSession(assistantEndpoint.id, resumed.threadId, "managed", resumed.nativeStatus);
+    runtime.setSession(assistantEndpoint.id, resumed.threadId, assistantMappingId, "managed", resumed.nativeStatus);
   }
 
   async function reconcileAssistantAttempts(): Promise<void> {
@@ -933,7 +947,7 @@ export async function buildProductionApp(
             }
             const checkpoint = operation.receipt as { pendingSettings?: { model?: string; effort?: string }; settingsObservationSequence?: number } | undefined;
             const appliedSettings = args.mode === "start" && checkpoint && Object.hasOwn(checkpoint, "pendingSettings") ? checkpoint.pendingSettings ?? {} : undefined;
-            if (appliedSettings) runtime.consumeSettings(session.endpoint, session.thread_id, appliedSettings);
+            if (appliedSettings) runtime.consumeSettings(session.endpoint, session.thread_id, session.mapping_id, appliedSettings);
             const receipt = { nickname: args.nickname, mode: args.mode, turnId: turn.id, terminal: isTerminalStatus(turn.status), ...(appliedSettings ? { appliedSettings } : {}) };
             await succeedRecovered(operation, receipt, () => {
               observeLastSent(args.nickname, args, { mode: args.mode, turnId: turn.id }, operation.sequence);
@@ -954,7 +968,7 @@ export async function buildProductionApp(
           }
         } else if (operation.kind === "set_session_model" || operation.kind === "set_reasoning_effort") {
           const session = registry.get(args.nickname);
-          const settings = session ? runtime.settings(session.endpoint, session.thread_id) : {};
+          const settings = session ? runtime.settings(session.endpoint, session.thread_id, session.mapping_id) : {};
           const proven = operation.kind === "set_session_model" ? settings.model === args.model : settings.effort === args.effort;
           if (proven) await succeedRecovered(operation, { pending: true }, () => observeLifecycle(args.nickname, operation.createdAt));
           else failRecoveredNoEffect(operation.id, "pending session setting was not committed");
@@ -993,11 +1007,11 @@ export async function buildProductionApp(
             const native = await pool.request<any>(session.endpoint, "thread/read", { threadId: session.thread_id, includeTurns: true });
             await verifySessionCwd(native.thread.cwd, session.project_dir);
             hydrateThreadOrder(session.endpoint, native.thread);
-            if (!runtime.getSession(session.endpoint, session.thread_id) && native.thread.status?.type === "idle") {
-              runtime.setSession(session.endpoint, session.thread_id, "managed", "idle");
-              runtime.beginEpoch(session.endpoint, session.thread_id, native.thread.turns?.at(-1)?.id, Date.now());
+            if (!runtime.getSession(session.endpoint, session.thread_id, session.mapping_id) && native.thread.status?.type === "idle") {
+              runtime.setSession(session.endpoint, session.thread_id, session.mapping_id, "managed", "idle");
+              runtime.beginEpoch(session.endpoint, session.thread_id, session.mapping_id, native.thread.turns?.at(-1)?.id, Date.now());
             }
-            await succeedRecovered(operation, { nickname: args.nickname }, () => {
+            await succeedRecovered(operation, { nickname: args.nickname, mapping_id: session.mapping_id }, () => {
               advanceNativeWatermark(args.nickname);
               observeLifecycle(args.nickname);
               const currentSettings = (checkpoint as any)?.currentSettings;
@@ -1027,7 +1041,7 @@ export async function buildProductionApp(
             ...(settingsObservedAt === undefined ? {} : { settingsObservedAt }),
             ...(nativeObservationSequence === undefined ? {} : { nativeObservationSequence }),
           });
-          let state = session ? runtime.getSession(session.endpoint, session.thread_id)?.managementState : undefined;
+          let state = session ? runtime.getSession(session.endpoint, session.thread_id, session.mapping_id)?.managementState : undefined;
           if (state === "detaching" || state === "attaching") {
             await lifecycle.reconcileStartup({ endpointId: session!.endpoint, threadId: session!.thread_id }, operation.kind === "attach_session" ? {
               onResumed: (settings) => {
@@ -1042,7 +1056,7 @@ export async function buildProductionApp(
                 checkpointAttach();
               },
             } : {});
-            state = session ? runtime.getSession(session.endpoint, session.thread_id)?.managementState : undefined;
+            state = session ? runtime.getSession(session.endpoint, session.thread_id, session.mapping_id)?.managementState : undefined;
           }
           const expected = operation.kind === "detach_session" ? "detached" : "managed";
           if (state === expected && expected === "managed") {
@@ -1060,13 +1074,13 @@ export async function buildProductionApp(
         } else if (operation.kind === "archive_session") {
           const session = registry.get(args.nickname);
           if (!session) continue;
-          let state = runtime.getSession(session.endpoint, session.thread_id)?.managementState;
+          let state = runtime.getSession(session.endpoint, session.thread_id, session.mapping_id)?.managementState;
           let discovered: { archived: boolean } | undefined;
           if (state !== "archived") {
             discovered = (await discovery.list({ endpointId: session.endpoint, cwd: session.project_dir, search: session.thread_id, limit: 1 })).sessions.find((candidate) => candidate.id === session.thread_id);
             if (discovered?.archived) {
-              runtime.endEpoch(session.endpoint, session.thread_id, Date.now());
-              runtime.setSession(session.endpoint, session.thread_id, "archived", "notLoaded");
+              runtime.endEpoch(session.endpoint, session.thread_id, session.mapping_id, Date.now());
+              runtime.setSession(session.endpoint, session.thread_id, session.mapping_id, "archived", "notLoaded");
               state = "archived";
             }
           }
@@ -1125,23 +1139,23 @@ export async function buildProductionApp(
   }
 
   async function resumeManagedSessions(): Promise<void> {
-    for (const session of Object.values(registry.snapshot().sessions)) {
+    for (const session of Object.values(registry.managedSnapshot().sessions)) {
       if (session.endpoint !== endpoint.id) continue;
-      const state = runtime.getSession(session.endpoint, session.thread_id);
+      const state = runtime.getSession(session.endpoint, session.thread_id, session.mapping_id);
       if (state?.managementState === "managed") {
-        runtime.setSession(session.endpoint, session.thread_id, "unavailable", state.nativeStatus);
+        runtime.setSession(session.endpoint, session.thread_id, session.mapping_id, "unavailable", state.nativeStatus);
       }
     }
-    for (const [nickname, session] of Object.entries(registry.snapshot().sessions)) {
+    for (const [nickname, session] of Object.entries(registry.managedSnapshot().sessions)) {
       if (session.endpoint !== endpoint.id) continue;
-      const state = runtime.getSession(session.endpoint, session.thread_id);
+      const state = runtime.getSession(session.endpoint, session.thread_id, session.mapping_id);
       if (!state) {
         try {
           const response = await endpoint.request<any>("thread/read", { threadId: session.thread_id, includeTurns: false });
           await verifySessionCwd(response.thread.cwd, session.project_dir);
-          runtime.setSession(session.endpoint, session.thread_id, "unavailable", response.thread.status?.type ?? "notLoaded");
+          runtime.setSession(session.endpoint, session.thread_id, session.mapping_id, "unavailable", response.thread.status?.type ?? "notLoaded");
         } catch {
-          runtime.setSession(session.endpoint, session.thread_id, "unavailable", "notLoaded");
+          runtime.setSession(session.endpoint, session.thread_id, session.mapping_id, "unavailable", "notLoaded");
         }
         dashboardStore.observeLifecycle({ endpointId: session.endpoint, threadId: session.thread_id }, Date.now());
         warnSessionUnavailable(nickname, session.endpoint, session.thread_id);
@@ -1162,18 +1176,18 @@ export async function buildProductionApp(
         const nativeObservationSequence = dashboardStore.allocateObservationSequence();
         hydrateThreadOrder(session.endpoint, authoritative.thread);
         const nativeStatus = authoritative.thread.status?.type ?? response.thread.status?.type ?? "idle";
-        runtime.setSession(session.endpoint, session.thread_id, "managed", state.nativeStatus);
+        runtime.setSession(session.endpoint, session.thread_id, session.mapping_id, "managed", state.nativeStatus);
         observations.observeResume(session.endpoint, session.thread_id, { ...response, thread: authoritative.thread }, Date.now(), {
           settings: resumeObservationSequence,
           native: nativeObservationSequence,
         });
         dashboardStore.observeLifecycle({ endpointId: session.endpoint, threadId: session.thread_id }, Date.now());
-        if (!runtime.currentEpoch(session.endpoint, session.thread_id)) {
+        if (!runtime.currentEpoch(session.endpoint, session.thread_id, session.mapping_id)) {
           const baseline = [...(authoritative.thread.turns ?? [])].reverse().find((turn: any) => isTerminalStatus(turn.status))?.id;
-          runtime.beginEpoch(session.endpoint, session.thread_id, baseline, Date.now());
+          runtime.beginEpoch(session.endpoint, session.thread_id, session.mapping_id, baseline, Date.now());
         }
       } catch {
-        runtime.setSession(session.endpoint, session.thread_id, "unavailable", "notLoaded");
+        runtime.setSession(session.endpoint, session.thread_id, session.mapping_id, "unavailable", "notLoaded");
         dashboardStore.observeLifecycle({ endpointId: session.endpoint, threadId: session.thread_id }, Date.now());
         warnSessionUnavailable(nickname, session.endpoint, session.thread_id);
       }
@@ -1187,7 +1201,7 @@ export async function buildProductionApp(
     pool.markEndpointUnavailable(target.id);
     for (const session of runtime.listSessions()) {
       if (session.endpointId === target.id && session.managementState === "managed") {
-        runtime.setSession(session.endpointId, session.threadId, "unavailable", "notLoaded");
+        runtime.setSession(session.endpointId, session.threadId, session.mappingId, "unavailable", "notLoaded");
         dashboardStore.observeLifecycle({ endpointId: session.endpointId, threadId: session.threadId }, Date.now());
       }
     }
@@ -1357,12 +1371,12 @@ export async function buildProductionApp(
   }
 
   async function initializeNewRegistryMappings(): Promise<void> {
-    for (const [nickname, session] of Object.entries(registry.snapshot().sessions)) {
-      if (runtime.getSession(session.endpoint, session.thread_id)) continue;
+    for (const [nickname, session] of Object.entries(registry.managedSnapshot().sessions)) {
+      if (runtime.getSession(session.endpoint, session.thread_id, session.mapping_id)) continue;
       const project = await projectWorkspaces.prepareExisting(session.project_dir);
       await projectWorkspaces.assertDispatchable(project);
       const response = await endpoint.request<any>("thread/read", { threadId: session.thread_id, includeTurns: false });
-      runtime.setSession(session.endpoint, session.thread_id, "unavailable", response.thread.status?.type ?? "notLoaded");
+      runtime.setSession(session.endpoint, session.thread_id, session.mapping_id, "unavailable", response.thread.status?.type ?? "notLoaded");
       dashboardStore.observeLifecycle({ endpointId: session.endpoint, threadId: session.thread_id }, Date.now());
       warnSessionUnavailable(nickname, session.endpoint, session.thread_id);
     }

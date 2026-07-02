@@ -57,7 +57,7 @@ export const SessionNotesPatchSchema = z.object({
 }).strict().refine((value) => Object.keys(value).length > 0, "at least one manager note field is required");
 
 export const AutoSessionInfoSchema = z.object({
-  management_state: z.enum(["managed", "detaching", "detached", "attaching", "archived", "unavailable"]),
+  management_state: z.enum(["adopting", "managed", "unadopting", "archiving", "detaching", "detached", "attaching", "archived", "unavailable"]),
   native_status: z.string(),
   active_turn_id: z.string().nullable(),
   last_sent: LastSentSchema.nullable(),

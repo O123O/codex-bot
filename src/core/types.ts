@@ -1,6 +1,9 @@
 export type SessionKey = `${string}:${string}`;
 export type ManagementState =
+  | "adopting"
   | "managed"
+  | "unadopting"
+  | "archiving"
   | "detaching"
   | "detached"
   | "attaching"

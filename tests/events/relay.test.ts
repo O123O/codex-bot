@@ -12,6 +12,8 @@ import { createTestDatabase } from "../../src/storage/database.ts";
 import { DeliveryStore } from "../../src/storage/delivery-store.ts";
 import { RuntimeStore } from "../../src/storage/runtime-store.ts";
 
+const mappingId = "mapping-1";
+
 class RelayEndpoint implements AppServerEndpoint {
   readonly id = "local"; state: AppServerEndpoint["state"] = "ready";
   turns: any[] = [];
@@ -22,13 +24,13 @@ async function fixture(onTerminal?: (event: any) => void | Promise<void>) {
   const dir = await realpath(await mkdtemp(join(tmpdir(), "relay-")));
   const db = createTestDatabase();
   const registry = await SessionRegistry.open(join(dir, "sessions.json"), {
-    version: 2, assistant: { endpoint: "local", thread_id: "coord", project_dir: dir },
-    sessions: { payments: { endpoint: "local", thread_id: "worker", project_dir: dir } },
+    version: 3, assistant: { endpoint: "local", thread_id: "coord", project_dir: dir },
+    sessions: { payments: { endpoint: "local", thread_id: "worker", project_dir: dir, mapping_id: mappingId, lifecycle_state: "managed" } },
   });
   const endpoint = new RelayEndpoint();
   const runtime = new RuntimeStore(db);
-  runtime.setSession("local", "worker", "managed", "idle");
-  runtime.beginEpoch("local", "worker", "baseline", 1);
+  runtime.setSession("local", "worker", mappingId, "managed", "idle");
+  runtime.beginEpoch("local", "worker", mappingId, "baseline", 1);
   const deliveries = new DeliveryStore(db);
   const relay = new EventRelay(db, new AppServerPool([endpoint], { maxConcurrentTurns: 4 }), registry, runtime, new FinalMessageStore(db), deliveries, { destination: "42", clock: { now: () => 100 }, ...(onTerminal ? { onTerminal } : {}) });
   return { db, endpoint, runtime, deliveries, relay };
@@ -70,9 +72,9 @@ test("managed worker finals create automatic delivery and metadata-only assistan
 test("failed no-final turns warn, detached turns are excluded, and permission blocks are deduplicated", async () => {
   const { db, runtime, deliveries, relay } = await fixture();
   await relay.handleNotification("local", "turn/completed", { threadId: "worker", turn: terminal("bad", "failed", "") });
-  runtime.setSession("local", "worker", "detached", "idle");
+  runtime.setSession("local", "worker", mappingId, "detached", "idle");
   await relay.handleNotification("local", "turn/completed", { threadId: "worker", turn: terminal("detached") });
-  runtime.setSession("local", "worker", "managed", "idle");
+  runtime.setSession("local", "worker", mappingId, "managed", "idle");
   await relay.handlePermissionBlocked("local", { threadId: "worker", turnId: "blocked", method: "approval", params: {} });
   await relay.handlePermissionBlocked("local", { threadId: "worker", turnId: "blocked", method: "approval", params: {} });
   assert.deepEqual(deliveries.listReady().map((item) => item.body), [
@@ -101,7 +103,7 @@ test("reconciliation stops at an in-progress turn without advancing past it", as
   const { endpoint, runtime, deliveries, relay } = await fixture();
   endpoint.turns = [terminal("baseline"), { id: "working", status: "inProgress", completedAt: null, items: [] }];
   await relay.reconcileEndpoint("local");
-  assert.equal(runtime.getSession("local", "worker")?.deliveryCursor, undefined);
+  assert.equal(runtime.getSession("local", "worker", mappingId)?.deliveryCursor, undefined);
 
   endpoint.turns = [terminal("baseline"), terminal("working", "completed", "later")];
   await relay.reconcileEndpoint("local");
@@ -110,9 +112,9 @@ test("reconciliation stops at an in-progress turn without advancing past it", as
 
 test("replaying an older terminal does not clear a newer active worker turn", async () => {
   const { endpoint, runtime, relay } = await fixture();
-  runtime.setActiveTurn("local", "worker", "current");
+  runtime.setActiveTurn("local", "worker", mappingId, "current");
   endpoint.turns = [terminal("baseline"), terminal("old"), { id: "current", status: "inProgress", completedAt: null, items: [] }];
   await relay.reconcileEndpoint("local");
-  assert.equal(runtime.activeTurn("local", "worker"), "current");
-  assert.equal(runtime.getSession("local", "worker")?.nativeStatus, "active");
+  assert.equal(runtime.activeTurn("local", "worker", mappingId), "current");
+  assert.equal(runtime.getSession("local", "worker", mappingId)?.nativeStatus, "active");
 });

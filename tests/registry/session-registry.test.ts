@@ -1,54 +1,84 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { SessionRegistry } from "../../src/registry/session-registry.ts";
+import { SessionRegistry, type MappingLifecycleState, type RegistrySession } from "../../src/registry/session-registry.ts";
 
 async function fixture() {
   const dir = await mkdtemp(join(tmpdir(), "qiyan-bot-registry-"));
   const path = join(dir, "sessions.json");
   const registry = await SessionRegistry.open(path, {
-    version: 2,
+    version: 3,
     assistant: { endpoint: "local", thread_id: "assistant", project_dir: dir },
     sessions: {},
   });
   return { dir, path, registry };
 }
 
-test("registers and renames a session atomically", async () => {
+function worker(dir: string, mappingId: string, threadId = "t1", lifecycleState: MappingLifecycleState = "adopting"): RegistrySession {
+  return {
+    endpoint: "local",
+    thread_id: threadId,
+    project_dir: dir,
+    mapping_id: mappingId,
+    lifecycle_state: lifecycleState,
+  };
+}
+
+test("reserves, promotes, and renames one immutable mapping generation", async () => {
   const { dir, path, registry } = await fixture();
-  await registry.register("payments", { endpoint: "local", thread_id: "t1", project_dir: dir });
-  await registry.rename("payments", "billing");
-  assert.equal(registry.get("billing")?.thread_id, "t1");
-  assert.equal(JSON.parse(await readFile(path, "utf8")).sessions.billing.thread_id, "t1");
+  const reserved = worker(dir, "mapping-1");
+  await registry.reserve("payments", reserved);
+  assert.equal(registry.managedSnapshot().sessions.payments, undefined);
+  await registry.promote("payments", reserved);
+  await registry.rename("payments", "billing", reserved);
+  assert.deepEqual(registry.get("billing"), { ...reserved, lifecycle_state: "managed" });
+  assert.equal(JSON.parse(await readFile(path, "utf8")).sessions.billing.mapping_id, "mapping-1");
 });
 
-test("rejects nickname and thread collisions", async () => {
+test("reserve compares nickname and native thread identity before writing", async () => {
   const { dir, registry } = await fixture();
-  await registry.register("payments", { endpoint: "local", thread_id: "t1", project_dir: dir });
-  await assert.rejects(() => registry.register("payments", { endpoint: "local", thread_id: "t2", project_dir: dir }));
-  await assert.rejects(() => registry.register("other", { endpoint: "local", thread_id: "t1", project_dir: dir }));
+  await registry.reserve("payments", worker(dir, "mapping-1"));
+  await assert.rejects(() => registry.reserve("payments", worker(dir, "mapping-2", "t2")));
+  await assert.rejects(() => registry.reserve("other", worker(dir, "mapping-3", "t1")));
+});
+
+test("transitions and removals compare the exact mapping generation", async () => {
+  const { dir, registry } = await fixture();
+  const old = worker(dir, "mapping-old");
+  await registry.reserve("payments", old);
+  await registry.promote("payments", old);
+  await assert.rejects(() => registry.transition("payments", worker(dir, "wrong"), "unadopting"));
+  await registry.transition("payments", old, "unadopting");
+  assert.equal(registry.get("payments")?.lifecycle_state, "unadopting");
+  assert.equal(await registry.removeIfMatch("payments", worker(dir, "wrong")), false);
+  assert.equal(await registry.removeIfMatch("payments", old), true);
+
+  const replacement = worker(dir, "mapping-new", "t2");
+  await registry.reserve("payments", replacement);
+  assert.equal(await registry.removeIfMatch("payments", old), false);
+  assert.equal(registry.get("payments")?.mapping_id, "mapping-new");
 });
 
 test("invalid external replacement preserves last known-good state", async () => {
   const { path, registry } = await fixture();
   await writeFile(path, "{broken", "utf8");
   assert.equal(await registry.reload(), false);
-  assert.equal(registry.snapshot().version, 2);
+  assert.equal(registry.snapshot().version, 3);
 });
 
 test("invalid startup registry is quarantined and replaced without activating corrupt mappings", async () => {
   const { dir, path } = await fixture();
   await writeFile(path, "{broken", "utf8");
   const registry = await SessionRegistry.open(path, {
-    version: 2,
+    version: 3,
     assistant: { endpoint: "local", thread_id: "assistant", project_dir: dir },
     sessions: {},
   });
   assert.deepEqual(registry.snapshot().sessions, {});
   assert.equal(registry.warnings().length, 1);
-  assert.equal(JSON.parse(await readFile(path, "utf8")).version, 2);
+  assert.equal(JSON.parse(await readFile(path, "utf8")).version, 3);
 });
 
 test("invalid startup registry without a last-known-good snapshot refuses unsafe reset", async () => {
@@ -56,8 +86,8 @@ test("invalid startup registry without a last-known-good snapshot refuses unsafe
   const path = join(dir, "sessions.json");
   await writeFile(path, "{broken", "utf8");
   await assert.rejects(SessionRegistry.open(path, {
-    version: 2,
-    assistant: { endpoint: "local", thread_id: "assistant", project_dir: dir },
+    version: 3,
+    assistant: { endpoint: "local", thread_id: "pending", project_dir: dir },
     sessions: {},
   }), /no valid last-known-good/);
 });
@@ -65,9 +95,9 @@ test("invalid startup registry without a last-known-good snapshot refuses unsafe
 test("external replacement is activated only after asynchronous mapping validation", async () => {
   const { dir, path, registry } = await fixture();
   await writeFile(path, JSON.stringify({
-    version: 2,
+    version: 3,
     assistant: { endpoint: "local", thread_id: "assistant", project_dir: dir },
-    sessions: { payments: { endpoint: "local", thread_id: "t1", project_dir: dir } },
+    sessions: { payments: worker(dir, "mapping-1", "t1", "managed") },
   }));
   assert.equal(await registry.reload(async () => { throw new Error("thread cwd mismatch"); }), false);
   assert.equal(registry.get("payments"), undefined);
@@ -75,11 +105,11 @@ test("external replacement is activated only after asynchronous mapping validati
   assert.equal(registry.get("payments")?.thread_id, "t1");
 });
 
-test("concurrent writes preserve both unique registrations", async () => {
+test("concurrent reservations preserve both unique mappings", async () => {
   const { dir, registry } = await fixture();
   await Promise.all([
-    registry.register("one", { endpoint: "local", thread_id: "t1", project_dir: dir }),
-    registry.register("two", { endpoint: "local", thread_id: "t2", project_dir: dir }),
+    registry.reserve("one", worker(dir, "mapping-1", "t1")),
+    registry.reserve("two", worker(dir, "mapping-2", "t2")),
   ]);
   assert.deepEqual(Object.keys(registry.snapshot().sessions).sort(), ["one", "two"]);
 });
@@ -91,18 +121,42 @@ test("updates the assistant identity atomically after first app-server start", a
   assert.equal(JSON.parse(await readFile(path, "utf8")).assistant.thread_id, "real-assistant");
 });
 
-test("a version-1 registry is rejected without migration", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "qiyan-bot-registry-v1-"));
+test("registry v3 preserves normalized transitional paths without touching the live filesystem", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "qiyan-bot-registry-paths-"));
+  const missing = join(dir, "missing-project");
+  const replacementTarget = join(dir, "replacement-target");
+  const alias = join(dir, "project-alias");
+  await mkdir(replacementTarget);
+  await symlink(replacementTarget, alias, "dir");
+  for (const [name, projectDir] of [["missing", missing], ["alias", alias]] as const) {
+    const path = join(dir, `${name}.json`);
+    await writeFile(path, JSON.stringify({
+      version: 3,
+      assistant: { endpoint: "local", thread_id: "assistant", project_dir: dir },
+      sessions: { work: worker(projectDir, `mapping-${name}`) },
+    }));
+    const registry = await SessionRegistry.open(path, {
+      version: 3,
+      assistant: { endpoint: "local", thread_id: "pending", project_dir: dir },
+      sessions: {},
+    });
+    assert.equal(registry.get("work")?.project_dir, projectDir);
+    assert.equal(registry.get("work")?.lifecycle_state, "adopting");
+  }
+});
+
+test("a version-2 registry is rejected without migration", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "qiyan-bot-registry-v2-"));
   const path = join(dir, "sessions.json");
   await writeFile(path, JSON.stringify({
-    version: 1,
+    version: 2,
     assistant: { endpoint: "assistant-local", thread_id: "old", project_dir: dir },
     sessions: {},
   }));
   await assert.rejects(SessionRegistry.open(path, {
-    version: 2,
+    version: 3,
     assistant: { endpoint: "assistant-local", thread_id: "pending", project_dir: dir },
     sessions: {},
   }), /no valid last-known-good/);
-  assert.equal(JSON.parse(await readFile(path, "utf8")).version, 1);
+  assert.equal(JSON.parse(await readFile(path, "utf8")).version, 2);
 });

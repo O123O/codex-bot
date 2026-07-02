@@ -5,15 +5,17 @@ import { createTestDatabase } from "../../src/storage/database.ts";
 import { RuntimeStore } from "../../src/storage/runtime-store.ts";
 import { SessionDashboardStore } from "../../src/storage/session-dashboard-store.ts";
 
+const mappingId = "mapping-1";
+
 function fixture(options: { readThread?: () => Promise<any>; readGoal?: () => Promise<any> } = {}) {
   const db = createTestDatabase();
   const store = new SessionDashboardStore(db);
   const runtime = new RuntimeStore(db);
-  runtime.setSession("local", "thread-1", "managed", "idle");
+  runtime.setSession("local", "thread-1", mappingId, "managed", "idle");
   const registry = { snapshot: () => ({
-    version: 2 as const,
+    version: 3 as const,
     assistant: { endpoint: "assistant-local", thread_id: "manager", project_dir: "/manager" },
-    sessions: { payments: { endpoint: "local", thread_id: "thread-1", project_dir: "/projects/payments" } },
+    sessions: { payments: { endpoint: "local", thread_id: "thread-1", project_dir: "/projects/payments", mapping_id: mappingId, lifecycle_state: "managed" as const } },
   }) };
   let changes = 0;
   const errors: unknown[] = [];
@@ -49,7 +51,7 @@ test("accepts body-free observations durably and processes settings, status, tok
   assert.equal(facts.currentSettings.model, "gpt-5");
   assert.equal(facts.tokenUsage?.total.total_tokens, 10);
   assert.equal(facts.goal?.objective, "finish");
-  assert.equal(value.runtime.getSession("local", "thread-1")?.nativeStatus, "idle");
+  assert.equal(value.runtime.getSession("local", "thread-1", mappingId)?.nativeStatus, "idle");
   assert.ok(value.changes() >= 1);
 });
 
@@ -88,11 +90,11 @@ test("a fresh equal resume watermark rejects an older delayed settings observati
 
 test("a resume response keeps its receipt order so a later settings notification wins", async () => {
   const value = fixture();
-  value.runtime.setSession("local", "thread-1", "unavailable", "notLoaded");
+  value.runtime.setSession("local", "thread-1", mappingId, "unavailable", "notLoaded");
   const resumeSequence = value.store.allocateObservationSequence();
   value.processor.accept("local", "thread/settings/updated", { threadId: "thread-1", threadSettings: { model: "new", effort: "high" } });
   await value.processor.idle();
-  value.runtime.setSession("local", "thread-1", "managed", "idle");
+  value.runtime.setSession("local", "thread-1", mappingId, "managed", "idle");
 
   value.processor.observeResume("local", "thread-1", {
     model: "old",
@@ -108,12 +110,12 @@ test("a resume response keeps its receipt order so a later settings notification
 
 test("resume orders native state at the later authoritative thread response", async () => {
   const value = fixture();
-  value.runtime.setSession("local", "thread-1", "unavailable", "notLoaded");
+  value.runtime.setSession("local", "thread-1", mappingId, "unavailable", "notLoaded");
   const settingsSequence = value.store.allocateObservationSequence();
   value.processor.accept("local", "thread/status/changed", { threadId: "thread-1", status: { type: "idle" } });
   await value.processor.idle();
   const nativeSequence = value.store.allocateObservationSequence();
-  value.runtime.setSession("local", "thread-1", "managed", "notLoaded");
+  value.runtime.setSession("local", "thread-1", mappingId, "managed", "notLoaded");
 
   value.processor.observeResume("local", "thread-1", {
     model: "gpt-5",
@@ -122,8 +124,8 @@ test("resume orders native state at the later authoritative thread response", as
   }, 300, { settings: settingsSequence, native: nativeSequence });
   await value.processor.drain("local");
 
-  assert.equal(value.runtime.getSession("local", "thread-1")?.nativeStatus, "active");
-  assert.equal(value.runtime.activeTurn("local", "thread-1"), "active-turn");
+  assert.equal(value.runtime.getSession("local", "thread-1", mappingId)?.nativeStatus, "active");
+  assert.equal(value.runtime.activeTurn("local", "thread-1", mappingId), "active-turn");
 });
 
 test("idle waits for a blocked handler and leaves endpoint failures pending for retry", async () => {
@@ -143,13 +145,13 @@ test("idle waits for a blocked handler and leaves endpoint failures pending for 
 
 test("defers observations for an unavailable session that will be restored as managed", async () => {
   const value = fixture();
-  value.runtime.setSession("local", "thread-1", "unavailable", "notLoaded");
+  value.runtime.setSession("local", "thread-1", mappingId, "unavailable", "notLoaded");
   value.processor.accept("local", "thread/settings/updated", { threadId: "thread-1", threadSettings: { model: "gpt-5", effort: "high" } });
   await value.processor.idle();
 
   assert.equal(value.store.pendingNotifications().length, 1);
   assert.equal(value.store.facts({ endpointId: "local", threadId: "thread-1" }).currentSettings.model, null);
-  value.runtime.setSession("local", "thread-1", "managed", "idle");
+  value.runtime.setSession("local", "thread-1", mappingId, "managed", "idle");
   await value.processor.drain("local");
   assert.equal(value.store.pendingNotifications().length, 0);
   assert.equal(value.store.facts({ endpointId: "local", threadId: "thread-1" }).currentSettings.model, "gpt-5");
@@ -183,9 +185,9 @@ test("an unorderable token observation stays pending without starving later rows
 
 test("terminal observation stores only metadata and cannot clear a newer active turn", async () => {
   const value = fixture({ readThread: async () => ({ turns: [{ id: "old", startedAt: 1 }, { id: "new", startedAt: 2 }] }) });
-  value.runtime.setActiveTurn("local", "thread-1", "new");
+  value.runtime.setActiveTurn("local", "thread-1", mappingId, "new");
   await value.processor.observeTerminal({ endpointId: "local", threadId: "thread-1", turnId: "old", status: "completed", startedAt: 1, completedAt: 2, finalMessageId: "message-1" });
-  assert.equal(value.runtime.activeTurn("local", "thread-1"), "new");
+  assert.equal(value.runtime.activeTurn("local", "thread-1", mappingId), "new");
   assert.deepEqual(value.store.facts({ endpointId: "local", threadId: "thread-1" }).lastWorkerEvent, {
     message_id: "message-1", turn_id: "old", status: "completed", at: "1970-01-01T00:00:02.000Z",
   });

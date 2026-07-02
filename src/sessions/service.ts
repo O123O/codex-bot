@@ -16,9 +16,9 @@ export class SessionService {
 
   async send(nickname: string, text: string, options: { mode?: "auto" | "start" | "steer"; clientUserMessageId?: string; input?: unknown[]; settings?: { model?: string; effort?: string } } = {}): Promise<{ mode: "start" | "steer"; turnId: string; terminal?: boolean; appliedSettings?: { model?: string; effort?: string } }> {
     const session = this.required(nickname);
-    const state = this.runtime.getSession(session.endpoint, session.thread_id);
+    const state = this.runtime.getSession(session.endpoint, session.thread_id, session.mapping_id);
     if (!state || state.managementState !== "managed") throw new AppError("SESSION_DETACHED", `${nickname} is not managed`);
-    const activeTurn = this.runtime.activeTurn(session.endpoint, session.thread_id);
+    const activeTurn = this.runtime.activeTurn(session.endpoint, session.thread_id, session.mapping_id);
     const mode = options.mode ?? "auto";
     const input = options.input ?? [{ type: "text", text, text_elements: [] }];
     if (activeTurn) {
@@ -37,30 +37,30 @@ export class SessionService {
       }
     }
     if (mode === "steer") throw new AppError("SESSION_IDLE", `${nickname} has no active turn`);
-    const settings = options.settings ?? this.runtime.settings(session.endpoint, session.thread_id);
+    const settings = options.settings ?? this.runtime.settings(session.endpoint, session.thread_id, session.mapping_id);
     const response = await this.pool.startTurn<{ turn: { id: string; status?: string } }>(session.endpoint, {
       threadId: session.thread_id, ...(options.clientUserMessageId ? { clientUserMessageId: options.clientUserMessageId } : {}), input, ...settings,
     });
-    this.runtime.consumeSettings(session.endpoint, session.thread_id, settings);
+    this.runtime.consumeSettings(session.endpoint, session.thread_id, session.mapping_id, settings);
     const terminal = new Set(["completed", "failed", "interrupted"]).has(response.turn.status ?? "");
     if (!terminal) {
-      this.runtime.setActiveTurn(session.endpoint, session.thread_id, response.turn.id);
+      this.runtime.setActiveTurn(session.endpoint, session.thread_id, session.mapping_id, response.turn.id);
     }
     return { mode: "start", turnId: response.turn.id, terminal, appliedSettings: settings };
   }
 
   async interrupt(nickname: string, turnId?: string): Promise<void> {
     const session = this.required(nickname);
-    const active = this.runtime.activeTurn(session.endpoint, session.thread_id);
+    const active = this.runtime.activeTurn(session.endpoint, session.thread_id, session.mapping_id);
     if (!active) throw new AppError("SESSION_IDLE", `${nickname} has no active turn`);
     if (turnId && turnId !== active) throw new AppError("OPERATION_CONFLICT", `active turn is ${active}, not ${turnId}`);
     await this.pool.interrupt(session.endpoint, session.thread_id, active);
-    this.runtime.setActiveTurn(session.endpoint, session.thread_id, undefined);
+    this.runtime.setActiveTurn(session.endpoint, session.thread_id, session.mapping_id, undefined);
   }
 
   activeTurnId(nickname: string): string {
     const session = this.managed(nickname);
-    const turnId = this.runtime.activeTurn(session.endpoint, session.thread_id);
+    const turnId = this.runtime.activeTurn(session.endpoint, session.thread_id, session.mapping_id);
     if (!turnId) throw new AppError("SESSION_IDLE", `${nickname} has no active turn`);
     return turnId;
   }
@@ -103,7 +103,7 @@ export class SessionService {
   } = {}): Promise<unknown> {
     const session = this.required(nickname);
     const native = await this.pool.request<any>(session.endpoint, "thread/read", { threadId: session.thread_id, includeTurns: true });
-    const runtime = this.runtime.getSession(session.endpoint, session.thread_id);
+    const runtime = this.runtime.getSession(session.endpoint, session.thread_id, session.mapping_id);
     const nativeStatus = native.thread.status?.type ?? "unknown";
     const activeTurnId = nativeStatus === "active"
       ? [...(native.thread.turns ?? [])].reverse().find((turn: any) => !isTerminalStatus(turn.status))?.id ?? null
@@ -126,20 +126,20 @@ export class SessionService {
     const session = this.managed(nickname);
     const available = await this.listModels(session.endpoint);
     if (!available.some((candidate) => candidate.id === model || candidate.model === model)) throw new AppError("UNSUPPORTED_CAPABILITY", `unknown model for ${session.endpoint}: ${model}`);
-    this.runtime.setModel(session.endpoint, session.thread_id, model);
+    this.runtime.setModel(session.endpoint, session.thread_id, session.mapping_id, model);
   }
 
   async setEffort(nickname: string, effort: string): Promise<void> {
     const session = this.managed(nickname);
     const available = await this.listModels(session.endpoint);
-    const pendingModel = this.runtime.settings(session.endpoint, session.thread_id).model;
+    const pendingModel = this.runtime.settings(session.endpoint, session.thread_id, session.mapping_id).model;
     const native = await this.pool.request<any>(session.endpoint, "thread/read", { threadId: session.thread_id, includeTurns: false });
     const configuredModel = pendingModel ?? native.thread.model;
     const model = available.find((candidate) => candidate.id === configuredModel || candidate.model === configuredModel) ?? available.find((candidate) => candidate.isDefault) ?? available[0];
     if (model?.supportedReasoningEfforts && !model.supportedReasoningEfforts.some((candidate: any) => candidate.reasoningEffort === effort || candidate === effort)) {
       throw new AppError("UNSUPPORTED_CAPABILITY", `reasoning effort ${effort} is not supported by ${model.id ?? model.model}`);
     }
-    this.runtime.setEffort(session.endpoint, session.thread_id, effort);
+    this.runtime.setEffort(session.endpoint, session.thread_id, session.mapping_id, effort);
   }
 
   getGoal(nickname: string): Promise<unknown> {
@@ -200,7 +200,7 @@ export class SessionService {
 
   private managed(nickname: string) {
     const session = this.required(nickname);
-    if (this.runtime.getSession(session.endpoint, session.thread_id)?.managementState !== "managed") throw new AppError("SESSION_DETACHED", `${nickname} is not managed`);
+    if (session.lifecycle_state !== "managed" || this.runtime.getSession(session.endpoint, session.thread_id, session.mapping_id)?.managementState !== "managed") throw new AppError("SESSION_DETACHED", `${nickname} is not managed`);
     return session;
   }
 }

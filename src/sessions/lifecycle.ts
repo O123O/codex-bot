@@ -1,4 +1,5 @@
 import { realpath } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import type { AppServerPool } from "../app-server/pool.ts";
 import type { Clock } from "../core/clock.ts";
 import { AppError } from "../core/errors.ts";
@@ -53,9 +54,10 @@ export class SessionLifecycle {
       onThreadCreated?.(response.thread, settings);
       await this.verifyCwd(response.thread.cwd, canonical);
       if (response.thread.status.type !== "idle") throw new AppError("OPERATION_UNCERTAIN", `new thread ${response.thread.id} was created in ${response.thread.status.type} state`);
-      await this.registry.register(nickname, { endpoint: endpointId, thread_id: response.thread.id, project_dir: canonical });
-      this.runtime.setSession(endpointId, response.thread.id, "managed", response.thread.status.type);
-      this.runtime.beginEpoch(endpointId, response.thread.id, this.baseline(response.thread), this.clock.now());
+      const mappingId = `mapping_${randomUUID()}`;
+      await this.registry.createManaged(nickname, { endpoint: endpointId, thread_id: response.thread.id, project_dir: canonical, mapping_id: mappingId });
+      this.runtime.setSession(endpointId, response.thread.id, mappingId, "managed", response.thread.status.type);
+      this.runtime.beginEpoch(endpointId, response.thread.id, mappingId, this.baseline(response.thread), this.clock.now());
       return settings;
     });
   }
@@ -73,34 +75,35 @@ export class SessionLifecycle {
       await this.verifyCwd(response.thread.cwd, canonical);
       this.requireIdle(response.thread);
       onThreadRead?.(response.thread);
-      await this.registry.register(nickname, { endpoint: endpointId, thread_id: threadId, project_dir: canonical });
-      this.runtime.setSession(endpointId, threadId, "managed", response.thread.status.type);
-      this.runtime.beginEpoch(endpointId, threadId, this.baseline(response.thread), this.clock.now());
+      const mappingId = `mapping_${randomUUID()}`;
+      await this.registry.createManaged(nickname, { endpoint: endpointId, thread_id: threadId, project_dir: canonical, mapping_id: mappingId });
+      this.runtime.setSession(endpointId, threadId, mappingId, "managed", response.thread.status.type);
+      this.runtime.beginEpoch(endpointId, threadId, mappingId, this.baseline(response.thread), this.clock.now());
     });
   }
 
   async detach(nickname: string): Promise<void> {
     const session = this.required(nickname);
     await this.lock(`${session.endpoint}:${session.thread_id}`, async () => {
-      this.requireManagementState(session.endpoint, session.thread_id, ["managed"]);
+      this.requireManagementState(session.endpoint, session.thread_id, session.mapping_id, ["managed"]);
       const response = await this.read(session.endpoint, session.thread_id);
       this.requireIdle(response.thread);
-      this.runtime.setSession(session.endpoint, session.thread_id, "detaching", "idle");
+      this.runtime.setSession(session.endpoint, session.thread_id, session.mapping_id, "detaching", "idle");
       await this.pool.request(session.endpoint, "thread/unsubscribe", { threadId: session.thread_id });
-      this.runtime.endEpoch(session.endpoint, session.thread_id, this.clock.now());
-      this.runtime.setSession(session.endpoint, session.thread_id, "detached", "notLoaded");
+      this.runtime.endEpoch(session.endpoint, session.thread_id, session.mapping_id, this.clock.now());
+      this.runtime.setSession(session.endpoint, session.thread_id, session.mapping_id, "detached", "notLoaded");
     });
   }
 
   async attach(nickname: string, observers: AttachObservers = {}): Promise<CurrentSessionSettings> {
     const session = this.required(nickname);
     return this.lock(`${session.endpoint}:${session.thread_id}`, async () => {
-      this.requireManagementState(session.endpoint, session.thread_id, ["detached", "unavailable"]);
+      this.requireManagementState(session.endpoint, session.thread_id, session.mapping_id, ["detached", "unavailable"]);
       const project = await this.workspaces.prepareExisting(session.project_dir);
       await this.workspaces.assertDispatchable(project);
       const before = await this.read(session.endpoint, session.thread_id);
       this.requireIdle(before.thread);
-      this.runtime.setSession(session.endpoint, session.thread_id, "attaching", "idle");
+      this.runtime.setSession(session.endpoint, session.thread_id, session.mapping_id, "attaching", "idle");
       let resumed = false;
       try {
         await this.workspaces.assertDispatchable(project);
@@ -116,8 +119,8 @@ export class SessionLifecycle {
         const after = await this.read(session.endpoint, session.thread_id);
         this.requireIdle(after.thread);
         observers.onThreadRead?.(after.thread);
-        this.runtime.beginEpoch(session.endpoint, session.thread_id, this.baseline(after.thread), this.clock.now());
-        this.runtime.setSession(session.endpoint, session.thread_id, "managed", "idle");
+        this.runtime.beginEpoch(session.endpoint, session.thread_id, session.mapping_id, this.baseline(after.thread), this.clock.now());
+        this.runtime.setSession(session.endpoint, session.thread_id, session.mapping_id, "managed", "idle");
         return settings;
       } catch (error) {
         if (resumed) {
@@ -126,7 +129,7 @@ export class SessionLifecycle {
             throw new AppError("OPERATION_UNCERTAIN", `attach failed and unsubscribe rollback could not be confirmed: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`);
           }
         }
-        this.runtime.setSession(session.endpoint, session.thread_id, "detached", before.thread.status.type);
+        this.runtime.setSession(session.endpoint, session.thread_id, session.mapping_id, "detached", before.thread.status.type);
         throw error;
       }
     });
@@ -135,12 +138,12 @@ export class SessionLifecycle {
   async archive(nickname: string): Promise<void> {
     const session = this.required(nickname);
     await this.lock(`${session.endpoint}:${session.thread_id}`, async () => {
-      this.requireManagementState(session.endpoint, session.thread_id, ["managed", "detached"]);
+      this.requireManagementState(session.endpoint, session.thread_id, session.mapping_id, ["managed", "detached"]);
       const response = await this.read(session.endpoint, session.thread_id);
       this.requireIdle(response.thread);
       await this.pool.request(session.endpoint, "thread/archive", { threadId: session.thread_id });
-      this.runtime.endEpoch(session.endpoint, session.thread_id, this.clock.now());
-      this.runtime.setSession(session.endpoint, session.thread_id, "archived", "notLoaded");
+      this.runtime.endEpoch(session.endpoint, session.thread_id, session.mapping_id, this.clock.now());
+      this.runtime.setSession(session.endpoint, session.thread_id, session.mapping_id, "archived", "notLoaded");
     });
   }
 
@@ -149,12 +152,12 @@ export class SessionLifecycle {
       if (only && (entry.endpointId !== only.endpointId || entry.threadId !== only.threadId)) continue;
       if (entry.managementState === "detaching") {
         await this.pool.request(entry.endpointId, "thread/unsubscribe", { threadId: entry.threadId });
-        this.runtime.endEpoch(entry.endpointId, entry.threadId, this.clock.now());
-        this.runtime.setSession(entry.endpointId, entry.threadId, "detached", "notLoaded");
+        this.runtime.endEpoch(entry.endpointId, entry.threadId, entry.mappingId, this.clock.now());
+        this.runtime.setSession(entry.endpointId, entry.threadId, entry.mappingId, "detached", "notLoaded");
       } else if (entry.managementState === "attaching") {
         const nickname = this.nicknameFor(entry.endpointId, entry.threadId);
-        this.runtime.endEpoch(entry.endpointId, entry.threadId, this.clock.now());
-        this.runtime.setSession(entry.endpointId, entry.threadId, "detached", entry.nativeStatus);
+        this.runtime.endEpoch(entry.endpointId, entry.threadId, entry.mappingId, this.clock.now());
+        this.runtime.setSession(entry.endpointId, entry.threadId, entry.mappingId, "detached", entry.nativeStatus);
         if (nickname) await this.attach(nickname, attachObservers);
       }
     }
@@ -178,8 +181,8 @@ export class SessionLifecycle {
     if (thread.status.type !== "idle") throw new AppError("SESSION_BUSY", `thread ${thread.id} is ${thread.status.type}`);
   }
 
-  private requireManagementState(endpointId: string, threadId: string, allowed: ManagementState[]): void {
-    const current = this.runtime.getSession(endpointId, threadId)?.managementState;
+  private requireManagementState(endpointId: string, threadId: string, mappingId: string, allowed: ManagementState[]): void {
+    const current = this.runtime.getSession(endpointId, threadId, mappingId)?.managementState;
     if (!current || !allowed.includes(current)) throw new AppError("OPERATION_CONFLICT", `thread ${threadId} is ${current ?? "unregistered"}, expected ${allowed.join(" or ")}`);
   }
 

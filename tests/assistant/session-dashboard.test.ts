@@ -16,17 +16,19 @@ async function fixture(options: { existing?: string; assistantRoot?: string } = 
   const db = createTestDatabase();
   const store = new SessionDashboardStore(db);
   const runtime = new RuntimeStore(db);
-  runtime.setSession("local", "thread-1", "managed", "idle");
+  runtime.setSession("local", "thread-1", "mapping-1", "managed", "idle");
   let document: RegistryDocument = {
-    version: 2,
+    version: 3,
     assistant: { endpoint: "assistant-local", thread_id: "manager", project_dir: options.assistantRoot ?? root },
-    sessions: { payments: { endpoint: "local", thread_id: "thread-1", project_dir: "/projects/payments" } },
+    sessions: { payments: { endpoint: "local", thread_id: "thread-1", project_dir: "/projects/payments", mapping_id: "mapping-1", lifecycle_state: "managed" } },
   };
-  const registry = { snapshot: () => structuredClone(document) };
+  const registry = { managedSnapshot: () => ({ ...structuredClone(document), sessions: Object.fromEntries(Object.entries(document.sessions).filter(([, session]) => session.lifecycle_state === "managed")) }) };
   const dashboard = new SessionDashboard(store, registry, runtime, { root, path });
   return { root, path, db, store, runtime, registry, dashboard, rename: (nickname: string) => {
     const session = document.sessions.payments!;
     document = { ...document, sessions: { [nickname]: session } };
+  }, setLifecycle: (lifecycleState: "adopting" | "managed" | "unadopting" | "archiving") => {
+    document.sessions.payments!.lifecycle_state = lifecycleState;
   } };
 }
 
@@ -56,8 +58,8 @@ test("validates and claims the canonical assistant root before inspecting migrat
 
   const claimed = await fixture();
   claimed.store.claimAssistantRoot(claimed.root);
-  (claimed.registry as any).snapshot = () => ({
-    version: 2,
+  (claimed.registry as any).managedSnapshot = () => ({
+    version: 3,
     assistant: { endpoint: "assistant-local", thread_id: "manager", project_dir: "/different" },
     sessions: {},
   });
@@ -74,6 +76,13 @@ test("rename changes only the rendered key while stable notes remain", async () 
   const sessions = JSON.parse(await readFile(value.path, "utf8")).sessions;
   assert.equal(sessions.payments, undefined);
   assert.equal(sessions.billing.manager_notes.project_summary, "Payments");
+});
+
+test("transitional mapping generations never appear in the managed dashboard", async () => {
+  const value = await fixture();
+  value.setLifecycle("adopting");
+  await value.dashboard.initializeAndRender();
+  assert.deepEqual(JSON.parse(await readFile(value.path, "utf8")).sessions, {});
 });
 
 test("render failures remain dirty, warn once per episode, and retry", async () => {

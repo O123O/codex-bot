@@ -15,6 +15,8 @@ import { DeliveryStore } from "../../src/storage/delivery-store.ts";
 import { RuntimeStore } from "../../src/storage/runtime-store.ts";
 import { SessionDashboardStore } from "../../src/storage/session-dashboard-store.ts";
 
+const mappingId = "mapping-1";
+
 class ServiceEndpoint implements AppServerEndpoint {
   readonly id = "local";
   state: AppServerEndpoint["state"] = "ready";
@@ -63,14 +65,14 @@ class ServiceEndpoint implements AppServerEndpoint {
 async function fixture() {
   const dir = await realpath(await mkdtemp(join(tmpdir(), "qiyan-bot-service-")));
   const registry = await SessionRegistry.open(join(dir, "sessions.json"), {
-    version: 2, assistant: { endpoint: "local", thread_id: "coord", project_dir: dir },
-    sessions: { payments: { endpoint: "local", thread_id: "thread", project_dir: dir } },
+    version: 3, assistant: { endpoint: "local", thread_id: "coord", project_dir: dir },
+    sessions: { payments: { endpoint: "local", thread_id: "thread", project_dir: dir, mapping_id: mappingId, lifecycle_state: "managed" } },
   });
   const db = createTestDatabase();
   const endpoint = new ServiceEndpoint();
   const pool = new AppServerPool([endpoint], { maxConcurrentTurns: 4 });
   const runtime = new RuntimeStore(db);
-  runtime.setSession("local", "thread", "managed", "idle");
+  runtime.setSession("local", "thread", mappingId, "managed", "idle");
   const finals = new FinalMessageStore(db);
   const deliveries = new DeliveryStore(db);
   const service = new SessionService(pool, registry, runtime, finals, deliveries);
@@ -87,9 +89,9 @@ test("starts idle sessions, steers active sessions, and interrupts the exact tur
     threadId: "thread", clientUserMessageId: "msg-1", input: [{ type: "text", text: "hello", text_elements: [] }], model: "gpt-5", effort: "high",
   });
   assert.deepEqual(started.appliedSettings, { model: "gpt-5", effort: "high" });
-  assert.deepEqual(runtime.settings("local", "thread"), {});
+  assert.deepEqual(runtime.settings("local", "thread", mappingId), {});
 
-  runtime.setActiveTurn("local", "thread", "active-1");
+  runtime.setActiveTurn("local", "thread", mappingId, "active-1");
   assert.equal((await service.send("payments", "more")).mode, "steer");
   await service.interrupt("payments", "active-1");
   assert.ok(endpoint.calls.some((call) => call.method === "turn/interrupt" && call.params.turnId === "active-1"));
@@ -97,17 +99,17 @@ test("starts idle sessions, steers active sessions, and interrupts the exact tur
 
 test("send enforces managed state and start/steer preconditions", async () => {
   const { runtime, service } = await fixture();
-  runtime.setSession("local", "thread", "detached", "idle");
+  runtime.setSession("local", "thread", mappingId, "detached", "idle");
   await assert.rejects(service.send("payments", "x"), (error: unknown) => error instanceof AppError && error.code === "SESSION_DETACHED");
   await assert.rejects(service.setModel("payments", "gpt-5"), (error: unknown) => error instanceof AppError && error.code === "SESSION_DETACHED");
   await assert.rejects(service.setGoal("payments", "do not mutate"), (error: unknown) => error instanceof AppError && error.code === "SESSION_DETACHED");
-  runtime.setSession("local", "thread", "managed", "idle");
+  runtime.setSession("local", "thread", mappingId, "managed", "idle");
   await assert.rejects(service.send("payments", "x", { mode: "steer" }), (error: unknown) => error instanceof AppError && error.code === "SESSION_IDLE");
 });
 
 test("status composes registry, runtime, native state, settings, and goal", async () => {
   const { runtime, service } = await fixture();
-  runtime.setModel("local", "thread", "gpt-5");
+  runtime.setModel("local", "thread", mappingId, "gpt-5");
   const status = await service.status("payments") as any;
   assert.equal(status.nickname, "payments");
   assert.equal(status.managementState, "managed");
@@ -120,7 +122,7 @@ test("status composes registry, runtime, native state, settings, and goal", asyn
 
 test("status derives the active turn from authoritative history instead of cached runtime", async () => {
   const { endpoint, runtime, service } = await fixture();
-  runtime.setActiveTurn("local", "thread", "stale-turn");
+  runtime.setActiveTurn("local", "thread", mappingId, "stale-turn");
   endpoint.status = "active";
   endpoint.threadTurns = [
     { id: "finished", status: "completed", items: [] },
@@ -155,7 +157,7 @@ test("status binds its native snapshot before a blocked goal read so a newer not
     observeNative: ({ nativeStatus, activeTurnId }) => {
       nativeObserved = true;
       const statusSequence = dashboardStore.allocateObservationSequence();
-      runtime.reconcileNativeState("local", "thread", nativeStatus, activeTurnId ?? undefined, statusSequence);
+      runtime.reconcileNativeState("local", "thread", mappingId, nativeStatus, activeTurnId ?? undefined, statusSequence);
     },
   });
   await waitingForGoal;
@@ -165,7 +167,7 @@ test("status binds its native snapshot before a blocked goal read so a newer not
   await status;
 
   assert.equal(nativeObserved, true);
-  assert.equal(runtime.activeTurn("local", "thread"), "new-turn");
+  assert.equal(runtime.activeTurn("local", "thread", mappingId), "new-turn");
 });
 
 test("status orders a notification received during thread read before the response snapshot", async () => {
@@ -189,48 +191,48 @@ test("status orders a notification received during thread read before the respon
   const status = service.status("payments", {
     observeNative: ({ nativeStatus, activeTurnId }) => {
       const statusSequence = dashboardStore.allocateObservationSequence();
-      runtime.reconcileNativeState("local", "thread", nativeStatus, activeTurnId ?? undefined, statusSequence);
+      runtime.reconcileNativeState("local", "thread", mappingId, nativeStatus, activeTurnId ?? undefined, statusSequence);
     },
   });
   await waitingForRead;
   processor.accept("local", "thread/status/changed", { threadId: "thread", status: { type: "idle" } });
   await processor.idle();
-  assert.equal(runtime.getSession("local", "thread")?.nativeStatus, "idle");
+  assert.equal(runtime.getSession("local", "thread", mappingId)?.nativeStatus, "idle");
   releaseRead();
   await status;
 
-  assert.equal(runtime.getSession("local", "thread")?.nativeStatus, "active");
-  assert.equal(runtime.activeTurn("local", "thread"), "response-turn");
+  assert.equal(runtime.getSession("local", "thread", mappingId)?.nativeStatus, "active");
+  assert.equal(runtime.activeTurn("local", "thread", mappingId), "response-turn");
 });
 
 test("a failed start retains pending settings and steer never consumes them", async () => {
   const { endpoint, runtime, service } = await fixture();
-  runtime.setModel("local", "thread", "gpt-5");
+  runtime.setModel("local", "thread", mappingId, "gpt-5");
   endpoint.failNextStart = true;
   await assert.rejects(service.send("payments", "first", { mode: "start" }), /start failed/);
-  assert.deepEqual(runtime.settings("local", "thread"), { model: "gpt-5" });
-  runtime.setActiveTurn("local", "thread", "active-1");
+  assert.deepEqual(runtime.settings("local", "thread", mappingId), { model: "gpt-5" });
+  runtime.setActiveTurn("local", "thread", mappingId, "active-1");
   const steered = await service.send("payments", "more", { mode: "steer", settings: { model: "ignored" } });
   assert.equal("appliedSettings" in steered, false);
-  assert.deepEqual(runtime.settings("local", "thread"), { model: "gpt-5" });
+  assert.deepEqual(runtime.settings("local", "thread", mappingId), { model: "gpt-5" });
 });
 
 test("uses the exact supplied settings snapshot and leaves a concurrent replacement pending", async () => {
   const { endpoint, runtime, service } = await fixture();
-  runtime.setModel("local", "thread", "old-model");
-  const dispatched = runtime.settings("local", "thread");
-  runtime.setModel("local", "thread", "next-model");
+  runtime.setModel("local", "thread", mappingId, "old-model");
+  const dispatched = runtime.settings("local", "thread", mappingId);
+  runtime.setModel("local", "thread", mappingId, "next-model");
   const result = await service.send("payments", "work", { mode: "start", settings: dispatched });
   assert.equal(endpoint.calls.find((call) => call.method === "turn/start")?.params.model, "old-model");
   assert.deepEqual(result.appliedSettings, { model: "old-model" });
-  assert.deepEqual(runtime.settings("local", "thread"), { model: "next-model" });
+  assert.deepEqual(runtime.settings("local", "thread", mappingId), { model: "next-model" });
 });
 
 test("a turn already terminal when turn/start resolves is not recorded as active", async () => {
   const { endpoint, runtime, service } = await fixture();
   endpoint.historyTurnStatus = "completed";
   await service.send("payments", "fast", { clientUserMessageId: "fast-message" });
-  assert.equal(runtime.activeTurn("local", "thread"), undefined);
+  assert.equal(runtime.activeTurn("local", "thread", mappingId), undefined);
 });
 
 test("collect returns assistant bodies or creates chronological direct deliveries", async () => {

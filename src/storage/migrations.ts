@@ -8,7 +8,7 @@ export const migrations: readonly Migration[] = [
     product TEXT PRIMARY KEY,
     state_version INTEGER NOT NULL
   );
-  INSERT INTO qiyan_state(product, state_version) VALUES ('qiyan-bot', 1);
+  INSERT INTO qiyan_state(product, state_version) VALUES ('qiyan-bot', 2);
 
   CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY);
   CREATE TABLE IF NOT EXISTS telegram_state (
@@ -115,6 +115,7 @@ export const migrations: readonly Migration[] = [
   CREATE TABLE IF NOT EXISTS session_runtime (
     endpoint_id TEXT NOT NULL,
     thread_id TEXT NOT NULL,
+    mapping_id TEXT NOT NULL,
     management_state TEXT NOT NULL,
     restore_state TEXT,
     native_status TEXT NOT NULL DEFAULT 'notLoaded',
@@ -123,12 +124,13 @@ export const migrations: readonly Migration[] = [
     effort TEXT,
     active_turn_id TEXT,
     last_error TEXT,
-    PRIMARY KEY(endpoint_id, thread_id)
+    PRIMARY KEY(endpoint_id, thread_id, mapping_id)
   );
   CREATE TABLE IF NOT EXISTS managed_epochs (
     id TEXT PRIMARY KEY,
     endpoint_id TEXT NOT NULL,
     thread_id TEXT NOT NULL,
+    mapping_id TEXT NOT NULL,
     baseline_turn_id TEXT,
     started_at INTEGER NOT NULL,
     ended_at INTEGER

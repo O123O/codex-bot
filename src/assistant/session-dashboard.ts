@@ -11,7 +11,7 @@ import {
   type SessionDashboardEntry,
 } from "./dashboard-schema.ts";
 
-interface RegistryView { snapshot(): RegistryDocument }
+interface RegistryView { managedSnapshot(): RegistryDocument }
 interface DashboardOptions {
   root: string;
   path: string;
@@ -32,7 +32,7 @@ export class SessionDashboard {
   }
 
   async initializeAndRender(): Promise<void> {
-    const registry = this.registry.snapshot();
+    const registry = this.registry.managedSnapshot();
     if (registry.assistant.project_dir !== this.options.root) {
       throw new AppError("CONFIGURATION_ERROR", "registry assistant workdir does not match the prepared assistant workdir");
     }
@@ -49,19 +49,19 @@ export class SessionDashboard {
 
   snapshot(): SessionDashboardDocument {
     const sessions: SessionDashboardDocument["sessions"] = {};
-    const registry = this.registry.snapshot();
+    const registry = this.registry.managedSnapshot();
     for (const nickname of Object.keys(registry.sessions).sort()) {
       const session = registry.sessions[nickname]!;
       const identity = { endpointId: session.endpoint, threadId: session.thread_id };
-      const runtime = this.runtime.getSession(session.endpoint, session.thread_id);
-      const pending = this.runtime.settings(session.endpoint, session.thread_id);
+      const runtime = this.runtime.getSession(session.endpoint, session.thread_id, session.mapping_id);
+      const pending = this.runtime.settings(session.endpoint, session.thread_id, session.mapping_id);
       const facts = this.store.facts(identity);
       sessions[nickname] = {
         identity: { thread_id: session.thread_id, endpoint: session.endpoint, project_dir: session.project_dir },
         auto_session_info: {
           management_state: runtime?.managementState ?? "unavailable",
           native_status: runtime?.nativeStatus ?? "notLoaded",
-          active_turn_id: this.runtime.activeTurn(session.endpoint, session.thread_id) ?? null,
+          active_turn_id: this.runtime.activeTurn(session.endpoint, session.thread_id, session.mapping_id) ?? null,
           last_sent: facts.lastSent,
           last_worker_event: facts.lastWorkerEvent,
           model: { current: facts.currentSettings.model, pending: pending.model ?? null },

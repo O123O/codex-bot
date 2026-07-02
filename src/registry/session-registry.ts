@@ -1,22 +1,31 @@
-import { open, readFile, realpath, rename } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { open, readFile, rename } from "node:fs/promises";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { mkdir } from "node:fs/promises";
 import { z } from "zod";
 
-const sessionSchema = z.object({
+const normalizedAbsolutePath = z.string().min(1).refine((path) => isAbsolute(path) && resolve(path) === path, "must be a normalized absolute path");
+const assistantSchema = z.object({
   endpoint: z.string().min(1),
   thread_id: z.string().min(1),
-  project_dir: z.string().min(1),
+  project_dir: normalizedAbsolutePath,
   description: z.string().optional(),
-});
-const registrySchema = z.object({
-  version: z.literal(2),
-  assistant: sessionSchema,
-  sessions: z.record(z.string().min(1), sessionSchema),
-});
+}).strict();
 
+export type MappingLifecycleState = "adopting" | "managed" | "unadopting" | "archiving";
+const sessionSchema = assistantSchema.extend({
+  mapping_id: z.string().min(1),
+  lifecycle_state: z.enum(["adopting", "managed", "unadopting", "archiving"]),
+}).strict();
+const registrySchema = z.object({
+  version: z.literal(3),
+  assistant: assistantSchema,
+  sessions: z.record(z.string().min(1), sessionSchema),
+}).strict();
+
+export type RegistryAssistant = z.infer<typeof assistantSchema>;
 export type RegistrySession = z.infer<typeof sessionSchema>;
 export type RegistryDocument = z.infer<typeof registrySchema>;
+export type MappingIdentity = Pick<RegistrySession, "endpoint" | "thread_id" | "mapping_id">;
 
 async function atomicWriteOne(path: string, value: unknown): Promise<void> {
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
@@ -38,22 +47,19 @@ async function atomicWrite(path: string, value: unknown): Promise<void> {
   await atomicWriteOne(path, value);
 }
 
-async function canonicalSession(session: RegistrySession): Promise<RegistrySession> {
-  return { ...session, project_dir: await realpath(session.project_dir) };
-}
-
-async function normalize(document: RegistryDocument): Promise<RegistryDocument> {
+function normalize(document: RegistryDocument): RegistryDocument {
   const parsed = registrySchema.parse(document);
-  const sessions: Record<string, RegistrySession> = {};
   const seen = new Set<string>();
-  for (const [nickname, session] of Object.entries(parsed.sessions)) {
-    const normalized = await canonicalSession(session);
-    const key = `${normalized.endpoint}:${normalized.thread_id}`;
+  for (const session of Object.values(parsed.sessions)) {
+    const key = `${session.endpoint}:${session.thread_id}`;
     if (seen.has(key)) throw new Error(`duplicate thread mapping ${key}`);
     seen.add(key);
-    sessions[nickname] = normalized;
   }
-  return { version: 2, assistant: await canonicalSession(parsed.assistant), sessions };
+  return structuredClone(parsed);
+}
+
+function sameMapping(left: RegistrySession, right: MappingIdentity): boolean {
+  return left.endpoint === right.endpoint && left.thread_id === right.thread_id && left.mapping_id === right.mapping_id;
 }
 
 export class SessionRegistry {
@@ -63,55 +69,89 @@ export class SessionRegistry {
 
   static async open(path: string, initial: RegistryDocument): Promise<SessionRegistry> {
     try {
-      const document = await normalize(JSON.parse(await readFile(path, "utf8")) as RegistryDocument);
+      const document = normalize(JSON.parse(await readFile(path, "utf8")) as RegistryDocument);
       return new SessionRegistry(path, document);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
         let document: RegistryDocument;
-        try { document = await normalize(JSON.parse(await readFile(`${path}.last-good`, "utf8")) as RegistryDocument); }
+        try { document = normalize(JSON.parse(await readFile(`${path}.last-good`, "utf8")) as RegistryDocument); }
         catch { throw new Error("registry is invalid and no valid last-known-good snapshot is available", { cause: error }); }
         await rename(path, `${path}.invalid-${Date.now()}`).catch(() => undefined);
         await atomicWrite(path, document);
         return new SessionRegistry(path, document, ["invalid registry was quarantined and the last-known-good registry was restored"]);
       }
-      const document = await normalize(initial);
+      const document = normalize(initial);
       await atomicWrite(path, document);
       return new SessionRegistry(path, document);
     }
   }
 
   warnings(): readonly string[] { return [...this.startupWarnings]; }
-
-  snapshot(): RegistryDocument {
-    return structuredClone(this.document);
+  snapshot(): RegistryDocument { return structuredClone(this.document); }
+  managedSnapshot(): RegistryDocument {
+    const document = structuredClone(this.document);
+    document.sessions = Object.fromEntries(Object.entries(document.sessions).filter(([, session]) => session.lifecycle_state === "managed"));
+    return document;
   }
-
   get(nickname: string): RegistrySession | undefined {
     const session = this.document.sessions[nickname];
     return session ? structuredClone(session) : undefined;
   }
+  getByIdentity(endpoint: string, threadId: string): { nickname: string; session: RegistrySession } | undefined {
+    const found = Object.entries(this.document.sessions).find(([, session]) => session.endpoint === endpoint && session.thread_id === threadId);
+    return found ? { nickname: found[0], session: structuredClone(found[1]) } : undefined;
+  }
 
-  async register(nickname: string, session: RegistrySession): Promise<void> {
+  async reserve(nickname: string, session: RegistrySession): Promise<void> {
     await this.lock(async () => {
-      if (this.document.sessions[nickname]) throw new Error(`nickname already exists: ${nickname}`);
-      const normalized = await canonicalSession(session);
-      if (Object.values(this.document.sessions).some((candidate) => candidate.endpoint === normalized.endpoint && candidate.thread_id === normalized.thread_id)) {
-        throw new Error(`thread is already registered: ${normalized.thread_id}`);
-      }
-      await this.replace({ ...this.document, sessions: { ...this.document.sessions, [nickname]: normalized } });
+      if (session.lifecycle_state !== "adopting") throw new Error("new mapping reservation must be adopting");
+      this.assertAvailable(nickname, session);
+      await this.replace({ ...this.document, sessions: { ...this.document.sessions, [nickname]: structuredClone(session) } });
     });
   }
 
-  async setAssistant(session: RegistrySession): Promise<void> {
+  async createManaged(nickname: string, session: Omit<RegistrySession, "lifecycle_state"> | RegistrySession): Promise<void> {
     await this.lock(async () => {
-      await this.replace({ ...this.document, assistant: await canonicalSession(session) });
+      const managed = { ...session, lifecycle_state: "managed" as const };
+      this.assertAvailable(nickname, managed);
+      await this.replace({ ...this.document, sessions: { ...this.document.sessions, [nickname]: managed } });
     });
   }
 
-  async rename(oldNickname: string, newNickname: string): Promise<void> {
+  async promote(nickname: string, expected: MappingIdentity): Promise<void> {
     await this.lock(async () => {
-      const session = this.document.sessions[oldNickname];
-      if (!session) throw new Error(`unknown nickname: ${oldNickname}`);
+      const current = this.requireMatch(nickname, expected);
+      if (current.lifecycle_state !== "adopting") throw new Error(`mapping is ${current.lifecycle_state}, expected adopting`);
+      await this.replace({ ...this.document, sessions: { ...this.document.sessions, [nickname]: { ...current, lifecycle_state: "managed" } } });
+    });
+  }
+
+  async transition(nickname: string, expected: MappingIdentity, state: "unadopting" | "archiving"): Promise<void> {
+    await this.lock(async () => {
+      const current = this.requireMatch(nickname, expected);
+      if (current.lifecycle_state !== "managed") throw new Error(`mapping is ${current.lifecycle_state}, expected managed`);
+      await this.replace({ ...this.document, sessions: { ...this.document.sessions, [nickname]: { ...current, lifecycle_state: state } } });
+    });
+  }
+
+  async removeIfMatch(nickname: string, expected: MappingIdentity): Promise<boolean> {
+    return this.lock(async () => {
+      const current = this.document.sessions[nickname];
+      if (!current || !sameMapping(current, expected)) return false;
+      const sessions = { ...this.document.sessions };
+      delete sessions[nickname];
+      await this.replace({ ...this.document, sessions });
+      return true;
+    });
+  }
+
+  async setAssistant(session: RegistryAssistant): Promise<void> {
+    await this.lock(async () => { await this.replace({ ...this.document, assistant: structuredClone(session) }); });
+  }
+
+  async rename(oldNickname: string, newNickname: string, expected: MappingIdentity): Promise<void> {
+    await this.lock(async () => {
+      const session = this.requireMatch(oldNickname, expected);
       if (this.document.sessions[newNickname]) throw new Error(`nickname already exists: ${newNickname}`);
       const sessions = { ...this.document.sessions };
       delete sessions[oldNickname];
@@ -123,23 +163,32 @@ export class SessionRegistry {
   async reload(validate?: (document: RegistryDocument) => Promise<void>): Promise<boolean> {
     return this.lock(async () => {
       try {
-        const document = await normalize(JSON.parse(await readFile(this.path, "utf8")) as RegistryDocument);
+        const document = normalize(JSON.parse(await readFile(this.path, "utf8")) as RegistryDocument);
         await validate?.(structuredClone(document));
         this.document = document;
         await atomicWriteOne(`${this.path}.last-good`, document);
         return true;
-      } catch {
-        return false;
-      }
+      } catch { return false; }
     });
   }
 
+  private assertAvailable(nickname: string, session: RegistrySession): void {
+    if (this.document.sessions[nickname]) throw new Error(`nickname already exists: ${nickname}`);
+    if (Object.values(this.document.sessions).some((candidate) => candidate.endpoint === session.endpoint && candidate.thread_id === session.thread_id)) {
+      throw new Error(`thread is already registered: ${session.thread_id}`);
+    }
+  }
+  private requireMatch(nickname: string, expected: MappingIdentity): RegistrySession {
+    const current = this.document.sessions[nickname];
+    if (!current) throw new Error(`unknown nickname: ${nickname}`);
+    if (!sameMapping(current, expected)) throw new Error(`mapping changed for nickname: ${nickname}`);
+    return current;
+  }
   private async replace(document: RegistryDocument): Promise<void> {
-    const normalized = await normalize(document);
+    const normalized = normalize(document);
     await atomicWrite(this.path, normalized);
     this.document = normalized;
   }
-
   private async lock<T>(action: () => Promise<T>): Promise<T> {
     const previous = this.tail;
     let release!: () => void;

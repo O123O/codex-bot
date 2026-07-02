@@ -15,7 +15,7 @@ test("fresh absent and empty databases receive the QiYan identity marker", async
     const db = openDatabase(path);
     const marker = db.prepare("SELECT product, state_version FROM qiyan_state").get()!;
     assert.equal(marker.product, "qiyan-bot");
-    assert.equal(marker.state_version, 1);
+    assert.equal(marker.state_version, 2);
     db.close();
   }
 });
@@ -43,6 +43,20 @@ test("a pre-QiYan database is rejected without mutation or sidecars", async () =
   assert.deepEqual(unchanged.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all().map((row) => row.name), ["legacy_state"]);
   assert.equal(unchanged.prepare("SELECT value FROM legacy_state").get()!.value, "preserve-me");
   unchanged.close();
+});
+
+test("a QiYan state-version-1 database is rejected read-only without mutation or sidecars", async () => {
+  const root = await mkdtemp(join(tmpdir(), "qiyan-bot-db-v1-"));
+  const path = join(root, "bot.sqlite3");
+  const legacy = new DatabaseSync(path);
+  legacy.exec("CREATE TABLE qiyan_state(product TEXT PRIMARY KEY, state_version INTEGER NOT NULL); INSERT INTO qiyan_state VALUES ('qiyan-bot', 1)");
+  legacy.close();
+  const before = await readFile(path);
+
+  assert.throws(() => openDatabase(path), /not a QiYan Bot state database/);
+  assert.deepEqual(await readFile(path), before);
+  await assert.rejects(access(`${path}-wal`));
+  await assert.rejects(access(`${path}-shm`));
 });
 
 test("an existing QiYan database reopens normally", async () => {

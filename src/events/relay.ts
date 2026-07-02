@@ -36,20 +36,21 @@ export class EventRelay {
 
   async handlePermissionBlocked(endpointId: string, event: { threadId?: string; turnId?: string; method: string; params: unknown }): Promise<void> {
     if (!event.threadId) return;
-    const nickname = this.nickname(endpointId, event.threadId);
-    const state = this.runtime.getSession(endpointId, event.threadId);
-    if (!nickname || state?.managementState !== "managed") return;
+    const mapping = this.mapping(endpointId, event.threadId);
+    const state = mapping ? this.runtime.getSession(endpointId, event.threadId, mapping.session.mapping_id) : undefined;
+    if (!mapping || mapping.session.lifecycle_state !== "managed" || state?.managementState !== "managed") return;
+    const nickname = mapping.nickname;
     const key = `permission:${endpointId}:${event.threadId}:${event.turnId ?? "unknown"}:${event.method}`;
     this.deliveries.prepare({ id: key, kind: "permission", destination: this.options.destination, body: `[${nickname}] blocked by a permission request`, mandatory: true });
     this.persistEvent(key, endpointId, event.threadId, event.turnId, "permission_blocked", { nickname, turnId: event.turnId ?? null, method: event.method });
-    this.runtime.setSession(endpointId, event.threadId, "managed", "permissionBlocked");
+    this.runtime.setSession(endpointId, event.threadId, mapping.session.mapping_id, "managed", "permissionBlocked");
   }
 
   async reconcileEndpoint(endpointId: string): Promise<void> {
-    for (const [nickname, session] of Object.entries(this.registry.snapshot().sessions)) {
+    for (const [nickname, session] of Object.entries(this.registry.managedSnapshot().sessions)) {
       if (session.endpoint !== endpointId) continue;
-      const state = this.runtime.getSession(endpointId, session.thread_id);
-      const epoch = this.runtime.currentEpoch(endpointId, session.thread_id);
+      const state = this.runtime.getSession(endpointId, session.thread_id, session.mapping_id);
+      const epoch = this.runtime.currentEpoch(endpointId, session.thread_id, session.mapping_id);
       if (state?.managementState !== "managed" || !epoch) continue;
       const response = await this.pool.request<{ thread: { turns: TerminalTurn[] } }>(endpointId, "thread/read", { threadId: session.thread_id, includeTurns: true });
       const turns = response.thread.turns;
@@ -62,20 +63,21 @@ export class EventRelay {
       for (const turn of turns.slice(index)) {
         if (!new Set(["completed", "failed", "interrupted"]).has(turn.status)) break;
         await this.handleTerminal(endpointId, session.thread_id, turn, nickname, true);
-        this.runtime.setDeliveryCursor(endpointId, session.thread_id, turn.id);
+        this.runtime.setDeliveryCursor(endpointId, session.thread_id, session.mapping_id, turn.id);
       }
     }
   }
 
   private async handleTerminal(endpointId: string, threadId: string, turn: TerminalTurn, knownNickname?: string, authoritative = false): Promise<void> {
-    const state = this.runtime.getSession(endpointId, threadId);
-    const nickname = knownNickname ?? this.nickname(endpointId, threadId);
-    if (!nickname || state?.managementState !== "managed" || !this.runtime.currentEpoch(endpointId, threadId)) return;
+    const mapping = this.mapping(endpointId, threadId);
+    const state = mapping ? this.runtime.getSession(endpointId, threadId, mapping.session.mapping_id) : undefined;
+    const nickname = knownNickname ?? mapping?.nickname;
+    if (!mapping || mapping.session.lifecycle_state !== "managed" || !nickname || state?.managementState !== "managed" || !this.runtime.currentEpoch(endpointId, threadId, mapping.session.mapping_id)) return;
     if (!authoritative) {
       const history = await this.pool.request<{ thread: { turns: TerminalTurn[] } }>(endpointId, "thread/read", { threadId, includeTurns: true });
       turn = history.thread.turns.find((candidate) => candidate.id === turn.id) ?? turn;
     }
-    this.runtime.clearActiveTurn(endpointId, threadId, turn.id);
+    this.runtime.clearActiveTurn(endpointId, threadId, mapping.session.mapping_id, turn.id);
     this.pool.markTurnTerminal(endpointId, threadId, turn.id);
     const messages = this.finals.persistTerminalTurn(endpointId, threadId, turn, this.options.clock.now());
     const eventId = `terminal:${endpointId}:${threadId}:${turn.id}`;
@@ -108,7 +110,7 @@ export class EventRelay {
       .run(id, endpointId, threadId, turnId ?? null, kind, JSON.stringify(payload), this.options.clock.now());
   }
 
-  private nickname(endpointId: string, threadId: string): string | undefined {
-    return Object.entries(this.registry.snapshot().sessions).find(([, session]) => session.endpoint === endpointId && session.thread_id === threadId)?.[0];
+  private mapping(endpointId: string, threadId: string) {
+    return this.registry.getByIdentity(endpointId, threadId);
   }
 }

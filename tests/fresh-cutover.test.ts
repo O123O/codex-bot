@@ -32,8 +32,8 @@ test("a version-1 dashboard is rejected without changing its bytes", async () =>
   const db = createTestDatabase();
   const dashboard = new SessionDashboard(
     new SessionDashboardStore(db),
-    { snapshot: () => ({
-      version: 2 as const,
+    { managedSnapshot: () => ({
+      version: 3 as const,
       assistant: { endpoint: "assistant-local", thread_id: "pending", project_dir: root },
       sessions: {},
     }) },
