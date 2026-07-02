@@ -10,6 +10,11 @@ test("README links to all focused guides and every local guide target exists", a
   assert.match(readme, /ordinary, resumable Codex sessions/iu);
   assert.match(readme, /Telegram is the first chat adapter/iu);
   assert.match(readme, /fresh QiYan state format.*rejected without migration/isu);
+  const firstInstall = readme.indexOf("npm install --global");
+  assert.ok(firstInstall > 0);
+  const beforeInstall = readme.slice(0, firstInstall);
+  assert.match(beforeInstall, /digest/iu);
+  assert.match(beforeInstall, /test -n "\$digest"/u);
   const links = [...readme.matchAll(/\]\((docs\/[^)#]+)(?:#[^)]+)?\)/gu)].map((match) => match[1]!);
   for (const expected of [
     "docs/installation.md",

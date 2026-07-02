@@ -107,6 +107,12 @@ test("packed qiyan-bot runs without source files or installed dependencies", asy
   assert.equal(startup.stderr, "qiyan-bot: startup failed\n");
   assert.equal(await readFile(join(workdir, "AGENTS.md"), "utf8"), await readFile(join(packageRoot, "assets", "assistant", "AGENTS.md"), "utf8"));
   assert.deepEqual(JSON.parse(await readFile(join(workdir, "session-status.json"), "utf8")), { version: 2, sessions: {} });
+  assert.deepEqual(JSON.parse(await readFile(join(workdir, "assistant-context.json"), "utf8")), {
+    version: 1,
+    user_home: temp,
+    default_projects_root: join(temp, "qiyan-bot-projects"),
+  });
+  assert.equal(listing.includes("package/assets/assistant/assistant-context.json"), false);
 
   const globalRoot = join(temp, "global");
   await execFileAsync("npm", ["install", "--global", "--ignore-scripts", "--no-audit", "--no-fund", "--prefix", globalRoot, archive]);

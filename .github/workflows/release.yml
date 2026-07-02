@@ -47,17 +47,25 @@ jobs:
           archive=$(npm pack --silent)
           mv -- "$archive" qiyan-bot.tgz
           tar -tzf qiyan-bot.tgz | sort > package-files.txt
-          for required in \
-            package/package.json \
-            package/README.md \
-            package/dist/qiyan-bot \
-            package/assets/assistant/AGENTS.md \
-            package/assets/assistant/session-status.example.json
-          do
-            grep -Fxq "$required" package-files.txt
-          done
-          if grep -Eq '^package/(src|tests|node_modules)/' package-files.txt; then
-            echo "release package contains development files" >&2
+          cat > expected-package-files.txt <<'EOF'
+          package/README.md
+          package/assets/assistant/AGENTS.md
+          package/assets/assistant/session-status.example.json
+          package/dist/qiyan-bot
+          package/package.json
+          EOF
+          diff -u expected-package-files.txt package-files.txt
+
+          mkdir extracted
+          tar -xzf qiyan-bot.tgz -C extracted
+          retired_role="coor""dinator"
+          retired_product="codex""-bot"
+          retired_package="codex""-chat-bot"
+          if grep -RIFni -- "$retired_role" extracted/package \
+            || grep -RIFn -- "$retired_product" extracted/package \
+            || grep -RIFn -- "$retired_package" extracted/package
+          then
+            echo "release package contains a retired product identifier" >&2
             exit 1
           fi
 
@@ -70,3 +78,15 @@ jobs:
             gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes
           fi
           gh release upload "$GITHUB_REF_NAME" qiyan-bot.tgz --clobber
+          asset_digest=""
+          for attempt in {1..10}; do
+            asset_digest=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
+              --jq '.assets[] | select(.name == "qiyan-bot.tgz") | .digest' || true)
+            [[ "$asset_digest" == sha256:* ]] && break
+            sleep 2
+          done
+          if [[ -z "$asset_digest" || "$asset_digest" != sha256:* ]]; then
+            echo "GitHub did not publish a sha256: digest for qiyan-bot.tgz" >&2
+            exit 1
+          fi
+          printf 'Published qiyan-bot.tgz with digest %s\n' "$asset_digest"

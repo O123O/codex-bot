@@ -22,12 +22,17 @@ Read this before installing or launching:
 
 ## Install
 
-QiYan is distributed through GitHub Releases, not the npm registry. Do not use `npm install -g qiyan-bot` without the Release URL.
+QiYan is distributed through GitHub Releases, not the npm registry. Require the nonempty GitHub asset digest and verify the downloaded archive before installation:
 
 ```bash
-npm install --global \
-  --prefix "$HOME/.local" \
-  https://github.com/O123O/qiyan-bot/releases/latest/download/qiyan-bot.tgz
+workdir=$(mktemp -d)
+curl -fsSL https://github.com/O123O/qiyan-bot/releases/latest/download/qiyan-bot.tgz -o "$workdir/qiyan-bot.tgz"
+digest=$(curl -fsSL https://api.github.com/repos/O123O/qiyan-bot/releases/latest |
+  node -e 'let s="";process.stdin.on("data",c=>s+=c).on("end",()=>{const a=JSON.parse(s).assets.find(x=>x.name==="qiyan-bot.tgz");if(!a?.digest)process.exit(1);process.stdout.write(a.digest)})')
+test -n "$digest"
+test "${digest%%:*}" = sha256
+printf '%s  %s\n' "${digest#sha256:}" "$workdir/qiyan-bot.tgz" | sha256sum --check --status
+npm install --global --prefix "$HOME/.local" "$workdir/qiyan-bot.tgz"
 export PATH="$HOME/.local/bin:$PATH"
 qiyan-bot --version
 ```
