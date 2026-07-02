@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile, spawnSync } from "node:child_process";
-import { mkdtemp, readFile, readdir, rm, stat } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -87,4 +87,49 @@ test("packed codex-bot runs without source files or installed dependencies", asy
   assert.equal(startup.stderr, "codex-bot: startup failed\n");
   assert.equal(await readFile(join(workdir, "AGENTS.md"), "utf8"), await readFile(join(packageRoot, "assets", "coordinator", "AGENTS.md"), "utf8"));
   assert.deepEqual(JSON.parse(await readFile(join(workdir, "session-status.json"), "utf8")), { version: 2, sessions: {} });
+
+  const globalRoot = join(temp, "global");
+  await execFileAsync("npm", ["install", "--global", "--ignore-scripts", "--no-audit", "--no-fund", "--prefix", globalRoot, archive]);
+  const fakeHome = join(temp, "update-home");
+  const fakeBin = join(temp, "fake-bin");
+  await mkdir(fakeHome);
+  await mkdir(fakeBin);
+  const fakeNpm = join(fakeBin, "npm");
+  await writeFile(fakeNpm, `#!/usr/bin/env node
+const { writeFileSync } = require("node:fs");
+const { join } = require("node:path");
+writeFileSync(join(process.env.HOME, "update-record.json"), JSON.stringify({ argv: process.argv.slice(2), env: process.env }));
+`);
+  await chmod(fakeNpm, 0o755);
+  const globalExecutable = join(globalRoot, "bin", "codex-bot");
+  const update = spawnSync(globalExecutable, ["--update"], {
+    cwd: temp,
+    encoding: "utf8",
+    env: {
+      PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
+      HOME: fakeHome,
+      TELEGRAM_BOT_TOKEN: "telegram-secret",
+      OPENAI_API_KEY: "openai-secret",
+      CODEX_HOME: "/secret/codex-home",
+      CODEX_BOT_MCP_TOKEN: "mcp-secret",
+      NPM_TOKEN: "npm-secret",
+      OTHER_SECRET: "other-secret",
+    },
+  });
+  assert.equal(update.status, 0);
+  assert.equal(update.stderr, "");
+  assert.equal(update.stdout, `Updated codex-bot to 0.1.0 in ${globalRoot}.\nRestart any running codex-bot process to use this version.\n`);
+  const updateRecord = JSON.parse(await readFile(join(fakeHome, "update-record.json"), "utf8")) as {
+    argv: string[];
+    env: NodeJS.ProcessEnv;
+  };
+  assert.deepEqual(updateRecord.argv, [
+    "install", "--global", "--prefix", globalRoot, "--ignore-scripts", "--no-audit", "--no-fund",
+    "https://github.com/O123O/codex-bot/releases/latest/download/codex-bot.tgz",
+  ]);
+  assert.equal(updateRecord.env.HOME, fakeHome);
+  assert.match(updateRecord.env.PATH ?? "", new RegExp(`^${fakeBin.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")}:`));
+  for (const key of ["TELEGRAM_BOT_TOKEN", "OPENAI_API_KEY", "CODEX_HOME", "CODEX_BOT_MCP_TOKEN", "NPM_TOKEN", "OTHER_SECRET"]) {
+    assert.equal(updateRecord.env[key], undefined, `leaked update environment key: ${key}`);
+  }
 });

@@ -3,6 +3,7 @@ import { parseCliArgs } from "./cli.ts";
 import { loadConfig, loadCoordinatorLoginConfig } from "./config.ts";
 import { runCoordinatorLogin } from "./coordinator/login.ts";
 import { readPackageInfo } from "./distribution/package-info.ts";
+import { updateFromLatestRelease } from "./distribution/update.ts";
 
 export async function main(env = process.env, argv: readonly string[] = process.argv.slice(2)): Promise<void> {
   const command = parseCliArgs(argv);
@@ -12,7 +13,10 @@ export async function main(env = process.env, argv: readonly string[] = process.
     return;
   }
   if (command.command === "update") {
-    throw new Error("update command is not implemented");
+    const result = await updateFromLatestRelease({ env });
+    process.stdout.write(`Updated codex-bot to ${result.version} in ${result.prefix}.\n`);
+    process.stdout.write("Restart any running codex-bot process to use this version.\n");
+    return;
   }
   if (command.command === "coordinator-login") {
     await runCoordinatorLogin(loadCoordinatorLoginConfig(env), env);
