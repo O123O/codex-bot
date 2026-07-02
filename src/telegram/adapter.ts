@@ -1,8 +1,8 @@
-import type { CanonicalMessage } from "../core/types.ts";
-import type { TelegramFileRef, TelegramMessage, TelegramUpdate } from "./types.ts";
+import type { CanonicalChatSource } from "../core/types.ts";
+import type { ClassifiedTelegramMessage, TelegramFileRef, TelegramMessage, TelegramUpdate } from "./types.ts";
 
 export type ClassifiedUpdate =
-  | { kind: "accepted"; message: CanonicalMessage; pendingFiles: readonly TelegramFileRef[] }
+  | { kind: "accepted"; message: ClassifiedTelegramMessage; pendingFiles: readonly TelegramFileRef[] }
   | { kind: "ignored"; updateId: number; reason: string };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -49,6 +49,7 @@ export function classifyUpdate(value: unknown, ownerId: number): ClassifiedUpdat
     kind: "accepted",
     message: {
       id: `telegram:${message.chat.id}:${message.message_id}`,
+      nativeMessageId: message.message_id,
       updateId: update.update_id,
       userId: ownerId,
       chatId: message.chat.id,
@@ -57,5 +58,21 @@ export function classifyUpdate(value: unknown, ownerId: number): ClassifiedUpdat
       receivedAt: message.date * 1000,
     },
     pendingFiles,
+  };
+}
+
+export function toTelegramCanonicalSource(message: ClassifiedTelegramMessage, attachmentIds: readonly string[]): CanonicalChatSource {
+  return {
+    id: message.id,
+    nativeSourceId: String(message.updateId),
+    binding: {
+      adapterId: "telegram",
+      conversationKey: `telegram:${message.chatId}`,
+      destination: { chatId: String(message.chatId) },
+      reply: { messageId: message.nativeMessageId },
+    },
+    rawText: message.rawText,
+    attachmentIds: [...attachmentIds],
+    receivedAt: message.receivedAt,
   };
 }

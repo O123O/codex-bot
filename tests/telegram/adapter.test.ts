@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { classifyUpdate } from "../../src/telegram/adapter.ts";
+import { classifyUpdate, toTelegramCanonicalSource } from "../../src/telegram/adapter.ts";
 
 test("accepts an ordinary owner message", () => {
   const result = classifyUpdate({
@@ -37,4 +37,35 @@ test("accepts supported photo and document metadata", () => {
   }, 42);
   assert.equal(photo.kind, "accepted");
   if (photo.kind === "accepted") assert.equal(photo.pendingFiles[0]?.fileId, "large");
+});
+
+test("normalizes stable Telegram conversation identity and native reply metadata", () => {
+  const first = classifyUpdate({
+    update_id: 20,
+    message: { message_id: 9, date: 100, chat: { id: 42, type: "private" }, from: { id: 42 }, text: "hello" },
+  }, 42);
+  const second = classifyUpdate({
+    update_id: 21,
+    message: { message_id: 10, date: 101, chat: { id: 42, type: "private" }, from: { id: 42 }, text: "again" },
+  }, 42);
+  const other = classifyUpdate({
+    update_id: 22,
+    message: { message_id: 1, date: 102, chat: { id: 99, type: "private" }, from: { id: 42 }, text: "other" },
+  }, 42);
+  assert.equal(first.kind, "accepted");
+  assert.equal(second.kind, "accepted");
+  assert.equal(other.kind, "accepted");
+  if (first.kind !== "accepted" || second.kind !== "accepted" || other.kind !== "accepted") return;
+  const canonical = toTelegramCanonicalSource(first.message, ["file-one", "file-two"]);
+  assert.deepEqual(canonical.binding, {
+    adapterId: "telegram",
+    conversationKey: "telegram:42",
+    destination: { chatId: "42" },
+    reply: { messageId: 9 },
+  });
+  assert.equal(canonical.id, "telegram:42:9");
+  assert.equal(canonical.nativeSourceId, "20");
+  assert.deepEqual(canonical.attachmentIds, ["file-one", "file-two"]);
+  assert.equal(toTelegramCanonicalSource(second.message, []).binding.conversationKey, canonical.binding.conversationKey);
+  assert.notEqual(toTelegramCanonicalSource(other.message, []).binding.conversationKey, canonical.binding.conversationKey);
 });

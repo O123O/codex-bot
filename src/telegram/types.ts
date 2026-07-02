@@ -1,3 +1,9 @@
+import type { CanonicalMessage } from "../core/types.ts";
+
+export interface ClassifiedTelegramMessage extends CanonicalMessage {
+  nativeMessageId: number;
+}
+
 export interface TelegramFileRef {
   fileId: string;
   fileName: string;
