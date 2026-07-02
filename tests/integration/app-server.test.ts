@@ -8,6 +8,7 @@ import { AppServerPool } from "../../src/app-server/pool.ts";
 import { DISCOVERY_SOURCE_KINDS } from "../../src/sessions/discovery.ts";
 
 const enabled = process.env.RUN_CODEX_INTEGRATION === "1";
+const steerEnabled = process.env.RUN_CODEX_STEER_INTEGRATION === "1";
 
 function captureNextTurn(endpoint: LocalEndpoint, threadId: string, timeoutMs = 120_000): { completed: Promise<any>; cancel(): void } {
   let unsubscribe: () => void = () => undefined;
@@ -67,4 +68,55 @@ test("pinned app-server supports multiple threads, discovery, goals, turns, and 
   const resumed = await endpoint.request<any>("thread/resume", { threadId: first.thread.id });
   assert.equal(resumed.thread.id, first.thread.id);
   assert.equal(resumed.thread.cwd, firstDir);
+});
+
+test("active turn steering persists its client correlation ID", { skip: !steerEnabled, timeout: 240_000 }, async (t) => {
+  const cwd = await mkdtemp(join(tmpdir(), "qiyan-bot-steer-probe-"));
+  const endpoint = new LocalEndpoint({ codexBinary: "codex", requestTimeoutMs: 30_000 });
+  t.after(() => endpoint.stop());
+  await endpoint.start();
+  const startedThread = await endpoint.request<any>("thread/start", { cwd, approvalPolicy: "never", sandbox: "danger-full-access", ephemeral: false });
+  const threadId = startedThread.thread.id as string;
+  const pool = new AppServerPool([endpoint], { maxConcurrentTurns: 1 });
+
+  let diagnostic = "the model completed before steering";
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    const terminal = captureNextTurn(endpoint, threadId);
+    const startId = `steer-probe-start-${attempt}`;
+    const steerId = `steer-probe-message-${attempt}`;
+    const turn = await pool.startTurn<any>(endpoint.id, {
+      threadId,
+      clientUserMessageId: startId,
+      input: [{ type: "text", text: "Use the shell tool to run `sleep 5`, then reply with DONE.", text_elements: [] }],
+    });
+    try {
+      await endpoint.request("turn/steer", {
+        threadId,
+        expectedTurnId: turn.turn.id,
+        clientUserMessageId: steerId,
+        input: [{ type: "text", text: "After the command, also include STEERED.", text_elements: [] }],
+      });
+    } catch (error) {
+      diagnostic = error instanceof Error ? error.message : String(error);
+      const completed = await terminal.completed;
+      pool.markTurnTerminal(endpoint.id, threadId, completed.id);
+      continue;
+    }
+
+    const repeat = await endpoint.request("turn/steer", {
+      threadId,
+      expectedTurnId: turn.turn.id,
+      clientUserMessageId: steerId,
+      input: [{ type: "text", text: "Duplicate correlation probe.", text_elements: [] }],
+    }).then(() => "accepted", () => "rejected");
+    assert.ok(repeat === "accepted" || repeat === "rejected");
+    const completed = await terminal.completed;
+    pool.markTurnTerminal(endpoint.id, threadId, completed.id);
+    const history = await pool.readFullThread(endpoint.id, threadId);
+    const user = history.turns.flatMap((candidate) => candidate.items)
+      .find((item) => item.type === "userMessage" && item.clientId === steerId);
+    assert.ok(user, "turn/steer clientUserMessageId is persisted in full history");
+    return;
+  }
+  assert.fail(`no probe turn remained active long enough to steer: ${diagnostic}`);
 });

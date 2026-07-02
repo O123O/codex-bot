@@ -103,3 +103,68 @@ test("a lost interrupt response succeeds only when the exact turn is proven term
   const pool = new AppServerPool([endpoint], { maxConcurrentTurns: 1 });
   await pool.interrupt("local", "thread", "turn-1");
 });
+
+test("caller-owned capacity claims restore, bind, and release on exact terminal turns", () => {
+  const endpoint = new FakeEndpoint();
+  const pool = new AppServerPool([endpoint], { maxConcurrentTurns: 1 });
+  const claim = pool.claimTurnCapacity("local", "assistant", "claim-1");
+  assert.equal(pool.activeTurnCount, 1);
+  assert.deepEqual(pool.restoreTurnCapacityClaim("local", "assistant", "claim-1", { phase: "provisional" }), claim);
+  assert.equal(pool.activeTurnCount, 1);
+  pool.bindTurnCapacityClaim(claim, "turn-1");
+  pool.markTurnTerminal("local", "assistant", "turn-1");
+  assert.equal(pool.activeTurnCount, 0);
+});
+
+test("ambiguous starts and endpoint loss retain caller-owned provisional claims", async () => {
+  const endpoint: AppServerEndpoint = {
+    id: "local", state: "ready",
+    request: async <T>(method: string) => {
+      if (method === "turn/start") throw new Error("response lost");
+      return { thread: { turns: [{ id: "older", status: "completed", itemsView: "summary", items: [] }] } } as T;
+    },
+  };
+  const pool = new AppServerPool([endpoint], { maxConcurrentTurns: 1, reconciliationTimeoutMs: 0 });
+  const claim = pool.claimTurnCapacity("local", "assistant", "claim-ambiguous");
+  await assert.rejects(
+    pool.startTurn("local", { threadId: "assistant", clientUserMessageId: "message", input: [] }, claim),
+    (error: unknown) => error instanceof AppError && error.code === "OPERATION_UNCERTAIN",
+  );
+  pool.markEndpointUnavailable("local");
+  assert.equal(pool.activeTurnCount, 1);
+  pool.releaseTurnCapacityClaim(claim);
+});
+
+test("only full item views can prove a client message absent", async () => {
+  for (const itemsView of ["summary", "notLoaded"] as const) {
+    const endpoint: AppServerEndpoint = {
+      id: "local", state: "ready",
+      request: async <T>() => ({ thread: { turns: [{ id: "turn", status: "completed", itemsView, items: [] }] } }) as T,
+    };
+    const pool = new AppServerPool([endpoint], { maxConcurrentTurns: 1 });
+    await assert.rejects(pool.readFullThread("local", "assistant"), (error: unknown) => error instanceof AppError && error.code === "OPERATION_UNCERTAIN");
+  }
+  const endpoint: AppServerEndpoint = {
+    id: "local", state: "ready",
+    request: async <T>() => ({ thread: { turns: [{ id: "turn", status: "completed", itemsView: "full", items: [] }] } }) as T,
+  };
+  const pool = new AppServerPool([endpoint], { maxConcurrentTurns: 1 });
+  assert.equal((await pool.readFullThread("local", "assistant")).turns[0]?.itemsView, "full");
+});
+
+test("capacity listeners fire once when a full pool becomes available and unsubscribe cleanly", async () => {
+  const endpoint = new FakeEndpoint();
+  const pool = new AppServerPool([endpoint], { maxConcurrentTurns: 1 });
+  const calls: number[] = [];
+  const unsubscribe = pool.onCapacityAvailable(() => { calls.push(1); });
+  const first = pool.claimTurnCapacity("local", "assistant", "claim-1");
+  assert.throws(() => pool.claimTurnCapacity("local", "other", "claim-2"), (error: unknown) => error instanceof AppError && error.code === "CAPACITY_EXCEEDED");
+  pool.releaseTurnCapacityClaim(first);
+  await Promise.resolve();
+  assert.equal(calls.length, 1);
+  unsubscribe();
+  const second = pool.claimTurnCapacity("local", "assistant", "claim-3");
+  pool.releaseTurnCapacityClaim(second);
+  await Promise.resolve();
+  assert.equal(calls.length, 1);
+});
