@@ -57,6 +57,10 @@ Use `qiyan-bot --home /absolute/private/home` consistently for validation, login
 
 QiYan's own replies have no prefix. Worker finals use `[nickname]`, and backend warnings use `[system]`.
 
+The backend permits one active QiYan conversation globally. Messages and attachments from the same conversation use Codex-native `turn/steer` while that turn is active. Each message from another conversation is durably queued and receives `[system] queued`; it starts only after the current ownership period ends. The backend owns this routing, so QiYan never chooses a platform or destination and never broadcasts a reply across adapters.
+
+`/pass` and `/collect` are ordinary messages for scheduling purposes. They follow the same start, steering, queue, and recovery path as other text. The backend only uses them later as FIFO safeguards: `/pass` verifies exact worker text and attachment order, while `/collect` verifies the requested count before direct delivery.
+
 ## Backup
 
 Stop QiYan, then copy `DATA_DIR`, an external `SESSION_REGISTRY_PATH`, and `ASSISTANT_WORKDIR` together. The isolated profile contains authentication and thread history. Do not restore generated JSON independently from SQLite.

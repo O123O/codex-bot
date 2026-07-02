@@ -136,3 +136,16 @@ test("Slack and WeChat pages are explicit roadmap stubs rather than fake setup g
     assert.doesNotMatch(guide, /npm install/iu);
   }
 });
+
+test("shared docs explain conversation-bound native steering and ordinary safeguards", async () => {
+  const readme = await readFile(resolve("README.md"), "utf8");
+  const setup = await readFile(resolve("docs/setup.md"), "utf8");
+  const telegram = await readFile(resolve("docs/chat-apps/telegram.md"), "utf8");
+  const combined = `${readme}\n${setup}\n${telegram}`;
+  assert.match(readme, /\[system\] queued/u);
+  assert.match(combined, /same conversation.*turn\/steer/isu);
+  assert.match(combined, /\/pass.*\/collect.*ordinary messages/isu);
+  assert.match(combined, /one active QiYan conversation/iu);
+  assert.match(combined, /QiYan.*never chooses.*platform.*destination/isu);
+  assert.match(telegram, /attachments?.*turn\/steer/isu);
+});

@@ -98,15 +98,19 @@ For sustained coding or project work, QiYan creates or resumes a worker session.
 
 QiYan's own replies have no label prefix. Every eligible worker final is automatically delivered as `[nickname] …`, and backend warnings use `[system]`. The assistant receives metadata and reads the full worker body only when needed. `session-status.json`, `assistant-context.json`, and the registry are generated, read-only state; do not edit them.
 
+QiYan has one active QiYan conversation globally. A follow-up from the same conversation, including attachments, is appended to the active Codex turn with native `turn/steer`. Messages from another conversation wait in durable FIFO order, and every blocked message immediately receives exactly `[system] queued`. The active turn is never interrupted merely to switch conversations.
+
+The backend remembers which adapter and conversation owns the turn and routes replies there automatically. QiYan itself never chooses a chat platform or destination, and output is not broadcast to every configured adapter. `/pass` and `/collect` are ordinary messages that use the same start, `turn/steer`, queue, and recovery paths as any other input; their only special behavior is a backend exactness safeguard when the corresponding worker tool is called.
+
 `adopt_session` preserves an existing Codex thread's native cwd. `unadopt_session` removes it from QiYan without deleting or archiving the Codex thread; `archive_session` invokes Codex archive and then removes the QiYan mapping.
 
-Use exact pass-through when wording must reach a worker unchanged:
+Use the `/pass` exactness safeguard when wording must reach a worker unchanged:
 
 ```text
 tell payments /pass  preserve this leading space
 ```
 
-Use direct collection when worker finals should bypass assistant summarization:
+Use the `/collect` exactness safeguard when worker finals should bypass assistant summarization:
 
 ```text
 report payments /collect 3

@@ -62,6 +62,8 @@ qiyan-bot
 
 No temporary Telegram exports or external service environment file are needed. Keep the process running. It starts in `~/.qiyan-bot/qiyan-workdir`; long polling receives updates while outbound replies use an independent transport, so one slow poll does not delay a ready response.
 
+Telegram private-chat messages share one conversation identity. If QiYan is already working for that conversation, later text and attachments enter the same Codex turn through native `turn/steer`. QiYan supports one active conversation globally; a message from a future second adapter or conversation receives `[system] queued` and waits durably. The backend routes output to the owning conversation—QiYan never chooses a platform or destination.
+
 ## 5. Smoke test
 
 In the bot's private chat:
@@ -74,5 +76,7 @@ In the bot's private chat:
 6. Ask the assistant to send a small project file back as an attachment.
 
 Worker terminal responses are delivered automatically with their session nickname. The assistant receives compact metadata and reads a full worker body only when management requires it.
+
+`/pass` and `/collect` are ordinary messages and are steered or queued normally. They only activate exact FIFO validation when QiYan later invokes the matching worker send or collection tool.
 
 If there is no input, confirm you messaged the bot before startup, the numeric owner ID is correct, and no other process is calling `getUpdates` for the same token. If replies are slow, inspect bot/app-server logs separately from Telegram delivery timing; sending itself should not wait for the long-poll request to finish.
