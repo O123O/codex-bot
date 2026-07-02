@@ -1,4 +1,4 @@
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { realpath } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -209,7 +209,7 @@ export async function buildProductionApp(
         discovery = new SessionDiscovery(db, pool);
         threadGate = new ThreadGate();
         lifecycle = new SessionLifecycle(pool, registry, runtime, { now: () => Date.now() }, projectWorkspaces, threadGate);
-        sessions = new SessionService(pool, registry, runtime, finals, deliveries);
+        sessions = new SessionService(pool, registry, runtime, finals, deliveries, projectWorkspaces, threadGate);
         observations = new SessionObservationProcessor(dashboardStore, registry, runtime, {
           now: () => Date.now(),
           readThread: async (endpointId, threadId) => (await pool.request<any>(endpointId, "thread/read", { threadId, includeTurns: true })).thread,
@@ -351,35 +351,37 @@ export async function buildProductionApp(
       create_session: async (args, context) => {
         const endpointId = projectEndpoint(args.endpoint);
         const project = await projectWorkspaces.prepareCreate(args.nickname, args.project_dir);
+        const mappingId = `mapping_${randomUUID()}`;
         const workspaceReceipt = projectWorkspaceReceipt(project);
         let dispatchStarted = false;
         let settingsObservationSequence: number | undefined;
-        context.checkpoint({ endpoint: endpointId, ...workspaceReceipt, dispatchStarted });
+        context.checkpoint({ endpoint: endpointId, mappingId, ...workspaceReceipt, dispatchStarted });
         const settings = await lifecycle.create(args.nickname, endpointId, project, context.operationId, (thread, currentSettings) => {
           settingsObservationSequence = dashboardStore.allocateObservationSequence();
-          context.checkpoint({ endpoint: endpointId, ...workspaceReceipt, dispatchStarted, threadId: thread.id, currentSettings, settingsObservationSequence });
+          context.checkpoint({ endpoint: endpointId, mappingId, ...workspaceReceipt, dispatchStarted, threadId: thread.id, currentSettings, settingsObservationSequence });
           hydrateThreadOrder(endpointId, thread);
         }, () => {
           dispatchStarted = true;
-          context.checkpoint({ endpoint: endpointId, ...workspaceReceipt, dispatchStarted });
-        });
+          context.checkpoint({ endpoint: endpointId, mappingId, ...workspaceReceipt, dispatchStarted });
+        }, mappingId);
         advanceNativeWatermark(args.nickname);
         observeLifecycle(args.nickname);
         observeCurrentSettings(args.nickname, settings, Date.now(), settingsObservationSequence);
         await renderDashboardSafely();
         const mapping = registry.get(args.nickname);
-        if (!mapping) throw new AppError("OPERATION_UNCERTAIN", "created session mapping was not committed");
+        if (!mapping || mapping.mapping_id !== mappingId) throw new AppError("OPERATION_UNCERTAIN", "created session mapping was not committed");
         return { nickname: args.nickname, mapping_id: mapping.mapping_id };
       },
       adopt_session: async (args, context) => {
         const endpointId = projectEndpoint(args.endpoint);
-        context.checkpoint({ endpoint: endpointId, threadId: args.thread_id });
-        await lifecycle.adopt(args.nickname, endpointId, args.thread_id, (thread) => hydrateThreadOrder(endpointId, thread));
+        const mappingId = `mapping_${randomUUID()}`;
+        context.checkpoint({ endpoint: endpointId, threadId: args.thread_id, mappingId });
+        await lifecycle.adopt(args.nickname, endpointId, args.thread_id, (thread) => hydrateThreadOrder(endpointId, thread), mappingId);
         advanceNativeWatermark(args.nickname);
         observeLifecycle(args.nickname);
         await renderDashboardSafely();
         const mapping = registry.get(args.nickname);
-        if (!mapping) throw new AppError("OPERATION_UNCERTAIN", "adopted session mapping was not committed");
+        if (!mapping || mapping.mapping_id !== mappingId) throw new AppError("OPERATION_UNCERTAIN", "adopted session mapping was not committed");
         return { nickname: args.nickname, mapping_id: mapping.mapping_id };
       },
       rename_session: async (args, context) => {
@@ -946,7 +948,7 @@ export async function buildProductionApp(
           else failRecoveredNoEffect(operation.id, "pending session setting was not committed");
         } else if (["create_session", "adopt_session"].includes(operation.kind)) {
           let session = registry.get(args.nickname);
-          const checkpoint = operation.receipt as ({ endpoint?: string; threadId?: string; dispatchStarted?: boolean } & Record<string, unknown>) | undefined;
+          const checkpoint = operation.receipt as ({ endpoint?: string; threadId?: string; mappingId?: string; dispatchStarted?: boolean } & Record<string, unknown>) | undefined;
           const project = operation.kind === "create_session" && checkpoint ? preparedProjectWorkspaceFromCheckpoint(checkpoint) : undefined;
           if (project) await projectWorkspaces.assertDispatchable(project);
           const expectedThread = args.thread_id as string | undefined ?? (operation.kind === "create_session" ? checkpoint?.threadId : undefined);
@@ -969,17 +971,19 @@ export async function buildProductionApp(
           }
           if (!session && operation.kind === "create_session" && checkpoint?.threadId && project) {
             const endpointId = projectEndpoint(checkpoint.endpoint ?? args.endpoint);
+            if (!checkpoint.mappingId) continue;
             await lifecycle.adopt(args.nickname, endpointId, checkpoint.threadId, (thread) => {
               if (thread.threadSource !== operation.id) throw new AppError("OPERATION_UNCERTAIN", "recovered worker thread has the wrong creation source");
               hydrateThreadOrder(endpointId, thread);
-            });
+            }, checkpoint.mappingId);
             session = registry.get(args.nickname);
           }
-          if (session?.lifecycle_state === "adopting") {
+          if (session?.lifecycle_state === "adopting" && session.mapping_id === checkpoint?.mappingId) {
             await lifecycle.reconcileAdopting();
             session = registry.get(args.nickname);
           }
-          if (session?.lifecycle_state === "managed" && (!expectedThread || session.thread_id === expectedThread) && (!expectedDir || session.project_dir === expectedDir)) {
+          if (session?.lifecycle_state === "managed" && session.mapping_id === checkpoint?.mappingId
+            && (!expectedThread || session.thread_id === expectedThread) && (!expectedDir || session.project_dir === expectedDir)) {
             const native = await pool.request<any>(session.endpoint, "thread/read", { threadId: session.thread_id, includeTurns: true });
             await verifySessionCwd(native.thread.cwd, session.project_dir);
             hydrateThreadOrder(session.endpoint, native.thread);
@@ -997,8 +1001,14 @@ export async function buildProductionApp(
             failRecoveredNoEffect(operation.id, "atomic session registry mapping was not committed");
           }
         } else if (operation.kind === "rename_session") {
-          if (!registry.get(args.old_nickname) && registry.get(args.new_nickname)) await succeedRecovered(operation, { nickname: args.new_nickname }, () => dashboardStore.markDirty());
-          else if (registry.get(args.old_nickname) && !registry.get(args.new_nickname)) failRecoveredNoEffect(operation.id, "atomic nickname replacement was not committed");
+          const saved = operation.receipt as Partial<RegistrySession> | undefined;
+          const oldMapping = registry.get(args.old_nickname);
+          const newMapping = registry.get(args.new_nickname);
+          if (saved?.mapping_id && newMapping?.mapping_id === saved.mapping_id) {
+            await succeedRecovered(operation, { nickname: args.new_nickname, mapping_id: saved.mapping_id }, () => dashboardStore.markDirty());
+          } else if (saved?.mapping_id && oldMapping?.mapping_id === saved.mapping_id && !newMapping) {
+            failRecoveredNoEffect(operation.id, "atomic nickname replacement was not committed");
+          }
         } else if (operation.kind === "unadopt_session" || operation.kind === "archive_session") {
           const saved = operation.receipt as (Partial<RegistrySession> & { nickname?: string; step?: string }) | undefined;
           if (saved?.endpoint && saved.thread_id && saved.project_dir && saved.mapping_id

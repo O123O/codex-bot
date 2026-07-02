@@ -43,6 +43,7 @@ export class SessionLifecycle {
     threadSource: string,
     onThreadCreated?: (thread: ThreadView, settings: CurrentSessionSettings) => void,
     onDispatching?: () => void,
+    mappingId = `mapping_${randomUUID()}`,
   ): Promise<CurrentSessionSettings> {
     if (this.registry.get(nickname)) throw new AppError("OPERATION_CONFLICT", `nickname already exists: ${nickname}`);
     await this.workspaces.assertDispatchable(project);
@@ -55,7 +56,6 @@ export class SessionLifecycle {
       await this.workspaces.assertDispatchable(project);
       await this.verifyCwd(response.thread.cwd, project.path);
       if (response.thread.status.type !== "idle") throw new AppError("OPERATION_UNCERTAIN", `new thread ${response.thread.id} was created in ${response.thread.status.type} state`);
-      const mappingId = `mapping_${randomUUID()}`;
       await this.registry.createManaged(nickname, {
         endpoint: endpointId,
         thread_id: response.thread.id,
@@ -73,6 +73,7 @@ export class SessionLifecycle {
     endpointId: string,
     threadId: string,
     onThreadRead?: (thread: ThreadView) => void,
+    mappingId = `mapping_${randomUUID()}`,
   ): Promise<void> {
     await this.gate.run(endpointId, threadId, async () => {
       this.requireAvailable(nickname, endpointId, threadId);
@@ -86,7 +87,7 @@ export class SessionLifecycle {
         endpoint: endpointId,
         thread_id: threadId,
         project_dir: project.path,
-        mapping_id: `mapping_${randomUUID()}`,
+        mapping_id: mappingId,
         lifecycle_state: "adopting",
       };
       await this.registry.reserve(nickname, reserved);

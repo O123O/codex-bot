@@ -64,6 +64,7 @@ test("pinned app-server supports multiple threads, discovery, goals, turns, and 
   await endpoint.request("thread/unarchive", { threadId: first.thread.id });
   await endpoint.stop();
   await endpoint.start();
-  const resumed = await endpoint.request<any>("thread/resume", { threadId: first.thread.id, cwd: firstDir, approvalPolicy: "never", sandbox: "danger-full-access" });
+  const resumed = await endpoint.request<any>("thread/resume", { threadId: first.thread.id });
   assert.equal(resumed.thread.id, first.thread.id);
+  assert.equal(resumed.thread.cwd, firstDir);
 });

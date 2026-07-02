@@ -1,9 +1,11 @@
 import type { AppServerPool } from "../app-server/pool.ts";
 import { AppError } from "../core/errors.ts";
-import type { SessionRegistry } from "../registry/session-registry.ts";
+import type { RegistrySession, SessionRegistry } from "../registry/session-registry.ts";
 import type { DeliveryStore } from "../storage/delivery-store.ts";
 import type { RuntimeStore } from "../storage/runtime-store.ts";
 import type { FinalMessageStore, LogicalFinalMessage } from "./final-messages.ts";
+import type { ProjectWorkspacePolicy } from "./project-workspace.ts";
+import type { ThreadGate } from "./thread-gate.ts";
 
 export class SessionService {
   constructor(
@@ -12,42 +14,40 @@ export class SessionService {
     private readonly runtime: RuntimeStore,
     private readonly finals: FinalMessageStore,
     private readonly deliveries: DeliveryStore,
+    private readonly workspaces: Pick<ProjectWorkspacePolicy, "prepareExisting" | "assertDispatchable">,
+    private readonly gate: ThreadGate,
   ) {}
 
   async send(nickname: string, text: string, options: { mode?: "auto" | "start" | "steer"; clientUserMessageId?: string; input?: unknown[]; settings?: { model?: string; effort?: string } } = {}): Promise<{ mode: "start" | "steer"; turnId: string; terminal?: boolean; appliedSettings?: { model?: string; effort?: string } }> {
-    const session = this.required(nickname);
-    if (session.lifecycle_state !== "managed") throw new AppError("SESSION_DETACHED", `${nickname} is not managed`);
-    const state = this.runtime.getSession(session.endpoint, session.thread_id, session.mapping_id);
-    if (!state || state.managementState !== "managed") throw new AppError("SESSION_DETACHED", `${nickname} is not managed`);
-    const activeTurn = this.runtime.activeTurn(session.endpoint, session.thread_id, session.mapping_id);
-    const mode = options.mode ?? "auto";
-    const input = options.input ?? [{ type: "text", text, text_elements: [] }];
-    if (activeTurn) {
-      if (mode === "start") throw new AppError("SESSION_BUSY", `${nickname} already has an active turn`);
-      try {
-        const response = await this.pool.request<{ turnId: string }>(session.endpoint, "turn/steer", {
-          threadId: session.thread_id, ...(options.clientUserMessageId ? { clientUserMessageId: options.clientUserMessageId } : {}), input, expectedTurnId: activeTurn,
-        });
-        return { mode: "steer", turnId: response.turnId };
-      } catch (error) {
-        if (!options.clientUserMessageId) throw error;
-        const history = await this.pool.request<any>(session.endpoint, "thread/read", { threadId: session.thread_id, includeTurns: true });
-        const proven = history.thread.turns.find((turn: any) => turn.id === activeTurn && turn.items.some((item: any) => item.type === "userMessage" && item.clientId === options.clientUserMessageId));
-        if (!proven) throw error;
-        return { mode: "steer", turnId: activeTurn };
+    return this.runVerifiedExecution(nickname, async (session, cwd) => {
+      const activeTurn = this.runtime.activeTurn(session.endpoint, session.thread_id, session.mapping_id);
+      const mode = options.mode ?? "auto";
+      const input = options.input ?? [{ type: "text", text, text_elements: [] }];
+      if (activeTurn) {
+        if (mode === "start") throw new AppError("SESSION_BUSY", `${nickname} already has an active turn`);
+        try {
+          const response = await this.pool.request<{ turnId: string }>(session.endpoint, "turn/steer", {
+            threadId: session.thread_id, ...(options.clientUserMessageId ? { clientUserMessageId: options.clientUserMessageId } : {}), input, expectedTurnId: activeTurn,
+          });
+          return { mode: "steer" as const, turnId: response.turnId };
+        } catch (error) {
+          if (!options.clientUserMessageId) throw error;
+          const history = await this.pool.request<any>(session.endpoint, "thread/read", { threadId: session.thread_id, includeTurns: true });
+          const proven = history.thread.turns.find((turn: any) => turn.id === activeTurn && turn.items.some((item: any) => item.type === "userMessage" && item.clientId === options.clientUserMessageId));
+          if (!proven) throw error;
+          return { mode: "steer" as const, turnId: activeTurn };
+        }
       }
-    }
-    if (mode === "steer") throw new AppError("SESSION_IDLE", `${nickname} has no active turn`);
-    const settings = options.settings ?? this.runtime.settings(session.endpoint, session.thread_id, session.mapping_id);
-    const response = await this.pool.startTurn<{ turn: { id: string; status?: string } }>(session.endpoint, {
-      threadId: session.thread_id, ...(options.clientUserMessageId ? { clientUserMessageId: options.clientUserMessageId } : {}), input, ...settings,
+      if (mode === "steer") throw new AppError("SESSION_IDLE", `${nickname} has no active turn`);
+      const settings = options.settings ?? this.runtime.settings(session.endpoint, session.thread_id, session.mapping_id);
+      const response = await this.pool.startTurn<{ turn: { id: string; status?: string } }>(session.endpoint, {
+        threadId: session.thread_id, cwd, ...(options.clientUserMessageId ? { clientUserMessageId: options.clientUserMessageId } : {}), input, ...settings,
+      });
+      this.runtime.consumeSettings(session.endpoint, session.thread_id, session.mapping_id, settings);
+      const terminal = new Set(["completed", "failed", "interrupted"]).has(response.turn.status ?? "");
+      if (!terminal) this.runtime.setActiveTurn(session.endpoint, session.thread_id, session.mapping_id, response.turn.id);
+      return { mode: "start" as const, turnId: response.turn.id, terminal, appliedSettings: settings };
     });
-    this.runtime.consumeSettings(session.endpoint, session.thread_id, session.mapping_id, settings);
-    const terminal = new Set(["completed", "failed", "interrupted"]).has(response.turn.status ?? "");
-    if (!terminal) {
-      this.runtime.setActiveTurn(session.endpoint, session.thread_id, session.mapping_id, response.turn.id);
-    }
-    return { mode: "start", turnId: response.turn.id, terminal, appliedSettings: settings };
   }
 
   async interrupt(nickname: string, turnId?: string): Promise<void> {
@@ -148,19 +148,22 @@ export class SessionService {
   }
 
   async setGoal(nickname: string, objective: string, tokenBudget?: number): Promise<unknown> {
-    const session = this.managed(nickname);
-    try {
-      return await this.pool.request(session.endpoint, "thread/goal/set", { threadId: session.thread_id, objective, status: "active", ...(tokenBudget === undefined ? {} : { tokenBudget }) });
-    } catch (error) {
-      const current = await this.getGoal(nickname).catch(() => undefined) as any;
-      const goal = current?.goal;
-      if (goal?.objective === objective && goal?.status === "active" && (tokenBudget === undefined || goal.tokenBudget === tokenBudget || goal.token_budget === tokenBudget)) return current;
-      throw error;
-    }
+    return this.runVerifiedExecution(nickname, async (session) => {
+      try {
+        return await this.pool.request(session.endpoint, "thread/goal/set", { threadId: session.thread_id, objective, status: "active", ...(tokenBudget === undefined ? {} : { tokenBudget }) });
+      } catch (error) {
+        const current = await this.pool.request(session.endpoint, "thread/goal/get", { threadId: session.thread_id }).catch(() => undefined) as any;
+        const goal = current?.goal;
+        if (goal?.objective === objective && goal?.status === "active" && (tokenBudget === undefined || goal.tokenBudget === tokenBudget || goal.token_budget === tokenBudget)) return current;
+        throw error;
+      }
+    });
   }
 
-  pauseGoal(nickname: string): Promise<unknown> { return this.setGoalStatus(nickname, "paused"); }
-  resumeGoal(nickname: string): Promise<unknown> { return this.setGoalStatus(nickname, "active"); }
+  pauseGoal(nickname: string): Promise<unknown> { return this.setGoalStatusUnchecked(nickname, "paused"); }
+  resumeGoal(nickname: string): Promise<unknown> {
+    return this.runVerifiedExecution(nickname, (session) => this.setGoalStatusForSession(session, "active"));
+  }
 
   async cancelGoal(nickname: string): Promise<unknown> {
     const session = this.managed(nickname);
@@ -172,14 +175,41 @@ export class SessionService {
     }
   }
 
-  private async setGoalStatus(nickname: string, status: "paused" | "active"): Promise<unknown> {
+  private async setGoalStatusUnchecked(nickname: string, status: "paused"): Promise<unknown> {
     const session = this.managed(nickname);
+    return this.setGoalStatusForSession(session, status);
+  }
+
+  private async setGoalStatusForSession(session: RegistrySession, status: "paused" | "active"): Promise<unknown> {
     try { return await this.pool.request(session.endpoint, "thread/goal/set", { threadId: session.thread_id, status }); }
     catch (error) {
-      const current = await this.getGoal(nickname).catch(() => undefined) as any;
+      const current = await this.pool.request(session.endpoint, "thread/goal/get", { threadId: session.thread_id }).catch(() => undefined) as any;
       if (current?.goal?.status === status) return current;
       throw error;
     }
+  }
+
+  private runVerifiedExecution<T>(nickname: string, mutate: (session: RegistrySession, cwd: string) => Promise<T>): Promise<T> {
+    const expected = this.managed(nickname);
+    return this.gate.run(expected.endpoint, expected.thread_id, async () => {
+      const session = this.assertExactManaged(nickname, expected.mapping_id);
+      const native = await this.pool.request<any>(session.endpoint, "thread/read", { threadId: session.thread_id, includeTurns: false });
+      const project = await this.workspaces.prepareExisting(String(native.thread.cwd));
+      await this.workspaces.assertDispatchable(project);
+      if (project.path !== session.project_dir) throw new AppError("CWD_MISMATCH", "managed thread cwd changed");
+      this.assertExactManaged(nickname, expected.mapping_id);
+      return mutate(session, project.path);
+    });
+  }
+
+  private assertExactManaged(nickname: string, mappingId: string) {
+    const session = this.registry.get(nickname);
+    if (!session || session.mapping_id !== mappingId || session.lifecycle_state !== "managed") {
+      throw new AppError("SESSION_DETACHED", `${nickname} mapping changed or is not managed`);
+    }
+    const runtime = this.runtime.getSession(session.endpoint, session.thread_id, session.mapping_id);
+    if (runtime?.managementState !== "managed") throw new AppError("SESSION_DETACHED", `${nickname} is not managed`);
+    return session;
   }
 
   private async listModels(endpointId: string): Promise<any[]> {

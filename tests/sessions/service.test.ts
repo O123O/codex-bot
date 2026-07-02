@@ -10,6 +10,8 @@ import { AppError } from "../../src/core/errors.ts";
 import { SessionRegistry } from "../../src/registry/session-registry.ts";
 import { FinalMessageStore } from "../../src/sessions/final-messages.ts";
 import { SessionService } from "../../src/sessions/service.ts";
+import { SessionLifecycle } from "../../src/sessions/lifecycle.ts";
+import { ThreadGate } from "../../src/sessions/thread-gate.ts";
 import { createTestDatabase } from "../../src/storage/database.ts";
 import { DeliveryStore } from "../../src/storage/delivery-store.ts";
 import { RuntimeStore } from "../../src/storage/runtime-store.ts";
@@ -30,13 +32,16 @@ class ServiceEndpoint implements AppServerEndpoint {
   onThreadReadRequest: (() => void) | undefined;
   failNextStart = false;
   goal: any = null;
+  cwd = "";
   goalBarrier: Promise<void> | undefined;
   onGoalRequest: (() => void) | undefined;
   loseNextGoalResponse = false;
+  onTurnStart: (() => void) | undefined;
   async request<T>(method: string, params: any): Promise<T> {
     this.calls.push({ method, params });
     if (method === "turn/start") {
       if (this.failNextStart) { this.failNextStart = false; throw new Error("start failed"); }
+      this.onTurnStart?.();
       this.lastClientId = params.clientUserMessageId;
       return { turn: { id: "started-1" } } as T;
     }
@@ -44,7 +49,7 @@ class ServiceEndpoint implements AppServerEndpoint {
     if (method === "thread/read") {
       this.onThreadReadRequest?.();
       await this.threadReadBarrier;
-      return { thread: { id: "thread", cwd: params.cwd, status: { type: this.status }, turns: this.threadTurns ?? (this.lastClientId ? [{ id: "started-1", ...(this.historyTurnStatus ? { status: this.historyTurnStatus } : {}), items: [{ type: "userMessage", clientId: this.lastClientId }] }] : []) } } as T;
+      return { thread: { id: "thread", cwd: this.cwd, status: { type: this.status }, turns: this.threadTurns ?? (this.lastClientId ? [{ id: "started-1", ...(this.historyTurnStatus ? { status: this.historyTurnStatus } : {}), items: [{ type: "userMessage", clientId: this.lastClientId }] }] : []) } } as T;
     }
     if (method === "thread/goal/get") {
       this.onGoalRequest?.();
@@ -70,13 +75,26 @@ async function fixture() {
   });
   const db = createTestDatabase();
   const endpoint = new ServiceEndpoint();
+  endpoint.cwd = dir;
   const pool = new AppServerPool([endpoint], { maxConcurrentTurns: 4 });
   const runtime = new RuntimeStore(db);
   runtime.setSession("local", "thread", mappingId, "managed", "idle");
   const finals = new FinalMessageStore(db);
   const deliveries = new DeliveryStore(db);
-  const service = new SessionService(pool, registry, runtime, finals, deliveries);
-  return { db, endpoint, registry, runtime, finals, deliveries, service };
+  let workspaceFailure: Error | undefined;
+  let workspaceBarrier: Promise<void> | undefined;
+  let onWorkspaceCheck: (() => void) | undefined;
+  const workspaces = {
+    prepareExisting: async (path: string) => ({ path, created: false, fallback: false, identity: { device: "1", inode: "1" } }),
+    assertDispatchable: async () => { onWorkspaceCheck?.(); await workspaceBarrier; if (workspaceFailure) throw workspaceFailure; },
+  };
+  const gate = new ThreadGate();
+  const service = new SessionService(pool, registry, runtime, finals, deliveries, workspaces, gate);
+  return {
+    db, dir, endpoint, pool, registry, runtime, finals, deliveries, service, gate, workspaces,
+    failWorkspace: () => { workspaceFailure = new AppError("CONFIGURATION_ERROR", "project workspace changed unexpectedly"); },
+    setWorkspaceBarrier: (barrier: Promise<void> | undefined, onCheck?: () => void) => { workspaceBarrier = barrier; onWorkspaceCheck = onCheck; },
+  };
 }
 
 test("starts idle sessions, steers active sessions, and interrupts the exact turn", async () => {
@@ -86,7 +104,7 @@ test("starts idle sessions, steers active sessions, and interrupts the exact tur
   const started = await service.send("payments", "hello", { clientUserMessageId: "msg-1" });
   assert.equal(started.turnId, "started-1");
   assert.deepEqual(endpoint.calls.find((call) => call.method === "turn/start")?.params, {
-    threadId: "thread", clientUserMessageId: "msg-1", input: [{ type: "text", text: "hello", text_elements: [] }], model: "gpt-5", effort: "high",
+    threadId: "thread", cwd: endpoint.cwd, clientUserMessageId: "msg-1", input: [{ type: "text", text: "hello", text_elements: [] }], model: "gpt-5", effort: "high",
   });
   assert.deepEqual(started.appliedSettings, { model: "gpt-5", effort: "high" });
   assert.deepEqual(runtime.settings("local", "thread", mappingId), {});
@@ -95,6 +113,64 @@ test("starts idle sessions, steers active sessions, and interrupts the exact tur
   assert.equal((await service.send("payments", "more")).mode, "steer");
   await service.interrupt("payments", "active-1");
   assert.ok(endpoint.calls.some((call) => call.method === "turn/interrupt" && call.params.turnId === "active-1"));
+});
+
+test("execution performs a fresh native cwd and project check before every mutation", async () => {
+  const { endpoint, service, failWorkspace } = await fixture();
+  await service.send("payments", "start");
+  assert.deepEqual(endpoint.calls.slice(0, 2).map((call) => call.method), ["thread/read", "turn/start"]);
+  assert.equal(endpoint.calls[1]?.params.cwd, endpoint.cwd);
+
+  endpoint.calls.length = 0;
+  failWorkspace();
+  await assert.rejects(service.send("payments", "blocked"), /changed unexpectedly/);
+  assert.equal(endpoint.calls.some((call) => call.method === "turn/start" || call.method === "turn/steer"), false);
+});
+
+test("native cwd drift and mapping generation replacement block execution inside the gate", async () => {
+  const drift = await fixture();
+  drift.endpoint.cwd = join(drift.dir, "other-project");
+  await assert.rejects(drift.service.send("payments", "blocked"), (error: unknown) => error instanceof AppError && error.code === "CWD_MISMATCH");
+  assert.equal(drift.endpoint.calls.some((call) => call.method === "turn/start"), false);
+
+  const replaced = await fixture();
+  let release!: () => void;
+  let entered!: () => void;
+  const barrier = new Promise<void>((resolve) => { release = resolve; });
+  const checking = new Promise<void>((resolve) => { entered = resolve; });
+  replaced.setWorkspaceBarrier(barrier, entered);
+  const sending = replaced.service.send("payments", "blocked");
+  await checking;
+  const old = replaced.registry.get("payments")!;
+  await replaced.registry.transition("payments", old, "unadopting");
+  await replaced.registry.removeIfMatch("payments", old);
+  const replacement = { ...old, mapping_id: "mapping-new", lifecycle_state: "adopting" as const };
+  await replaced.registry.reserve("payments", replacement);
+  await replaced.registry.promote("payments", replacement);
+  release();
+  await assert.rejects(sending, /mapping changed|not managed/iu);
+  assert.equal(replaced.endpoint.calls.some((call) => call.method === "turn/start" || call.method === "turn/steer"), false);
+});
+
+test("unadopt waits for an in-flight execution check and cannot transition after the turn starts", async () => {
+  const value = await fixture();
+  const lifecycle = new SessionLifecycle(value.pool, value.registry, value.runtime, { now: () => 10 }, value.workspaces, value.gate);
+  let release!: () => void;
+  let entered!: () => void;
+  const barrier = new Promise<void>((resolve) => { release = resolve; });
+  const checking = new Promise<void>((resolve) => { entered = resolve; });
+  value.setWorkspaceBarrier(barrier, entered);
+  value.endpoint.onTurnStart = () => { value.endpoint.status = "active"; };
+
+  const sending = value.service.send("payments", "start");
+  await checking;
+  const removing = lifecycle.unadopt("payments");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(value.registry.get("payments")?.lifecycle_state, "managed");
+  release();
+  await sending;
+  await assert.rejects(removing, (error: unknown) => error instanceof AppError && error.code === "SESSION_BUSY");
+  assert.equal(value.registry.get("payments")?.lifecycle_state, "managed");
 });
 
 test("send enforces managed state and start/steer preconditions", async () => {
@@ -291,6 +367,17 @@ test("goal operations replace, pause, resume and cancel without exposing complet
     ["thread/goal/set", "active"], ["thread/goal/set", "paused"], ["thread/goal/set", "active"], ["thread/goal/clear", undefined],
   ]);
   assert.equal("completeGoal" in service, false);
+});
+
+test("goal activation and resume are verified while pause and cancel remain available to stop unsafe work", async () => {
+  const { endpoint, service, failWorkspace } = await fixture();
+  failWorkspace();
+  await assert.rejects(service.setGoal("payments", "blocked"), /changed unexpectedly/);
+  await assert.rejects(service.resumeGoal("payments"), /changed unexpectedly/);
+  endpoint.calls.length = 0;
+  await service.pauseGoal("payments");
+  await service.cancelGoal("payments");
+  assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/goal/set", "thread/goal/clear"]);
 });
 
 test("a lost goal response is reconciled against native goal state", async () => {
