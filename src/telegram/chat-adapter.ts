@@ -4,6 +4,7 @@ import type { Database } from "../storage/database.ts";
 import type { OperationStore } from "../storage/operation-store.ts";
 import { TelegramPoller } from "./poller.ts";
 import { createTelegramTransports, type TelegramTransports } from "./transport.ts";
+import { TelegramDeliveryAdapter } from "./delivery-adapter.ts";
 
 interface TelegramChatAdapterDependencies {
   createTransports?: (token: string) => TelegramTransports;
@@ -25,7 +26,7 @@ export class TelegramChatAdapter implements ChatAdapter {
     dependencies: TelegramChatAdapterDependencies = {},
   ) {
     this.transports = (dependencies.createTransports ?? createTelegramTransports)(options.token);
-    this.delivery = this.transports.delivery;
+    this.delivery = new TelegramDeliveryAdapter(this.transports.delivery);
     this.poller = new TelegramPoller(db, this.transports.polling, operations, attachments, {
       ownerId: options.ownerId,
       maxMessageBytes: options.maxMessageBytes,

@@ -3,13 +3,14 @@ import type { Database } from "../storage/database.ts";
 import type { DeliveryStore } from "../storage/delivery-store.ts";
 import type { OperationStore } from "../storage/operation-store.ts";
 import { inTransaction } from "../storage/database.ts";
+import type { ConversationBinding } from "../chat/binding.ts";
 
 export interface ActiveAssistantContext { contextId: string; attemptId: string; turnId: string; triggerKind: "user" | "internal" }
 
 export class AssistantRuntime {
   private active: ActiveAssistantContext | undefined;
 
-  constructor(private readonly db: Database, private readonly operations: OperationStore, private readonly deliveries: DeliveryStore, private readonly options: { destination: string }) {}
+  constructor(private readonly db: Database, private readonly operations: OperationStore, private readonly deliveries: DeliveryStore, private readonly options: { binding: ConversationBinding }) {}
 
   beginUserAttempt(contextId: string, attemptId: string, turnId: string): void { this.begin(contextId, attemptId, turnId, "user"); }
   beginInternalAttempt(contextId: string, attemptId: string, turnId: string): void { this.begin(contextId, attemptId, turnId, "internal"); }
@@ -60,7 +61,7 @@ export class AssistantRuntime {
       this.finalizeEventBatch(attempt.contextId, "processed");
       this.releaseSourceAttachments(attempt.contextId);
       if (attempt.triggerKind === "user" && finalText) {
-        this.deliveries.prepare({ id: `assistant:${turnId}`, kind: "assistant_final", destination: this.options.destination, body: finalText, mandatory: true });
+        this.deliveries.prepare({ id: `assistant:${turnId}`, kind: "assistant_final", binding: this.options.binding, body: finalText, mandatory: true });
       }
     });
     if (this.active?.turnId === turnId) this.active = undefined;

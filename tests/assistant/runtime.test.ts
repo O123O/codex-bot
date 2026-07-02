@@ -5,6 +5,8 @@ import { createTestDatabase } from "../../src/storage/database.ts";
 import { DeliveryStore } from "../../src/storage/delivery-store.ts";
 import { OperationStore } from "../../src/storage/operation-store.ts";
 
+const binding = { adapterId: "telegram", conversationKey: "telegram:42", destination: { chatId: "42" } } as const;
+
 test("user assistant finals are durable deliveries while internal finals are suppressed", () => {
   const db = createTestDatabase();
   const deliveries = new DeliveryStore(db);
@@ -13,12 +15,12 @@ test("user assistant finals are durable deliveries while internal finals are sup
   operations.createSourceContext({ id: "batch", kind: "event_batch", sourceId: "b1", rawText: "", attachmentIds: [] });
   db.prepare("INSERT INTO events(id, endpoint_id, thread_id, kind, payload_json, state, created_at) VALUES ('batch-event', 'local', 'worker', 'terminal', '{}', 'pending', 1)").run();
   db.prepare("INSERT INTO event_batches(id, event_ids_json, state, created_at) VALUES ('batch', '[\"batch-event\"]', 'pending', 1)").run();
-  const runtime = new AssistantRuntime(db, operations, deliveries, { destination: "42" });
+  const runtime = new AssistantRuntime(db, operations, deliveries, { binding });
   runtime.beginUserAttempt("ctx", "attempt", "turn-user");
   runtime.handleTerminal("turn-user", "answer");
   assert.equal((db.prepare("SELECT state FROM source_contexts WHERE id = 'ctx'").get() as any).state, "completed");
   runtime.beginInternalAttempt("batch", "attempt-2", "turn-internal");
-  const restarted = new AssistantRuntime(db, operations, deliveries, { destination: "42" });
+  const restarted = new AssistantRuntime(db, operations, deliveries, { binding });
   restarted.handleTerminal("turn-internal", "do not send");
   assert.deepEqual(deliveries.listReady().map((item) => item.body), ["answer"]);
   assert.equal((db.prepare("SELECT state FROM events WHERE id = 'batch-event'").get() as any).state, "processed");
@@ -32,7 +34,7 @@ test("post-dispatch assistant failure creates one recovery context with receipts
   operations.markDispatched(operation.id);
   db.prepare("INSERT INTO events(id, endpoint_id, thread_id, kind, payload_json, state, created_at) VALUES ('event-1', 'local', 'worker', 'terminal', '{}', 'pending', 1)").run();
   db.prepare("INSERT INTO event_batches(id, event_ids_json, state, created_at) VALUES ('ctx', '[\"event-1\"]', 'active', 1)").run();
-  const runtime = new AssistantRuntime(db, operations, new DeliveryStore(db), { destination: "42" });
+  const runtime = new AssistantRuntime(db, operations, new DeliveryStore(db), { binding });
   runtime.beginUserAttempt("ctx", "a", "turn");
   const first = runtime.failAttempt("turn", new Error("lost"));
   const replay = runtime.failAttempt("turn", new Error("lost"));
@@ -48,7 +50,7 @@ test("terminalization rolls back attempt and source state if final delivery prep
   const operations = new OperationStore(db);
   operations.createSourceContext({ id: "ctx-atomic", kind: "telegram", sourceId: "atomic", rawText: "question", attachmentIds: [] });
   const failingDeliveries = { prepare() { throw new Error("outbox failed"); } } as unknown as DeliveryStore;
-  const runtime = new AssistantRuntime(db, operations, failingDeliveries, { destination: "42" });
+  const runtime = new AssistantRuntime(db, operations, failingDeliveries, { binding });
   runtime.beginUserAttempt("ctx-atomic", "attempt-atomic", "turn-atomic");
   assert.throws(() => runtime.handleTerminal("turn-atomic", "answer"), /outbox failed/);
   assert.equal((db.prepare("SELECT state FROM assistant_attempts WHERE id = 'attempt-atomic'").get() as any).state, "active");
@@ -59,7 +61,7 @@ test("failed-attempt terminalization rolls back if recovery creation fails", () 
   const db = createTestDatabase();
   const operations = new OperationStore(db);
   operations.createSourceContext({ id: "ctx-fail-atomic", kind: "telegram", sourceId: "fail-atomic", rawText: "", attachmentIds: [] });
-  const runtime = new AssistantRuntime(db, operations, new DeliveryStore(db), { destination: "42" });
+  const runtime = new AssistantRuntime(db, operations, new DeliveryStore(db), { binding });
   runtime.beginUserAttempt("ctx-fail-atomic", "attempt-fail-atomic", "turn-fail-atomic");
   const operation = operations.prepare({ contextId: "ctx-fail-atomic", attemptId: "attempt-fail-atomic", callId: "call", kind: "send", args: {} });
   operations.markDispatched(operation.id);
@@ -75,7 +77,7 @@ test("source attachment retention is released exactly once at terminalization", 
     VALUES ('file-one', 'ctx-file', 'a', 'text/plain', '/tmp/a', 1, 'x', 1, 999, 1)`).run();
   const operations = new OperationStore(db);
   operations.createSourceContext({ id: "ctx-file", kind: "telegram", sourceId: "file", rawText: "", attachmentIds: ["file-one"] });
-  const runtime = new AssistantRuntime(db, operations, new DeliveryStore(db), { destination: "42" });
+  const runtime = new AssistantRuntime(db, operations, new DeliveryStore(db), { binding });
   runtime.beginUserAttempt("ctx-file", "attempt-file", "turn-file");
   runtime.handleTerminal("turn-file");
   runtime.handleTerminal("turn-file");
@@ -86,7 +88,7 @@ test("assistant context exists before turn/start dispatch and later binds the re
   const db = createTestDatabase();
   const operations = new OperationStore(db);
   operations.createSourceContext({ id: "ctx", kind: "telegram", sourceId: "4", rawText: "go", attachmentIds: [] });
-  const runtime = new AssistantRuntime(db, operations, new DeliveryStore(db), { destination: "1" });
+  const runtime = new AssistantRuntime(db, operations, new DeliveryStore(db), { binding });
   runtime.prepareAttempt("ctx", "attempt", "user");
   assert.equal(runtime.current()?.turnId, "pending:attempt");
   assert.deepEqual(operations.listPendingSourceContexts(["telegram"]), []);
@@ -101,7 +103,7 @@ test("successful read-only tools do not force a recovery context after a failed 
   const db = createTestDatabase();
   const operations = new OperationStore(db);
   operations.createSourceContext({ id: "ctx-read", kind: "telegram", sourceId: "3", rawText: "status", attachmentIds: [] });
-  const runtime = new AssistantRuntime(db, operations, new DeliveryStore(db), { destination: "chat" });
+  const runtime = new AssistantRuntime(db, operations, new DeliveryStore(db), { binding });
   runtime.beginUserAttempt("ctx-read", "a-read", "t-read");
   const operation = operations.prepare({ contextId: "ctx-read", attemptId: "a-read", callId: "c", kind: "get_session_status", args: {} });
   operations.succeed(operation.id, { status: "idle" });

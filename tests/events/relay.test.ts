@@ -13,6 +13,7 @@ import { DeliveryStore } from "../../src/storage/delivery-store.ts";
 import { RuntimeStore } from "../../src/storage/runtime-store.ts";
 
 const mappingId = "mapping-1";
+const binding = { adapterId: "telegram", conversationKey: "telegram:42", destination: { chatId: "42" } } as const;
 
 class RelayEndpoint implements AppServerEndpoint {
   readonly id = "local"; state: AppServerEndpoint["state"] = "ready";
@@ -32,7 +33,7 @@ async function fixture(onTerminal?: (event: any) => void | Promise<void>) {
   runtime.setSession("local", "worker", mappingId, "managed", "idle");
   runtime.beginEpoch("local", "worker", mappingId, "baseline", 1);
   const deliveries = new DeliveryStore(db);
-  const relay = new EventRelay(db, new AppServerPool([endpoint], { maxConcurrentTurns: 4 }), registry, runtime, new FinalMessageStore(db), deliveries, { destination: "42", clock: { now: () => 100 }, ...(onTerminal ? { onTerminal } : {}) });
+  const relay = new EventRelay(db, new AppServerPool([endpoint], { maxConcurrentTurns: 4 }), registry, runtime, new FinalMessageStore(db), deliveries, { binding, clock: { now: () => 100 }, ...(onTerminal ? { onTerminal } : {}) });
   return { db, endpoint, registry, runtime, deliveries, relay };
 }
 

@@ -4,13 +4,15 @@ import { reconcileDeliveryStateEvents } from "../../src/events/delivery-status.t
 import { createTestDatabase } from "../../src/storage/database.ts";
 import { DeliveryStore } from "../../src/storage/delivery-store.ts";
 
+const binding = { adapterId: "telegram", conversationKey: "telegram:42", destination: { chatId: "42" } } as const;
+
 test("delivery metadata reconciliation visits only terminal rows missing their stable event", () => {
   const db = createTestDatabase();
   const deliveries = new DeliveryStore(db);
   for (let index = 0; index < 25; index += 1) {
-    const delivery = deliveries.prepare({ id: `delivery-${index}`, kind: "worker_final", destination: "42", body: "hidden", mandatory: true });
+    const delivery = deliveries.prepare({ id: `delivery-${index}`, kind: "worker_final", binding, body: "hidden", mandatory: true });
     deliveries.markDispatched(delivery.id);
-    deliveries.confirm(delivery.id, String(index));
+    deliveries.confirm(delivery.id, { messageId: index });
   }
   assert.equal(reconcileDeliveryStateEvents(db, deliveries), 25);
   assert.equal(reconcileDeliveryStateEvents(db, deliveries), 0);

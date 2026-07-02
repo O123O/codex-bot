@@ -6,6 +6,7 @@ import type { Database } from "../storage/database.ts";
 import type { DeliveryStore } from "../storage/delivery-store.ts";
 import type { RuntimeStore } from "../storage/runtime-store.ts";
 import type { AttachmentStore } from "../attachments/store.ts";
+import type { ConversationBinding } from "../chat/binding.ts";
 
 interface TerminalTurn { id: string; status: string; startedAt?: number | null; completedAt: number | null; items: Array<{ type: string; id: string; text?: string; phase?: string | null }> }
 interface ExpectedGeneration { mappingId: string; epochId: string }
@@ -27,7 +28,7 @@ export class EventRelay {
     private readonly runtime: RuntimeStore,
     private readonly finals: FinalMessageStore,
     private readonly deliveries: DeliveryStore,
-    private readonly options: { destination: string; clock: Clock; onTerminal?(event: TerminalObservation): void | Promise<void> },
+    private readonly options: { binding: ConversationBinding; clock: Clock; onTerminal?(event: TerminalObservation): void | Promise<void> },
     private readonly attachments?: Pick<AttachmentStore, "releaseTurn">,
   ) {}
 
@@ -42,7 +43,7 @@ export class EventRelay {
     if (!mapping || mapping.session.lifecycle_state !== "managed" || state?.managementState !== "managed") return;
     const nickname = mapping.nickname;
     const key = `permission:${endpointId}:${event.threadId}:${event.turnId ?? "unknown"}:${event.method}`;
-    this.deliveries.prepare({ id: key, kind: "permission", destination: this.options.destination, body: `[${nickname}] blocked by a permission request`, mandatory: true });
+    this.deliveries.prepare({ id: key, kind: "permission", binding: this.options.binding, body: `[${nickname}] blocked by a permission request`, mandatory: true });
     this.persistEvent(key, endpointId, event.threadId, event.turnId, "permission_blocked", { nickname, turnId: event.turnId ?? null, method: event.method });
     this.runtime.setSession(endpointId, event.threadId, mapping.session.mapping_id, "managed", "permissionBlocked");
   }
@@ -118,11 +119,11 @@ export class EventRelay {
       finalMessageId: messages.at(-1)?.id ?? null,
     });
     if (messages.length === 0 && turn.status !== "completed") {
-      this.deliveries.prepare({ id: `${eventId}:warning`, kind: "worker_warning", destination: this.options.destination, body: `[${nickname}] turn ${turn.id} ${turn.status} without a final response`, mandatory: true });
+      this.deliveries.prepare({ id: `${eventId}:warning`, kind: "worker_warning", binding: this.options.binding, body: `[${nickname}] turn ${turn.id} ${turn.status} without a final response`, mandatory: true });
     }
     for (const message of messages) {
       const status = turn.status === "completed" ? "" : ` · ${turn.status}`;
-      this.deliveries.prepare({ id: `worker:${endpointId}:${threadId}:${message.turnId}:${message.itemId}`, kind: "worker_final", destination: this.options.destination, body: `[${nickname}${status}] ${message.body}`, mandatory: true });
+      this.deliveries.prepare({ id: `worker:${endpointId}:${threadId}:${message.turnId}:${message.itemId}`, kind: "worker_final", binding: this.options.binding, body: `[${nickname}${status}] ${message.body}`, mandatory: true });
     }
     this.attachments?.releaseTurn(endpointId, threadId, turn.id);
     return true;

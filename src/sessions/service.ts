@@ -2,6 +2,7 @@ import type { AppServerPool } from "../app-server/pool.ts";
 import { AppError } from "../core/errors.ts";
 import type { RegistrySession, SessionRegistry } from "../registry/session-registry.ts";
 import type { DeliveryStore } from "../storage/delivery-store.ts";
+import type { ConversationBinding } from "../chat/binding.ts";
 import type { RuntimeStore } from "../storage/runtime-store.ts";
 import type { FinalMessageStore, LogicalFinalMessage } from "./final-messages.ts";
 import type { ProjectWorkspacePolicy } from "./project-workspace.ts";
@@ -69,32 +70,32 @@ export class SessionService {
   managedProjectRoot(nickname: string): string { return this.managed(nickname).project_dir; }
 
   collect(nickname: string, count: number): Promise<LogicalFinalMessage[]>;
-  collect(nickname: string, count: number, options: { direct?: false; destination?: string }): Promise<LogicalFinalMessage[]>;
-  collect(nickname: string, count: number, options: { direct: true; destination: string; deliveryKey?: string; onSelected?(messageIds: readonly string[]): void }): Promise<Array<{ deliveryId: string }>>;
-  async collect(nickname: string, count: number, options: { direct?: boolean; destination?: string; deliveryKey?: string; onSelected?(messageIds: readonly string[]): void } = {}): Promise<LogicalFinalMessage[] | Array<{ deliveryId: string }>> {
+  collect(nickname: string, count: number, options: { direct?: false; binding?: ConversationBinding }): Promise<LogicalFinalMessage[]>;
+  collect(nickname: string, count: number, options: { direct: true; binding: ConversationBinding; deliveryKey?: string; onSelected?(messageIds: readonly string[]): void }): Promise<Array<{ deliveryId: string }>>;
+  async collect(nickname: string, count: number, options: { direct?: boolean; binding?: ConversationBinding; deliveryKey?: string; onSelected?(messageIds: readonly string[]): void } = {}): Promise<LogicalFinalMessage[] | Array<{ deliveryId: string }>> {
     const session = this.required(nickname);
     const messages = this.finals.list(session.endpoint, session.thread_id, count);
     if (!options.direct) return messages;
-    if (!options.destination) throw new TypeError("destination is required for direct collection");
+    if (!options.binding) throw new TypeError("binding is required for direct collection");
     options.onSelected?.(messages.map((message) => message.id));
-    return this.prepareCollection(nickname, session, messages, options.destination, options.deliveryKey ?? "direct-collection");
+    return this.prepareCollection(nickname, session, messages, options.binding, options.deliveryKey ?? "direct-collection");
   }
 
-  async collectSelected(nickname: string, messageIds: readonly string[], options: { destination: string; deliveryKey: string }): Promise<Array<{ deliveryId: string }>> {
+  async collectSelected(nickname: string, messageIds: readonly string[], options: { binding: ConversationBinding; deliveryKey: string }): Promise<Array<{ deliveryId: string }>> {
     const session = this.required(nickname);
     const messages = messageIds.map((id) => {
       const message = this.finals.getById(id);
       if (!message || message.endpointId !== session.endpoint || message.threadId !== session.thread_id) throw new AppError("OPERATION_CONFLICT", `collection message does not belong to ${nickname}: ${id}`);
       return message;
     });
-    return this.prepareCollection(nickname, session, messages, options.destination, options.deliveryKey);
+    return this.prepareCollection(nickname, session, messages, options.binding, options.deliveryKey);
   }
 
-  private prepareCollection(nickname: string, session: { endpoint: string; thread_id: string }, messages: readonly LogicalFinalMessage[], destination: string, deliveryKey: string): Array<{ deliveryId: string }> {
+  private prepareCollection(nickname: string, session: { endpoint: string; thread_id: string }, messages: readonly LogicalFinalMessage[], binding: ConversationBinding, deliveryKey: string): Array<{ deliveryId: string }> {
     return messages.map((message) => ({
       deliveryId: this.deliveries.prepare({
-        id: `collect:${deliveryKey}:${session.endpoint}:${session.thread_id}:${message.turnId}:${message.itemId}:${destination}`,
-        kind: "collection", destination, body: `[${nickname}] ${message.body}`, mandatory: true,
+        id: `collect:${deliveryKey}:${session.endpoint}:${session.thread_id}:${message.turnId}:${message.itemId}:${binding.adapterId}:${binding.conversationKey}`,
+        kind: "collection", binding, body: `[${nickname}] ${message.body}`, mandatory: true,
       }).id,
     }));
   }

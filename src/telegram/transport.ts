@@ -1,6 +1,5 @@
 import { globalAgent as httpsGlobalAgent } from "node:https";
 import { Agent, EnvHttpProxyAgent, fetch as undiciFetch } from "undici";
-import type { ChatDeliveryAdapter } from "../chat/contracts.ts";
 import { TelegramApi } from "./api.ts";
 
 export type PollingDispatcherConfiguration =
@@ -22,7 +21,7 @@ type DispatcherFetch = (
 
 export interface TelegramTransports {
   polling: Pick<TelegramApi, "getUpdates" | "downloadFile">;
-  delivery: ChatDeliveryAdapter;
+  delivery: Pick<TelegramApi, "sendMessage" | "sendDocument">;
   closePolling(): Promise<void>;
   closeDelivery(): Promise<void>;
 }

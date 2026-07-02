@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import type { ConversationBinding, JsonValue } from "../chat/binding.ts";
 import type { DeliveryState } from "../core/types.ts";
 import type { Database } from "./database.ts";
 import { inTransaction } from "./database.ts";
@@ -6,28 +7,27 @@ import { inTransaction } from "./database.ts";
 export interface DeliveryRecord {
   id: string;
   kind: string;
-  destination: string;
+  binding: ConversationBinding;
   body: string;
   attachmentId?: string;
   attachmentScopeId?: string;
-  replyTo?: number;
   mandatory: boolean;
   state: DeliveryState;
-  telegramMessageId?: string;
+  receipt?: JsonValue;
   attemptCount: number;
 }
 
 export class DeliveryStore {
   constructor(private readonly db: Database) {}
 
-  prepare(input: { kind: string; destination: string; body: string; mandatory: boolean; id?: string; attachmentId?: string; attachmentScopeId?: string; replyTo?: number }): DeliveryRecord {
+  prepare(input: { kind: string; binding: ConversationBinding; body: string; mandatory: boolean; id?: string; attachmentId?: string; attachmentScopeId?: string }): DeliveryRecord {
     const id = input.id ?? `delivery_${randomUUID()}`;
     const existing = this.get(id);
     if (existing) return existing;
     return this.insert(id, input);
   }
 
-  prepareAttachment(input: { kind: string; destination: string; body: string; mandatory: boolean; id?: string; attachmentId: string; attachmentScopeId: string; replyTo?: number }): DeliveryRecord {
+  prepareAttachment(input: { kind: string; binding: ConversationBinding; body: string; mandatory: boolean; id?: string; attachmentId: string; attachmentScopeId: string }): DeliveryRecord {
     const id = input.id ?? `delivery_${randomUUID()}`;
     return inTransaction(this.db, () => {
       const existing = this.get(id);
@@ -40,12 +40,15 @@ export class DeliveryStore {
     });
   }
 
-  private insert(id: string, input: { kind: string; destination: string; body: string; mandatory: boolean; attachmentId?: string; attachmentScopeId?: string; replyTo?: number }): DeliveryRecord {
+  private insert(id: string, input: { kind: string; binding: ConversationBinding; body: string; mandatory: boolean; attachmentId?: string; attachmentScopeId?: string }): DeliveryRecord {
     const now = Date.now();
     this.db.prepare(`INSERT INTO deliveries
-      (id, kind, destination, body, attachment_id, attachment_scope_id, reply_to, mandatory, state, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'prepared', ?, ?)`)
-      .run(id, input.kind, input.destination, input.body, input.attachmentId ?? null, input.attachmentScopeId ?? null, input.replyTo ?? null, input.mandatory ? 1 : 0, now, now);
+      (id, kind, destination, body, attachment_id, attachment_scope_id, reply_to, mandatory, state, created_at, updated_at,
+        adapter_id, conversation_key, destination_json, reply_json)
+      VALUES (?, ?, ?, ?, ?, ?, NULL, ?, 'prepared', ?, ?, ?, ?, ?, ?)`)
+      .run(id, input.kind, JSON.stringify(input.binding.destination), input.body, input.attachmentId ?? null, input.attachmentScopeId ?? null,
+        input.mandatory ? 1 : 0, now, now, input.binding.adapterId, input.binding.conversationKey,
+        JSON.stringify(input.binding.destination), input.binding.reply === undefined ? null : JSON.stringify(input.binding.reply));
     return this.get(id) as DeliveryRecord;
   }
 
@@ -55,14 +58,18 @@ export class DeliveryStore {
     return {
       id: String(row.id),
       kind: String(row.kind),
-      destination: String(row.destination),
+      binding: {
+        adapterId: String(row.adapter_id),
+        conversationKey: String(row.conversation_key),
+        destination: JSON.parse(String(row.destination_json)),
+        ...(row.reply_json ? { reply: JSON.parse(String(row.reply_json)) as JsonValue } : {}),
+      },
       body: String(row.body),
       ...(row.attachment_id ? { attachmentId: String(row.attachment_id) } : {}),
       ...(row.attachment_scope_id ? { attachmentScopeId: String(row.attachment_scope_id) } : {}),
-      ...(row.reply_to !== null && row.reply_to !== undefined ? { replyTo: Number(row.reply_to) } : {}),
       mandatory: Number(row.mandatory) === 1,
       state: String(row.state) as DeliveryState,
-      ...(row.telegram_message_id ? { telegramMessageId: String(row.telegram_message_id) } : {}),
+      ...(row.receipt_json ? { receipt: JSON.parse(String(row.receipt_json)) as JsonValue } : {}),
       attemptCount: Number(row.attempt_count),
     };
   }
@@ -71,10 +78,10 @@ export class DeliveryStore {
     this.db.prepare("UPDATE deliveries SET state = 'dispatched', attempt_count = attempt_count + 1, updated_at = ? WHERE id = ?").run(Date.now(), id);
   }
 
-  confirm(id: string, telegramMessageId: string): void {
+  confirm(id: string, receipt: JsonValue): void {
     inTransaction(this.db, () => {
-      const changed = this.db.prepare("UPDATE deliveries SET state = 'confirmed', telegram_message_id = ?, updated_at = ? WHERE id = ? AND state <> 'confirmed'")
-        .run(telegramMessageId, Date.now(), id).changes;
+      const changed = this.db.prepare("UPDATE deliveries SET state = 'confirmed', receipt_json = ?, updated_at = ? WHERE id = ? AND state <> 'confirmed'")
+        .run(JSON.stringify(receipt), Date.now(), id).changes;
       if (changed) this.releaseAttachment(id);
     });
   }
@@ -101,15 +108,16 @@ export class DeliveryStore {
 
   recoverAfterCrash(): DeliveryRecord[] {
     return inTransaction(this.db, () => {
-      const optional = this.db.prepare("SELECT id, destination FROM deliveries WHERE state = 'dispatched' AND mandatory = 0").all() as Array<{ id: string; destination: string }>;
+      const optional = this.db.prepare("SELECT id FROM deliveries WHERE state = 'dispatched' AND mandatory = 0").all() as Array<{ id: string }>;
       const recovered = this.db.prepare("SELECT id FROM deliveries WHERE state = 'dispatched' ORDER BY created_at, id").all() as Array<{ id: string }>;
       this.db.prepare("UPDATE deliveries SET state = 'uncertain', updated_at = ? WHERE state = 'dispatched'").run(Date.now());
       for (const delivery of optional) {
         this.releaseAttachment(delivery.id);
+        const original = this.get(delivery.id)!;
         this.prepare({
           id: `delivery-warning:${delivery.id}`,
           kind: "delivery_warning",
-          destination: delivery.destination,
+          binding: original.binding,
           body: `[system] delivery ${delivery.id} could not be confirmed and was not automatically retried`,
           mandatory: true,
         });

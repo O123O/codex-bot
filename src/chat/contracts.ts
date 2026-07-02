@@ -1,13 +1,16 @@
+import type { JsonValue } from "./binding.ts";
+
 export interface ChatDeliveryAdapter {
-  sendMessage(destination: string | number, body: string, replyTo?: number): Promise<{ message_id: number }>;
-  sendDocument?(destination: string | number, file: {
+  readonly id: string;
+  sendMessage(destination: JsonValue, body: string, reply?: JsonValue): Promise<JsonValue>;
+  sendDocument?(destination: JsonValue, file: {
     stream: AsyncIterable<Uint8Array | string>;
     size: number;
     displayName: string;
     mediaType: string;
     caption?: string;
-    replyTo?: number;
-  }): Promise<{ message_id: number }>;
+    reply?: JsonValue;
+  }): Promise<JsonValue>;
 }
 
 export interface ChatAdapter {

@@ -5,6 +5,9 @@ import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 import { AttachmentStore, type FileHandleId } from "./attachments/store.ts";
 import type { ChatAdapter } from "./chat/contracts.ts";
+import type { ConversationBinding } from "./chat/binding.ts";
+import { ChatAdapterRegistry } from "./chat/adapter-registry.ts";
+import { DeliveryWorker } from "./chat/delivery-worker.ts";
 import { LocalEndpoint } from "./app-server/local-endpoint.ts";
 import { AppServerPool } from "./app-server/pool.ts";
 import { SUPPORTED_CODEX_VERSION } from "./app-server/protocol.ts";
@@ -37,7 +40,6 @@ import { OperationStore } from "./storage/operation-store.ts";
 import { RuntimeStore } from "./storage/runtime-store.ts";
 import { SessionDashboardStore } from "./storage/session-dashboard-store.ts";
 import { TelegramChatAdapter } from "./telegram/chat-adapter.ts";
-import { DeliveryWorker } from "./telegram/delivery-worker.ts";
 
 const assistantAssetRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../assets/assistant");
 const fullAccessWarning = "QiYan assistant is running non-interactively with full filesystem access and approvals disabled.";
@@ -78,6 +80,11 @@ export async function buildProductionApp(
   options: { chdir?: (path: string) => void } = {},
 ): Promise<BotApp> {
   const token = randomBytes(32).toString("base64url");
+  const administrativeBinding: ConversationBinding = {
+    adapterId: "telegram",
+    conversationKey: `telegram:${config.telegramDestinationChatId}`,
+    destination: { chatId: String(config.telegramDestinationChatId) },
+  };
 
   let assistantDir = config.assistantWorkdir;
   let dataDir = config.dataDir;
@@ -177,17 +184,17 @@ export async function buildProductionApp(
           sessions: {},
         });
         for (const [index, warning] of registry.warnings().entries()) {
-          deliveries.prepare({ id: `registry-startup-warning:${index}`, kind: "system_warning", destination: String(config.telegramDestinationChatId), body: `[system] ${warning}`, mandatory: true });
+          deliveries.prepare({ id: `registry-startup-warning:${index}`, kind: "system_warning", binding: administrativeBinding, body: `[system] ${warning}`, mandatory: true });
         }
         for (const [index, warning] of assistantWarnings.entries()) {
-          deliveries.prepare({ id: `assistant-workspace-warning:${index}`, kind: "system_warning", destination: String(config.telegramDestinationChatId), body: `[system] ${warning}`, mandatory: true });
+          deliveries.prepare({ id: `assistant-workspace-warning:${index}`, kind: "system_warning", binding: administrativeBinding, body: `[system] ${warning}`, mandatory: true });
         }
         const accessWarning = assistantAccessWarning(config.assistantSandboxMode);
         if (accessWarning) {
           deliveries.prepare({
             id: "assistant-full-access-warning",
             kind: "system_warning",
-            destination: String(config.telegramDestinationChatId),
+            binding: administrativeBinding,
             body: `[system] ${accessWarning}`,
             mandatory: true,
           });
@@ -213,7 +220,7 @@ export async function buildProductionApp(
     {
       name: "mcp",
       start: async () => {
-        assistant = new AssistantRuntime(db, operations, deliveries, { destination: String(config.telegramDestinationChatId) });
+        assistant = new AssistantRuntime(db, operations, deliveries, { binding: administrativeBinding });
         const actions = buildActions();
         const tools = createAssistantTools(operations, actions, { maxCollectCount: config.maxCollectCount });
         mcp = new LoopbackMcpServer(tools, { current: () => assistant.current() }, { host: config.mcpHost, port: config.mcpPort, token, allowedClientProcess: () => assistantEndpoint?.mcpClientIdentity });
@@ -245,7 +252,7 @@ export async function buildProductionApp(
           onError: () => recordBackgroundFailure("session observation"),
         });
         relay = new EventRelay(db, pool, registry, runtime, finals, deliveries, {
-          destination: String(config.telegramDestinationChatId),
+          binding: administrativeBinding,
           clock: { now: () => Date.now() },
           onTerminal: (event) => observations.observeTerminal(event),
         }, attachments);
@@ -345,7 +352,7 @@ export async function buildProductionApp(
       name: "delivery",
       start: async () => {
         chat = new TelegramChatAdapter(db, operations, attachments, { token: config.telegramBotToken, ownerId: config.telegramOwnerId, maxMessageBytes: config.attachmentMaxBytes, onAccepted: async (contextId) => { enqueueSource(contextId); } });
-        deliveryWorker = new DeliveryWorker(deliveries, chat.delivery, attachments, undefined, (delivery) => { persistDeliveryState(delivery); });
+        deliveryWorker = new DeliveryWorker(deliveries, new ChatAdapterRegistry([chat.delivery]), attachments, undefined, (delivery) => { persistDeliveryState(delivery); });
         deliveryWorker.start();
       },
       stop: async () => { await deliveryWorker.stop(); await chat.close(); },
@@ -487,7 +494,7 @@ export async function buildProductionApp(
       collect_messages: async (args, context) => args.direct
         ? sessions.collect(args.nickname, args.count, {
           direct: true,
-          destination: String(config.telegramDestinationChatId),
+          binding: administrativeBinding,
           deliveryKey: context.sourceContextId,
           onSelected: (messageIds) => context.checkpoint({ messageIds }),
         })
@@ -554,7 +561,7 @@ export async function buildProductionApp(
         await renderDashboardSafely();
         return result;
       },
-      send_chat_message: async (args, context) => ({ deliveryId: deliveries.prepare({ id: `chat:${context.sourceContextId}:${context.attemptId}:${context.callId}`, kind: "chat", destination: String(config.telegramDestinationChatId), body: args.content, mandatory: false, replyTo: args.reply_to }).id }),
+      send_chat_message: async (args, context) => ({ deliveryId: deliveries.prepare({ id: `chat:${context.sourceContextId}:${context.attemptId}:${context.callId}`, kind: "chat", binding: administrativeBinding, body: args.content, mandatory: false }).id }),
       prepare_chat_attachment: async (args, context) => {
         const ownerRoot = args.owner === "assistant" ? assistantDir : sessions.managedProjectRoot(args.owner);
         const prepared = await attachments.prepareOutbound(context.sourceContextId, ownerRoot, args.relative_path, undefined, undefined, operationFileHandle(context.sourceContextId, context.attemptId, context.callId));
@@ -565,9 +572,8 @@ export async function buildProductionApp(
         void attachment;
         const delivery = deliveries.prepareAttachment({
           id: `chat-attachment:${context.sourceContextId}:${context.attemptId}:${context.callId}`,
-          kind: "attachment", destination: String(config.telegramDestinationChatId), body: args.caption ?? "", mandatory: false,
+          kind: "attachment", binding: administrativeBinding, body: args.caption ?? "", mandatory: false,
           attachmentId: args.file_handle, attachmentScopeId: context.sourceContextId,
-          replyTo: args.reply_to,
         });
         return { deliveryId: delivery.id };
       },
@@ -593,7 +599,7 @@ export async function buildProductionApp(
     deliveries.prepare({
       id: `dashboard-render-warning:${state.failureGeneration}`,
       kind: "system_warning",
-      destination: String(config.telegramDestinationChatId),
+      binding: administrativeBinding,
       body: "[system] session dashboard rendering failed; durable state is safe and rendering will retry",
       mandatory: true,
     });
@@ -925,10 +931,10 @@ export async function buildProductionApp(
         } else if (operation.kind === "collect_messages") {
           const checkpoint = operation.receipt as { messageIds?: string[] } | undefined;
           const result = Array.isArray(checkpoint?.messageIds)
-            ? await sessions.collectSelected(args.nickname, checkpoint.messageIds, { destination: String(config.telegramDestinationChatId), deliveryKey: operation.contextId })
+            ? await sessions.collectSelected(args.nickname, checkpoint.messageIds, { binding: administrativeBinding, deliveryKey: operation.contextId })
             : await sessions.collect(args.nickname, args.count, {
               direct: true,
-              destination: String(config.telegramDestinationChatId),
+              binding: administrativeBinding,
               deliveryKey: operation.contextId,
               onSelected: (messageIds) => operations.checkpoint(operation.id, { messageIds }),
             });
@@ -1156,7 +1162,7 @@ export async function buildProductionApp(
     deliveries.prepare({
       id: `endpoint-unavailable:${target.id}:${endpointIncident}`,
       kind: "system_warning",
-      destination: String(config.telegramDestinationChatId),
+      binding: administrativeBinding,
       body: `[system] ${target.id} app-server is unavailable; reconnecting`,
       mandatory: true,
     });
@@ -1196,7 +1202,7 @@ export async function buildProductionApp(
         await startAuthenticatedAssistantEndpoint(assistantEndpoint, assistantProfile);
       } catch (error) {
         if (error instanceof AppError && error.details?.reason === "assistant_auth_required") {
-          recordAssistantAuthenticationFailure(deliveries, String(config.telegramDestinationChatId), endpointIncident);
+          recordAssistantAuthenticationFailure(deliveries, administrativeBinding, endpointIncident);
         }
         throw error;
       }
@@ -1219,7 +1225,7 @@ export async function buildProductionApp(
     deliveries.prepare({
       id: `session-unavailable:${endpointId}:${threadId}:${endpointIncident}`,
       kind: "worker_warning",
-      destination: String(config.telegramDestinationChatId),
+      binding: administrativeBinding,
       body: `[${nickname}] unavailable; its registered thread and project directory require verification`,
       mandatory: true,
     });
@@ -1249,7 +1255,7 @@ export async function buildProductionApp(
     try {
       backgroundIncident += 1;
       const id = `background-failure:${backgroundIncident}`;
-      deliveries.prepare({ id, kind: "system_warning", destination: String(config.telegramDestinationChatId), body: `[system] ${label} failed; durable reconciliation will retry`, mandatory: true });
+      deliveries.prepare({ id, kind: "system_warning", binding: administrativeBinding, body: `[system] ${label} failed; durable reconciliation will retry`, mandatory: true });
       const identity = registry.snapshot().assistant;
       db.prepare(`INSERT OR IGNORE INTO events(id, endpoint_id, thread_id, kind, payload_json, state, created_at)
         VALUES (?, ?, ?, 'background_failure', ?, 'pending', ?)`)
@@ -1285,7 +1291,7 @@ export async function buildProductionApp(
         deliveries.prepare({
           id: `registry-invalid:${Date.now()}`,
           kind: "system_warning",
-          destination: String(config.telegramDestinationChatId),
+          binding: administrativeBinding,
           body: "[system] sessions.json replacement was rejected; the last valid registry remains active",
           mandatory: true,
         });

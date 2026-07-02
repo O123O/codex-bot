@@ -335,10 +335,11 @@ test("collect returns assistant bodies or creates chronological direct deliverie
   finals.persistTerminalTurn("local", "thread", { id: "one", status: "completed", completedAt: 1, items: [{ type: "agentMessage", id: "i1", text: "old", phase: "final_answer" }] }, 1);
   finals.persistTerminalTurn("local", "thread", { id: "two", status: "completed", completedAt: 2, items: [{ type: "agentMessage", id: "i2", text: "new", phase: "final_answer" }] }, 2);
   assert.deepEqual((await service.collect("payments", 2)).map((message) => message.body), ["old", "new"]);
-  const receipt = await service.collect("payments", 2, { direct: true, destination: "chat", deliveryKey: "request-1" });
+  const binding = { adapterId: "telegram", conversationKey: "telegram:chat", destination: { chatId: "chat" } } as const;
+  const receipt = await service.collect("payments", 2, { direct: true, binding, deliveryKey: "request-1" });
   assert.equal(receipt.length, 2);
   assert.deepEqual(deliveries.listReady().map((delivery) => delivery.body), ["[payments] old", "[payments] new"]);
-  const secondRequest = await service.collect("payments", 2, { direct: true, destination: "chat", deliveryKey: "request-2" });
+  const secondRequest = await service.collect("payments", 2, { direct: true, binding, deliveryKey: "request-2" });
   assert.notDeepEqual(secondRequest, receipt);
   assert.equal(deliveries.listReady().length, 4);
   await assert.rejects(service.collect("payments", 21), RangeError);
@@ -350,11 +351,12 @@ test("direct collection recovery fills a frozen partial selection and accepts an
   const two = finals.persistTerminalTurn("local", "thread", { id: "two", status: "completed", completedAt: 2, items: [{ type: "agentMessage", id: "i2", text: "two", phase: "final_answer" }] }, 2)[0]!;
   const three = finals.persistTerminalTurn("local", "thread", { id: "three", status: "completed", completedAt: 3, items: [{ type: "agentMessage", id: "i3", text: "three", phase: "final_answer" }] }, 3)[0]!;
   const selected = [one.id, two.id, three.id];
-  await service.collectSelected("payments", selected.slice(0, 1), { destination: "chat", deliveryKey: "frozen" });
-  const recovered = await service.collectSelected("payments", selected, { destination: "chat", deliveryKey: "frozen" });
+  const binding = { adapterId: "telegram", conversationKey: "telegram:chat", destination: { chatId: "chat" } } as const;
+  await service.collectSelected("payments", selected.slice(0, 1), { binding, deliveryKey: "frozen" });
+  const recovered = await service.collectSelected("payments", selected, { binding, deliveryKey: "frozen" });
   assert.equal(recovered.length, 3);
   assert.equal(deliveries.listReady().filter((delivery) => delivery.kind === "collection").length, 3);
-  assert.deepEqual(await service.collectSelected("payments", [], { destination: "chat", deliveryKey: "empty" }), []);
+  assert.deepEqual(await service.collectSelected("payments", [], { binding, deliveryKey: "empty" }), []);
 });
 
 test("goal operations replace, pause, resume and cancel without exposing completion", async () => {

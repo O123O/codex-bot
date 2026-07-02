@@ -1,7 +1,9 @@
-import { AppError } from "../core/errors.ts";
 import type { AttachmentStore, FileHandleId } from "../attachments/store.ts";
+import { AppError } from "../core/errors.ts";
 import type { DeliveryRecord, DeliveryStore } from "../storage/delivery-store.ts";
-import type { ChatDeliveryAdapter } from "../chat/contracts.ts";
+import type { JsonValue } from "./binding.ts";
+import type { ChatDeliveryAdapter } from "./contracts.ts";
+import type { ChatAdapterRegistry } from "./adapter-registry.ts";
 
 export class DeliveryWorker {
   private timer: ReturnType<typeof setInterval> | undefined;
@@ -9,7 +11,7 @@ export class DeliveryWorker {
 
   constructor(
     private readonly store: DeliveryStore,
-    private readonly api: ChatDeliveryAdapter,
+    private readonly adapters: ChatAdapterRegistry,
     private readonly attachments?: AttachmentStore,
     private readonly sleep: (ms: number) => Promise<void> = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
     private readonly onStateChange: (delivery: DeliveryRecord, error?: unknown) => Promise<void> | void = () => undefined,
@@ -18,16 +20,15 @@ export class DeliveryWorker {
   async processOne(id: string): Promise<void> {
     const delivery = this.store.get(id);
     if (!delivery || delivery.state === "confirmed") return;
-    if (delivery.state === "uncertain" && !delivery.mandatory) {
-      throw new AppError("DELIVERY_UNCERTAIN", `optional delivery ${id} may already have been sent`);
-    }
+    if (delivery.state === "uncertain" && !delivery.mandatory) throw new AppError("DELIVERY_UNCERTAIN", `optional delivery ${id} may already have been sent`);
     const body = delivery.state === "uncertain" ? this.recoveryEnvelope(delivery.body, delivery.id) : delivery.body;
+    const adapter = this.adapters.delivery(delivery.binding.adapterId);
     try {
       this.store.markDispatched(id);
-      const result = delivery.attachmentId
-        ? await this.sendAttachment(delivery, body)
-        : await this.api.sendMessage(delivery.destination, body, delivery.replyTo);
-      this.store.confirm(id, String(result.message_id));
+      const receipt = delivery.attachmentId
+        ? await this.sendAttachment(adapter, delivery, body)
+        : await adapter.sendMessage(delivery.binding.destination, body, delivery.binding.reply);
+      this.store.confirm(id, receipt);
       await this.notify(this.store.get(id)!);
     } catch (error) {
       if (isRateLimitError(error)) this.store.markPrepared(id);
@@ -37,7 +38,7 @@ export class DeliveryWorker {
         this.store.prepare({
           id: `delivery-warning:${id}`,
           kind: "delivery_warning",
-          destination: delivery.destination,
+          binding: delivery.binding,
           body: `[system] delivery ${id} could not be confirmed and was not automatically retried`,
           mandatory: true,
         });
@@ -75,16 +76,23 @@ export class DeliveryWorker {
 
   private async notify(delivery: DeliveryRecord, error?: unknown): Promise<void> {
     try { await this.onStateChange(delivery, error); }
-    catch { /* delivery state is authoritative; maintenance can rebuild metadata */ }
+    catch { /* delivery state is authoritative */ }
   }
 
-  private async sendAttachment(delivery: NonNullable<ReturnType<DeliveryStore["get"]>>, body: string): Promise<{ message_id: number }> {
-    if (!delivery.attachmentId || !delivery.attachmentScopeId || !this.attachments || !this.api.sendDocument) throw new AppError("ATTACHMENT_INVALID", "attachment delivery is not configured");
+  private async sendAttachment(adapter: ChatDeliveryAdapter, delivery: DeliveryRecord, body: string): Promise<JsonValue> {
+    if (!delivery.attachmentId || !delivery.attachmentScopeId || !this.attachments || !adapter.sendDocument) throw new AppError("ATTACHMENT_INVALID", "attachment delivery is not configured");
     let lastError: unknown;
     for (let attempt = 0; attempt < 4; attempt += 1) {
       const upload = await this.attachments.openForUpload(delivery.attachmentScopeId, delivery.attachmentId as FileHandleId);
       try {
-        return await this.api.sendDocument(delivery.destination, { stream: upload.stream, size: upload.size, displayName: upload.displayName, mediaType: upload.mediaType, ...(body ? { caption: body } : {}), ...(delivery.replyTo === undefined ? {} : { replyTo: delivery.replyTo }) });
+        return await adapter.sendDocument(delivery.binding.destination, {
+          stream: upload.stream,
+          size: upload.size,
+          displayName: upload.displayName,
+          mediaType: upload.mediaType,
+          ...(body ? { caption: body } : {}),
+          ...(delivery.binding.reply === undefined ? {} : { reply: delivery.binding.reply }),
+        });
       } catch (error) {
         lastError = error;
         if (!isRateLimitError(error) || attempt === 3) throw error;

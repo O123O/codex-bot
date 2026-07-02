@@ -6,12 +6,12 @@ export function persistDeliveryStateEvent(db: Database, delivery: DeliveryRecord
   const id = `delivery-status:${delivery.id}:${delivery.state}`;
   return db.prepare(`INSERT OR IGNORE INTO events(id, endpoint_id, thread_id, kind, payload_json, state, created_at)
     VALUES (?, 'chat', ?, 'delivery_status', ?, 'pending', ?)`)
-    .run(id, delivery.destination, JSON.stringify({
+    .run(id, delivery.binding.conversationKey, JSON.stringify({
       deliveryId: delivery.id,
       kind: delivery.kind,
       state: delivery.state,
       mandatory: delivery.mandatory,
-      telegramMessageId: delivery.telegramMessageId ?? null,
+      receipt: delivery.receipt ?? null,
     }), Date.now()).changes === 1;
 }
 
