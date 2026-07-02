@@ -8,12 +8,12 @@ export interface ToolCallContext { sourceContextId: string; attemptId: string; t
 export type ToolHandler = (context: ToolCallContext, args: unknown) => Promise<unknown>;
 export interface ToolActionContext extends ToolCallContext { operationId: string; operationCreatedAt: number; operationSequence: number; checkpoint(receipt: unknown): void }
 
-const nickname = z.string().min(1);
+const nickname = z.string().regex(/^[a-z0-9][a-z0-9_-]{0,63}$/u);
 export const ASSISTANT_TOOL_SCHEMAS = {
   list_managed_sessions: z.object({}).strict(),
   discover_sessions: z.object({ endpoint: z.string().optional(), search: z.string().optional(), cwd: z.string().optional(), cursor: z.string().optional(), limit: z.number().int().positive().max(100).optional() }).strict(),
   get_session_status: z.object({ nickname: nickname }).strict(),
-  create_session: z.object({ nickname, project_dir: z.string().min(1), endpoint: z.string().optional() }).strict(),
+  create_session: z.object({ nickname, project_dir: z.string().min(1).optional(), endpoint: z.string().optional() }).strict(),
   register_session: z.object({ nickname, thread_id: z.string().min(1), project_dir: z.string().min(1), endpoint: z.string().optional() }).strict(),
   adopt_session: z.object({ nickname, thread_id: z.string().min(1), endpoint: z.string().optional(), project_dir: z.string().optional() }).strict(),
   rename_session: z.object({ old_nickname: nickname, new_nickname: nickname }).strict(),

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, readlink, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readlink, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
@@ -25,11 +25,13 @@ async function fixtureWithTemplates(policy: string, options: { nestedInGit?: boo
   const policyTemplate = join(assets, "AGENTS.md");
   const dataDir = join(root, "backend-data");
   const registryPath = join(root, "backend-registry", "sessions.json");
+  const userHome = join(root, "home");
+  await mkdir(userHome);
   await writeFile(policyTemplate, policy);
   return {
     workdir,
     policyTemplate,
-    options: { workdir, dataDir, registryPath, policyTemplatePath: policyTemplate },
+    options: { workdir, dataDir, registryPath, policyTemplatePath: policyTemplate, userHome },
   };
 }
 
@@ -39,7 +41,29 @@ test("installs the managed policy and returns the generated dashboard path", asy
   assert.equal(await readFile(join(prepared.root, "AGENTS.md"), "utf8"), "policy-v1\n");
   assert.equal((await readFile(join(prepared.root, ".qiyan-bot-agents.sha256"), "utf8")).trim(), sha256("policy-v1\n"));
   assert.equal(prepared.dashboardPath, join(prepared.root, "session-status.json"));
+  assert.equal(prepared.contextPath, join(prepared.root, "assistant-context.json"));
+  assert.deepEqual(JSON.parse(await readFile(prepared.contextPath, "utf8")), {
+    version: 1,
+    user_home: await realpath(fixture.options.userHome),
+    default_projects_root: join(await realpath(fixture.options.userHome), "qiyan-bot-projects"),
+  });
+  assert.equal((await stat(prepared.contextPath)).mode & 0o777, 0o400);
   await assert.rejects(readFile(prepared.dashboardPath), (error: unknown) => (error as NodeJS.ErrnoException).code === "ENOENT");
+});
+
+test("updates an unchanged generated context and rejects manual replacement", async () => {
+  const update = await fixtureWithTemplates("policy-v1\n");
+  const initial = await prepareAssistantWorkspace(update.options);
+  const alternateHome = join(dirname(update.options.userHome), "alternate-home");
+  await mkdir(alternateHome);
+  await prepareAssistantWorkspace({ ...update.options, userHome: alternateHome });
+  assert.equal(JSON.parse(await readFile(initial.contextPath, "utf8")).user_home, await realpath(alternateHome));
+
+  const fixture = await fixtureWithTemplates("policy-v1\n");
+  const first = await prepareAssistantWorkspace(fixture.options);
+  await chmod(first.contextPath, 0o600);
+  await writeFile(first.contextPath, "manual\n");
+  await assert.rejects(prepareAssistantWorkspace(fixture.options), /assistant-context\.json.*modified/);
 });
 
 test("upgrades an unmodified managed policy", async () => {

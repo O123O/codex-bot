@@ -23,6 +23,7 @@ test("loadConfig applies bounded defaults", () => {
   assert.equal(config.maxCollectCount, 20);
   assert.equal(config.mcpHost, "127.0.0.1");
   assert.equal(config.assistantWorkdir, "/home/test-user/.qiyan-bot/assistant");
+  assert.equal(config.userHome, "/home/test-user");
   assert.equal(config.dataDir, "/home/test-user/.qiyan-bot/data");
   assert.equal(config.sessionRegistryPath, "/home/test-user/.qiyan-bot/data/sessions.json");
   assert.equal(config.assistantSandboxMode, "danger-full-access");

@@ -24,6 +24,7 @@ test("production prepares the configured assistant workdir before endpoint start
     telegramBotToken: "test-token",
     telegramOwnerId: 42,
     telegramDestinationChatId: 42,
+    userHome: root,
     assistantWorkdir: workdir,
     dataDir,
     sessionRegistryPath: registryPath,
@@ -43,6 +44,12 @@ test("production prepares the configured assistant workdir before endpoint start
   assert.equal(await readFile(join(workdir, "AGENTS.md"), "utf8"), await readFile(policyAsset, "utf8"));
   assert.match(await readFile(join(workdir, ".qiyan-bot-agents.sha256"), "utf8"), /^[a-f0-9]{64}\n$/u);
   assert.deepEqual(JSON.parse(await readFile(join(workdir, "session-status.json"), "utf8")), { version: 2, sessions: {} });
+  assert.deepEqual(JSON.parse(await readFile(join(workdir, "assistant-context.json"), "utf8")), {
+    version: 1,
+    user_home: await realpath(root),
+    default_projects_root: join(await realpath(root), "qiyan-bot-projects"),
+  });
+  assert.equal((await stat(join(workdir, "assistant-context.json"))).mode & 0o777, 0o400);
   assert.equal(JSON.parse(await readFile(registryPath, "utf8")).assistant.project_dir, await realpath(workdir));
   for (const path of [
     join(dataDir, "assistant-profile"),

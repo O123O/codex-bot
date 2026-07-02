@@ -28,6 +28,7 @@ import { SessionRegistry, type RegistryDocument } from "./registry/session-regis
 import { SessionDiscovery } from "./sessions/discovery.ts";
 import { FinalMessageStore } from "./sessions/final-messages.ts";
 import { SessionLifecycle, workerThreadResumeParams } from "./sessions/lifecycle.ts";
+import { preparedProjectWorkspaceFromCheckpoint, ProjectWorkspacePolicy, type PreparedProjectWorkspace } from "./sessions/project-workspace.ts";
 import { SessionService } from "./sessions/service.ts";
 import { inTransaction, openDatabase, type Database } from "./storage/database.ts";
 import { DeliveryStore, type DeliveryRecord } from "./storage/delivery-store.ts";
@@ -68,6 +69,7 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
   let pool!: AppServerPool;
   let discovery!: SessionDiscovery;
   let lifecycle!: SessionLifecycle;
+  let projectWorkspaces!: ProjectWorkspacePolicy;
   let sessions!: SessionService;
   let relay!: EventRelay;
   let assistant!: AssistantRuntime;
@@ -100,12 +102,20 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
           dataDir: config.dataDir,
           registryPath: config.sessionRegistryPath,
           policyTemplatePath: join(assistantAssetRoot, "AGENTS.md"),
+          userHome: config.userHome,
         });
         assistantDir = prepared.root;
         dataDir = prepared.dataRoot;
         registryPath = prepared.registryPath;
         dashboardPath = prepared.dashboardPath;
         assistantWarnings = prepared.warnings;
+        projectWorkspaces = new ProjectWorkspacePolicy({
+          userHome: prepared.userHome,
+          assistantWorkdir: prepared.root,
+          dataDir: prepared.dataRoot,
+          registryPath: prepared.registryPath,
+          defaultProjectsRoot: prepared.defaultProjectsRoot,
+        });
         assistantProfile = await prepareAssistantProfile(dataDir);
       },
       stop: async () => undefined,
@@ -185,7 +195,7 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
         });
         pool = new AppServerPool([endpoint, assistantEndpoint], { maxConcurrentTurns: config.maxConcurrentTurns });
         discovery = new SessionDiscovery(db, pool);
-        lifecycle = new SessionLifecycle(pool, registry, runtime, { now: () => Date.now() });
+        lifecycle = new SessionLifecycle(pool, registry, runtime, { now: () => Date.now() }, projectWorkspaces);
         sessions = new SessionService(pool, registry, runtime, finals, deliveries);
         observations = new SessionObservationProcessor(dashboardStore, registry, runtime, {
           now: () => Date.now(),
@@ -327,11 +337,18 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
       },
       create_session: async (args, context) => {
         const endpointId = projectEndpoint(args.endpoint);
+        const project = await projectWorkspaces.prepareCreate(args.nickname, args.project_dir);
+        const workspaceReceipt = projectWorkspaceReceipt(project);
+        let dispatchStarted = false;
         let settingsObservationSequence: number | undefined;
-        const settings = await lifecycle.create(args.nickname, endpointId, args.project_dir, (thread, currentSettings) => {
+        context.checkpoint({ endpoint: endpointId, ...workspaceReceipt, dispatchStarted });
+        const settings = await lifecycle.create(args.nickname, endpointId, project, context.operationId, (thread, currentSettings) => {
           settingsObservationSequence = dashboardStore.allocateObservationSequence();
-          context.checkpoint({ endpoint: endpointId, threadId: thread.id, projectDir: thread.cwd, currentSettings, settingsObservationSequence });
+          context.checkpoint({ endpoint: endpointId, ...workspaceReceipt, dispatchStarted, threadId: thread.id, currentSettings, settingsObservationSequence });
           hydrateThreadOrder(endpointId, thread);
+        }, () => {
+          dispatchStarted = true;
+          context.checkpoint({ endpoint: endpointId, ...workspaceReceipt, dispatchStarted });
         });
         advanceNativeWatermark(args.nickname);
         observeLifecycle(args.nickname);
@@ -339,18 +356,22 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
         await renderDashboardSafely();
         return { nickname: args.nickname };
       },
-      register_session: async (args) => {
+      register_session: async (args, context) => {
         const endpointId = projectEndpoint(args.endpoint);
-        await lifecycle.register(args.nickname, endpointId, args.thread_id, args.project_dir, (thread) => hydrateThreadOrder(endpointId, thread));
+        const project = await projectWorkspaces.prepareExisting(args.project_dir);
+        context.checkpoint({ endpoint: endpointId, ...projectWorkspaceReceipt(project) });
+        await lifecycle.register(args.nickname, endpointId, args.thread_id, project, (thread) => hydrateThreadOrder(endpointId, thread));
         advanceNativeWatermark(args.nickname);
         observeLifecycle(args.nickname);
         await renderDashboardSafely();
         return { nickname: args.nickname };
       },
-      adopt_session: async (args) => {
+      adopt_session: async (args, context) => {
         const endpointId = projectEndpoint(args.endpoint);
         const projectDir = args.project_dir ?? String((await pool.request<any>(endpointId, "thread/read", { threadId: args.thread_id, includeTurns: false })).thread.cwd);
-        await lifecycle.adopt(args.nickname, endpointId, args.thread_id, projectDir, (thread) => hydrateThreadOrder(endpointId, thread));
+        const project = await projectWorkspaces.prepareExisting(projectDir);
+        context.checkpoint({ endpoint: endpointId, ...projectWorkspaceReceipt(project) });
+        await lifecycle.adopt(args.nickname, endpointId, args.thread_id, project, (thread) => hydrateThreadOrder(endpointId, thread));
         advanceNativeWatermark(args.nickname);
         observeLifecycle(args.nickname);
         await renderDashboardSafely();
@@ -948,12 +969,32 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
           else failRecoveredNoEffect(operation.id, "pending session setting was not committed");
         } else if (["create_session", "register_session", "adopt_session"].includes(operation.kind)) {
           let session = registry.get(args.nickname);
-          const checkpoint = operation.receipt as { endpoint?: string; threadId?: string; projectDir?: string } | undefined;
+          const checkpoint = operation.receipt as ({ endpoint?: string; threadId?: string; dispatchStarted?: boolean } & Record<string, unknown>) | undefined;
+          const project = checkpoint ? preparedProjectWorkspaceFromCheckpoint(checkpoint) : undefined;
           const expectedThread = args.thread_id as string | undefined ?? (operation.kind === "create_session" ? checkpoint?.threadId : undefined);
-          const expectedDir = args.project_dir ? await realpath(args.project_dir) : undefined;
-          if (!session && operation.kind === "create_session" && checkpoint?.threadId && expectedDir) {
+          const expectedDir = project?.path;
+          if (!session && operation.kind === "create_session" && checkpoint?.dispatchStarted === false) {
+            failRecoveredNoEffect(operation.id, "project workspace was prepared before worker dispatch began");
+            continue;
+          }
+          if (!session && operation.kind === "create_session" && checkpoint?.dispatchStarted === true && !checkpoint.threadId && project) {
             const endpointId = projectEndpoint(checkpoint.endpoint ?? args.endpoint);
-            await lifecycle.adopt(args.nickname, endpointId, checkpoint.threadId, expectedDir, (thread) => hydrateThreadOrder(endpointId, thread));
+            const candidates = (await discovery.list({ endpointId, cwd: project.path, limit: 100 })).sessions
+              .filter((candidate) => candidate.threadSource === operation.id && !candidate.archived);
+            if (candidates.length === 0) {
+              failRecoveredNoEffect(operation.id, "worker discovery proved the requested thread was not created");
+              continue;
+            }
+            if (candidates.length !== 1) continue;
+            checkpoint.threadId = candidates[0]!.id;
+            operations.checkpoint(operation.id, checkpoint);
+          }
+          if (!session && operation.kind === "create_session" && checkpoint?.threadId && project) {
+            const endpointId = projectEndpoint(checkpoint.endpoint ?? args.endpoint);
+            await lifecycle.adopt(args.nickname, endpointId, checkpoint.threadId, project, (thread) => {
+              if (thread.threadSource !== operation.id) throw new AppError("OPERATION_UNCERTAIN", "recovered worker thread has the wrong creation source");
+              hydrateThreadOrder(endpointId, thread);
+            });
             session = registry.get(args.nickname);
           }
           if (session && (!expectedThread || session.thread_id === expectedThread) && (!expectedDir || session.project_dir === expectedDir)) {
@@ -1079,6 +1120,16 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
         // Leave the operation uncertain unless authoritative state proves its exact outcome.
       }
     }
+  }
+
+  function projectWorkspaceReceipt(project: PreparedProjectWorkspace): Record<string, unknown> {
+    return {
+      projectDir: project.path,
+      projectDirCreated: project.created,
+      projectDirFallback: project.fallback,
+      projectDirDevice: project.identity.device,
+      projectDirInode: project.identity.inode,
+    };
   }
 
   async function resumeManagedSessions(): Promise<void> {

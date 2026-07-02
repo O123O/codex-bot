@@ -28,6 +28,7 @@ export interface BotConfig {
   telegramBotToken: string;
   telegramOwnerId: number;
   telegramDestinationChatId: number;
+  userHome: string;
   assistantWorkdir: string;
   dataDir: string;
   sessionRegistryPath: string;
@@ -69,6 +70,7 @@ export function loadConfig(env: Record<string, string | undefined>, overrides: C
     telegramBotToken: parsed.TELEGRAM_BOT_TOKEN,
     telegramOwnerId: parsed.TELEGRAM_OWNER_ID,
     telegramDestinationChatId: parsed.TELEGRAM_DESTINATION_CHAT_ID,
+    userHome: home,
     assistantWorkdir: resolve(parsed.ASSISTANT_WORKDIR ?? join(defaultRoot, "assistant")),
     dataDir,
     sessionRegistryPath: resolve(parsed.SESSION_REGISTRY_PATH ?? join(dataDir, "sessions.json")),

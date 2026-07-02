@@ -24,7 +24,7 @@ class LifecycleEndpoint implements AppServerEndpoint {
 
   async request<T>(method: string, params: any): Promise<T> {
     this.calls.push({ method, params });
-    const thread = { id: this.threadId, cwd: this.cwd, status: { type: this.status }, turns: this.turns };
+    const thread = { id: this.threadId, cwd: this.cwd, threadSource: params?.threadSource ?? null, status: { type: this.status }, turns: this.turns };
     if (method === "thread/start" || method === "thread/resume") {
       this.afterResume?.();
       return { thread: { ...thread, status: { type: this.status } }, cwd: this.cwd, model: "gpt-5", reasoningEffort: "high" } as T;
@@ -45,13 +45,21 @@ async function fixture() {
   const endpoint = new LifecycleEndpoint();
   endpoint.cwd = dir;
   const runtime = new RuntimeStore(createTestDatabase());
-  const lifecycle = new SessionLifecycle(new AppServerPool([endpoint], { maxConcurrentTurns: 2 }), registry, runtime, { now: () => 10_000 });
-  return { dir, registry, endpoint, runtime, lifecycle };
+  const project = { path: dir, created: false, fallback: false, identity: { device: "1", inode: "1" } };
+  const checked: string[] = [];
+  const lifecycle = new SessionLifecycle(
+    new AppServerPool([endpoint], { maxConcurrentTurns: 2 }),
+    registry,
+    runtime,
+    { now: () => 10_000 },
+    { assertDispatchable: async (prepared) => { checked.push(prepared.path); } },
+  );
+  return { dir, registry, endpoint, runtime, lifecycle, project, checked };
 }
 
 test("create and adopt verify canonical cwd and establish a managed epoch baseline", async () => {
-  const { dir, registry, endpoint, runtime, lifecycle } = await fixture();
-  const created = await lifecycle.create("payments", "local", dir);
+  const { dir, registry, endpoint, runtime, lifecycle, project, checked } = await fixture();
+  const created = await lifecycle.create("payments", "local", project, "operation-1");
   assert.deepEqual(created, { model: "gpt-5", effort: "high" });
   assert.equal(registry.get("payments")?.thread_id, "thread-1");
   assert.equal(runtime.getSession("local", "thread-1")?.managementState, "managed");
@@ -59,27 +67,28 @@ test("create and adopt verify canonical cwd and establish a managed epoch baseli
 
   endpoint.threadId = "thread-2";
   let adoptedTurns: Array<{ id: string }> | undefined;
-  await lifecycle.adopt("billing", "local", "thread-2", dir, (thread) => { adoptedTurns = thread.turns; });
+  await lifecycle.adopt("billing", "local", "thread-2", project, (thread) => { adoptedTurns = thread.turns; });
   assert.equal(registry.get("billing")?.thread_id, "thread-2");
   assert.equal(runtime.currentEpoch("local", "thread-2")?.baselineTurnId, "historical");
   assert.deepEqual(adoptedTurns, [{ id: "historical" }]);
+  assert.deepEqual(checked, [dir, dir]);
   const started = endpoint.calls.find((call) => call.method === "thread/start")!.params;
-  assert.deepEqual(started, { cwd: dir, ephemeral: false });
+  assert.deepEqual(started, { cwd: dir, ephemeral: false, threadSource: "operation-1" });
   for (const key of ["approvalPolicy", "sandbox", "config"]) assert.equal(Object.hasOwn(started, key), false);
 });
 
 test("adoption rejects active or cwd-mismatched sessions", async () => {
-  const { dir, endpoint, lifecycle } = await fixture();
+  const { project, endpoint, lifecycle } = await fixture();
   endpoint.status = "active";
-  await assert.rejects(lifecycle.adopt("busy", "local", "thread-1", dir), (error: unknown) => error instanceof AppError && error.code === "SESSION_BUSY");
+  await assert.rejects(lifecycle.adopt("busy", "local", "thread-1", project), (error: unknown) => error instanceof AppError && error.code === "SESSION_BUSY");
   endpoint.status = "idle";
   endpoint.cwd = tmpdir();
-  await assert.rejects(lifecycle.adopt("wrong", "local", "thread-1", dir), (error: unknown) => error instanceof AppError && error.code === "CWD_MISMATCH");
+  await assert.rejects(lifecycle.adopt("wrong", "local", "thread-1", project), (error: unknown) => error instanceof AppError && error.code === "CWD_MISMATCH");
 });
 
 test("detach ends the epoch and attach requires idle both before and after resume", async () => {
-  const { dir, endpoint, runtime, lifecycle } = await fixture();
-  await lifecycle.adopt("payments", "local", "thread-1", dir);
+  const { dir, project, endpoint, runtime, lifecycle } = await fixture();
+  await lifecycle.adopt("payments", "local", "thread-1", project);
   await lifecycle.detach("payments");
   assert.equal(runtime.getSession("local", "thread-1")?.managementState, "detached");
   assert.ok(runtime.latestEpoch("local", "thread-1")?.endedAt);
@@ -106,8 +115,8 @@ test("detach ends the epoch and attach requires idle both before and after resum
 });
 
 test("archive requires idle and startup reconciliation completes intermediate states", async () => {
-  const { dir, endpoint, runtime, lifecycle } = await fixture();
-  await lifecycle.adopt("payments", "local", "thread-1", dir);
+  const { project, endpoint, runtime, lifecycle } = await fixture();
+  await lifecycle.adopt("payments", "local", "thread-1", project);
   runtime.setSession("local", "thread-1", "detaching", "idle");
   await lifecycle.reconcileStartup();
   assert.equal(runtime.getSession("local", "thread-1")?.managementState, "detached");
@@ -119,8 +128,8 @@ test("archive requires idle and startup reconciliation completes intermediate st
 });
 
 test("startup reconciliation exposes reattach settings and authoritative history", async () => {
-  const { dir, endpoint, runtime, lifecycle } = await fixture();
-  await lifecycle.adopt("payments", "local", "thread-1", dir);
+  const { project, endpoint, runtime, lifecycle } = await fixture();
+  await lifecycle.adopt("payments", "local", "thread-1", project);
   await lifecycle.detach("payments");
   runtime.setSession("local", "thread-1", "attaching", "idle");
   endpoint.turns = [{ id: "manual-turn" }];
@@ -136,8 +145,8 @@ test("startup reconciliation exposes reattach settings and authoritative history
 });
 
 test("a failed attach rollback remains uncertain instead of being classified as no effect", async () => {
-  const { dir, endpoint, runtime, lifecycle } = await fixture();
-  await lifecycle.adopt("payments", "local", "thread-1", dir);
+  const { project, endpoint, runtime, lifecycle } = await fixture();
+  await lifecycle.adopt("payments", "local", "thread-1", project);
   await lifecycle.detach("payments");
   endpoint.afterResume = () => { endpoint.status = "active"; };
   endpoint.failUnsubscribe = true;
@@ -146,8 +155,8 @@ test("a failed attach rollback remains uncertain instead of being classified as 
 });
 
 test("endpoint loss preserves managed restore state for attach recovery", async () => {
-  const { dir, runtime, lifecycle } = await fixture();
-  await lifecycle.adopt("payments", "local", "thread-1", dir);
+  const { project, runtime, lifecycle } = await fixture();
+  await lifecycle.adopt("payments", "local", "thread-1", project);
   runtime.setSession("local", "thread-1", "unavailable", "notLoaded");
   assert.deepEqual(runtime.getSession("local", "thread-1"), {
     managementState: "unavailable",

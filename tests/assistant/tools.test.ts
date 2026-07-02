@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { AppError } from "../../src/core/errors.ts";
-import { TOOL_NAMES, createAssistantTools } from "../../src/assistant/tools.ts";
+import { ASSISTANT_TOOL_SCHEMAS, TOOL_NAMES, createAssistantTools } from "../../src/assistant/tools.ts";
 import { createTestDatabase } from "../../src/storage/database.ts";
 import { OperationStore } from "../../src/storage/operation-store.ts";
 
@@ -16,6 +16,13 @@ test("tool catalog is curated and excludes completion and raw RPC", () => {
   assert.deepEqual([...TOOL_NAMES].sort(), expected);
   assert.equal(TOOL_NAMES.includes("complete_goal" as any), false);
   assert.equal(TOOL_NAMES.includes("raw_rpc" as any), false);
+});
+
+test("session nicknames are safe and create_session may use the backend fallback", () => {
+  assert.deepEqual(ASSISTANT_TOOL_SCHEMAS.create_session.parse({ nickname: "docs_2026" }), { nickname: "docs_2026" });
+  for (const nickname of ["Bad", "has space", "../escape", "", "x".repeat(65)]) {
+    assert.throws(() => ASSISTANT_TOOL_SCHEMAS.create_session.parse({ nickname }));
+  }
 });
 
 test("every curated handler validates, records, dispatches, and replays its receipt", async () => {

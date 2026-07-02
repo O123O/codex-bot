@@ -1,16 +1,20 @@
 import { createHash, randomUUID } from "node:crypto";
-import { lstat, mkdir, readFile, realpath, rename, unlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, readFile, realpath, rename, unlink, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
 import { AppError } from "../core/errors.ts";
 
 const POLICY_FILE = "AGENTS.md";
 const DIGEST_FILE = ".qiyan-bot-agents.sha256";
+const CONTEXT_FILE = "assistant-context.json";
+const CONTEXT_DIGEST_FILE = ".qiyan-bot-context.sha256";
 
 export interface AssistantWorkspaceOptions {
   workdir: string;
   dataDir: string;
   registryPath: string;
   policyTemplatePath: string;
+  userHome: string;
+  defaultProjectsRoot?: string;
 }
 
 export interface PreparedAssistantWorkspace {
@@ -18,6 +22,9 @@ export interface PreparedAssistantWorkspace {
   dataRoot: string;
   registryPath: string;
   dashboardPath: string;
+  contextPath: string;
+  userHome: string;
+  defaultProjectsRoot: string;
   warnings: string[];
 }
 
@@ -36,6 +43,8 @@ export async function prepareAssistantWorkspace(options: AssistantWorkspaceOptio
     const root = await realpath(options.workdir);
     const dataRoot = await realpath(options.dataDir);
     const registryPath = await canonicalFilePath(options.registryPath);
+    const userHome = await realpath(options.userHome);
+    const defaultProjectsRoot = await canonicalProjectedPath(options.defaultProjectsRoot ?? join(userHome, "qiyan-bot-projects"));
     assertSeparated(root, requestedDataRoot, "configured data directory");
     assertSeparated(root, requestedRegistryPath, "configured registry path");
     assertSeparated(requestedRoot, dataRoot, "canonical data directory");
@@ -71,9 +80,18 @@ export async function prepareAssistantWorkspace(options: AssistantWorkspaceOptio
       }
     }
 
+    const contextPath = join(root, CONTEXT_FILE);
+    const contextDigestPath = join(root, CONTEXT_DIGEST_FILE);
+    const context = Buffer.from(`${JSON.stringify({
+      version: 1,
+      user_home: userHome,
+      default_projects_root: defaultProjectsRoot,
+    }, null, 2)}\n`);
+    await installGeneratedContext(contextPath, contextDigestPath, context);
+
     const gitRoot = await findGitAncestor(root);
     const warnings = gitRoot ? [`Assistant workdir ${root} is inside Git worktree ${gitRoot}; Codex may inherit parent instructions, project configuration, and repository skills.`] : [];
-    return { root, dataRoot, registryPath, dashboardPath: join(root, "session-status.json"), warnings };
+    return { root, dataRoot, registryPath, dashboardPath: join(root, "session-status.json"), contextPath, userHome, defaultProjectsRoot, warnings };
   } catch (error) {
     if (error instanceof AppError) throw error;
     throw managedError(`cannot prepare assistant workdir ${options.workdir}`);
@@ -101,15 +119,44 @@ async function regularFileState(path: string): Promise<FileState> {
   }
 }
 
-async function atomicWrite(path: string, value: Uint8Array): Promise<void> {
+async function atomicWrite(path: string, value: Uint8Array, mode = 0o600): Promise<void> {
   const temporary = join(dirname(path), `.${basename(path)}.${process.pid}.${randomUUID()}.tmp`);
   try {
-    await writeFile(temporary, value, { flag: "wx", mode: 0o600 });
+    await writeFile(temporary, value, { flag: "wx", mode });
     await rename(temporary, path);
   } finally {
     await unlink(temporary).catch((error) => {
       if (!isErrno(error, "ENOENT")) throw error;
     });
+  }
+}
+
+async function installGeneratedContext(path: string, digestPath: string, expected: Uint8Array): Promise<void> {
+  const expectedDigest = digest(expected);
+  const contextState = await regularFileState(path);
+  const digestState = await regularFileState(digestPath);
+  if (contextState === "missing" && digestState === "missing") {
+    await atomicWrite(path, expected, 0o400);
+    await atomicWrite(digestPath, Buffer.from(`${expectedDigest}\n`));
+    return;
+  }
+  if (contextState === "missing") throw managedError(`digest exists but assistant-context.json is missing at ${path}`);
+  const installed = await readFile(path);
+  if (digestState === "missing") {
+    if (digest(installed) !== expectedDigest) throw managedError(`${path} has no bot digest and does not match the generated assistant context`);
+    await chmod(path, 0o400);
+    await atomicWrite(digestPath, Buffer.from(`${expectedDigest}\n`));
+    return;
+  }
+  const recorded = (await readFile(digestPath, "utf8")).trim();
+  if (!/^[a-f0-9]{64}$/u.test(recorded) || digest(installed) !== recorded) {
+    throw managedError(`${path} is managed by qiyan-bot and was modified`);
+  }
+  if (recorded !== expectedDigest) {
+    await atomicWrite(path, expected, 0o400);
+    await atomicWrite(digestPath, Buffer.from(`${expectedDigest}\n`));
+  } else {
+    await chmod(path, 0o400);
   }
 }
 
@@ -119,6 +166,16 @@ async function canonicalFilePath(path: string): Promise<string> {
   } catch (error) {
     if (!isErrno(error, "ENOENT")) throw error;
     return join(await realpath(dirname(path)), basename(path));
+  }
+}
+
+async function canonicalProjectedPath(path: string): Promise<string> {
+  try { return await realpath(path); }
+  catch (error) {
+    if (!isErrno(error, "ENOENT")) throw error;
+    const parent = dirname(path);
+    if (parent === path) throw error;
+    return join(await canonicalProjectedPath(parent), basename(path));
   }
 }
 

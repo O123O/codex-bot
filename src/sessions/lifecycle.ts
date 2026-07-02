@@ -5,8 +5,9 @@ import { AppError } from "../core/errors.ts";
 import type { ManagementState } from "../core/types.ts";
 import type { SessionRegistry } from "../registry/session-registry.ts";
 import type { RuntimeStore } from "../storage/runtime-store.ts";
+import type { PreparedProjectWorkspace, ProjectWorkspacePolicy } from "./project-workspace.ts";
 
-interface ThreadView { id: string; cwd: string; status: { type: string }; turns: Array<{ id: string }> }
+interface ThreadView { id: string; cwd: string; threadSource?: string | null; status: { type: string }; turns: Array<{ id: string }> }
 interface ThreadResponse { thread: ThreadView; cwd?: string; model?: string; reasoningEffort?: string | null }
 export interface CurrentSessionSettings { model?: string; effort?: string | null }
 interface AttachObservers {
@@ -14,8 +15,8 @@ interface AttachObservers {
   onThreadRead?(thread: ThreadView): void;
 }
 
-export function workerThreadStartParams(cwd: string): { cwd: string; ephemeral: false } {
-  return { cwd, ephemeral: false };
+export function workerThreadStartParams(cwd: string, threadSource: string): { cwd: string; ephemeral: false; threadSource: string } {
+  return { cwd, ephemeral: false, threadSource };
 }
 
 export function workerThreadResumeParams(threadId: string, cwd: string): { threadId: string; cwd: string } {
@@ -30,13 +31,24 @@ export class SessionLifecycle {
     private readonly registry: SessionRegistry,
     private readonly runtime: RuntimeStore,
     private readonly clock: Clock,
+    private readonly workspaces: Pick<ProjectWorkspacePolicy, "assertDispatchable">,
   ) {}
 
-  async create(nickname: string, endpointId: string, projectDir: string, onThreadCreated?: (thread: ThreadView, settings: CurrentSessionSettings) => void): Promise<CurrentSessionSettings> {
+  async create(
+    nickname: string,
+    endpointId: string,
+    project: PreparedProjectWorkspace,
+    threadSource: string,
+    onThreadCreated?: (thread: ThreadView, settings: CurrentSessionSettings) => void,
+    onDispatching?: () => void,
+  ): Promise<CurrentSessionSettings> {
     return this.lock(`${endpointId}:new:${nickname}`, async () => {
       if (this.registry.get(nickname)) throw new AppError("OPERATION_CONFLICT", `nickname already exists: ${nickname}`);
-      const canonical = await realpath(projectDir);
-      const response = await this.pool.request<ThreadResponse>(endpointId, "thread/start", workerThreadStartParams(canonical));
+      await this.workspaces.assertDispatchable(project);
+      const canonical = project.path;
+      onDispatching?.();
+      const response = await this.pool.request<ThreadResponse>(endpointId, "thread/start", workerThreadStartParams(canonical, threadSource));
+      if (response.thread.threadSource !== threadSource) throw new AppError("OPERATION_UNCERTAIN", "new thread returned an unexpected creation source");
       const settings = this.responseSettings(response);
       onThreadCreated?.(response.thread, settings);
       await this.verifyCwd(response.thread.cwd, canonical);
@@ -48,14 +60,15 @@ export class SessionLifecycle {
     });
   }
 
-  register(nickname: string, endpointId: string, threadId: string, projectDir: string, onThreadRead?: (thread: ThreadView) => void): Promise<void> {
-    return this.adopt(nickname, endpointId, threadId, projectDir, onThreadRead);
+  register(nickname: string, endpointId: string, threadId: string, project: PreparedProjectWorkspace, onThreadRead?: (thread: ThreadView) => void): Promise<void> {
+    return this.adopt(nickname, endpointId, threadId, project, onThreadRead);
   }
 
-  async adopt(nickname: string, endpointId: string, threadId: string, projectDir: string, onThreadRead?: (thread: ThreadView) => void): Promise<void> {
+  async adopt(nickname: string, endpointId: string, threadId: string, project: PreparedProjectWorkspace, onThreadRead?: (thread: ThreadView) => void): Promise<void> {
     await this.lock(`${endpointId}:${threadId}`, async () => {
       if (this.registry.get(nickname)) throw new AppError("OPERATION_CONFLICT", `nickname already exists: ${nickname}`);
-      const canonical = await realpath(projectDir);
+      await this.workspaces.assertDispatchable(project);
+      const canonical = project.path;
       const response = await this.read(endpointId, threadId);
       await this.verifyCwd(response.thread.cwd, canonical);
       this.requireIdle(response.thread);
