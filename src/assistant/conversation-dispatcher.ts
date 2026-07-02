@@ -36,6 +36,7 @@ interface DispatcherOptions {
   endpointId: string;
   threadId: string;
   attachments?: AttachmentStore;
+  membershipObserver?: { notifyMembership(contextId: string): void };
   retryMs?: number;
 }
 
@@ -176,6 +177,7 @@ export class ConversationDispatcher {
       this.runner.start(params, claim),
       (response) => {
         this.store.markSubmitted(submission.attemptId, submission.contextId, response.turn.id);
+        this.options.membershipObserver?.notifyMembership(submission.contextId);
         this.pool.bindTurnCapacityClaim(claim, response.turn.id);
         const early = this.earlyTerminals.get(response.turn.id);
         if (early || isTerminal(response.turn.status)) {
@@ -201,6 +203,7 @@ export class ConversationDispatcher {
       this.runner.steer(params),
       (response) => {
         this.store.markSubmitted(submission.attemptId, submission.contextId, response.turnId);
+        this.options.membershipObserver?.notifyMembership(submission.contextId);
         this.pump();
       },
       (error) => this.handleSubmissionFailure(submission, undefined, error),
@@ -210,6 +213,7 @@ export class ConversationDispatcher {
   private handleSubmissionFailure(submission: ReservedSubmission, claim: TurnCapacityClaim | undefined, error: unknown): void {
     if (this.isKnownNonSteerable(error) && submission.submissionKind === "steer") {
       this.store.restorePending(submission.attemptId, submission.contextId);
+      this.options.membershipObserver?.notifyMembership(submission.contextId);
       this.store.pauseSteering(submission.attemptId, "native_turn_not_steerable");
       return;
     }
@@ -226,6 +230,7 @@ export class ConversationDispatcher {
       turn.items.some((item) => item.type === "userMessage" && item.clientId === submission.clientUserMessageId));
     if (positive) {
       this.store.markSubmitted(submission.attemptId, submission.contextId, positive.id);
+      this.options.membershipObserver?.notifyMembership(submission.contextId);
       if (claim) this.pool.bindTurnCapacityClaim(claim, positive.id);
       if (isTerminal(positive.status)) {
         this.store.beginTerminalizing(positive.id);
@@ -243,6 +248,7 @@ export class ConversationDispatcher {
     if (!provenAbsent) return;
 
     this.store.restorePending(submission.attemptId, submission.contextId);
+    this.options.membershipObserver?.notifyMembership(submission.contextId);
     if (claim) {
       this.pumpPaused = true;
       this.store.clearLease(submission.attemptId);

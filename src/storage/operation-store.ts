@@ -135,6 +135,12 @@ export class OperationStore {
       FROM operations WHERE attempt_id = ? ORDER BY sequence`).all(attemptId) as Array<Record<string, unknown>>).map((row) => this.parseOperation(row));
   }
 
+  findForCall(attemptId: string, callId: string, kind: string): OperationRecord | undefined {
+    const row = this.db.prepare(`SELECT id, context_id, attempt_id, call_id, kind, effect_class, state, receipt_json, created_at, sequence
+      FROM operations WHERE attempt_id = ? AND call_id = ? AND kind = ?`).get(attemptId, callId, kind) as Record<string, unknown> | undefined;
+    return row ? this.parseOperation(row) : undefined;
+  }
+
   listRecoverable(): RecoverableOperation[] {
     return (this.db.prepare(`SELECT id, context_id, attempt_id, call_id, kind, args_json, effect_class, state, receipt_json, created_at, sequence
       FROM operations WHERE state IN ('dispatched', 'uncertain') ORDER BY created_at, id`).all() as Array<Record<string, unknown>>).map((row) => ({

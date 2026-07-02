@@ -452,15 +452,15 @@ export async function buildProductionApp(
         context.checkpoint(args.mode === "steer"
           ? { turnId: sessions.activeTurnId(args.nickname) }
           : { pendingSettings, ...(settingsObservationSequence === undefined ? {} : { settingsObservationSequence }) });
-        const files = args.attachment_ids.map((id: any) => attachments.toUserInput(context.sourceContextId, id));
+        const files = args.attachment_ids.map((id: any) => attachments.toUserInput(context.effectiveSourceContextId, id));
         const input = [...(args.content.length > 0 ? [{ type: "text", text: args.content, text_elements: [] }] : []), ...files];
-        const holdId = workerAttachmentHoldId(context.sourceContextId, context.attemptId, context.callId);
-        if (args.attachment_ids.length > 0) attachments.retainForOperation(holdId, context.sourceContextId, args.attachment_ids);
+        const holdId = workerAttachmentHoldId(context.effectiveSourceContextId, context.attemptId, context.callId);
+        if (args.attachment_ids.length > 0) attachments.retainForOperation(holdId, context.effectiveSourceContextId, args.attachment_ids);
         let result: Awaited<ReturnType<SessionService["send"]>>;
         try {
           result = await sessions.send(args.nickname, args.content, {
             mode: args.mode,
-            clientUserMessageId: `${context.sourceContextId}:${context.callId}`,
+            clientUserMessageId: `${context.effectiveSourceContextId}:${context.callId}`,
             input,
             ...(pendingSettings ? { settings: pendingSettings } : {}),
           });
@@ -494,8 +494,8 @@ export async function buildProductionApp(
       collect_messages: async (args, context) => args.direct
         ? sessions.collect(args.nickname, args.count, {
           direct: true,
-          binding: administrativeBinding,
-          deliveryKey: context.sourceContextId,
+          binding: assistant.current()?.binding ?? administrativeBinding,
+          deliveryKey: context.operationId,
           onSelected: (messageIds) => context.checkpoint({ messageIds }),
         })
         : sessions.collect(args.nickname, args.count),
@@ -561,19 +561,19 @@ export async function buildProductionApp(
         await renderDashboardSafely();
         return result;
       },
-      send_chat_message: async (args, context) => ({ deliveryId: deliveries.prepare({ id: `chat:${context.sourceContextId}:${context.attemptId}:${context.callId}`, kind: "chat", binding: administrativeBinding, body: args.content, mandatory: false }).id }),
+      send_chat_message: async (args, context) => ({ deliveryId: deliveries.prepare({ id: `chat:${context.effectiveSourceContextId}:${context.attemptId}:${context.callId}`, kind: "chat", binding: assistant.current()?.binding ?? administrativeBinding, body: args.content, mandatory: false }).id }),
       prepare_chat_attachment: async (args, context) => {
         const ownerRoot = args.owner === "assistant" ? assistantDir : sessions.managedProjectRoot(args.owner);
-        const prepared = await attachments.prepareOutbound(context.sourceContextId, ownerRoot, args.relative_path, undefined, undefined, operationFileHandle(context.sourceContextId, context.attemptId, context.callId));
+        const prepared = await attachments.prepareOutbound(context.effectiveSourceContextId, ownerRoot, args.relative_path, undefined, undefined, operationFileHandle(context.effectiveSourceContextId, context.attemptId, context.callId));
         return { file_handle: prepared.id, display_name: prepared.displayName, media_type: prepared.mediaType, size: prepared.size, sha256: prepared.sha256 };
       },
       send_chat_attachment: async (args, context) => {
-        const attachment = attachments.toUserInput(context.sourceContextId, args.file_handle);
+        const attachment = attachments.toUserInput(context.effectiveSourceContextId, args.file_handle);
         void attachment;
         const delivery = deliveries.prepareAttachment({
-          id: `chat-attachment:${context.sourceContextId}:${context.attemptId}:${context.callId}`,
-          kind: "attachment", binding: administrativeBinding, body: args.caption ?? "", mandatory: false,
-          attachmentId: args.file_handle, attachmentScopeId: context.sourceContextId,
+          id: `chat-attachment:${context.effectiveSourceContextId}:${context.attemptId}:${context.callId}`,
+          kind: "attachment", binding: assistant.current()?.binding ?? administrativeBinding, body: args.caption ?? "", mandatory: false,
+          attachmentId: args.file_handle, attachmentScopeId: context.effectiveSourceContextId,
         });
         return { deliveryId: delivery.id };
       },

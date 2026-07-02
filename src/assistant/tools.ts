@@ -3,10 +3,11 @@ import { z } from "zod";
 import { AppError } from "../core/errors.ts";
 import { parseDirective } from "../directives/parser.ts";
 import type { OperationRecord, OperationStore } from "../storage/operation-store.ts";
+import type { AttemptScope } from "./attempt-scope.ts";
 
 export interface ToolCallContext { sourceContextId: string; attemptId: string; turnId: string; callId: string; toolFence?: number }
 export type ToolHandler = (context: ToolCallContext, args: unknown) => Promise<unknown>;
-export interface ToolActionContext extends ToolCallContext { operationId: string; operationCreatedAt: number; operationSequence: number; checkpoint(receipt: unknown): void }
+export interface ToolActionContext extends ToolCallContext { effectiveSourceContextId: string; operationId: string; operationCreatedAt: number; operationSequence: number; checkpoint(receipt: unknown): void }
 
 const nickname = z.string().regex(/^[a-z0-9][a-z0-9_-]{0,63}$/u);
 export const ASSISTANT_TOOL_SCHEMAS = {
@@ -34,9 +35,9 @@ export const ASSISTANT_TOOL_SCHEMAS = {
     supervision_objective: z.string().max(4_000).nullable().optional(),
     pending_follow_up: z.string().max(4_000).nullable().optional(),
   }).strict().refine((value) => Object.keys(value).some((key) => key !== "nickname"), "at least one manager note field is required"),
-  send_chat_message: z.object({ content: z.string(), reply_to: z.number().int().optional() }).strict(),
+  send_chat_message: z.object({ content: z.string() }).strict(),
   prepare_chat_attachment: z.object({ owner: z.string().min(1), relative_path: z.string().min(1) }).strict(),
-  send_chat_attachment: z.object({ file_handle: z.string().min(1), caption: z.string().optional(), reply_to: z.number().int().optional() }).strict(),
+  send_chat_attachment: z.object({ file_handle: z.string().min(1), caption: z.string().optional() }).strict(),
 } as const;
 
 export const TOOL_NAMES = Object.freeze(Object.keys(ASSISTANT_TOOL_SCHEMAS)) as readonly (keyof typeof ASSISTANT_TOOL_SCHEMAS)[];
@@ -50,7 +51,7 @@ export const READ_ONLY_TOOLS = new Set<AssistantToolName>([
 export function createAssistantTools(
   operations: OperationStore,
   actions: Partial<Record<AssistantToolName, Action>>,
-  options: { maxCollectCount: number },
+  options: { maxCollectCount: number; attemptScope?: AttemptScope },
 ): Record<AssistantToolName, ToolHandler> {
   const result = {} as Record<AssistantToolName, ToolHandler>;
   for (const name of TOOL_NAMES) {
@@ -59,7 +60,22 @@ export function createAssistantTools(
       const source = operations.getSourceContext(context.sourceContextId);
       if (!source) throw new AppError("OPERATION_CONFLICT", "tool call is not bound to an active source context");
       let directive: { kind: "pass" | "collect"; binding: unknown } | undefined;
-      if (name === "send_to_session" || name === "collect_messages") {
+      let operation: OperationRecord | undefined;
+      let effectiveSourceContextId = context.sourceContextId;
+      const guarded = name === "send_to_session" || name === "collect_messages";
+      if (guarded && options.attemptScope) {
+        const resolved = await options.attemptScope.resolveSafeguard({
+          attemptId: context.attemptId,
+          callId: context.callId,
+          tool: name,
+          args,
+          ...(context.toolFence === undefined ? {} : { toolFence: context.toolFence }),
+        });
+        operation = resolved.operation;
+        effectiveSourceContextId = resolved.effectiveSourceContextId;
+        if (resolved.directiveKind === "pass") directive = { kind: "pass", binding: { nickname: args.nickname, mode: args.mode, content: args.content, attachment_ids: args.attachment_ids } };
+        if (resolved.directiveKind === "collect") directive = { kind: "collect", binding: { nickname: args.nickname, count: args.count } };
+      } else if (guarded) {
         const parsed = parseDirective(source.rawText, source.attachmentIds, options.maxCollectCount);
         if (parsed.kind === "malformed") throw new AppError("DIRECTIVE_MISMATCH", parsed.reason);
         if (name === "send_to_session" && parsed.kind === "pass") {
@@ -77,13 +93,12 @@ export function createAssistantTools(
 
       const sideEffecting = name === "collect_messages" ? directive?.kind === "collect" : !READ_ONLY_TOOLS.has(name);
       const effectClass = sideEffecting ? "side_effecting" : "read_only";
-      let operation: OperationRecord | undefined;
-      if (directive) operation = operations.replayDirective(context.sourceContextId, directive.kind, directive.binding);
-      operation ??= operations.prepare({ contextId: context.sourceContextId, attemptId: context.attemptId, callId: context.callId, kind: name, args, effectClass, ...(context.toolFence === undefined ? {} : { toolFence: context.toolFence }) });
+      if (!options.attemptScope && directive) operation = operations.replayDirective(context.sourceContextId, directive.kind, directive.binding);
+      operation ??= operations.prepare({ contextId: effectiveSourceContextId, attemptId: context.attemptId, callId: context.callId, kind: name, args, effectClass, ...(context.toolFence === undefined ? {} : { toolFence: context.toolFence }) });
       if (operation.state === "succeeded") return operation.receipt;
       if (operation.state === "dispatched" || operation.state === "uncertain") throw new AppError("OPERATION_UNCERTAIN", `${name} may already have taken effect`);
       if (operation.state === "failed") throw new AppError("OPERATION_UNCERTAIN", `${name} previously failed and requires reconciliation`);
-      if (directive) operations.bindDirective(context.sourceContextId, directive.kind, directive.binding, operation.id);
+      if (!options.attemptScope && directive) operations.bindDirective(context.sourceContextId, directive.kind, directive.binding, operation.id);
 
       const action = actions[name];
       if (!action) throw new AppError("UNSUPPORTED_CAPABILITY", `tool is not configured: ${name}`);
@@ -91,6 +106,7 @@ export function createAssistantTools(
       try {
         const actionResult = await action(directive?.kind === "collect" ? { ...args, direct: true } : args, {
           ...context,
+          effectiveSourceContextId,
           operationId: operation.id,
           operationCreatedAt: operation.createdAt,
           operationSequence: operation.sequence,

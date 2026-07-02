@@ -2,7 +2,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { AppError } from "../../src/core/errors.ts";
 import { ASSISTANT_TOOL_SCHEMAS, TOOL_NAMES, createAssistantTools } from "../../src/assistant/tools.ts";
+import { AttemptScope } from "../../src/assistant/attempt-scope.ts";
+import { ConversationStore } from "../../src/storage/conversation-store.ts";
 import { createTestDatabase } from "../../src/storage/database.ts";
+import { DeliveryStore } from "../../src/storage/delivery-store.ts";
 import { OperationStore } from "../../src/storage/operation-store.ts";
 
 const expected = [
@@ -153,4 +156,27 @@ test("manager note updates require a bounded partial patch and expose stable ope
   assert.equal(calls.length, 1);
   assert.ok(calls[0].sequence > 0);
   assert.deepEqual(await tools.update_session_notes(context, { nickname: "payments", project_summary: "Payments", pending_follow_up: null }), receipt);
+});
+
+test("attempt-scoped safeguards feed the ordinary action path with the admitted source scope", async () => {
+  const db = createTestDatabase();
+  const operations = new OperationStore(db);
+  const conversations = new ConversationStore(db, new DeliveryStore(db));
+  const binding = { adapterId: "telegram", conversationKey: "telegram:chat", destination: { chatId: "chat" } } as const;
+  for (const [id, rawText] of [["primary", "ordinary"], ["guard", "/pass exact"]] as const) conversations.acceptChatSource({ id, nativeSourceId: id, binding, rawText, attachmentIds: [], receivedAt: 1 });
+  const lease = conversations.acquireLease({ kind: "chat", contextId: "primary" }, "claim");
+  conversations.reserveStart("primary");
+  conversations.markSubmitted(lease.attemptId, "primary", "turn");
+  conversations.reserveNextSteer(lease.attemptId);
+  conversations.markSubmitted(lease.attemptId, "guard", "turn");
+  const scope = new AttemptScope(db, operations, { maxCollectCount: 20 });
+  let effective = "";
+  const tools = createAssistantTools(operations, {
+    send_to_session: async (_args, context) => { effective = context.effectiveSourceContextId; return { turnId: "worker" }; },
+  }, { maxCollectCount: 20, attemptScope: scope });
+  const args = { nickname: "worker", content: "exact", attachment_ids: [], mode: "steer" };
+  const result = await tools.send_to_session({ sourceContextId: "primary", attemptId: lease.attemptId, turnId: "turn", callId: "call", toolFence: 0 }, args);
+  assert.equal(effective, "guard");
+  assert.equal(operations.findForCall(lease.attemptId, "call", "send_to_session")?.contextId, "guard");
+  assert.equal((result as any).actualText, "exact");
 });
