@@ -113,12 +113,13 @@ const path = require("node:path");
 const uid = process.getuid();
 function privateRealDirectory(label, input) {
   const resolved = path.resolve(input);
+  if (input !== resolved) throw new Error(`${label} must use its exact absolute normalized path`);
   const value = fs.lstatSync(resolved);
   if (!value.isDirectory() || value.isSymbolicLink() || value.uid !== uid || (value.mode & 0o077) !== 0) {
     throw new Error(`${label} must be a private current-user real directory`);
   }
   const canonical = fs.realpathSync(resolved);
-  if (canonical !== resolved) throw new Error(`${label} must not use a symlink alias`);
+  if (canonical !== resolved) throw new Error(`${label} must use its exact canonical path without a symlink alias`);
   return canonical;
 }
 function contains(parent, child) {
@@ -130,7 +131,7 @@ const home = privateRealDirectory("HOME", process.env.USER_HOME);
 const oldHome = privateRealDirectory("old_home", process.env.OLD_HOME);
 const stage = privateRealDirectory("stage", process.env.STAGE);
 const requiredNewHome = path.join(home, ".qiyan-bot");
-if (path.resolve(process.env.NEW_HOME) !== requiredNewHome) throw new Error("new_home must be $HOME/.qiyan-bot");
+if (process.env.NEW_HOME !== requiredNewHome) throw new Error("new_home must be the exact $HOME/.qiyan-bot path");
 let newHome = requiredNewHome;
 if (fs.existsSync(requiredNewHome)) newHome = privateRealDirectory("new_home", requiredNewHome);
 if (oldHome === path.parse(oldHome).root || oldHome === home || contains(oldHome, home)) {
