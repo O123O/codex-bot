@@ -16,6 +16,7 @@ export class SessionService {
 
   async send(nickname: string, text: string, options: { mode?: "auto" | "start" | "steer"; clientUserMessageId?: string; input?: unknown[]; settings?: { model?: string; effort?: string } } = {}): Promise<{ mode: "start" | "steer"; turnId: string; terminal?: boolean; appliedSettings?: { model?: string; effort?: string } }> {
     const session = this.required(nickname);
+    if (session.lifecycle_state !== "managed") throw new AppError("SESSION_DETACHED", `${nickname} is not managed`);
     const state = this.runtime.getSession(session.endpoint, session.thread_id, session.mapping_id);
     if (!state || state.managementState !== "managed") throw new AppError("SESSION_DETACHED", `${nickname} is not managed`);
     const activeTurn = this.runtime.activeTurn(session.endpoint, session.thread_id, session.mapping_id);

@@ -6,7 +6,7 @@ import { createTestDatabase } from "../../src/storage/database.ts";
 import { OperationStore } from "../../src/storage/operation-store.ts";
 
 const expected = [
-  "list_managed_sessions", "discover_sessions", "get_session_status", "create_session", "register_session", "adopt_session", "rename_session", "detach_session", "attach_session", "archive_session",
+  "list_managed_sessions", "discover_sessions", "get_session_status", "create_session", "adopt_session", "rename_session", "unadopt_session", "archive_session",
   "send_to_session", "read_worker_message", "collect_messages", "interrupt_session", "list_models", "set_session_model", "set_reasoning_effort", "get_goal", "set_goal", "pause_goal", "resume_goal", "cancel_goal",
   "update_session_notes",
   "send_chat_message", "prepare_chat_attachment", "send_chat_attachment",
@@ -23,6 +23,14 @@ test("session nicknames are safe and create_session may use the backend fallback
   for (const nickname of ["Bad", "has space", "../escape", "", "x".repeat(65)]) {
     assert.throws(() => ASSISTANT_TOOL_SCHEMAS.create_session.parse({ nickname }));
   }
+});
+
+test("adoption uses the native Codex cwd and rejects a caller-supplied project directory", () => {
+  assert.deepEqual(ASSISTANT_TOOL_SCHEMAS.adopt_session.parse({ nickname: "payments", thread_id: "thread-1" }), {
+    nickname: "payments",
+    thread_id: "thread-1",
+  });
+  assert.throws(() => ASSISTANT_TOOL_SCHEMAS.adopt_session.parse({ nickname: "payments", thread_id: "thread-1", project_dir: "/wrong" }));
 });
 
 test("every curated handler validates, records, dispatches, and replays its receipt", async () => {

@@ -38,6 +38,12 @@ test("parses a complete strict version-2 dashboard", () => {
   assert.deepEqual(SessionDashboardDocumentSchema.parse(document), document);
   assert.throws(() => SessionDashboardDocumentSchema.parse({ ...document, extra: true }));
   assert.throws(() => SessionDashboardDocumentSchema.parse({ ...document, sessions: { payments: { ...document.sessions.payments, extra: true } } }));
+  for (const state of ["adopting", "unadopting", "archiving", "detached", "attaching", "archived"]) {
+    assert.throws(() => SessionDashboardDocumentSchema.parse({
+      ...document,
+      sessions: { payments: { ...document.sessions.payments, auto_session_info: { ...document.sessions.payments.auto_session_info, management_state: state } } },
+    }));
+  }
 });
 
 test("manager note patches require a field and accept null clearing", () => {

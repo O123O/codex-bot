@@ -4,10 +4,6 @@ export type ManagementState =
   | "managed"
   | "unadopting"
   | "archiving"
-  | "detaching"
-  | "detached"
-  | "attaching"
-  | "archived"
   | "unavailable";
 export type OperationState = "prepared" | "dispatched" | "succeeded" | "failed" | "uncertain";
 export type DeliveryState = "prepared" | "dispatched" | "confirmed" | "failed" | "uncertain";

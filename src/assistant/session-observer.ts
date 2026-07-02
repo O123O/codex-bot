@@ -218,7 +218,7 @@ export class SessionObservationProcessor {
     if (!session) return { kind: "discarded" };
     const state = this.runtime.getSession(endpointId, threadId, session.mapping_id);
     if (session.lifecycle_state === "managed" && state?.managementState === "managed") return { kind: "managed", identity: { endpointId, threadId }, mappingId: session.mapping_id };
-    if (state?.managementState === "attaching" || (state?.managementState === "unavailable" && state.restoreState === "managed")) {
+    if (session.lifecycle_state === "managed" && state?.managementState === "unavailable" && state.restoreState === "managed") {
       return { kind: "deferred" };
     }
     return { kind: "discarded" };

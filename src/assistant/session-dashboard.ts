@@ -54,12 +54,13 @@ export class SessionDashboard {
       const session = registry.sessions[nickname]!;
       const identity = { endpointId: session.endpoint, threadId: session.thread_id };
       const runtime = this.runtime.getSession(session.endpoint, session.thread_id, session.mapping_id);
+      const managementState = runtime?.managementState === "managed" ? "managed" : "unavailable";
       const pending = this.runtime.settings(session.endpoint, session.thread_id, session.mapping_id);
       const facts = this.store.facts(identity);
       sessions[nickname] = {
         identity: { thread_id: session.thread_id, endpoint: session.endpoint, project_dir: session.project_dir },
         auto_session_info: {
-          management_state: runtime?.managementState ?? "unavailable",
+          management_state: managementState,
           native_status: runtime?.nativeStatus ?? "notLoaded",
           active_turn_id: this.runtime.activeTurn(session.endpoint, session.thread_id, session.mapping_id) ?? null,
           last_sent: facts.lastSent,

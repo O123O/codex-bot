@@ -23,12 +23,13 @@ import { prepareAssistantWorkspace } from "./assistant/workspace.ts";
 import { EventRelay } from "./events/relay.ts";
 import { persistDeliveryStateEvent, reconcileDeliveryStateEvents } from "./events/delivery-status.ts";
 import { buildWorkerChildEnvironment, assistantTurnConfig, LoopbackMcpServer } from "./mcp/server.ts";
-import { SessionRegistry, type RegistryDocument } from "./registry/session-registry.ts";
+import { SessionRegistry, type RegistryDocument, type RegistrySession } from "./registry/session-registry.ts";
 import { SessionDiscovery } from "./sessions/discovery.ts";
 import { FinalMessageStore } from "./sessions/final-messages.ts";
 import { SessionLifecycle, workerThreadResumeParams } from "./sessions/lifecycle.ts";
 import { preparedProjectWorkspaceFromCheckpoint, ProjectWorkspacePolicy, type PreparedProjectWorkspace } from "./sessions/project-workspace.ts";
 import { SessionService } from "./sessions/service.ts";
+import { ThreadGate } from "./sessions/thread-gate.ts";
 import { inTransaction, openDatabase, type Database } from "./storage/database.ts";
 import { DeliveryStore, type DeliveryRecord } from "./storage/delivery-store.ts";
 import { OperationStore } from "./storage/operation-store.ts";
@@ -72,6 +73,7 @@ export async function buildProductionApp(
   let pool!: AppServerPool;
   let discovery!: SessionDiscovery;
   let lifecycle!: SessionLifecycle;
+  let threadGate!: ThreadGate;
   let projectWorkspaces!: ProjectWorkspacePolicy;
   let sessions!: SessionService;
   let relay!: EventRelay;
@@ -205,7 +207,8 @@ export async function buildProductionApp(
         });
         pool = new AppServerPool([endpoint, assistantEndpoint], { maxConcurrentTurns: config.maxConcurrentTurns });
         discovery = new SessionDiscovery(db, pool);
-        lifecycle = new SessionLifecycle(pool, registry, runtime, { now: () => Date.now() }, projectWorkspaces);
+        threadGate = new ThreadGate();
+        lifecycle = new SessionLifecycle(pool, registry, runtime, { now: () => Date.now() }, projectWorkspaces, threadGate);
         sessions = new SessionService(pool, registry, runtime, finals, deliveries);
         observations = new SessionObservationProcessor(dashboardStore, registry, runtime, {
           now: () => Date.now(),
@@ -270,7 +273,8 @@ export async function buildProductionApp(
     {
       name: "reconciliation",
       start: async () => {
-        await lifecycle.reconcileStartup();
+        await lifecycle.reconcileAdopting();
+        await lifecycle.reconcileRemovals();
         await resumeManagedSessions();
         await observations.drain(endpoint.id);
         await relay.reconcileEndpoint(endpoint.id);
@@ -367,24 +371,10 @@ export async function buildProductionApp(
         if (!mapping) throw new AppError("OPERATION_UNCERTAIN", "created session mapping was not committed");
         return { nickname: args.nickname, mapping_id: mapping.mapping_id };
       },
-      register_session: async (args, context) => {
-        const endpointId = projectEndpoint(args.endpoint);
-        const project = await projectWorkspaces.prepareExisting(args.project_dir);
-        context.checkpoint({ endpoint: endpointId, ...projectWorkspaceReceipt(project) });
-        await lifecycle.register(args.nickname, endpointId, args.thread_id, project, (thread) => hydrateThreadOrder(endpointId, thread));
-        advanceNativeWatermark(args.nickname);
-        observeLifecycle(args.nickname);
-        await renderDashboardSafely();
-        const mapping = registry.get(args.nickname);
-        if (!mapping) throw new AppError("OPERATION_UNCERTAIN", "registered session mapping was not committed");
-        return { nickname: args.nickname, mapping_id: mapping.mapping_id };
-      },
       adopt_session: async (args, context) => {
         const endpointId = projectEndpoint(args.endpoint);
-        const projectDir = args.project_dir ?? String((await pool.request<any>(endpointId, "thread/read", { threadId: args.thread_id, includeTurns: false })).thread.cwd);
-        const project = await projectWorkspaces.prepareExisting(projectDir);
-        context.checkpoint({ endpoint: endpointId, ...projectWorkspaceReceipt(project) });
-        await lifecycle.adopt(args.nickname, endpointId, args.thread_id, project, (thread) => hydrateThreadOrder(endpointId, thread));
+        context.checkpoint({ endpoint: endpointId, threadId: args.thread_id });
+        await lifecycle.adopt(args.nickname, endpointId, args.thread_id, (thread) => hydrateThreadOrder(endpointId, thread));
         advanceNativeWatermark(args.nickname);
         observeLifecycle(args.nickname);
         await renderDashboardSafely();
@@ -392,48 +382,30 @@ export async function buildProductionApp(
         if (!mapping) throw new AppError("OPERATION_UNCERTAIN", "adopted session mapping was not committed");
         return { nickname: args.nickname, mapping_id: mapping.mapping_id };
       },
-      rename_session: async (args) => {
+      rename_session: async (args, context) => {
         const session = registry.get(args.old_nickname);
         if (!session) throw new AppError("UNKNOWN_SESSION", `unknown session: ${args.old_nickname}`);
-        await registry.rename(args.old_nickname, args.new_nickname, session);
+        context.checkpoint({ nickname: args.old_nickname, ...session });
+        await lifecycle.rename(args.old_nickname, args.new_nickname);
         await reconcileDashboard();
-        return { nickname: args.new_nickname };
+        return { nickname: args.new_nickname, mapping_id: session.mapping_id };
       },
-      detach_session: async (args) => { await lifecycle.detach(args.nickname); observeLifecycle(args.nickname); await renderDashboardSafely(); return { nickname: args.nickname }; },
-      attach_session: async (args, context) => {
+      unadopt_session: async (args, context) => {
         const session = registry.get(args.nickname);
         if (!session) throw new AppError("UNKNOWN_SESSION", `unknown session: ${args.nickname}`);
-        let settingsObservationSequence: number | undefined;
-        let settingsObservedAt: number | undefined;
-        let nativeObservationSequence: number | undefined;
-        let resumedSettings: { model?: string; effort?: string | null } | undefined;
-        const checkpoint = () => context.checkpoint({
-          ...(resumedSettings ? { currentSettings: resumedSettings } : {}),
-          ...(settingsObservationSequence === undefined ? {} : { settingsObservationSequence }),
-          ...(settingsObservedAt === undefined ? {} : { settingsObservedAt }),
-          ...(nativeObservationSequence === undefined ? {} : { nativeObservationSequence }),
-        });
-        const settings = await lifecycle.attach(args.nickname, {
-          onResumed: (currentSettings) => {
-            resumedSettings = currentSettings;
-            settingsObservationSequence = dashboardStore.allocateObservationSequence();
-            settingsObservedAt = Date.now();
-            checkpoint();
-          },
-          onThreadRead: (thread) => {
-            nativeObservationSequence = dashboardStore.allocateObservationSequence();
-            hydrateThreadOrder(session.endpoint, thread);
-            checkpoint();
-          },
-        });
-        advanceNativeWatermark(args.nickname, nativeObservationSequence);
-        observeLifecycle(args.nickname);
-        observeCurrentSettings(args.nickname, settings, settingsObservedAt, settingsObservationSequence);
-        await observations.drain(session.endpoint);
-        await renderDashboardSafely();
-        return { nickname: args.nickname };
+        context.checkpoint({ nickname: args.nickname, ...session, step: "prepared" });
+        await lifecycle.unadopt(args.nickname, (checkpoint) => context.checkpoint(checkpoint));
+        await reconcileDashboard();
+        return { nickname: args.nickname, mapping_id: session.mapping_id };
       },
-      archive_session: async (args) => { await lifecycle.archive(args.nickname); observeLifecycle(args.nickname); await renderDashboardSafely(); return { nickname: args.nickname }; },
+      archive_session: async (args, context) => {
+        const session = registry.get(args.nickname);
+        if (!session) throw new AppError("UNKNOWN_SESSION", `unknown session: ${args.nickname}`);
+        context.checkpoint({ nickname: args.nickname, ...session, step: "prepared" });
+        await lifecycle.archive(args.nickname, (checkpoint) => context.checkpoint(checkpoint));
+        await reconcileDashboard();
+        return { nickname: args.nickname, mapping_id: session.mapping_id };
+      },
       send_to_session: async (args, context) => {
         const worker = registry.get(args.nickname);
         if (!worker) throw new AppError("UNKNOWN_SESSION", `unknown session: ${args.nickname}`);
@@ -972,10 +944,10 @@ export async function buildProductionApp(
           const proven = operation.kind === "set_session_model" ? settings.model === args.model : settings.effort === args.effort;
           if (proven) await succeedRecovered(operation, { pending: true }, () => observeLifecycle(args.nickname, operation.createdAt));
           else failRecoveredNoEffect(operation.id, "pending session setting was not committed");
-        } else if (["create_session", "register_session", "adopt_session"].includes(operation.kind)) {
+        } else if (["create_session", "adopt_session"].includes(operation.kind)) {
           let session = registry.get(args.nickname);
           const checkpoint = operation.receipt as ({ endpoint?: string; threadId?: string; dispatchStarted?: boolean } & Record<string, unknown>) | undefined;
-          const project = checkpoint ? preparedProjectWorkspaceFromCheckpoint(checkpoint) : undefined;
+          const project = operation.kind === "create_session" && checkpoint ? preparedProjectWorkspaceFromCheckpoint(checkpoint) : undefined;
           if (project) await projectWorkspaces.assertDispatchable(project);
           const expectedThread = args.thread_id as string | undefined ?? (operation.kind === "create_session" ? checkpoint?.threadId : undefined);
           const expectedDir = project?.path;
@@ -997,13 +969,17 @@ export async function buildProductionApp(
           }
           if (!session && operation.kind === "create_session" && checkpoint?.threadId && project) {
             const endpointId = projectEndpoint(checkpoint.endpoint ?? args.endpoint);
-            await lifecycle.adopt(args.nickname, endpointId, checkpoint.threadId, project, (thread) => {
+            await lifecycle.adopt(args.nickname, endpointId, checkpoint.threadId, (thread) => {
               if (thread.threadSource !== operation.id) throw new AppError("OPERATION_UNCERTAIN", "recovered worker thread has the wrong creation source");
               hydrateThreadOrder(endpointId, thread);
             });
             session = registry.get(args.nickname);
           }
-          if (session && (!expectedThread || session.thread_id === expectedThread) && (!expectedDir || session.project_dir === expectedDir)) {
+          if (session?.lifecycle_state === "adopting") {
+            await lifecycle.reconcileAdopting();
+            session = registry.get(args.nickname);
+          }
+          if (session?.lifecycle_state === "managed" && (!expectedThread || session.thread_id === expectedThread) && (!expectedDir || session.project_dir === expectedDir)) {
             const native = await pool.request<any>(session.endpoint, "thread/read", { threadId: session.thread_id, includeTurns: true });
             await verifySessionCwd(native.thread.cwd, session.project_dir);
             hydrateThreadOrder(session.endpoint, native.thread);
@@ -1023,69 +999,20 @@ export async function buildProductionApp(
         } else if (operation.kind === "rename_session") {
           if (!registry.get(args.old_nickname) && registry.get(args.new_nickname)) await succeedRecovered(operation, { nickname: args.new_nickname }, () => dashboardStore.markDirty());
           else if (registry.get(args.old_nickname) && !registry.get(args.new_nickname)) failRecoveredNoEffect(operation.id, "atomic nickname replacement was not committed");
-        } else if (["detach_session", "attach_session"].includes(operation.kind)) {
-          const session = registry.get(args.nickname);
-          const saved = operation.receipt as {
-            currentSettings?: { model?: string; effort?: string | null };
-            settingsObservationSequence?: number;
-            settingsObservedAt?: number;
-            nativeObservationSequence?: number;
-          } | undefined;
-          let currentSettings = saved?.currentSettings;
-          let settingsObservationSequence = saved?.settingsObservationSequence;
-          let settingsObservedAt = saved?.settingsObservedAt;
-          let nativeObservationSequence = saved?.nativeObservationSequence;
-          const checkpointAttach = () => operations.checkpoint(operation.id, {
-            ...(currentSettings ? { currentSettings } : {}),
-            ...(settingsObservationSequence === undefined ? {} : { settingsObservationSequence }),
-            ...(settingsObservedAt === undefined ? {} : { settingsObservedAt }),
-            ...(nativeObservationSequence === undefined ? {} : { nativeObservationSequence }),
-          });
-          let state = session ? runtime.getSession(session.endpoint, session.thread_id, session.mapping_id)?.managementState : undefined;
-          if (state === "detaching" || state === "attaching") {
-            await lifecycle.reconcileStartup({ endpointId: session!.endpoint, threadId: session!.thread_id }, operation.kind === "attach_session" ? {
-              onResumed: (settings) => {
-                currentSettings = settings;
-                settingsObservationSequence = dashboardStore.allocateObservationSequence();
-                settingsObservedAt = Date.now();
-                checkpointAttach();
-              },
-              onThreadRead: (thread) => {
-                nativeObservationSequence = dashboardStore.allocateObservationSequence();
-                hydrateThreadOrder(session!.endpoint, thread);
-                checkpointAttach();
-              },
-            } : {});
-            state = session ? runtime.getSession(session.endpoint, session.thread_id, session.mapping_id)?.managementState : undefined;
-          }
-          const expected = operation.kind === "detach_session" ? "detached" : "managed";
-          if (state === expected && expected === "managed") {
-            advanceNativeWatermark(args.nickname, nativeObservationSequence);
-            if (currentSettings) observeCurrentSettings(args.nickname, currentSettings, settingsObservedAt ?? operation.createdAt, settingsObservationSequence);
-            observeLifecycle(args.nickname);
-            await observations.drain(session!.endpoint);
-            await succeedRecovered(operation, { nickname: args.nickname });
-          } else if (state === expected) {
-            await succeedRecovered(operation, { nickname: args.nickname }, () => observeLifecycle(args.nickname));
-          }
-          else if ((operation.kind === "detach_session" && state === "managed") || (operation.kind === "attach_session" && state === "detached")) {
-            failRecoveredNoEffect(operation.id, `durable ${operation.kind === "detach_session" ? "detaching" : "attaching"} marker was not committed`);
-          }
-        } else if (operation.kind === "archive_session") {
-          const session = registry.get(args.nickname);
-          if (!session) continue;
-          let state = runtime.getSession(session.endpoint, session.thread_id, session.mapping_id)?.managementState;
-          let discovered: { archived: boolean } | undefined;
-          if (state !== "archived") {
-            discovered = (await discovery.list({ endpointId: session.endpoint, cwd: session.project_dir, search: session.thread_id, limit: 1 })).sessions.find((candidate) => candidate.id === session.thread_id);
-            if (discovered?.archived) {
-              runtime.endEpoch(session.endpoint, session.thread_id, session.mapping_id, Date.now());
-              runtime.setSession(session.endpoint, session.thread_id, session.mapping_id, "archived", "notLoaded");
-              state = "archived";
+        } else if (operation.kind === "unadopt_session" || operation.kind === "archive_session") {
+          const saved = operation.receipt as (Partial<RegistrySession> & { nickname?: string; step?: string }) | undefined;
+          if (saved?.endpoint && saved.thread_id && saved.project_dir && saved.mapping_id
+            && (saved.lifecycle_state === "unadopting" || saved.lifecycle_state === "archiving")) {
+            const expected = saved as RegistrySession;
+            await lifecycle.reconcileRemoval(saved.nickname ?? args.nickname, expected);
+            const current = registry.get(saved.nickname ?? args.nickname);
+            if (!current || current.mapping_id !== saved.mapping_id) {
+              await succeedRecovered(operation, { nickname: args.nickname, mapping_id: saved.mapping_id }, () => dashboardStore.markDirty());
             }
+          } else {
+            const current = registry.get(args.nickname);
+            if (current?.lifecycle_state === "managed") failRecoveredNoEffect(operation.id, "durable removal transition was not committed");
           }
-          if (state === "archived") await succeedRecovered(operation, { nickname: args.nickname }, () => observeLifecycle(args.nickname));
-          else if (discovered && !discovered.archived) failRecoveredNoEffect(operation.id, "thread archive was not committed");
         } else if (["set_goal", "pause_goal", "resume_goal", "cancel_goal"].includes(operation.kind)) {
           const current = await sessions.getGoal(args.nickname) as any;
           const goal = current?.goal;
@@ -1244,6 +1171,8 @@ export async function buildProductionApp(
     if (stopping) return;
     if (target.id === endpoint.id) {
       await target.start();
+      await lifecycle.reconcileAdopting();
+      await lifecycle.reconcileRemovals();
       await resumeManagedSessions();
       await observations.drain(endpoint.id);
       await relay.reconcileEndpoint(endpoint.id);
@@ -1352,6 +1281,8 @@ export async function buildProductionApp(
       return;
     }
     registryInvalid = false;
+    await lifecycle.reconcileAdopting();
+    await lifecycle.reconcileRemovals();
     await initializeNewRegistryMappings();
     await reconcileDashboard();
   }

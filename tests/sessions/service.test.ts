@@ -98,13 +98,32 @@ test("starts idle sessions, steers active sessions, and interrupts the exact tur
 });
 
 test("send enforces managed state and start/steer preconditions", async () => {
-  const { runtime, service } = await fixture();
-  runtime.setSession("local", "thread", mappingId, "detached", "idle");
+  const { registry, service } = await fixture();
+  await registry.transition("payments", registry.get("payments")!, "unadopting");
   await assert.rejects(service.send("payments", "x"), (error: unknown) => error instanceof AppError && error.code === "SESSION_DETACHED");
   await assert.rejects(service.setModel("payments", "gpt-5"), (error: unknown) => error instanceof AppError && error.code === "SESSION_DETACHED");
   await assert.rejects(service.setGoal("payments", "do not mutate"), (error: unknown) => error instanceof AppError && error.code === "SESSION_DETACHED");
-  runtime.setSession("local", "thread", mappingId, "managed", "idle");
-  await assert.rejects(service.send("payments", "x", { mode: "steer" }), (error: unknown) => error instanceof AppError && error.code === "SESSION_IDLE");
+  const idle = await fixture();
+  await assert.rejects(idle.service.send("payments", "x", { mode: "steer" }), (error: unknown) => error instanceof AppError && error.code === "SESSION_IDLE");
+});
+
+test("execution is rejected for every transitional mapping lifecycle", async () => {
+  for (const state of ["adopting", "unadopting", "archiving"] as const) {
+    const { registry, endpoint, runtime, service } = await fixture();
+    const current = registry.get("payments")!;
+    if (state === "adopting") {
+      await registry.transition("payments", current, "unadopting");
+      await registry.removeIfMatch("payments", current);
+      await registry.reserve("payments", { ...current, mapping_id: "mapping-adopting", lifecycle_state: "adopting" });
+      runtime.setSession("local", "thread", "mapping-adopting", "adopting", "idle");
+    } else {
+      await registry.transition("payments", current, state);
+      runtime.setSession("local", "thread", current.mapping_id, state, "idle");
+    }
+    endpoint.calls.length = 0;
+    await assert.rejects(service.send("payments", "must not run"), (error: unknown) => error instanceof AppError && error.code === "SESSION_DETACHED");
+    assert.equal(endpoint.calls.some((call) => call.method === "turn/start" || call.method === "turn/steer"), false);
+  }
 });
 
 test("status composes registry, runtime, native state, settings, and goal", async () => {
