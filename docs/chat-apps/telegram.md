@@ -33,29 +33,34 @@ Choose the ID belonging to your private message. Telegram's Bot API exposes user
 
 ## 3. Set the private-chat configuration
 
-In the shell or private service environment that will start the bot:
+Store the three adapter values in `~/.qiyan-bot/.env`. Replace both placeholders and keep destination equal to owner:
 
 ```bash
-# TELEGRAM_BOT_TOKEN is already set by the private prompt above.
-export TELEGRAM_OWNER_ID='<your-numeric-user-id>'
-export TELEGRAM_DESTINATION_CHAT_ID="$TELEGRAM_OWNER_ID"
-export DATA_DIR="$HOME/.qiyan-bot/data"
-export SESSION_REGISTRY_PATH="$HOME/.qiyan-bot/data/sessions.json"
-export ASSISTANT_WORKDIR="$HOME/.qiyan-bot/assistant"
+mkdir -p "$HOME/.qiyan-bot"
+chmod 700 "$HOME/.qiyan-bot"
+cat > "$HOME/.qiyan-bot/.env" <<'EOF'
+TELEGRAM_BOT_TOKEN=replace-with-botfather-token
+TELEGRAM_OWNER_ID=123456789
+TELEGRAM_DESTINATION_CHAT_ID=123456789
+EOF
+chmod 600 "$HOME/.qiyan-bot/.env"
 ```
 
 `TELEGRAM_DESTINATION_CHAT_ID` must equal `TELEGRAM_OWNER_ID`; this enforces the single-user private chat. Group, channel, callback, edited, service, and non-owner input is not accepted as an assistant message.
+
+For a nondefault QiYan home, create `<QIYAN_HOME>/.env` instead and pass the same absolute `--home` to each command. Home selection is CLI `--home`, process `QIYAN_HOME`, then `$HOME/.qiyan-bot`; `QIYAN_HOME` is not valid inside `.env`.
 
 ## 4. Authenticate and start
 
 Before starting, remember that the assistant defaults to non-interactive `danger-full-access`; workers must use an auto/non-interactive normal Codex configuration because Telegram has no approval UI. Complete the independent assistant login once, then start the bot:
 
 ```bash
-DATA_DIR="$DATA_DIR" qiyan-bot assistant-login
-qiyan-bot --workdir "$ASSISTANT_WORKDIR"
+qiyan-bot config-check
+qiyan-bot assistant-login
+qiyan-bot
 ```
 
-Keep that process running. Long polling receives Telegram updates; outbound replies use an independent transport, so one slow poll does not delay a ready response.
+No temporary Telegram exports or external service environment file are needed. Keep the process running. It starts in `~/.qiyan-bot/qiyan-workdir`; long polling receives updates while outbound replies use an independent transport, so one slow poll does not delay a ready response.
 
 ## 5. Smoke test
 

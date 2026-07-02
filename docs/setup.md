@@ -13,28 +13,33 @@ Chat approvals are unsupported. Configure normal Codex for automatic, non-intera
 With no path variables, QiYan uses:
 
 ```text
-$HOME/.qiyan-bot/assistant
+$HOME/.qiyan-bot/qiyan-workdir
 $HOME/.qiyan-bot/data
 $HOME/.qiyan-bot/data/sessions.json
-$HOME/qiyan-bot-projects
+$HOME/qiyan-projects
 ```
 
-For a service, optional absolute overrides are:
+QiYan home precedence is CLI `--home`, then process environment `QIYAN_HOME`, then `$HOME/.qiyan-bot`. Other values use CLI, process environment, `<QIYAN_HOME>/.env`, then defaults. Do not put `QIYAN_HOME` inside `.env`.
 
-```bash
-export ASSISTANT_WORKDIR="$HOME/.qiyan-bot/assistant"
-export DATA_DIR="$HOME/.qiyan-bot/data"
-export SESSION_REGISTRY_PATH="$HOME/.qiyan-bot/data/sessions.json"
-export ASSISTANT_SANDBOX_MODE=danger-full-access
+Optional settings in the private `.env` include:
+
+```dotenv
+ASSISTANT_WORKDIR=/absolute/path/to/qiyan-workdir
+DATA_DIR=/absolute/path/to/qiyan-data
+SESSION_REGISTRY_PATH=/absolute/path/to/qiyan-data/sessions.json
+ASSISTANT_SANDBOX_MODE=danger-full-access
 ```
 
-The assistant workdir must be separate from data and registry state. QiYan creates the directories, managed `AGENTS.md`, read-only `assistant-context.json`, and read-only `session-status.json`. Customize the complete prompt with `AGENTS.override.md`; never edit generated files.
+The assistant workdir must be separate from data and registry state and is the process working directory after startup. QiYan creates managed `AGENTS.md`, read-only `assistant-context.json`, and read-only `session-status.json`. Customize the prompt with `AGENTS.override.md`; never edit generated files.
+
+Worker projects use relevant/user-specified semantic locations, with `~/qiyan-projects/<nickname>` as the backend fallback. QiYan home, its descendants, and ancestors containing it are never worker projects.
 
 ## Authenticate the assistant
 
-Run device authentication once. If `DATA_DIR` is overridden, provide the same value here:
+Run device authentication once after configuring the home:
 
 ```bash
+qiyan-bot config-check
 qiyan-bot assistant-login
 ```
 
@@ -42,13 +47,15 @@ This starts no bot and needs no chat credentials. The assistant profile is indep
 
 ## Configure an adapter and launch
 
-Set adapter variables from its guide. Before launching, remember: the assistant has non-interactive full filesystem access, and workers must already be configured for auto mode because chat approvals are unsupported.
+Store adapter variables in `<QIYAN_HOME>/.env` as its guide describes. Before launching, remember: the assistant has non-interactive full filesystem access, and workers must already be configured for auto mode because chat approvals are unsupported. Child processes do not inherit bot secrets from `.env`, but QiYan has the same OS-user filesystem access and can technically read that file.
 
 ```bash
 qiyan-bot
 ```
 
-Use `qiyan-bot --workdir "$ASSISTANT_WORKDIR"` only when overriding the HOME-based assistant path. SIGINT and SIGTERM perform graceful shutdown. Put secrets and configuration in your service manager's private environment, not a repository file or shell history.
+Use `qiyan-bot --home /absolute/private/home` consistently for validation, login, and run when overriding the default. SIGINT and SIGTERM perform graceful shutdown. For a service, start directly in `qiyan-workdir`; do not use an external `EnvironmentFile`. QiYan reads its private mode-0600 `.env` itself.
+
+QiYan's own replies have no prefix. Worker finals use `[nickname]`, and backend warnings use `[system]`.
 
 ## Backup
 

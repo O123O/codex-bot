@@ -20,7 +20,7 @@ test("user assistant finals are durable deliveries while internal finals are sup
   runtime.beginInternalAttempt("batch", "attempt-2", "turn-internal");
   const restarted = new AssistantRuntime(db, operations, deliveries, { destination: "42" });
   restarted.handleTerminal("turn-internal", "do not send");
-  assert.deepEqual(deliveries.listReady().map((item) => item.body), ["[assistant] answer"]);
+  assert.deepEqual(deliveries.listReady().map((item) => item.body), ["answer"]);
   assert.equal((db.prepare("SELECT state FROM events WHERE id = 'batch-event'").get() as any).state, "processed");
 });
 

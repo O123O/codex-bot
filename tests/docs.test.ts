@@ -52,7 +52,7 @@ test("full-access and non-interactive worker warnings precede installation and l
     ["installation", install, "npm install --global"],
     ["README launch", readme, "\nqiyan-bot\n"],
     ["setup launch", setup, "\nqiyan-bot\n"],
-    ["Telegram launch", telegram, "qiyan-bot --workdir"],
+    ["Telegram launch", telegram, "\nqiyan-bot\n"],
   ] as const) {
     const boundary = document.indexOf(marker);
     assert.ok(boundary >= 0, `${name} marker missing`);
@@ -66,12 +66,32 @@ test("Telegram guide is actionable for the implemented private single-user adapt
   const guide = await readFile(resolve("docs/chat-apps/telegram.md"), "utf8");
   for (const required of [
     "Status: Implemented", "@BotFather", "numeric Telegram user ID", "TELEGRAM_BOT_TOKEN",
-    "TELEGRAM_OWNER_ID", "TELEGRAM_DESTINATION_CHAT_ID", "assistant-login", "qiyan-bot --workdir",
+    "TELEGRAM_OWNER_ID", "TELEGRAM_DESTINATION_CHAT_ID", "assistant-login", "qiyan-bot",
     "private chat", "Smoke test", "attachment",
   ]) {
     assert.equal(guide.includes(required), true, `Telegram guide is missing: ${required}`);
   }
   assert.match(guide, /TELEGRAM_DESTINATION_CHAT_ID[^\n]+TELEGRAM_OWNER_ID/iu);
+  assert.match(guide, /~\/\.qiyan-bot\/\.env/u);
+  assert.match(guide, /chmod 600[^\n]*\.env/iu);
+  assert.doesNotMatch(guide, /EnvironmentFile=/u);
+});
+
+test("primary guides document QiYan home precedence, private dotenv setup, and message prefixes", async () => {
+  const readme = await readFile(resolve("README.md"), "utf8");
+  const setup = await readFile(resolve("docs/setup.md"), "utf8");
+  const telegram = await readFile(resolve("docs/chat-apps/telegram.md"), "utf8");
+  const combined = `${readme}\n${setup}`;
+  for (const required of ["--home", "QIYAN_HOME", "qiyan-workdir", "qiyan-projects", "config-check"]) {
+    assert.equal(combined.includes(required), true, `primary guides are missing: ${required}`);
+  }
+  assert.match(combined, /CLI.*process environment.*\.env.*default/isu);
+  assert.match(combined, /QiYan.*repl(?:y|ies).*no prefix/isu);
+  assert.match(combined, /worker.*\[nickname\]/isu);
+  assert.match(combined, /full.*access.*same OS user.*\.env/isu);
+  assert.match(setup, /do not use.*EnvironmentFile/iu);
+  assert.match(telegram, /cat > "?\$HOME\/\.qiyan-bot\/\.env"?/u);
+  assert.doesNotMatch(telegram.split("## 4. Authenticate and start")[1] ?? "", /export\s+TELEGRAM_/u);
 });
 
 test("Slack and WeChat pages are explicit roadmap stubs rather than fake setup guides", async () => {

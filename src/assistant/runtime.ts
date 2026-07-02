@@ -60,7 +60,7 @@ export class AssistantRuntime {
       this.finalizeEventBatch(attempt.contextId, "processed");
       this.releaseSourceAttachments(attempt.contextId);
       if (attempt.triggerKind === "user" && finalText) {
-        this.deliveries.prepare({ id: `assistant:${turnId}`, kind: "assistant_final", destination: this.options.destination, body: `[assistant] ${finalText}`, mandatory: true });
+        this.deliveries.prepare({ id: `assistant:${turnId}`, kind: "assistant_final", destination: this.options.destination, body: finalText, mandatory: true });
       }
     });
     if (this.active?.turnId === turnId) this.active = undefined;

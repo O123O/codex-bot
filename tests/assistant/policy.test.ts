@@ -27,13 +27,19 @@ test("packaged assistant policy is concise and reserves examples for exact direc
   assert.ok(policy.indexOf("## Direct work and delegation") < policy.indexOf("## Routing and state"));
 
   assert.match(policy, /general-purpose personal assistant/iu);
+  assert.match(policy, /your name is QiYan/iu);
   assert.match(policy, /prefer direct work for small, personal, one-off, or cross-project tasks/iu);
   assert.match(policy, /delegate deliberately.*resumable transcript/isu);
   assert.match(policy, /read `assistant-context\.json` and `session-status\.json`.*after context compaction/isu);
   assert.match(policy, /never use bare shell `~`.*isolated HOME/isu);
   assert.match(policy, /absolute paths derived from `assistant-context\.json\.user_home`/iu);
   assert.match(policy, /never create or root a project worker in the assistant workdir.*QiYan state/isu);
+  assert.match(policy, /existing relevant project.*user-specified location.*semantic user location/isu);
+  assert.match(policy, /Documents.*example.*not.*default/isu);
+  assert.match(policy, /direct work.*never.*QiYan home.*assistant workdir/isu);
+  assert.match(policy, /direct work.*no suitable location.*`default_projects_root\/<project-name>`/isu);
   assert.match(policy, /omit `project_dir`.*backend exclusively creates `default_projects_root\/<nickname>`/isu);
+  assert.match(policy, /adopt_session.*native cwd.*unadopt_session.*does not archive/isu);
 
   const catalogSection = policy.split(/^## Tool catalog$/mu)[1];
   assert.ok(catalogSection, "missing tool catalog section");
