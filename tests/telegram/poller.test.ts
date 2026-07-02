@@ -25,6 +25,12 @@ test("accepted input atomically stores source context and advances the offset af
   const context = operations.getSourceContext("telegram:10:2");
   assert.equal(context?.rawText, "/pass hi");
   assert.equal(context?.attachmentIds.length, 1);
+  assert.deepEqual(context?.binding, {
+    adapterId: "telegram",
+    conversationKey: "telegram:10",
+    destination: { chatId: "10" },
+    reply: { messageId: 2 },
+  });
   assert.equal((db.prepare("SELECT ref_count FROM attachments").get() as any).ref_count, 1);
   assert.deepEqual(queued, ["telegram:10:2"]);
 });

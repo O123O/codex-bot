@@ -91,3 +91,21 @@ test("operations receive a monotonic order even when creation timestamps tie", (
     Date.now = originalNow;
   }
 });
+
+test("chat source bindings persist and recovery inherits the route as internal work", () => {
+  const db = createTestDatabase();
+  const store = new OperationStore(db);
+  store.createSourceContext({
+    id: "chat-bound",
+    kind: "telegram",
+    sourceId: "update-1",
+    rawText: "hello",
+    attachmentIds: [],
+    binding: { adapterId: "telegram", conversationKey: "telegram:42", destination: { chatId: "42" }, reply: { messageId: 7 } },
+  });
+  const source = store.getSourceContext("chat-bound");
+  assert.deepEqual(source?.binding, { adapterId: "telegram", conversationKey: "telegram:42", destination: { chatId: "42" }, reply: { messageId: 7 } });
+  const recovery = store.supersedeWithRecovery("chat-bound", [{ state: "uncertain" }]);
+  assert.deepEqual(recovery.binding, source?.binding);
+  assert.equal((db.prepare("SELECT source_class FROM source_contexts WHERE id = ?").get(recovery.id) as any).source_class, "internal");
+});

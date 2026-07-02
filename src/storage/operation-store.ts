@@ -36,10 +36,25 @@ export class OperationStore {
   constructor(private readonly db: Database) {}
 
   createSourceContext(context: SourceContext): boolean {
-    return this.db.prepare(`INSERT OR IGNORE INTO source_contexts
-      (id, kind, source_id, raw_text, attachment_ids_json, created_at)
-      VALUES (?, ?, ?, ?, ?, ?)`)
-      .run(context.id, context.kind, context.sourceId, context.rawText, JSON.stringify(context.attachmentIds), Date.now()).changes === 1;
+    this.db.exec("SAVEPOINT create_source_context");
+    try {
+      const arrival = Number((this.db.prepare("SELECT next_value FROM arrival_sequence WHERE singleton = 1").get() as { next_value: number }).next_value);
+      const inserted = this.db.prepare(`INSERT OR IGNORE INTO source_contexts
+        (id, kind, source_id, raw_text, attachment_ids_json, adapter_id, conversation_key, destination_json, native_reply_json,
+          arrival_sequence, source_class, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+        .run(context.id, context.kind, context.sourceId, context.rawText, JSON.stringify(context.attachmentIds),
+          context.binding?.adapterId ?? null, context.binding?.conversationKey ?? null,
+          context.binding === undefined ? null : JSON.stringify(context.binding.destination),
+          context.binding?.reply === undefined ? null : JSON.stringify(context.binding.reply), arrival,
+          context.kind === "telegram" ? "chat" : "internal", Date.now()).changes === 1;
+      if (inserted) this.db.prepare("UPDATE arrival_sequence SET next_value = ? WHERE singleton = 1").run(arrival + 1);
+      this.db.exec("RELEASE SAVEPOINT create_source_context");
+      return inserted;
+    } catch (error) {
+      this.db.exec("ROLLBACK TO SAVEPOINT create_source_context; RELEASE SAVEPOINT create_source_context");
+      throw error;
+    }
   }
 
   getSourceContext(id: string): (SourceContext & { state: "pending" | "active" | "completed" | "superseded"; supersededBy?: string }) | undefined {
@@ -51,6 +66,16 @@ export class OperationStore {
       sourceId: String(row.source_id),
       rawText: String(row.raw_text),
       attachmentIds: JSON.parse(String(row.attachment_ids_json)) as string[],
+      ...(row.adapter_id && row.conversation_key && row.destination_json ? {
+        binding: {
+          adapterId: String(row.adapter_id),
+          conversationKey: String(row.conversation_key),
+          destination: JSON.parse(String(row.destination_json)),
+          ...(row.native_reply_json ? { reply: JSON.parse(String(row.native_reply_json)) } : {}),
+        },
+      } : {}),
+      ...(row.arrival_sequence == null ? {} : { arrivalSequence: Number(row.arrival_sequence) }),
+      queueNoticeRequired: Number(row.queue_notice_required) === 1,
       state: String(row.state) as "pending" | "active" | "completed" | "superseded",
       ...(row.superseded_by ? { supersededBy: String(row.superseded_by) } : {}),
     };
@@ -177,6 +202,7 @@ export class OperationStore {
       sourceId: contextId,
       rawText: JSON.stringify(receipts),
       attachmentIds: [],
+      ...(source.binding ? { binding: source.binding } : {}),
     };
     this.createSourceContext(recovery);
     this.db.prepare("UPDATE source_contexts SET state = 'superseded', superseded_by = ? WHERE id = ?").run(recovery.id, contextId);

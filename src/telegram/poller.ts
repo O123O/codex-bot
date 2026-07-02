@@ -43,6 +43,12 @@ export class TelegramPoller {
       inTransaction(this.db, () => {
         const created = this.operations.createSourceContext({
           id: contextId, kind: "telegram", sourceId: String(update.update_id), rawText: classified.message.rawText, attachmentIds: saved.map((item) => item.id),
+          binding: {
+            adapterId: "telegram",
+            conversationKey: `telegram:${classified.message.chatId}`,
+            destination: { chatId: String(classified.message.chatId) },
+            reply: { messageId: Number(contextId.split(":").at(-1)) },
+          },
         });
         if (created) for (const attachment of saved) this.attachments.retain(contextId, attachment.id);
         this.advance(update.update_id + 1);

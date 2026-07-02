@@ -67,3 +67,25 @@ test("an existing QiYan database reopens normally", async () => {
   assert.equal(reopened.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get()!.count, 8);
   reopened.close();
 });
+
+test("a cut-over QiYan state-version-3 database reopens normally", async () => {
+  const root = await mkdtemp(join(tmpdir(), "qiyan-bot-db-v3-"));
+  const path = join(root, "bot.sqlite3");
+  const db = openDatabase(path);
+  db.prepare("UPDATE qiyan_state SET state_version = 3 WHERE product = 'qiyan-bot'").run();
+  db.close();
+  const reopened = openDatabase(path);
+  assert.equal(reopened.prepare("SELECT state_version FROM qiyan_state WHERE product = 'qiyan-bot'").get()!.state_version, 3);
+  reopened.close();
+});
+
+test("an unknown future QiYan state version is rejected read-only", async () => {
+  const root = await mkdtemp(join(tmpdir(), "qiyan-bot-db-v4-"));
+  const path = join(root, "bot.sqlite3");
+  const db = openDatabase(path);
+  db.prepare("UPDATE qiyan_state SET state_version = 4 WHERE product = 'qiyan-bot'").run();
+  db.close();
+  const before = await readFile(path);
+  assert.throws(() => openDatabase(path), /not a QiYan Bot state database/);
+  assert.deepEqual(await readFile(path), before);
+});

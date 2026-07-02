@@ -32,7 +32,7 @@ function assertQiYanDatabase(path: string): void {
     inspector = new DatabaseSync(path, { readOnly: true });
     const marker = inspector.prepare("SELECT product, state_version FROM qiyan_state WHERE product = 'qiyan-bot'").get() as
       { product?: unknown; state_version?: unknown } | undefined;
-    if (marker?.product !== "qiyan-bot" || marker.state_version !== 2) throw new Error("invalid marker");
+    if (marker?.product !== "qiyan-bot" || (marker.state_version !== 2 && marker.state_version !== 3)) throw new Error("invalid marker");
   } catch {
     throw new AppError("CONFIGURATION_ERROR", "not a QiYan Bot state database");
   } finally {
