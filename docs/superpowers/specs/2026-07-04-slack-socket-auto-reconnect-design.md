@@ -40,6 +40,10 @@ Unit tests will verify that the adapter disables SDK automatic reconnection, pre
 
 After packaging and restarting the local service, a fresh owner DM will be measured using metadata-only timestamps for Slack event time, assistant admission, terminal completion, and confirmed delivery. Success means the service stays active and a stable connection delivers the test event without the previous 10-plus-second pre-admission stall. On a connection that has never returned a pong, the SDK's default heartbeat detects failure on the fourth approximately 1.7-second ping tick, after about 6.7 seconds, before QiYan's 1-second reconnect delay. A single transient slow event will be reported rather than hidden; repeated samples are needed before attributing residual delay to the network route.
 
+## Potential Future Improvement
+
+Slack permits up to 10 concurrent Socket Mode connections and may route each payload to any one of them. If repeated metadata-only measurements show frequent event-to-admission delays specifically caused by reconnect gaps, QiYan can evaluate two overlapping connections so one remains available while the other refreshes. That design must coordinate independent connection lifecycles through the existing durable event-ID deduplication boundary and prove clean startup, replacement, and shutdown behavior. Isolated missed pongs or ordinary periodic refreshes are not sufficient reason to add this complexity.
+
 ## Non-Goals
 
 - Maintaining multiple simultaneous Socket Mode connections.
