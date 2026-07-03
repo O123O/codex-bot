@@ -45,6 +45,7 @@ import { OperationStore } from "./storage/operation-store.ts";
 import { RuntimeStore } from "./storage/runtime-store.ts";
 import { SessionDashboardStore } from "./storage/session-dashboard-store.ts";
 import { TelegramChatAdapter } from "./telegram/chat-adapter.ts";
+import type { SlackContextService } from "./slack/context-service.ts";
 
 const assistantAssetRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../assets/assistant");
 const fullAccessWarning = "QiYan assistant is running non-interactively with full filesystem access and approvals disabled.";
@@ -126,6 +127,7 @@ export async function buildProductionApp(
   let mcp!: LoopbackMcpServer;
   let chat!: ChatAdapter;
   let chatRegistry!: ChatAdapterRegistry;
+  let slackContextService: SlackContextService | undefined;
   let deliveryWorker!: DeliveryWorker;
   let acceptingReadyEvents = false;
   let schedulerAccepting = false;
@@ -658,6 +660,8 @@ export async function buildProductionApp(
         return { deliveryId: delivery.id };
       },
       get_chat_history: createChatHistoryAction(() => chatRegistry, assistantAttemptBinding),
+      search_slack: async (args) => requireSlackContext().search(args.query, args.date_from, args.date_to),
+      get_slack_mentions: async (args) => requireSlackContext().mentions(args.date_from),
     };
   }
 
@@ -673,6 +677,11 @@ export async function buildProductionApp(
       destination: JSON.parse(String(row.destination_json)),
       ...(row.native_reply_json ? { reply: JSON.parse(String(row.native_reply_json)) } : {}),
     };
+  }
+
+  function requireSlackContext(): SlackContextService {
+    if (!slackContextService) throw new AppError("UNSUPPORTED_CAPABILITY", "Slack search is not configured");
+    return slackContextService;
   }
 
   async function reconcileDashboard(required = false): Promise<void> {

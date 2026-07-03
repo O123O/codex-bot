@@ -43,14 +43,18 @@ export const ASSISTANT_TOOL_SCHEMAS = {
     count: z.number().int().positive().max(100),
     before: z.string().min(1).optional(),
   }).strict(),
+  search_slack: z.object({ query: z.string().min(1), date_from: z.string().optional(), date_to: z.string().optional() }).strict(),
+  get_slack_mentions: z.object({ date_from: z.string() }).strict(),
 } as const;
 
 export const TOOL_NAMES = Object.freeze(Object.keys(ASSISTANT_TOOL_SCHEMAS)) as readonly (keyof typeof ASSISTANT_TOOL_SCHEMAS)[];
 export type AssistantToolName = keyof typeof ASSISTANT_TOOL_SCHEMAS;
 type Action = (args: any, context: ToolActionContext) => Promise<any>;
 
+export const EPHEMERAL_READ_TOOLS = new Set<AssistantToolName>(["search_slack", "get_slack_mentions"]);
+
 export const READ_ONLY_TOOLS = new Set<AssistantToolName>([
-  "list_managed_sessions", "discover_sessions", "get_session_status", "read_worker_message", "list_models", "get_goal", "get_chat_history",
+  "list_managed_sessions", "discover_sessions", "get_session_status", "read_worker_message", "list_models", "get_goal", "get_chat_history", "search_slack", "get_slack_mentions",
 ]);
 
 export function createAssistantTools(
@@ -64,6 +68,18 @@ export function createAssistantTools(
       const args = ASSISTANT_TOOL_SCHEMAS[name].parse(raw) as any;
       const source = operations.getSourceContext(context.sourceContextId);
       if (!source) throw new AppError("OPERATION_CONFLICT", "tool call is not bound to an active source context");
+      if (EPHEMERAL_READ_TOOLS.has(name)) {
+        const action = actions[name];
+        if (!action) throw new AppError("UNSUPPORTED_CAPABILITY", `tool is not configured: ${name}`);
+        return action(args, {
+          ...context,
+          effectiveSourceContextId: context.sourceContextId,
+          operationId: `ephemeral:${context.attemptId}:${context.callId}:${name}`,
+          operationCreatedAt: Date.now(),
+          operationSequence: 0,
+          checkpoint: () => { throw new AppError("UNSUPPORTED_CAPABILITY", `${name} cannot create a durable checkpoint`); },
+        });
+      }
       let directive: { kind: "pass" | "collect"; binding: unknown } | undefined;
       let operation: OperationRecord | undefined;
       let effectiveSourceContextId = context.sourceContextId;

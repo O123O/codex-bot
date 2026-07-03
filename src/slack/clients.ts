@@ -51,6 +51,10 @@ export interface SlackSearchCoverage {
   searchAvailable: boolean;
   omitted: readonly SlackSearchCategory[];
   errors: readonly string[];
+  limitedTo?: {
+    channelTypes: readonly ("public_channel" | "private_channel" | "mpim" | "im")[];
+    contentTypes: readonly ("messages" | "files" | "channels" | "users")[];
+  };
 }
 
 export interface SlackStartupIdentity {

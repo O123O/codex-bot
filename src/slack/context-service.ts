@@ -1,6 +1,8 @@
 import type { ConversationBinding, JsonValue } from "../chat/binding.ts";
 import type { ChatHistoryProvider, ChatHistoryRequest } from "../chat/contracts.ts";
-import type { SlackBotClient } from "./clients.ts";
+import { AppError } from "../core/errors.ts";
+import type { SlackBotClient, SlackSearchClient, SlackSearchCoverage } from "./clients.ts";
+import { TransientResultLimiter, type TransientResults } from "./result-limiter.ts";
 
 interface SlackDestination {
   workspaceId: string;
@@ -16,8 +18,26 @@ interface NormalizedHistoryMessage {
   threadTs?: string;
 }
 
+type SearchMatch = Record<string, unknown> & { kind: "message" | "file" | "channel" | "user" };
+interface IndexedSearchMatch {
+  result: SearchMatch;
+  sortTimestamp: string;
+  sortChannelId: string;
+  sortKey: string;
+}
+
+const CHANNEL_TYPES = ["public_channel", "private_channel", "mpim", "im"] as const;
+const CONTENT_TYPES = ["messages", "files", "channels", "users"] as const;
+
+interface SlackContextOptions {
+  search: SlackSearchClient;
+  ownerUserId: string;
+  coverage: SlackSearchCoverage;
+  now(): number;
+}
+
 export class SlackContextService implements ChatHistoryProvider {
-  constructor(private readonly client: SlackBotClient, private readonly teamId: string) {}
+  constructor(private readonly client: SlackBotClient, private readonly teamId: string, private readonly options?: SlackContextOptions) {}
 
   async getHistory(binding: ConversationBinding, request: ChatHistoryRequest): Promise<JsonValue> {
     if (!Number.isInteger(request.count) || request.count < 1 || request.count > 100) throw new TypeError("Slack history count is invalid");
@@ -26,6 +46,104 @@ export class SlackContextService implements ChatHistoryProvider {
     return request.scope === "conversation" && destination.threadTs
       ? this.threadHistory({ ...destination, threadTs: destination.threadTs }, request)
       : this.channelHistory(destination, request);
+  }
+
+  search(query: string, dateFrom?: string, dateTo?: string): Promise<TransientResults<SearchMatch>> {
+    if (!query.trim()) throw new TypeError("Slack search query is required");
+    return this.searchPages({
+      query,
+      ...(dateFrom === undefined ? {} : { dateFrom }),
+      ...(dateTo === undefined ? {} : { dateTo }),
+      contentTypes: CONTENT_TYPES,
+      exactMention: false,
+    });
+  }
+
+  mentions(dateFrom: string): Promise<TransientResults<SearchMatch>> {
+    const ownerUserId = this.requireSearch().ownerUserId;
+    return this.searchPages({ query: `<@${ownerUserId}>`, dateFrom, contentTypes: ["messages"], exactMention: true });
+  }
+
+  private async searchPages(input: {
+    query: string;
+    dateFrom?: string;
+    dateTo?: string;
+    contentTypes: readonly ("messages" | "files" | "channels" | "users")[];
+    exactMention: boolean;
+  }): Promise<TransientResults<SearchMatch>> {
+    const options = this.requireSearch();
+    const fromMs = input.dateFrom === undefined ? undefined : parseUtcDate(input.dateFrom, "date_from");
+    const toMs = input.dateTo === undefined ? options.now() : parseUtcDate(input.dateTo, "date_to");
+    if (fromMs !== undefined && fromMs >= toMs) throw new TypeError("Slack search date_from must precede date_to");
+    const coverage: SlackSearchCoverage = {
+      ...options.coverage,
+      requested: [...options.coverage.requested],
+      omitted: [...options.coverage.omitted],
+      errors: [...options.coverage.errors],
+      limitedTo: { channelTypes: [...CHANNEL_TYPES], contentTypes: [...input.contentTypes] },
+    };
+    const limiter = new TransientResultLimiter<IndexedSearchMatch>({
+      identity: (item) => ({ channelId: item.sortChannelId, timestamp: item.sortTimestamp, key: item.sortKey }),
+      render: renderSearchMatch,
+    });
+    let cursor: string | undefined;
+    let page = 0;
+    let complete = true;
+    let warning: string | undefined;
+    const seenCursors = new Set<string>();
+    do {
+      let response: Record<string, unknown>;
+      try {
+        response = await options.search.searchContext({
+          query: input.query,
+          channel_types: [...CHANNEL_TYPES],
+          content_types: [...input.contentTypes],
+          include_context_messages: true,
+          include_message_blocks: true,
+          include_bots: true,
+          sort: "timestamp",
+          sort_dir: "desc",
+          limit: 20,
+          ...(fromMs === undefined ? {} : { after: Math.floor(fromMs / 1_000) - 1 }),
+          before: Math.ceil(toMs / 1_000),
+          ...(cursor ? { cursor } : {}),
+        });
+      } catch {
+        if (page === 0) throw new AppError("ENDPOINT_UNAVAILABLE", "Slack search is unavailable; verify the read-only user token and search scopes");
+        complete = false;
+        warning = "Slack search continuation failed; returned results are partial.";
+        coverage.errors = [...coverage.errors, "pagination_failed"];
+        break;
+      }
+      const results = record(response.results);
+      if (!results) {
+        if (page === 0) throw new AppError("ENDPOINT_UNAVAILABLE", "Slack search is unavailable; Slack returned no result page");
+        complete = false;
+        warning = "Slack search continuation returned an invalid page; returned results are partial.";
+        coverage.errors = [...coverage.errors, "invalid_page"];
+        break;
+      }
+      const normalized = normalizeSearchPage(results, this.teamId);
+      const bounded = normalized.filter((item) => withinDateBounds(item, fromMs, toMs));
+      limiter.addPage(input.exactMention ? bounded.filter((item) => isExactOwnerMention(item, options.ownerUserId)) : bounded);
+      page += 1;
+      const next = nextCursor(results) ?? nextCursor(response);
+      if (next && seenCursors.has(next)) {
+        complete = false;
+        warning = "Slack search continuation repeated a cursor; returned results are partial.";
+        coverage.errors = [...coverage.errors, "repeated_cursor"];
+        break;
+      }
+      if (next) seenCursors.add(next);
+      cursor = next;
+    } while (cursor);
+    const limited = limiter.finish({ complete, coverage, ...(warning ? { warning } : {}) });
+    return { ...limited, results: limited.results.map(({ result }) => result) };
+  }
+
+  private requireSearch(): SlackContextOptions {
+    if (!this.options) throw new AppError("UNSUPPORTED_CAPABILITY", "Slack search is not configured");
+    return this.options;
   }
 
   private async channelHistory(destination: SlackDestination, request: ChatHistoryRequest): Promise<JsonValue> {
@@ -97,6 +215,162 @@ export class SlackContextService implements ChatHistoryProvider {
     }
     return { workspaceId, channelId, ...(threadTs ? { threadTs } : {}) };
   }
+}
+
+function normalizeSearchPage(results: Record<string, unknown>, expectedTeamId: string): IndexedSearchMatch[] {
+  return [
+    ...array(results.messages).flatMap((value) => normalizeSearchMessage(value, expectedTeamId)),
+    ...array(results.files).flatMap((value) => normalizeSearchFile(value, expectedTeamId)),
+    ...array(results.channels).flatMap((value) => normalizeSearchChannel(value, expectedTeamId)),
+    ...array(results.users).flatMap((value) => normalizeSearchUser(value, expectedTeamId)),
+  ];
+}
+
+function normalizeSearchMessage(value: unknown, expectedTeamId: string): IndexedSearchMatch[] {
+  const item = record(value);
+  const channelId = item && string(item.channel_id);
+  const messageTs = item && string(item.message_ts);
+  if (!item || !channelId || !messageTs || !isTimestamp(messageTs) || wrongTeam(item, expectedTeamId)) return [];
+  const context = record(item.context_messages);
+  const result: SearchMatch = {
+    kind: "message",
+    channelId,
+    messageTs,
+    text: typeof item.content === "string" ? item.content : "",
+    ...(string(item.channel_name) ? { channelName: string(item.channel_name)! } : {}),
+    ...(string(item.author_user_id) ? { authorUserId: string(item.author_user_id)! } : {}),
+    ...(string(item.author_name) ? { authorName: string(item.author_name)! } : {}),
+    ...(typeof item.is_author_bot === "boolean" ? { isAuthorBot: item.is_author_bot } : {}),
+    ...(string(item.thread_ts) ? { threadTs: string(item.thread_ts)! } : {}),
+    ...(string(item.permalink) ? { permalink: string(item.permalink)! } : {}),
+    ...(item.blocks === undefined ? {} : { blocks: cloneJson(item.blocks) }),
+    ...(context ? { contextMessages: {
+      before: normalizeContextMessages(context.before),
+      after: normalizeContextMessages(context.after),
+    } } : {}),
+  };
+  return [{ result, sortTimestamp: messageTs, sortChannelId: channelId, sortKey: `message:${channelId}:${messageTs}` }];
+}
+
+function normalizeSearchFile(value: unknown, expectedTeamId: string): IndexedSearchMatch[] {
+  const item = record(value);
+  const fileId = item && string(item.file_id);
+  if (!item || !fileId || wrongTeam(item, expectedTeamId)) return [];
+  const epoch = epochSeconds(item.date_updated) ?? epochSeconds(item.date_created) ?? 0;
+  const result: SearchMatch = {
+    kind: "file",
+    fileId,
+    title: string(item.title) ?? "",
+    content: typeof item.content === "string" ? item.content : "",
+    ...(string(item.file_type) ? { fileType: string(item.file_type)! } : {}),
+    ...(string(item.author_user_id) ? { authorUserId: string(item.author_user_id)! } : {}),
+    ...(string(item.author_name) ? { authorName: string(item.author_name)! } : {}),
+    ...(string(item.permalink) ? { permalink: string(item.permalink)! } : {}),
+    ...(epoch ? { dateUpdated: epoch } : {}),
+  };
+  return [{ result, sortTimestamp: `${epoch}.000000`, sortChannelId: "", sortKey: `file:${fileId}` }];
+}
+
+function normalizeSearchChannel(value: unknown, expectedTeamId: string): IndexedSearchMatch[] {
+  const item = record(value);
+  if (!item || wrongTeam(item, expectedTeamId)) return [];
+  const channelId = string(item.channel_id) ?? "";
+  const name = string(item.name);
+  if (!channelId && !name) return [];
+  const epoch = epochSeconds(item.date_updated) ?? epochSeconds(item.date_created) ?? 0;
+  const result: SearchMatch = {
+    kind: "channel",
+    ...(channelId ? { channelId } : {}),
+    ...(name ? { name } : {}),
+    ...(string(item.topic) ? { topic: string(item.topic)! } : {}),
+    ...(string(item.purpose) ? { purpose: string(item.purpose)! } : {}),
+    ...(string(item.creator_user_id) ? { creatorUserId: string(item.creator_user_id)! } : {}),
+    ...(string(item.creator_name) ? { creatorName: string(item.creator_name)! } : {}),
+    ...(string(item.permalink) ? { permalink: string(item.permalink)! } : {}),
+  };
+  return [{ result, sortTimestamp: `${epoch}.000000`, sortChannelId: channelId, sortKey: `channel:${channelId || name}` }];
+}
+
+function normalizeSearchUser(value: unknown, expectedTeamId: string): IndexedSearchMatch[] {
+  const item = record(value);
+  const userId = item && (string(item.user_id) ?? string(item.id));
+  if (!item || !userId || wrongTeam(item, expectedTeamId)) return [];
+  const epoch = epochSeconds(item.date_updated) ?? 0;
+  const result: SearchMatch = {
+    kind: "user",
+    userId,
+    ...(string(item.name) ? { name: string(item.name)! } : {}),
+    ...(string(item.display_name) ? { displayName: string(item.display_name)! } : {}),
+    ...(string(item.real_name) ? { realName: string(item.real_name)! } : {}),
+  };
+  return [{ result, sortTimestamp: `${epoch}.000000`, sortChannelId: "", sortKey: `user:${userId}` }];
+}
+
+function normalizeContextMessages(value: unknown): Array<Record<string, string>> {
+  return array(value).flatMap((candidate) => {
+    const item = record(candidate);
+    const messageTs = item && string(item.ts);
+    if (!item || !messageTs) return [];
+    return [{
+      text: typeof item.text === "string" ? item.text : "",
+      ...(string(item.user_id) ? { userId: string(item.user_id)! } : {}),
+      messageTs,
+    }];
+  });
+}
+
+function isExactOwnerMention(item: IndexedSearchMatch, ownerUserId: string): boolean {
+  if (item.result.kind !== "message") return false;
+  const text = typeof item.result.text === "string" ? item.result.text : "";
+  return text.includes(`<@${ownerUserId}>`) || containsUserElement(item.result.blocks, ownerUserId);
+}
+
+function containsUserElement(value: unknown, ownerUserId: string): boolean {
+  if (Array.isArray(value)) return value.some((item) => containsUserElement(item, ownerUserId));
+  const item = record(value);
+  if (!item) return false;
+  if (item.type === "user" && item.user_id === ownerUserId) return true;
+  return Object.values(item).some((child) => containsUserElement(child, ownerUserId));
+}
+
+function renderSearchMatch(item: IndexedSearchMatch): string { return JSON.stringify(item.result); }
+
+function withinDateBounds(item: IndexedSearchMatch, fromMs: number | undefined, toMs: number): boolean {
+  const timestamp = slackTimestampMs(item.sortTimestamp);
+  if (timestamp === undefined || timestamp === 0) return true;
+  return (fromMs === undefined || timestamp >= fromMs) && timestamp < toMs;
+}
+
+function slackTimestampMs(value: string): number | undefined {
+  const match = /^(\d+)\.(\d+)$/u.exec(value);
+  if (!match) return undefined;
+  const seconds = Number(match[1]);
+  const milliseconds = Number(`0.${match[2]}`) * 1_000;
+  const result = seconds * 1_000 + milliseconds;
+  return Number.isFinite(result) ? result : undefined;
+}
+
+function parseUtcDate(value: string, field: string): number {
+  const normalized = /^\d{4}-\d{2}-\d{2}$/u.test(value) ? `${value}T00:00:00.000Z` : value;
+  if (!/^\d{4}-\d{2}-\d{2}T.*(?:Z|[+-]\d{2}:\d{2})$/u.test(normalized)) throw new TypeError(`${field} must be an ISO date or timestamp with a timezone`);
+  const timestamp = Date.parse(normalized);
+  if (!Number.isFinite(timestamp)) throw new TypeError(`${field} is invalid`);
+  return timestamp;
+}
+
+function wrongTeam(item: Record<string, unknown>, expectedTeamId: string): boolean {
+  return item.team_id !== undefined && item.team_id !== expectedTeamId;
+}
+
+function epochSeconds(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+}
+
+function array(value: unknown): unknown[] { return Array.isArray(value) ? value : []; }
+
+function cloneJson(value: unknown): unknown {
+  try { return JSON.parse(JSON.stringify(value)); }
+  catch { return null; }
 }
 
 function messages(response: Record<string, unknown>): unknown[] {

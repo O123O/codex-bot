@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { AppError } from "../../src/core/errors.ts";
-import { ASSISTANT_TOOL_SCHEMAS, TOOL_NAMES, createAssistantTools } from "../../src/assistant/tools.ts";
+import { ASSISTANT_TOOL_SCHEMAS, EPHEMERAL_READ_TOOLS, TOOL_NAMES, createAssistantTools } from "../../src/assistant/tools.ts";
 import { AttemptScope } from "../../src/assistant/attempt-scope.ts";
 import { ConversationStore } from "../../src/storage/conversation-store.ts";
 import { createTestDatabase } from "../../src/storage/database.ts";
@@ -12,7 +12,7 @@ const expected = [
   "list_managed_sessions", "discover_sessions", "get_session_status", "create_session", "adopt_session", "rename_session", "unadopt_session", "archive_session",
   "send_to_session", "read_worker_message", "collect_messages", "interrupt_session", "list_models", "set_session_model", "set_reasoning_effort", "get_goal", "set_goal", "pause_goal", "resume_goal", "cancel_goal",
   "update_session_notes",
-  "send_chat_message", "prepare_chat_attachment", "send_chat_attachment", "get_chat_history",
+  "send_chat_message", "prepare_chat_attachment", "send_chat_attachment", "get_chat_history", "search_slack", "get_slack_mentions",
 ].sort();
 
 test("tool catalog is curated and excludes completion and raw RPC", () => {
@@ -36,6 +36,32 @@ test("chat history has one bounded platform-neutral read-only schema", () => {
   for (const input of [
     { scope: "workspace", count: 1 }, { scope: "channel", count: 0 }, { scope: "channel", count: 101 }, { scope: "channel", count: 1, adapter: "slack" },
   ]) assert.throws(() => ASSISTANT_TOOL_SCHEMAS.get_chat_history.parse(input));
+});
+
+test("Slack search schemas are the only ephemeral reads and never create replay receipts", async () => {
+  assert.deepEqual([...EPHEMERAL_READ_TOOLS].sort(), ["get_slack_mentions", "search_slack"]);
+  assert.deepEqual(ASSISTANT_TOOL_SCHEMAS.search_slack.parse({ query: "launch", date_from: "2026-01-01", date_to: "2026-02-01" }), {
+    query: "launch", date_from: "2026-01-01", date_to: "2026-02-01",
+  });
+  assert.deepEqual(ASSISTANT_TOOL_SCHEMAS.get_slack_mentions.parse({ date_from: "2026-01-01" }), { date_from: "2026-01-01" });
+  assert.throws(() => ASSISTANT_TOOL_SCHEMAS.search_slack.parse({ query: "x", cursor: "forbidden" }));
+
+  const db = createTestDatabase();
+  const operations = new OperationStore(db);
+  operations.createSourceContext({ id: "ctx-search", kind: "slack", sourceId: "source", rawText: "search", attachmentIds: [] });
+  let calls = 0;
+  const sentinel = "TRANSIENT_SLACK_RESULT_DO_NOT_STORE_91f2";
+  const tools = createAssistantTools(operations, {
+    search_slack: async () => ({ results: [{ text: sentinel, call: ++calls }] }),
+  }, { maxCollectCount: 20 });
+  const context = { sourceContextId: "ctx-search", attemptId: "a", turnId: "t", callId: "same-call" };
+  assert.equal(((await tools.search_slack(context, { query: "launch" })) as any).results[0].call, 1);
+  assert.equal(((await tools.search_slack(context, { query: "launch" })) as any).results[0].call, 2);
+  assert.equal((db.prepare("SELECT COUNT(*) AS count FROM operations").get() as any).count, 0);
+  for (const { name } of db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").all() as Array<{ name: string }>) {
+    const rows = db.prepare(`SELECT * FROM "${name.replaceAll('"', '""')}"`).all();
+    assert.doesNotMatch(JSON.stringify(rows), new RegExp(sentinel));
+  }
 });
 
 test("adoption uses the native Codex cwd and rejects a caller-supplied project directory", () => {

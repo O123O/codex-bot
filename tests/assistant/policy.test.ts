@@ -11,6 +11,7 @@ const catalog = [
   ["Work and results", ["send_to_session", "read_worker_message", "collect_messages", "interrupt_session"]],
   ["Model, goal, and management memory", ["list_models", "set_session_model", "set_reasoning_effort", "get_goal", "set_goal", "pause_goal", "resume_goal", "cancel_goal", "update_session_notes"]],
   ["User output and attachments", ["send_chat_message", "prepare_chat_attachment", "send_chat_attachment"]],
+  ["Chat context and Slack retrieval", ["get_chat_history", "search_slack", "get_slack_mentions"]],
 ] as const;
 
 test("packaged assistant policy is concise and reserves examples for exact directives", async () => {
@@ -76,6 +77,8 @@ test("packaged assistant policy is concise and reserves examples for exact direc
   assert.match(policy, /thread context usage.*not.*(?:billing|account usage|credits|rate limits)/isu);
   assert.match(policy, /no `?watch_session`? tool/iu);
   assert.match(policy, /preserve attachment IDs deliberately.*never invent backend paths.*never expose tokens, hidden bodies/isu);
+  assert.match(policy, /Slack search results are transient, newest-first, and may be truncated/iu);
+  assert.match(policy, /coverage and completeness warnings.*narrow the query or date range/isu);
 
   assert.match(policy, /\/pass.*every character.*attachment IDs in original order exactly/isu);
   assert.match(policy, /one required ASCII space/iu);

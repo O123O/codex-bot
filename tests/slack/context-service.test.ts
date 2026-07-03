@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { Readable } from "node:stream";
 import test from "node:test";
 import type { ConversationBinding } from "../../src/chat/binding.ts";
-import type { SlackBotClient } from "../../src/slack/clients.ts";
+import { SlackApiError, type SlackBotClient, type SlackSearchClient, type SlackSearchCoverage } from "../../src/slack/clients.ts";
 import { SlackContextService } from "../../src/slack/context-service.ts";
 
 type ResponseFactory = (args: Record<string, unknown>) => Record<string, unknown>;
@@ -83,4 +83,110 @@ test("history validates the persisted Slack binding instead of accepting model-s
   await assert.rejects(service.getHistory({ ...dm, adapterId: "telegram" }, { scope: "conversation", count: 1 }), /Slack binding/i);
   await assert.rejects(service.getHistory({ ...dm, destination: { workspaceId: "T999", channelId: "D123" } }, { scope: "conversation", count: 1 }), /Slack binding/i);
   await assert.rejects(service.getHistory(dm, { scope: "conversation", count: 1, before: "not-a-timestamp" }), /boundary/i);
+});
+
+const searchCoverage: SlackSearchCoverage = {
+  requested: ["public_channels", "private_channels", "im", "mpim", "files", "users"],
+  authorization: "slack_enforced",
+  searchAvailable: true,
+  omitted: [],
+  errors: [],
+};
+
+function searchHarness(handler: (args: Record<string, unknown>, call: number) => Promise<Record<string, unknown>> | Record<string, unknown>) {
+  const calls: Record<string, unknown>[] = [];
+  const search: SlackSearchClient = {
+    authTest: async () => ({ ok: true }),
+    searchInfo: async () => ({ ok: true, is_ai_search_enabled: true }),
+    searchContext: async (args) => { calls.push(args); return handler(args, calls.length); },
+  };
+  return { search, calls };
+}
+
+test("Slack search normalizes UTC bounds, consumes every cursor, and preserves supported result context", async () => {
+  const now = Date.parse("2026-07-04T00:00:00Z");
+  const resultEpoch = Math.floor(Date.parse("2026-07-02T12:00:00Z") / 1_000);
+  const fake = searchHarness((args) => args.cursor === "next-page" ? {
+    ok: true,
+    results: {
+      channels: [{ channel_id: "C2", team_id: "T123", name: "launch", topic: "Ship", purpose: "Coordination", date_updated: resultEpoch - 100, permalink: "https://example.slack.com/archives/C2" }],
+      users: [{ user_id: "U2", team_id: "T123", name: "Lin", display_name: "Lin", date_updated: resultEpoch - 200 }],
+      response_metadata: { next_cursor: "" },
+    },
+  } : {
+    ok: true,
+    results: {
+      messages: [{
+        team_id: "T123", channel_id: "C1", channel_name: "general", author_user_id: "U1", author_name: "Ada",
+        message_ts: `${resultEpoch}.000100`, content: "launch details", thread_ts: `${resultEpoch - 1}.000000`,
+        permalink: "https://example.slack.com/archives/C1/p1", blocks: [{ type: "rich_text", elements: [] }],
+        context_messages: { before: [{ text: "before", user_id: "U3", ts: "1751999998.0" }], after: [{ text: "after", user_id: "U4", ts: "1752000001.0" }] },
+      }, { channel_id: "C1", message_ts: `${Math.floor(Date.parse("2026-07-03T12:00:00Z") / 1_000)}.700000`, content: "outside exclusive date_to" }],
+      files: [{ team_id: "T123", file_id: "F1", author_user_id: "U1", author_name: "Ada", date_created: resultEpoch + 100, title: "plan", file_type: "text/plain", content: "file body", permalink: "https://example.slack.com/files/F1" }],
+      response_metadata: { next_cursor: "next-page" },
+    },
+  });
+  const service = new SlackContextService(bot({}).client, "T123", { search: fake.search, ownerUserId: "U123", coverage: searchCoverage, now: () => now });
+  const result = await service.search("launch", "2026-07-01", "2026-07-03T12:00:00.500Z");
+  assert.equal(fake.calls.length, 2);
+  assert.deepEqual(fake.calls[0], {
+    query: "launch",
+    channel_types: ["public_channel", "private_channel", "mpim", "im"],
+    content_types: ["messages", "files", "channels", "users"],
+    include_context_messages: true,
+    include_message_blocks: true,
+    include_bots: true,
+    sort: "timestamp",
+    sort_dir: "desc",
+    limit: 20,
+    after: Math.floor(Date.parse("2026-07-01T00:00:00Z") / 1_000) - 1,
+    before: Math.ceil(Date.parse("2026-07-03T12:00:00.500Z") / 1_000),
+  });
+  assert.equal(fake.calls[1]?.cursor, "next-page");
+  assert.equal(result.complete, true);
+  assert.equal(result.count, 4);
+  assert.deepEqual(result.results.map((item: any) => item.kind).sort(), ["channel", "file", "message", "user"]);
+  const found = result.results.find((item: any) => item.kind === "message") as any;
+  assert.equal(found.text, "launch details");
+  assert.equal(found.permalink, "https://example.slack.com/archives/C1/p1");
+  assert.deepEqual(found.contextMessages.before, [{ text: "before", userId: "U3", messageTs: "1751999998.0" }]);
+  assert.deepEqual(found.blocks, [{ type: "rich_text", elements: [] }]);
+  assert.equal(JSON.stringify(result).includes("next-page"), false);
+});
+
+test("owner mention search uses the exact token and post-filters text and rich-text user elements", async () => {
+  const base = Math.floor(Date.parse("2026-07-02T12:00:00Z") / 1_000);
+  const fake = searchHarness(() => ({ ok: true, results: { messages: [
+    { channel_id: "C1", message_ts: `${base}.0`, content: "hello <@U123>", author_user_id: "U1" },
+    { channel_id: "C1", message_ts: `${base - 1}.0`, content: "block mention", author_user_id: "U1", blocks: [{ type: "rich_text", elements: [{ type: "rich_text_section", elements: [{ type: "user", user_id: "U123" }] }] }] },
+    { channel_id: "C1", message_ts: `${base - 2}.0`, content: "&lt;@U123&gt;" },
+    { channel_id: "C1", message_ts: `${base - 3}.0`, content: "prefixU123suffix" },
+    { channel_id: "C1", message_ts: `${base - 4}.0`, content: "hello <@U999>", blocks: [{ type: "user", user_id: "U999" }] },
+  ], response_metadata: { next_cursor: "" } } }));
+  const service = new SlackContextService(bot({}).client, "T123", { search: fake.search, ownerUserId: "U123", coverage: searchCoverage, now: () => Date.parse("2026-07-04T00:00:00Z") });
+  const result = await service.mentions("2026-07-01");
+  assert.equal(fake.calls[0]?.query, "<@U123>");
+  assert.deepEqual(fake.calls[0]?.content_types, ["messages"]);
+  assert.deepEqual(result.results.map((item: any) => item.messageTs), [`${base}.0`, `${base - 1}.0`]);
+  assert.equal(result.count, 2);
+  assert.deepEqual((result.coverage as any).limitedTo, { channelTypes: ["public_channel", "private_channel", "mpim", "im"], contentTypes: ["messages"] });
+});
+
+test("search fails actionably on page one and returns explicit partial coverage after a later page failure", async () => {
+  const failure = new SlackApiError("Slack assistant.search.context was rejected", undefined, undefined, true, false);
+  const first = searchHarness(() => { throw failure; });
+  const firstService = new SlackContextService(bot({}).client, "T123", { search: first.search, ownerUserId: "U123", coverage: searchCoverage, now: () => Date.now() });
+  await assert.rejects(firstService.search("launch"), /Slack search is unavailable/i);
+
+  const later = searchHarness((_args, call) => {
+    if (call > 1) throw failure;
+    return { ok: true, results: { messages: [{ channel_id: "C1", message_ts: "20.0", content: "one" }], response_metadata: { next_cursor: "next" } } };
+  });
+  const partialService = new SlackContextService(bot({}).client, "T123", { search: later.search, ownerUserId: "U123", coverage: searchCoverage, now: () => Date.now() });
+  const result = await partialService.search("launch");
+  assert.equal(result.complete, false);
+  assert.equal(result.returned_count, 1);
+  assert.match(result.warning ?? "", /continuation/i);
+  assert.deepEqual(result.coverage.errors, ["pagination_failed"]);
+  assert.equal(JSON.stringify(result).includes("next"), false);
 });
