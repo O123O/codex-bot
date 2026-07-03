@@ -127,3 +127,19 @@ test("document rate limits reopen the stream and retry without becoming uncertai
   assert.deepEqual(sleeps, [2_000]);
   assert.equal(store.get(delivery.id)?.state, "confirmed");
 });
+
+test("delivery identity is passed to document adapters without changing Telegram retry defaults", async () => {
+  const db = createTestDatabase();
+  const attachments = new AttachmentStore(db, await mkdtemp(join(tmpdir(), "delivery-id-file-")), { maxFileBytes: 100, maxStoreBytes: 100 });
+  await attachments.initialize();
+  const file = await attachments.ingest("ctx", Readable.from(["payload"]), { displayName: "report.txt", mediaType: "text/plain" });
+  const store = new DeliveryStore(db);
+  const delivery = store.prepareAttachment({ id: "stable-file-id", kind: "attachment", binding, body: "", mandatory: true, attachmentId: file.id, attachmentScopeId: "ctx" });
+  let seen: string | undefined;
+  const worker = new DeliveryWorker(store, adapters({
+    sendMessage: async () => ({ messageId: 1 }),
+    sendDocument: async (_destination, upload) => { seen = upload.deliveryId; return { messageId: 2 }; },
+  }), attachments);
+  await worker.processOne(delivery.id);
+  assert.equal(seen, delivery.id);
+});

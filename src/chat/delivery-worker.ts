@@ -27,14 +27,15 @@ export class DeliveryWorker {
       this.store.markDispatched(id);
       const receipt = delivery.attachmentId
         ? await this.sendAttachment(adapter, delivery, body)
-        : await adapter.sendMessage(delivery.binding.destination, body, delivery.binding.reply);
+        : await adapter.sendMessage(delivery.binding.destination, body, delivery.binding.reply, { deliveryId: delivery.id });
       this.store.confirm(id, receipt);
       await this.notify(this.store.get(id)!);
     } catch (error) {
-      if (isRateLimitError(error)) this.store.markPrepared(id);
+      const safeToRetry = adapter.isSafeToRetry?.(error) ?? isRateLimitError(error);
+      if (safeToRetry) this.store.markPrepared(id);
       else if (isDeterministicDeliveryError(error)) this.store.fail(id);
       else this.store.markUncertain(id);
-      if (!delivery.mandatory && !isRateLimitError(error)) {
+      if (!delivery.mandatory && !safeToRetry) {
         this.store.prepare({
           id: `delivery-warning:${id}`,
           kind: "delivery_warning",
@@ -43,7 +44,7 @@ export class DeliveryWorker {
           mandatory: true,
         });
       }
-      if (!isRateLimitError(error)) await this.notify(this.store.get(id)!, error);
+      if (!safeToRetry) await this.notify(this.store.get(id)!, error);
       throw error;
     }
   }
@@ -90,12 +91,14 @@ export class DeliveryWorker {
           size: upload.size,
           displayName: upload.displayName,
           mediaType: upload.mediaType,
+          deliveryId: delivery.id,
           ...(body ? { caption: body } : {}),
           ...(delivery.binding.reply === undefined ? {} : { reply: delivery.binding.reply }),
         });
       } catch (error) {
         lastError = error;
-        if (!isRateLimitError(error) || attempt === 3) throw error;
+        const safeToRetry = adapter.isSafeToRetry?.(error) ?? isRateLimitError(error);
+        if (!safeToRetry || attempt === 3) throw error;
         await this.sleep(retryAfterMs(error));
       } finally {
         await upload.close();
@@ -114,6 +117,8 @@ function isRateLimitError(error: unknown): boolean {
 }
 
 function retryAfterMs(error: unknown): number {
+  const direct = (error as { retryAfterMs?: unknown }).retryAfterMs;
+  if (typeof direct === "number" && Number.isFinite(direct) && direct >= 0) return Math.max(1, direct);
   const response = (error as { response?: { parameters?: { retry_after?: number } } }).response;
   return Math.max(1, response?.parameters?.retry_after ?? 1) * 1_000;
 }
