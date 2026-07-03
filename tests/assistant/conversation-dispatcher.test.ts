@@ -20,6 +20,8 @@ import { createTestDatabase } from "../../src/storage/database.ts";
 import { ConversationStore } from "../../src/storage/conversation-store.ts";
 import { DeliveryStore } from "../../src/storage/delivery-store.ts";
 import { AssistantScheduler } from "../../src/assistant/scheduler.ts";
+import { AssistantRuntime } from "../../src/assistant/runtime.ts";
+import { OperationStore } from "../../src/storage/operation-store.ts";
 
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -105,22 +107,44 @@ test("starts an idle conversation and naturally steers same-conversation follow-
   const { runner, dispatcher } = fixture();
   await dispatcher.accept(chat("first"));
   assert.equal(runner.starts.length, 1);
+  const startClientId = runner.starts[0]!.params.clientUserMessageId;
+  assert.match(startClientId, /^qiyan:attempt_[0-9a-f-]{36}:1$/u);
   assert.deepEqual(runner.starts[0]?.params, {
     threadId: "assistant",
-    clientUserMessageId: "first",
+    clientUserMessageId: startClientId,
     input: [{ type: "text", text: "[telegram]", text_elements: [] }, { type: "text", text: "hello", text_elements: [] }],
   });
   runner.starts[0]!.result.resolve({ turn: { id: "turn-1", status: "inProgress", itemsView: "full", items: [] } });
   await dispatcher.idle();
 
   await dispatcher.accept(chat("follow-up"));
+  const steerClientId = runner.steers[0]!.params.clientUserMessageId;
+  assert.equal(steerClientId, startClientId.replace(/:1$/u, ":2"));
   assert.deepEqual(runner.steers[0]?.params, {
     threadId: "assistant",
     expectedTurnId: "turn-1",
-    clientUserMessageId: "follow-up",
+    clientUserMessageId: steerClientId,
     input: [{ type: "text", text: "[telegram]", text_elements: [] }, { type: "text", text: "more", text_elements: [] }],
   });
   runner.steers[0]!.result.resolve({ turnId: "turn-1" });
+  await dispatcher.idle();
+  await dispatcher.stop();
+});
+
+test("retrying a restored source uses a new native submission identity", async () => {
+  const { db, deliveries, runner, dispatcher } = fixture();
+  const runtime = new AssistantRuntime(db, new OperationStore(db), deliveries, { binding: route("chat-1") });
+  await dispatcher.accept(chat("first"));
+  const firstClientId = runner.starts[0]?.params.clientUserMessageId;
+  runner.starts[0]!.result.resolve({ turn: { id: "interrupted", status: "inProgress", itemsView: "full", items: [] } });
+  await dispatcher.idle();
+  await dispatcher.terminal({ id: "interrupted", status: "interrupted", itemsView: "full", items: [] });
+  runtime.handleTerminal("interrupted", "interrupted");
+
+  await dispatcher.enqueueInternal("retry");
+  await waitFor(() => runner.starts.length === 2);
+  assert.notEqual(runner.starts[1]?.params.clientUserMessageId, firstClientId);
+  runner.starts[1]!.result.resolve({ turn: { id: "retry", status: "inProgress", itemsView: "full", items: [] } });
   await dispatcher.idle();
   await dispatcher.stop();
 });
@@ -223,11 +247,12 @@ test("terminal history admits a positively correlated steer before forwarding fi
   runner.starts[0]!.result.resolve({ turn: { id: "turn-1", status: "inProgress", itemsView: "full", items: [] } });
   await dispatcher.idle();
   await dispatcher.accept(chat("follow-up"));
+  const steerClientId = runner.steers[0]!.params.clientUserMessageId;
   const terminal = {
     id: "turn-1",
     status: "completed",
     itemsView: "full" as const,
-    items: [{ type: "userMessage", clientId: "follow-up" }],
+    items: [{ type: "userMessage", clientId: steerClientId }],
   };
   runner.history = { status: "idle", turns: [terminal] };
   await dispatcher.terminal(terminal);
@@ -364,11 +389,11 @@ test("an active thread with empty full history cannot prove an ambiguous start a
 
 test("positive full-history correlation binds an ambiguous start exactly once", async () => {
   const { db, pool, runner, dispatcher } = fixture();
+  await dispatcher.accept(chat("first"));
   runner.history = {
     status: "active",
-    turns: [{ id: "recovered-turn", status: "inProgress", itemsView: "full", items: [{ type: "userMessage", clientId: "first" }] }],
+    turns: [{ id: "recovered-turn", status: "inProgress", itemsView: "full", items: [{ type: "userMessage", clientId: runner.starts[0]!.params.clientUserMessageId }] }],
   };
-  await dispatcher.accept(chat("first"));
   runner.starts[0]!.result.reject(new Error("response lost"));
   await dispatcher.idle();
   assert.equal(runner.starts.length, 1);
@@ -385,16 +410,16 @@ test("terminal history correlation forwards the recovered turn for finalization"
   const pool = new AppServerPool([endpoint], { maxConcurrentTurns: 1 });
   const runner = new FakeRunner();
   const terminal: TurnSnapshot[] = [];
-  runner.history = {
-    status: "idle",
-    turns: [{ id: "recovered-terminal", status: "completed", itemsView: "full", items: [{ type: "userMessage", clientId: "first" }] }],
-  };
   const dispatcher = new ConversationDispatcher(store, pool, runner, {
     endpointId: "assistant-local",
     threadId: "assistant",
     onDeferredTerminal: (turn) => { terminal.push(turn); },
   });
   await dispatcher.accept(chat("first"));
+  runner.history = {
+    status: "idle",
+    turns: [{ id: "recovered-terminal", status: "completed", itemsView: "full", items: [{ type: "userMessage", clientId: runner.starts[0]!.params.clientUserMessageId }] }],
+  };
   runner.starts[0]!.result.reject(new Error("response lost"));
   await dispatcher.idle();
   assert.deepEqual(terminal.map((turn) => turn.id), ["recovered-terminal"]);
@@ -425,7 +450,7 @@ test("a starved internal event wins only at a lease boundary and materializes on
   const runner = new FakeRunner();
   const dispatcher = new ConversationDispatcher(store, pool, runner, { endpointId: "assistant-local", threadId: "assistant", scheduler });
   await dispatcher.accept(chat("chat-pending"));
-  assert.equal(runner.starts[0]?.params.clientUserMessageId, "batch:e1");
+  assert.match(runner.starts[0]!.params.clientUserMessageId, /^qiyan:attempt_[0-9a-f-]{36}:1$/u);
   assert.equal(deliveries.get("queued:chat-pending")?.body, "[system] queued");
   assert.equal(scheduler.peekEligibleEventBatch(), undefined);
   runner.starts[0]!.result.resolve({ turn: { id: "event-turn", status: "inProgress", itemsView: "full", items: [] } });

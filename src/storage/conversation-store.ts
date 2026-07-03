@@ -161,7 +161,7 @@ export class ConversationStore {
       const lease = this.requiredLease();
       if (lease.phase !== "starting" || lease.primaryContextId !== contextId) this.conflict("start reservation does not match the lease");
       this.assertNoUnresolvedSubmission();
-      return this.reserve(lease, this.source(contextId), "start", lease.clientUserMessageId);
+      return this.reserve(lease, this.source(contextId), "start");
     });
   }
 
@@ -175,7 +175,7 @@ export class ConversationStore {
         WHERE state = 'pending' AND source_class = 'chat' AND adapter_id = ? AND conversation_key = ?
         ORDER BY arrival_sequence, id`).all(lease.binding.adapterId, lease.binding.conversationKey) as Array<{ id: string }>;
       const next = rows.map((row) => this.source(row.id)).find((source) => !this.membershipForSource(source.id));
-      return next ? this.reserve(lease, next, "steer", next.id) : undefined;
+      return next ? this.reserve(lease, next, "steer") : undefined;
     });
   }
 
@@ -294,7 +294,7 @@ export class ConversationStore {
     if (candidate.kind === "chat" && !source.binding) this.conflict("chat lease candidate has no binding");
 
     const attemptId = `attempt_${randomUUID()}`;
-    const clientUserMessageId = source.id;
+    const clientUserMessageId = nativeSubmissionId(attemptId, 1);
     const now = Date.now();
     this.db.prepare(`INSERT INTO assistant_attempts
       (id, context_id, turn_id, trigger_kind, state, created_at, adapter_id, conversation_key, destination_json, native_reply_json)
@@ -331,10 +331,11 @@ export class ConversationStore {
     return true;
   }
 
-  private reserve(lease: AssistantLease, source: StoredSource, kind: "start" | "steer", clientUserMessageId: string): ReservedSubmission {
+  private reserve(lease: AssistantLease, source: StoredSource, kind: "start" | "steer"): ReservedSubmission {
     if (source.state !== "pending") this.conflict("source is not pending");
     const ordinal = Number((this.db.prepare("SELECT COALESCE(MAX(source_ordinal), 0) + 1 AS ordinal FROM assistant_attempt_sources WHERE attempt_id = ?")
       .get(lease.attemptId) as { ordinal: number }).ordinal);
+    const clientUserMessageId = kind === "start" ? lease.clientUserMessageId : nativeSubmissionId(lease.attemptId, ordinal);
     const now = Date.now();
     this.db.prepare(`INSERT INTO assistant_attempt_sources
       (attempt_id, context_id, source_ordinal, client_user_message_id, submission_kind, state, expected_turn_id, observed_turn_id, created_at, updated_at)
@@ -439,6 +440,10 @@ export class ConversationStore {
   private conflict(message: string): never {
     throw new AppError("OPERATION_CONFLICT", `OPERATION_CONFLICT: ${message}`);
   }
+}
+
+function nativeSubmissionId(attemptId: string, ordinal: number): string {
+  return `qiyan:${attemptId}:${ordinal}`;
 }
 
 interface StoredSource {
