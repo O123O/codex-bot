@@ -33,16 +33,12 @@ interface SlackChatAdapterDependencies {
       retryConfig: { retries: number };
       timeout: number;
     };
-    clientPingTimeout: number;
-    serverPingTimeout: number;
   }) => SlackSocketModeClient;
   now?: () => number;
   setReconnectTimer?: (callback: () => void, delayMs: number) => object;
   clearReconnectTimer?: (timer: object) => void;
 }
 
-const SLACK_CLIENT_PING_TIMEOUT_MS = 30_000;
-const SLACK_SERVER_PING_TIMEOUT_MS = 60_000;
 const SLACK_CONNECTION_OPEN_TIMEOUT_MS = 10_000;
 const SLACK_RECONNECT_DELAY_MS = 1_000;
 const SLACK_MAX_RECONNECT_DELAY_MS = 30_000;
@@ -113,8 +109,6 @@ export class SlackChatAdapter implements ChatAdapter {
         retryConfig: { retries: 0 },
         timeout: SLACK_CONNECTION_OPEN_TIMEOUT_MS,
       },
-      clientPingTimeout: SLACK_CLIENT_PING_TIMEOUT_MS,
-      serverPingTimeout: SLACK_SERVER_PING_TIMEOUT_MS,
     });
     this.now = dependencies.now ?? Date.now;
     this.setReconnectTimer = dependencies.setReconnectTimer ?? ((callback, delayMs) => setTimeout(callback, delayMs));

@@ -138,8 +138,6 @@ test("Slack initializes identities, recovers ingress, subscribes before connect,
       retryConfig: { retries: number };
       timeout: number;
     };
-    clientPingTimeout: number;
-    serverPingTimeout: number;
   } | undefined;
   let accepted = 0;
   const adapter = new SlackChatAdapter(db, attachments, conversations, deliveries, {
@@ -163,8 +161,6 @@ test("Slack initializes identities, recovers ingress, subscribes before connect,
       retryConfig: { retries: 0 },
       timeout: 10_000,
     },
-    clientPingTimeout: 30_000,
-    serverPingTimeout: 60_000,
   });
   assert.deepEqual(adapter.primaryBinding, { adapterId: "slack", conversationKey: "slack:T1:dm:D1", destination: { workspaceId: "T1", channelId: "D1" } });
   assert.deepEqual(await adapter.delivery.sendMessage(
