@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { openDatabase } from "../../src/storage/database.ts";
+import { migrations } from "../../src/storage/migrations.ts";
 import { AppError } from "../../src/core/errors.ts";
 import { preflightConversationCutover } from "../../src/storage/conversation-cutover.ts";
 
@@ -85,7 +86,7 @@ test("an existing QiYan database reopens normally", async () => {
   const path = join(root, "bot.sqlite3");
   openDatabase(path).close();
   const reopened = openDatabase(path);
-  assert.equal(reopened.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get()!.count, 10);
+  assert.equal(reopened.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get()!.count, migrations.length);
   reopened.close();
 });
 

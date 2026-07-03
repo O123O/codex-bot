@@ -10,6 +10,8 @@ Remove `SLACK_TEAM_ID` from user configuration. QiYan will derive the Slack work
 
 The Slack startup validator will call `auth.test` with both the bot token and owner user token. It will require a nonempty `team_id` from each result and require the two values to match. The bot result becomes the authoritative internal `teamId`. Existing downstream event filtering, conversation keys, delivery checks, and search normalization continue to receive this resolved ID through `SlackStartupIdentity`; those security boundaries do not change.
 
+The resolved workspace is also pinned in QiYan's state database before Slack ingress or delivery starts. On the first upgraded startup, QiYan checks existing Slack inbox and routed-delivery state before creating the pin. A later token change to another workspace fails startup without recovering old-workspace work; switching workspaces therefore requires an explicitly fresh QiYan state directory.
+
 Startup will still verify the configured owner ID against the user token, reject a bot/owner identity collision, verify Real-time Search availability, and resolve the owner DM. Missing or mismatched workspace identities fail startup with a sanitized configuration error.
 
 ## Alternatives considered
@@ -28,5 +30,6 @@ Startup will still verify the configured owner ID against the user token, reject
 - Partial Slack configuration still fails.
 - Startup derives the bot workspace ID and returns it downstream.
 - Startup rejects missing bot or user workspace identity and rejects bot/user workspace mismatch.
+- Restart rejects tokens that conflict with the pinned workspace or legacy Slack routing state.
 - Documentation and packaged configuration-key audits no longer require `SLACK_TEAM_ID`.
 - `npm run check` remains the final regression gate.

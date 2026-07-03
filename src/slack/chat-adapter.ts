@@ -14,6 +14,7 @@ import { SlackDeliveryAdapter } from "./delivery-adapter.ts";
 import { SlackEnvelopeHandler } from "./envelope-handler.ts";
 import { SlackInboxStore } from "./inbox-store.ts";
 import { SlackIngressWorker } from "./ingress-worker.ts";
+import { SlackWorkspaceStore } from "./workspace-store.ts";
 
 export interface SlackSocketModeClient {
   on(event: string, listener: (event: unknown) => void): unknown;
@@ -36,6 +37,7 @@ export class SlackChatAdapter implements ChatAdapter {
   private readonly clients: SlackClients;
   private readonly socket: SlackSocketModeClient;
   private readonly inbox: SlackInboxStore;
+  private readonly workspace: SlackWorkspaceStore;
   private readonly worker: SlackIngressWorker;
   private readonly now: () => number;
   private contextService: SlackContextService | undefined;
@@ -77,9 +79,10 @@ export class SlackChatAdapter implements ChatAdapter {
       { appToken: options.config.appToken },
     );
     this.now = dependencies.now ?? Date.now;
-    this.delivery = new SlackDeliveryAdapter(options.config.teamId, this.clients.bot);
+    this.delivery = new SlackDeliveryAdapter(this.clients.bot);
     this.history = { getHistory: (binding, request) => this.context.getHistory(binding, request) };
     this.inbox = new SlackInboxStore(db);
+    this.workspace = new SlackWorkspaceStore(db);
     this.worker = new SlackIngressWorker(this.inbox, attachments, conversations, deliveries, {
       downloadFile: (url) => this.clients.bot.downloadFile(url),
       isTransient: transientSlackFailure,
@@ -96,6 +99,8 @@ export class SlackChatAdapter implements ChatAdapter {
   initialize(): Promise<void> {
     return this.initializing ??= (async () => {
       const identity = await validateSlackStartup(this.options.config, this.clients);
+      this.workspace.bind(identity.teamId);
+      this.delivery.bindWorkspace(identity.teamId);
       this.identity = identity;
       this.primaryBinding = {
         adapterId: "slack",

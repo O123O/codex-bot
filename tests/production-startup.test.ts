@@ -87,7 +87,7 @@ test("production initializes exactly the configured Telegram and Slack adapters 
     } as ChatAdapter);
     const adapters = mode === "telegram" ? [fake("telegram")] : mode === "slack" ? [fake("slack")] : [fake("telegram"), fake("slack")];
     const telegram = mode === "slack" ? undefined : { token: "test-token", ownerId: 42, destinationChatId: 42 };
-    const slack = mode === "telegram" ? undefined : { appToken: "xapp-test", botToken: "xoxb-test", userToken: "xoxp-test", teamId: "T1", ownerUserId: "U1" };
+    const slack = mode === "telegram" ? undefined : { appToken: "xapp-test", botToken: "xoxb-test", userToken: "xoxp-test", ownerUserId: "U1" };
     const config: BotConfig = {
       qiyanHome: join(root, "qiyan-home"),
       chat: { primary: mode === "telegram" ? "telegram" : "slack", ...(telegram ? { telegram } : {}), ...(slack ? { slack } : {}) },

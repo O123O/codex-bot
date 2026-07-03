@@ -397,4 +397,10 @@ export const migrations: readonly Migration[] = [
     accepted_at INTEGER NOT NULL
   );
   `,
+  `
+  CREATE TABLE slack_workspace_identity (
+    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+    team_id TEXT NOT NULL
+  );
+  `,
 ];

@@ -31,7 +31,6 @@ test("loadConfig accepts Telegram-only and Slack-only adapter groups", () => {
     SLACK_APP_TOKEN: "xapp-test",
     SLACK_BOT_TOKEN: "xoxb-test",
     SLACK_USER_TOKEN: "xoxp-test",
-    SLACK_TEAM_ID: "T123",
     SLACK_OWNER_USER_ID: "U123",
   }, { qiyanHome }).chat, {
     primary: "slack",
@@ -39,9 +38,22 @@ test("loadConfig accepts Telegram-only and Slack-only adapter groups", () => {
       appToken: "xapp-test",
       botToken: "xoxb-test",
       userToken: "xoxp-test",
-      teamId: "T123",
       ownerUserId: "U123",
     },
+  });
+
+  assert.deepEqual(loadConfig({
+    HOME: "/home/test-user",
+    SLACK_APP_TOKEN: "xapp-test",
+    SLACK_BOT_TOKEN: "xoxb-test",
+    SLACK_USER_TOKEN: "xoxp-test",
+    SLACK_TEAM_ID: "E123",
+    SLACK_OWNER_USER_ID: "U123",
+  }, { qiyanHome }).chat.slack, {
+    appToken: "xapp-test",
+    botToken: "xoxb-test",
+    userToken: "xoxp-test",
+    ownerUserId: "U123",
   });
 });
 
@@ -50,7 +62,6 @@ test("loadConfig requires an exact configured primary when both adapters exist",
     SLACK_APP_TOKEN: "xapp-test",
     SLACK_BOT_TOKEN: "xoxb-test",
     SLACK_USER_TOKEN: "xoxp-test",
-    SLACK_TEAM_ID: "T123",
     SLACK_OWNER_USER_ID: "U123",
   });
   assert.throws(() => loadConfig(both, { qiyanHome }), /PRIMARY_CHAT_APP/);
@@ -61,7 +72,6 @@ test("loadConfig requires an exact configured primary when both adapters exist",
     SLACK_APP_TOKEN: "xapp-test",
     SLACK_BOT_TOKEN: "xoxb-test",
     SLACK_USER_TOKEN: "xoxp-test",
-    SLACK_TEAM_ID: "T123",
     SLACK_OWNER_USER_ID: "U123",
     PRIMARY_CHAT_APP: "telegram",
   }, { qiyanHome }), /PRIMARY_CHAT_APP/);
@@ -73,14 +83,12 @@ test("loadConfig rejects malformed Slack credential identities", () => {
     SLACK_APP_TOKEN: "xapp-test",
     SLACK_BOT_TOKEN: "xoxb-test",
     SLACK_USER_TOKEN: "xoxp-test",
-    SLACK_TEAM_ID: "T123",
     SLACK_OWNER_USER_ID: "U123",
   };
   for (const [key, value] of [
     ["SLACK_APP_TOKEN", "xoxb-wrong"],
     ["SLACK_BOT_TOKEN", "xoxp-wrong"],
     ["SLACK_USER_TOKEN", "xoxb-wrong"],
-    ["SLACK_TEAM_ID", "U123"],
     ["SLACK_OWNER_USER_ID", "T123"],
   ] as const) assert.throws(() => loadConfig({ ...slack, [key]: value }, { qiyanHome }), new RegExp(key));
 });
@@ -143,4 +151,6 @@ test("the example environment preserves canonical full-access HOME defaults", as
   const example = await import("node:fs/promises").then(({ readFile }) => readFile(resolve(".env.example"), "utf8"));
   assert.doesNotMatch(example, /^(?:DATA_DIR|SESSION_REGISTRY_PATH)=/mu);
   assert.doesNotMatch(example, /^ASSISTANT_SANDBOX_MODE=(?!danger-full-access$)/mu);
+  assert.match(example, /all four Slack values/iu);
+  assert.doesNotMatch(example, /SLACK_TEAM_ID/u);
 });

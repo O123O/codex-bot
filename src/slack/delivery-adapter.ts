@@ -11,8 +11,17 @@ interface SlackDestination {
 
 export class SlackDeliveryAdapter implements ChatDeliveryAdapter {
   readonly id = "slack";
+  private teamId: string | undefined;
 
-  constructor(private readonly teamId: string, private readonly client: SlackBotClient) {}
+  constructor(private readonly client: SlackBotClient) {}
+
+  bindWorkspace(teamId: string): void {
+    if (this.teamId === undefined) {
+      this.teamId = teamId;
+      return;
+    }
+    if (this.teamId !== teamId) throw new TypeError("Slack delivery workspace cannot be rebound");
+  }
 
   async sendMessage(
     destination: JsonValue,
@@ -67,6 +76,7 @@ export class SlackDeliveryAdapter implements ChatDeliveryAdapter {
   }
 
   private destination(value: JsonValue): SlackDestination {
+    if (!this.teamId) throw new TypeError("Slack delivery workspace must initialize before use");
     const candidate = record(value);
     const workspaceId = candidate && stringField(candidate, "workspaceId");
     const channelId = candidate && stringField(candidate, "channelId");

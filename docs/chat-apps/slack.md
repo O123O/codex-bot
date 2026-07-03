@@ -26,9 +26,9 @@ Never paste tokens into source, screenshots, issue trackers, or shell history. R
 
 The manifest requests user scopes for public, private, IM, MPIM, file, and user search. A workspace administrator may need to enable the Real-time Search API or approve the internal AI app. Private search also requires Slack's applicable administrator and user consent. Successful search never proves workspace-wide completeness: results cannot exceed the owner's permissions, consent, retention, or workspace policy.
 
-Copy the owner's member ID (`U…`) from the Slack profile menu (**Copy member ID**). Copy the workspace/team ID (`T…`) from workspace details, or verify it with `auth.test` while keeping the token in a protected environment. QiYan validates at startup that the bot token, user token, configured owner, and configured workspace all match, and that the bot is not the owner identity.
+Copy the owner's member ID (`U…`) from the Slack profile menu (**Copy member ID**). The workspace is derived at startup with `auth.test` from the bot token, and the user token must report the same workspace. QiYan also validates the configured owner identity and ensures that the bot is not the owner identity.
 
-## 3. Store the five Slack values
+## 3. Store the four Slack values
 
 Create the private QiYan dotenv file:
 
@@ -39,19 +39,18 @@ ${EDITOR:-vi} "$HOME/.qiyan-bot/.env"
 chmod 600 "$HOME/.qiyan-bot/.env"
 ```
 
-Enter the five values in the editor, using this shape:
+Enter the four values in the editor, using this shape:
 
 ```dotenv
 SLACK_APP_TOKEN=xapp-replace-with-app-token
 SLACK_BOT_TOKEN=xoxb-replace-with-bot-token
 SLACK_USER_TOKEN=xoxp-replace-with-owner-user-token
-SLACK_TEAM_ID=T01234567
 SLACK_OWNER_USER_ID=U01234567
 ```
 
 Creating the empty file with mode `0600` before editing prevents a temporary world-readable token file. Editing it directly also keeps literal credentials out of shell history; do not place real tokens in command arguments or an interactive heredoc.
 
-All five values are required together. For a nondefault QiYan home, write `<QIYAN_HOME>/.env` and pass the same absolute `--home` to validation, login, and run. Do not put `QIYAN_HOME` inside `.env`.
+All four values are required together. For a nondefault QiYan home, write `<QIYAN_HOME>/.env` and pass the same absolute `--home` to validation, login, and run. Do not put `QIYAN_HOME` inside `.env`.
 
 To run Telegram and Slack at the same time, place both complete credential groups in the same file and add exactly one of:
 
@@ -89,7 +88,8 @@ Smoke-test the App Home DM, a channel mention and same-thread follow-up, a small
 
 ## Troubleshooting and revocation
 
-- Startup identity/search failure: verify all token prefixes, workspace and owner IDs, app installation, Real-time Search eligibility, scopes, and private-search consent.
+- Startup identity/search failure: verify all token prefixes, the owner ID, that both OAuth tokens belong to the same workspace, app installation, Real-time Search eligibility, scopes, and private-search consent.
+- Persisted workspace mismatch: restore tokens for the original workspace, or intentionally start with a fresh QiYan home when moving the entire assistant to another workspace.
 - No DM event: enable the App Home messages tab, reinstall after manifest changes, and confirm `message.im` subscription.
 - No channel event: invite QiYan, mention it once in the intended thread, and confirm the four event subscriptions.
 - Search is partial: narrow dates/query and inspect returned coverage; Activity notifications are not an API completeness source.

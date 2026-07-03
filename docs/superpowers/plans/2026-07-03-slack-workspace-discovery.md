@@ -41,6 +41,8 @@ Run `node --import tsx --test tests/config.test.ts` and expect all configuration
 - Modify: `src/slack/clients.ts`
 - Modify: `src/slack/delivery-adapter.ts`
 - Modify: `src/slack/chat-adapter.ts`
+- Create: `src/slack/workspace-store.ts`
+- Modify: `src/storage/migrations.ts`
 - Modify: Slack test fixtures that construct `SlackConfig`
 
 - [ ] **Step 1: Write failing identity and binding tests**
@@ -53,7 +55,7 @@ Run `node --import tsx --test tests/slack/clients.test.ts tests/slack/delivery-a
 
 - [ ] **Step 3: Implement workspace discovery**
 
-In `validateSlackStartup`, require both `auth.test` responses to contain a workspace ID and compare them directly. Return `botTeamId`. In `SlackDeliveryAdapter`, replace the constructor workspace parameter with a private unbound field and add a one-time `bindWorkspace(teamId)` method; destination validation fails while unbound. In `SlackChatAdapter.initialize()`, call `delivery.bindWorkspace(identity.teamId)` immediately after validation and before exposing bindings or handlers.
+In `validateSlackStartup`, require both `auth.test` responses to contain a workspace ID and compare them directly. Return `botTeamId`. In `SlackDeliveryAdapter`, replace the constructor workspace parameter with a private unbound field and add a one-time `bindWorkspace(teamId)` method; destination validation fails while unbound. Add a migrated Slack workspace identity record that validates legacy inbox and routed destinations on first use and rejects later workspace changes. In `SlackChatAdapter.initialize()`, persist this identity and call `delivery.bindWorkspace(identity.teamId)` immediately after validation and before exposing bindings or handlers.
 
 - [ ] **Step 4: Update typed fixtures and verify GREEN**
 

@@ -10,7 +10,6 @@ const configSchema = z.object({
   SLACK_APP_TOKEN: z.string().regex(/^xapp-.+/u).optional(),
   SLACK_BOT_TOKEN: z.string().regex(/^xoxb-.+/u).optional(),
   SLACK_USER_TOKEN: z.string().regex(/^xoxp-.+/u).optional(),
-  SLACK_TEAM_ID: z.string().regex(/^T[A-Z0-9]+$/u).optional(),
   SLACK_OWNER_USER_ID: z.string().regex(/^U[A-Z0-9]+$/u).optional(),
   PRIMARY_CHAT_APP: z.enum(["telegram", "slack"]).optional(),
   HOME: z.string().min(1),
@@ -27,7 +26,7 @@ const configSchema = z.object({
   ASSISTANT_SANDBOX_MODE: z.enum(["read-only", "workspace-write", "danger-full-access"]).default("danger-full-access"),
 }).superRefine((value, context) => {
   const telegramFields = [value.TELEGRAM_BOT_TOKEN, value.TELEGRAM_OWNER_ID, value.TELEGRAM_DESTINATION_CHAT_ID];
-  const slackFields = [value.SLACK_APP_TOKEN, value.SLACK_BOT_TOKEN, value.SLACK_USER_TOKEN, value.SLACK_TEAM_ID, value.SLACK_OWNER_USER_ID];
+  const slackFields = [value.SLACK_APP_TOKEN, value.SLACK_BOT_TOKEN, value.SLACK_USER_TOKEN, value.SLACK_OWNER_USER_ID];
   const telegramPresent = telegramFields.filter((field) => field !== undefined).length;
   const slackPresent = slackFields.filter((field) => field !== undefined).length;
   const telegram = telegramPresent === telegramFields.length;
@@ -52,7 +51,7 @@ const configSchema = z.object({
 });
 
 export interface TelegramConfig { token: string; ownerId: number; destinationChatId: number }
-export interface SlackConfig { appToken: string; botToken: string; userToken: string; teamId: string; ownerUserId: string }
+export interface SlackConfig { appToken: string; botToken: string; userToken: string; ownerUserId: string }
 export interface ChatConfig { primary: "telegram" | "slack"; telegram?: TelegramConfig; slack?: SlackConfig }
 
 export interface BotConfig {
@@ -104,7 +103,6 @@ export function loadConfig(env: Record<string, string | undefined>, overrides: C
     appToken: parsed.SLACK_APP_TOKEN,
     botToken: parsed.SLACK_BOT_TOKEN!,
     userToken: parsed.SLACK_USER_TOKEN!,
-    teamId: parsed.SLACK_TEAM_ID!,
     ownerUserId: parsed.SLACK_OWNER_USER_ID!,
   };
   const primary = parsed.PRIMARY_CHAT_APP ?? (telegram ? "telegram" : "slack");

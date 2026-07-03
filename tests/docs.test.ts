@@ -131,13 +131,15 @@ test("primary guides document QiYan home precedence, private dotenv setup, and m
 test("Slack guide covers the implemented single-user Socket Mode setup and limits", async () => {
   const guide = await readFile(resolve("docs/chat-apps/slack.md"), "utf8");
   for (const required of [
-    "Status: Implemented", "Socket Mode", "SLACK_APP_TOKEN", "SLACK_BOT_TOKEN", "SLACK_USER_TOKEN", "SLACK_TEAM_ID", "SLACK_OWNER_USER_ID",
+    "Status: Implemented", "Socket Mode", "SLACK_APP_TOKEN", "SLACK_BOT_TOKEN", "SLACK_USER_TOKEN", "SLACK_OWNER_USER_ID",
     "PRIMARY_CHAT_APP", "chmod 600", "connections:write", "xapp-", "xoxb-", "xoxp-", "private-search consent", "Copy member ID",
     "/invite @QiYan", "activated thread", "transient", "3,000", "Activity feed", "ATTACHMENT_MAX_BYTES", "Revoked",
   ]) assert.equal(guide.includes(required), true, `Slack guide is missing: ${required}`);
   assert.match(guide, /internal Slack app|workspace-internal app/iu);
   assert.match(guide, /user token.*code boundary.*read-only.*powerful/isu);
   assert.match(guide, /search.*cannot exceed.*owner.*permissions.*workspace policy/isu);
+  assert.match(guide, /workspace.*deriv.*auth\.test.*bot.*user token.*same workspace/isu);
+  assert.doesNotMatch(guide, /^SLACK_TEAM_ID=/mu);
   const secureCreate = guide.indexOf('install -m 600 /dev/null "$HOME/.qiyan-bot/.env"');
   const privateEdit = guide.indexOf('${EDITOR:-vi} "$HOME/.qiyan-bot/.env"');
   assert.ok(secureCreate >= 0 && privateEdit > secureCreate, "Slack dotenv must be mode 0600 before credentials are edited");

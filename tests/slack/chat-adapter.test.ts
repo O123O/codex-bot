@@ -15,7 +15,7 @@ import { ConversationStore } from "../../src/storage/conversation-store.ts";
 import { createTestDatabase } from "../../src/storage/database.ts";
 import { DeliveryStore } from "../../src/storage/delivery-store.ts";
 
-const config: SlackConfig = { appToken: "xapp-secret", botToken: "xoxb-secret", userToken: "xoxp-secret", teamId: "T1", ownerUserId: "U1" };
+const config: SlackConfig = { appToken: "xapp-secret", botToken: "xoxb-secret", userToken: "xoxp-secret", ownerUserId: "U1" };
 
 class FakeSocket extends EventEmitter implements SlackSocketModeClient {
   starts = 0;
@@ -25,9 +25,9 @@ class FakeSocket extends EventEmitter implements SlackSocketModeClient {
   async disconnect(): Promise<void> { this.disconnects += 1; }
 }
 
-function clients(order: string[], overrides: Partial<SlackBotClient> = {}): SlackClients {
+function clients(order: string[], overrides: Partial<SlackBotClient> = {}, teamId = "T1"): SlackClients {
   const bot: SlackBotClient = {
-    authTest: async () => { order.push("bot-auth"); return { ok: true, team_id: "T1", user_id: "B1" }; },
+    authTest: async () => { order.push("bot-auth"); return { ok: true, team_id: teamId, user_id: "B1" }; },
     openOwnerDm: async () => { order.push("open-dm"); return { ok: true, channel: { id: "D1" } }; },
     conversationHistory: async () => ({ ok: true, messages: [] }),
     conversationReplies: async () => ({ ok: true, messages: [] }),
@@ -39,12 +39,71 @@ function clients(order: string[], overrides: Partial<SlackBotClient> = {}): Slac
     ...overrides,
   };
   const search: SlackSearchClient = {
-    authTest: async () => { order.push("user-auth"); return { ok: true, team_id: "T1", user_id: "U1" }; },
+    authTest: async () => { order.push("user-auth"); return { ok: true, team_id: teamId, user_id: "U1" }; },
     searchInfo: async () => { order.push("search-info"); return { ok: true, is_ai_search_enabled: true }; },
     searchContext: async () => ({ ok: true, results: { response_metadata: { next_cursor: "" } } }),
   };
   return { bot, search };
 }
+
+test("Slack restart rejects tokens for a workspace different from its durable identity", async (context) => {
+  const db = createTestDatabase();
+  context.after(() => db.close());
+  const attachments = new AttachmentStore(db, await mkdtemp(join(tmpdir(), "qiyan-slack-adapter-identity-")), { maxFileBytes: 100, maxStoreBytes: 1_000 });
+  await attachments.initialize();
+  const deliveries = new DeliveryStore(db);
+  const conversations = new ConversationStore(db, deliveries, attachments);
+  const makeAdapter = (teamId: string) => new SlackChatAdapter(db, attachments, conversations, deliveries, {
+    config,
+    maxMessageBytes: 100,
+    onMessage: async (source, effects) => { conversations.acceptChatSource(source, effects); },
+  }, { clients: clients([], {}, teamId), createSocketModeClient: () => new FakeSocket() });
+
+  await makeAdapter("T1").initialize();
+  await assert.rejects(makeAdapter("T2").initialize(), /persisted Slack workspace/iu);
+});
+
+test("Slack upgrade rejects tokens that conflict with a legacy inbox workspace", async (context) => {
+  const db = createTestDatabase();
+  context.after(() => db.close());
+  const attachments = new AttachmentStore(db, await mkdtemp(join(tmpdir(), "qiyan-slack-adapter-legacy-identity-")), { maxFileBytes: 100, maxStoreBytes: 1_000 });
+  await attachments.initialize();
+  const deliveries = new DeliveryStore(db);
+  const conversations = new ConversationStore(db, deliveries, attachments);
+  new SlackInboxStore(db).accept(pendingEvent());
+  const adapter = new SlackChatAdapter(db, attachments, conversations, deliveries, {
+    config,
+    maxMessageBytes: 100,
+    onMessage: async (source, effects) => { conversations.acceptChatSource(source, effects); },
+  }, { clients: clients([], {}, "T2"), createSocketModeClient: () => new FakeSocket() });
+
+  await assert.rejects(adapter.initialize(), /persisted Slack workspace/iu);
+  assert.equal(new SlackInboxStore(db).get("E-pending")?.state, "pending");
+});
+
+test("Slack upgrade rejects tokens that conflict with a legacy delivery workspace", async (context) => {
+  const db = createTestDatabase();
+  context.after(() => db.close());
+  const attachments = new AttachmentStore(db, await mkdtemp(join(tmpdir(), "qiyan-slack-adapter-legacy-delivery-")), { maxFileBytes: 100, maxStoreBytes: 1_000 });
+  await attachments.initialize();
+  const deliveries = new DeliveryStore(db);
+  const conversations = new ConversationStore(db, deliveries, attachments);
+  deliveries.prepare({
+    id: "legacy-delivery",
+    kind: "chat",
+    binding: { adapterId: "slack", conversationKey: "slack:T1:dm:D1", destination: { workspaceId: "T1", channelId: "D1" } },
+    body: "pending",
+    mandatory: true,
+  });
+  const adapter = new SlackChatAdapter(db, attachments, conversations, deliveries, {
+    config,
+    maxMessageBytes: 100,
+    onMessage: async (source, effects) => { conversations.acceptChatSource(source, effects); },
+  }, { clients: clients([], {}, "T2"), createSocketModeClient: () => new FakeSocket() });
+
+  await assert.rejects(adapter.initialize(), /persisted Slack workspace/iu);
+  assert.equal(deliveries.get("legacy-delivery")?.state, "prepared");
+});
 
 function pendingEvent(): NormalizedSlackEvent {
   return {
@@ -80,6 +139,9 @@ test("Slack initializes identities, recovers ingress, subscribes before connect,
   assert.deepEqual(order, ["bot-auth", "user-auth", "search-info", "open-dm"]);
   assert.deepEqual(factoryOptions, { appToken: "xapp-secret" });
   assert.deepEqual(adapter.primaryBinding, { adapterId: "slack", conversationKey: "slack:T1:dm:D1", destination: { workspaceId: "T1", channelId: "D1" } });
+  assert.deepEqual(await adapter.delivery.sendMessage(
+    { workspaceId: "T1", channelId: "D1" }, "initialized", undefined, { deliveryId: "initialized-delivery" },
+  ), { channelId: "D1", messageTs: "2.0" });
   assert.equal(socket.listenerCount("slack_event"), 0);
 
   let acked = 0;

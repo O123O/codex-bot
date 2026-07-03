@@ -18,14 +18,14 @@ test("live Slack owner DM, channel, files, search, and mentions round trip", { s
     appToken: required("SLACK_TEST_APP_TOKEN"),
     botToken: required("SLACK_TEST_BOT_TOKEN"),
     userToken: required("SLACK_TEST_USER_TOKEN"),
-    teamId: required("SLACK_TEST_TEAM_ID"),
     ownerUserId: required("SLACK_TEST_OWNER_USER_ID"),
   };
-  assert.equal(required("SLACK_TEST_ALLOW_WRITES"), `${config.teamId}:${config.ownerUserId}`, "live writes require an exact workspace:user guard");
+  const expectedTeamId = required("SLACK_TEST_TEAM_ID");
+  assert.equal(required("SLACK_TEST_ALLOW_WRITES"), `${expectedTeamId}:${config.ownerUserId}`, "live writes require an exact workspace:user guard");
   const channelId = required("SLACK_TEST_CHANNEL_ID");
   const clients = createSlackClients(config);
   const identity = await validateSlackStartup(config, clients);
-  assert.equal(identity.teamId, config.teamId);
+  assert.equal(identity.teamId, expectedTeamId);
   assert.equal(identity.ownerUserId, config.ownerUserId);
 
   const dmHistory = await clients.bot.conversationHistory({ channel: identity.ownerDmChannelId, limit: 20 });
@@ -33,10 +33,11 @@ test("live Slack owner DM, channel, files, search, and mentions round trip", { s
     typeof value === "object" && value !== null && (value as Record<string, unknown>).user === config.ownerUserId);
   assert.ok(ownerDm, "send a recent owner message in the QiYan App Home DM before running the live test");
 
-  const delivery = new SlackDeliveryAdapter(config.teamId, clients.bot);
+  const delivery = new SlackDeliveryAdapter(clients.bot);
+  delivery.bindWorkspace(identity.teamId);
   const stamp = new Date().toISOString();
   const dmReceipt = await delivery.sendMessage(
-    { workspaceId: config.teamId, channelId: identity.ownerDmChannelId },
+    { workspaceId: identity.teamId, channelId: identity.ownerDmChannelId },
     `QiYan live DM test ${stamp}`,
     undefined,
     { deliveryId: `live-dm-${stamp}` },
@@ -51,7 +52,7 @@ test("live Slack owner DM, channel, files, search, and mentions round trip", { s
   assert.ok(mention?.ts, "mention QiYan recently in SLACK_TEST_CHANNEL_ID before running the live test");
   const threadTs = typeof mention.thread_ts === "string" ? mention.thread_ts : String(mention.ts);
   await delivery.sendMessage(
-    { workspaceId: config.teamId, channelId, threadTs },
+    { workspaceId: identity.teamId, channelId, threadTs },
     `QiYan live thread reply ${stamp}`,
     undefined,
     { deliveryId: `live-thread-${stamp}` },
@@ -71,7 +72,7 @@ test("live Slack owner DM, channel, files, search, and mentions round trip", { s
   for await (const chunk of download.stream) downloaded += Buffer.byteLength(chunk);
   assert.ok(downloaded > 0 && downloaded <= 1024 * 1024, "the dedicated inbound test file must be 1 MiB or smaller");
 
-  const upload = await delivery.sendDocument!({ workspaceId: config.teamId, channelId, threadTs }, {
+  const upload = await delivery.sendDocument!({ workspaceId: identity.teamId, channelId, threadTs }, {
     stream: Readable.from([`QiYan Slack live upload ${stamp}\n`]),
     size: Buffer.byteLength(`QiYan Slack live upload ${stamp}\n`),
     displayName: "qiyan-live.txt",
@@ -81,7 +82,7 @@ test("live Slack owner DM, channel, files, search, and mentions round trip", { s
   });
   assert.ok(Array.isArray((upload as Record<string, unknown>).fileIds));
 
-  const context = new SlackContextService(clients.bot, config.teamId, {
+  const context = new SlackContextService(clients.bot, identity.teamId, {
     search: clients.search,
     ownerUserId: config.ownerUserId,
     coverage: identity.coverage,

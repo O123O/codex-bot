@@ -14,7 +14,6 @@ const config: SlackConfig = {
   appToken: "xapp-secret",
   botToken: "xoxb-secret",
   userToken: "xoxp-secret",
-  teamId: "T123",
   ownerUserId: "U123",
 };
 
@@ -118,6 +117,8 @@ test("startup proves bot, owner, workspace, Real-time Search, and primary DM ide
 });
 
 for (const [name, overrides, match] of [
+  ["missing bot workspace identity", { botAuth: { ok: true, user_id: "B123" } }, /workspace/i],
+  ["missing user workspace identity", { userAuth: { ok: true, user_id: "U123" } }, /workspace/i],
   ["wrong bot workspace", { botAuth: { ok: true, team_id: "T999", user_id: "B123" } }, /workspace/i],
   ["wrong user workspace", { userAuth: { ok: true, team_id: "T999", user_id: "U123" } }, /workspace/i],
   ["wrong owner identity", { userAuth: { ok: true, team_id: "T123", user_id: "U999" } }, /owner/i],

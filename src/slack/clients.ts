@@ -165,12 +165,13 @@ export async function validateSlackStartup(config: SlackConfig, clients: SlackCl
 
   const botTeamId = stringField(botAuth, "team_id");
   const botUserId = stringField(botAuth, "user_id");
-  if (botTeamId !== config.teamId) throw configuration("Slack bot belongs to a different workspace");
+  if (!botTeamId) throw configuration("Slack bot workspace identity could not be resolved");
   if (!botUserId) throw configuration("Slack bot identity could not be resolved");
 
   const ownerTeamId = stringField(ownerAuth, "team_id");
   const ownerUserId = stringField(ownerAuth, "user_id");
-  if (ownerTeamId !== config.teamId) throw configuration("Slack user token belongs to a different workspace");
+  if (!ownerTeamId) throw configuration("Slack user token workspace identity could not be resolved");
+  if (ownerTeamId !== botTeamId) throw configuration("Slack bot and user token belong to different workspaces");
   if (ownerUserId !== config.ownerUserId) throw configuration("Slack user token does not belong to the configured owner");
   if (botUserId === ownerUserId) throw configuration("Slack owner and bot identity collision");
   if (searchInfo.is_ai_search_enabled !== true) throw configuration("Slack Real-time Search is unavailable");
@@ -182,7 +183,7 @@ export async function validateSlackStartup(config: SlackConfig, clients: SlackCl
   return {
     botUserId,
     ownerUserId,
-    teamId: config.teamId,
+    teamId: botTeamId,
     ownerDmChannelId,
     coverage: {
       requested: [...SEARCH_CATEGORIES],
