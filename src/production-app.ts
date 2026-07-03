@@ -420,7 +420,7 @@ export async function buildProductionApp(
           token: telegramConfig.token,
           ownerId: telegramConfig.ownerId,
           maxMessageBytes: config.attachmentMaxBytes,
-          onMessage: (source, checkpoint) => dispatcher.accept(source, checkpoint),
+          onMessage: (source, checkpoint) => dispatcher.accept(source, { commitNativeCheckpoint: checkpoint }),
         });
         deliveryWorker = new DeliveryWorker(deliveries, new ChatAdapterRegistry([chat.delivery]), attachments, undefined, (delivery) => { persistDeliveryState(delivery); });
         deliveryWorker.start();

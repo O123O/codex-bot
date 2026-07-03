@@ -155,9 +155,36 @@ test("chat acceptance retains attachments exactly once and rolls source/checkpoi
   assert.equal(db.prepare("SELECT ref_count FROM attachments WHERE id = ?").get(file.id)!.ref_count, 1);
 
   const rolledBack = await attachments.ingest("rollback", Readable.from(["x"]), { displayName: "b.txt", mediaType: "text/plain" });
-  assert.throws(() => store.acceptChatSource(message("rollback", binding("telegram", "chat-1"), [rolledBack.id]), () => { throw new Error("checkpoint failed"); }), /checkpoint failed/u);
+  assert.throws(() => store.acceptChatSource(message("rollback", binding("telegram", "chat-1"), [rolledBack.id]), { commitNativeCheckpoint: () => { throw new Error("checkpoint failed"); } }), /checkpoint failed/u);
   assert.equal(db.prepare("SELECT id FROM source_contexts WHERE id = 'rollback'").get(), undefined);
   assert.equal(db.prepare("SELECT ref_count FROM attachments WHERE id = ?").get(rolledBack.id)!.ref_count, 0);
+});
+
+test("Slack acceptance preserves failed attachment metadata without changing owner text", () => {
+  const db = createTestDatabase();
+  const store = new ConversationStore(db, new DeliveryStore(db));
+  const slack = { adapterId: "slack", conversationKey: "slack:T1:dm:D1", destination: { workspaceId: "T1", channelId: "D1" } } as const;
+  const failedAttachments = [{ nativeId: "F1", displayName: "missing.txt", reasonCode: "not_accessible" }] as const;
+  store.acceptChatSource({
+    id: "slack-source",
+    nativeSourceId: "T1:D1:1.0",
+    binding: slack,
+    rawText: "/pass exact",
+    attachmentIds: [],
+    failedAttachments,
+    receivedAt: 1,
+  });
+  assert.equal(store.hasChatSource("slack", "T1:D1:1.0"), true);
+  assert.equal(store.hasChatSource("slack", "missing"), false);
+  const lease = store.acquireLease({ kind: "chat", contextId: "slack-source" }, "claim");
+  const submission = store.reserveStart("slack-source");
+  assert.equal(submission.rawText, "/pass exact");
+  assert.deepEqual(submission.failedAttachments, failedAttachments);
+  assert.equal(lease.binding?.adapterId, "slack");
+  const row = db.prepare("SELECT kind, raw_text, failed_attachments_json FROM source_contexts WHERE id = 'slack-source'").get()!;
+  assert.equal(row.kind, "slack");
+  assert.equal(row.raw_text, "/pass exact");
+  assert.deepEqual(JSON.parse(String(row.failed_attachments_json)), failedAttachments);
 });
 
 test("event materialization and lease acquisition are one CAS transaction", () => {

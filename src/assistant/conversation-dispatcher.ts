@@ -3,7 +3,7 @@ import type { AppServerPool, TurnCapacityClaim } from "../app-server/pool.ts";
 import { JsonRpcResponseError } from "../app-server/json-rpc-client.ts";
 import { AppError } from "../core/errors.ts";
 import type { CanonicalChatSource } from "../core/types.ts";
-import type { AssistantLease, ConversationStore, ReservedSubmission } from "../storage/conversation-store.ts";
+import type { AssistantLease, ChatAcceptanceEffects, ConversationStore, ReservedSubmission } from "../storage/conversation-store.ts";
 import type { AssistantScheduler } from "./scheduler.ts";
 
 export interface TurnSnapshot {
@@ -72,10 +72,10 @@ export class ConversationDispatcher {
     });
   }
 
-  accept(source: CanonicalChatSource, commitNativeCheckpoint?: () => void): Promise<void> {
+  accept(source: CanonicalChatSource, effects: ChatAcceptanceEffects = {}): Promise<void> {
     return this.post(() => {
       this.pumpPaused = false;
-      this.store.acceptChatSource(source, commitNativeCheckpoint);
+      this.store.acceptChatSource(source, effects);
       this.pump();
     });
   }
@@ -343,6 +343,10 @@ export class ConversationDispatcher {
   private input(submission: ReservedSubmission): unknown[] {
     const input: unknown[] = [];
     if (submission.rawText) input.push({ type: "text", text: submission.rawText, text_elements: [] });
+    for (const failed of submission.failedAttachments) {
+      const name = failed.displayName.replace(/[\u0000-\u001f\u007f\]]/gu, "_").trim().slice(0, 180) || "attachment";
+      input.push({ type: "text", text: `[Slack attachment unavailable: ${name}]`, text_elements: [] });
+    }
     if (submission.attachmentIds.length > 0) {
       if (!this.options.attachments) throw new AppError("ATTACHMENT_INVALID", "assistant attachment input is not configured");
       for (const id of submission.attachmentIds) {

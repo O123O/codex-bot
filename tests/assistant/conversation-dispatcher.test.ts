@@ -264,6 +264,23 @@ test("submission input preserves text, image, and document source order", async 
   await dispatcher.idle();
 });
 
+test("failed attachments are separate model input and never mutate owner text", async (context) => {
+  const { db, runner, dispatcher } = fixture();
+  context.after(() => dispatcher.stop());
+  await dispatcher.accept({
+    ...chat("first"),
+    rawText: "/pass exact",
+    failedAttachments: [{ nativeId: "F1", displayName: "missing.txt", reasonCode: "not_accessible" }],
+  });
+  assert.deepEqual(runner.starts[0]?.params.input, [
+    { type: "text", text: "/pass exact", text_elements: [] },
+    { type: "text", text: "[Slack attachment unavailable: missing.txt]", text_elements: [] },
+  ]);
+  assert.equal(db.prepare("SELECT raw_text FROM source_contexts WHERE id = 'first'").get()!.raw_text, "/pass exact");
+  runner.starts[0]!.result.resolve({ turn: { id: "turn", status: "inProgress", itemsView: "full", items: [] } });
+  await dispatcher.idle();
+});
+
 test("capacity exhaustion leaves input pending and wakes once after capacity release", async () => {
   const { db, pool, runner, dispatcher } = fixture();
   const blocker = pool.claimTurnCapacity("assistant-local", "other", "blocker");

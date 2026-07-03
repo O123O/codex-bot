@@ -23,7 +23,7 @@ test("accepted input atomically stores source context and advances the offset af
     downloadFile: async () => ({ stream: Readable.from(["abc"]) }),
   };
   const poller = new TelegramPoller(db, api, attachments, { ownerId: 42, onMessage: async (source, checkpoint) => {
-    conversations.acceptChatSource(source, checkpoint);
+    conversations.acceptChatSource(source, { commitNativeCheckpoint: checkpoint });
     queued.push(source.id);
   } });
   await poller.pollOnce();
@@ -69,7 +69,7 @@ test("source, retain, notice, and offset roll back together when the native chec
   const api = { getUpdates: async () => updates, downloadFile: async () => ({ stream: Readable.from([]) }) };
   let fail = true;
   const poller = new TelegramPoller(db, api, attachments, { ownerId: 42, onMessage: async (source, checkpoint) => {
-    conversations.acceptChatSource(source, () => { if (fail) throw new Error("offset failed"); checkpoint(); });
+    conversations.acceptChatSource(source, { commitNativeCheckpoint: () => { if (fail) throw new Error("offset failed"); checkpoint(); } });
   } });
   await assert.rejects(poller.pollOnce(), /offset failed/u);
   assert.equal(db.prepare("SELECT COUNT(*) AS n FROM source_contexts").get()!.n, 0);

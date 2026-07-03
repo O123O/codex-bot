@@ -12,10 +12,11 @@ export type DeliveryState = "prepared" | "dispatched" | "confirmed" | "failed" |
 
 export interface SourceContext {
   id: string;
-  kind: "telegram" | "event_batch" | "recovery";
+  kind: "telegram" | "slack" | "event_batch" | "recovery";
   sourceId: string;
   rawText: string;
   attachmentIds: readonly string[];
+  failedAttachments?: readonly FailedAttachmentDescriptor[];
   binding?: ConversationBinding;
   arrivalSequence?: number;
   queueNoticeRequired?: boolean;
@@ -27,7 +28,14 @@ export interface CanonicalChatSource {
   binding: ConversationBinding;
   rawText: string;
   attachmentIds: readonly string[];
+  failedAttachments?: readonly FailedAttachmentDescriptor[];
   receivedAt: number;
+}
+
+export interface FailedAttachmentDescriptor {
+  nativeId: string;
+  displayName: string;
+  reasonCode: string;
 }
 
 export interface CanonicalAttachment {

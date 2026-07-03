@@ -94,6 +94,49 @@ test("safeguards consume FIFO, replay by call ID, and reject mismatch or exhaust
   );
 });
 
+test("pass rejects a failed attachment on its matched directive source", async () => {
+  const value = fixture();
+  value.db.prepare("UPDATE source_contexts SET failed_attachments_json = ? WHERE id = 'pass-one'")
+    .run(JSON.stringify([{ nativeId: "F1", displayName: "missing.txt", reasonCode: "not_accessible" }]));
+  admitNext(value);
+  await assert.rejects(
+    value.scope.resolveSafeguard({
+      attemptId: value.lease.attemptId,
+      callId: "failed-pass",
+      tool: "send_to_session",
+      args: { nickname: "worker", content: "first", attachment_ids: ["file-one"], mode: "start" },
+    }),
+    (error: unknown) => error instanceof AppError && error.code === "ATTACHMENT_INVALID",
+  );
+  assert.equal(value.operations.listForAttempt(value.lease.attemptId).length, 0);
+});
+
+test("an unrelated failed attachment does not invalidate another source's pass", async () => {
+  const db = createTestDatabase();
+  const operations = new OperationStore(db);
+  const conversations = new ConversationStore(db, new DeliveryStore(db));
+  for (const source of [
+    { id: "primary", rawText: "ordinary", failedAttachments: [] },
+    { id: "failed-ordinary", rawText: "also ordinary", failedAttachments: [{ nativeId: "F1", displayName: "missing.txt", reasonCode: "not_accessible" }] },
+    { id: "valid-pass", rawText: "/pass exact", failedAttachments: [] },
+  ]) conversations.acceptChatSource({ ...source, nativeSourceId: `native:${source.id}`, binding, attachmentIds: [], receivedAt: 1 });
+  const lease = conversations.acquireLease({ kind: "chat", contextId: "primary" }, "claim");
+  conversations.reserveStart("primary");
+  conversations.markSubmitted(lease.attemptId, "primary", "turn");
+  const failed = conversations.reserveNextSteer(lease.attemptId)!;
+  conversations.markSubmitted(lease.attemptId, failed.contextId, "turn");
+  const valid = conversations.reserveNextSteer(lease.attemptId)!;
+  conversations.markSubmitted(lease.attemptId, valid.contextId, "turn");
+  const scope = new AttemptScope(db, operations, { maxCollectCount: 20 });
+  const resolved = await scope.resolveSafeguard({
+    attemptId: lease.attemptId,
+    callId: "valid-pass",
+    tool: "send_to_session",
+    args: { nickname: "worker", content: "exact", attachment_ids: [], mode: "steer" },
+  });
+  assert.equal(resolved.effectiveSourceContextId, "valid-pass");
+});
+
 test("proven no-effect release allows the same safeguard to be consumed by a new call", async () => {
   const value = fixture();
   admitNext(value);

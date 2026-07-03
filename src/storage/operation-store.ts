@@ -48,13 +48,13 @@ export class OperationStore {
       const arrival = Number((this.db.prepare("SELECT next_value FROM arrival_sequence WHERE singleton = 1").get() as { next_value: number }).next_value);
       const inserted = this.db.prepare(`INSERT OR IGNORE INTO source_contexts
         (id, kind, source_id, raw_text, attachment_ids_json, adapter_id, conversation_key, destination_json, native_reply_json,
-          arrival_sequence, source_class, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+          arrival_sequence, source_class, created_at, failed_attachments_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
         .run(context.id, context.kind, context.sourceId, context.rawText, JSON.stringify(context.attachmentIds),
           context.binding?.adapterId ?? null, context.binding?.conversationKey ?? null,
           context.binding === undefined ? null : JSON.stringify(context.binding.destination),
           context.binding?.reply === undefined ? null : JSON.stringify(context.binding.reply), arrival,
-          context.kind === "telegram" ? "chat" : "internal", Date.now()).changes === 1;
+          context.kind === "telegram" || context.kind === "slack" ? "chat" : "internal", Date.now(), JSON.stringify(context.failedAttachments ?? [])).changes === 1;
       if (inserted) this.db.prepare("UPDATE arrival_sequence SET next_value = ? WHERE singleton = 1").run(arrival + 1);
       this.db.exec("RELEASE SAVEPOINT create_source_context");
       return inserted;
@@ -73,6 +73,7 @@ export class OperationStore {
       sourceId: String(row.source_id),
       rawText: String(row.raw_text),
       attachmentIds: JSON.parse(String(row.attachment_ids_json)) as string[],
+      failedAttachments: JSON.parse(String(row.failed_attachments_json ?? "[]")),
       ...(row.adapter_id && row.conversation_key && row.destination_json ? {
         binding: {
           adapterId: String(row.adapter_id),

@@ -91,6 +91,9 @@ export class AttemptScope {
       if (selected.kind === "malformed") throw new AppError("DIRECTIVE_MISMATCH", selected.reason);
       const contextId = selected.kind === "ordinary" ? selected.primaryContextId : selected.contextId;
       const source = this.source(contextId);
+      if (selected.kind === "directive" && selected.parsed.kind === "pass" && source.failedAttachments.length > 0) {
+        throw new AppError("ATTACHMENT_INVALID", "the /pass source contains an unavailable attachment");
+      }
       const directiveKind = selected.kind === "directive"
         ? this.validate(input.tool, input.args, selected.parsed, source.attachmentIds, true)
         : undefined;
@@ -143,6 +146,9 @@ export class AttemptScope {
   ): SafeguardResolution {
     const source = this.source(replay.contextId);
     const parsed = parseDirective(source.rawText, source.attachmentIds, this.options.maxCollectCount);
+    if (parsed.kind === "pass" && source.failedAttachments.length > 0) {
+      throw new AppError("ATTACHMENT_INVALID", "the /pass source contains an unavailable attachment");
+    }
     const directiveKind = this.validate(input.tool, input.args, parsed, source.attachmentIds, false);
     const operation = this.operations.prepare({
       contextId: replay.contextId,
@@ -205,10 +211,15 @@ export class AttemptScope {
       : { nickname: value.nickname, count: value.count };
   }
 
-  private source(contextId: string): { rawText: string; attachmentIds: string[] } {
-    const row = this.db.prepare("SELECT raw_text, attachment_ids_json FROM source_contexts WHERE id = ?").get(contextId) as { raw_text: string; attachment_ids_json: string } | undefined;
+  private source(contextId: string): { rawText: string; attachmentIds: string[]; failedAttachments: unknown[] } {
+    const row = this.db.prepare("SELECT raw_text, attachment_ids_json, failed_attachments_json FROM source_contexts WHERE id = ?").get(contextId) as
+      { raw_text: string; attachment_ids_json: string; failed_attachments_json: string } | undefined;
     if (!row) throw new AppError("OPERATION_CONFLICT", `unknown source context ${contextId}`);
-    return { rawText: row.raw_text, attachmentIds: JSON.parse(row.attachment_ids_json) as string[] };
+    return {
+      rawText: row.raw_text,
+      attachmentIds: JSON.parse(row.attachment_ids_json) as string[],
+      failedAttachments: JSON.parse(row.failed_attachments_json) as unknown[],
+    };
   }
 
   private resolution(contextId: string, operation: OperationRecord, replay: boolean, directiveKind?: "pass" | "collect"): SafeguardResolution {

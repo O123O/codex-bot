@@ -3,7 +3,7 @@ import type { AttachmentStore, FileHandleId } from "../attachments/store.ts";
 import type { ConversationBinding, JsonValue } from "../chat/binding.ts";
 import { sameConversation } from "../chat/binding.ts";
 import { AppError } from "../core/errors.ts";
-import type { CanonicalChatSource, SourceContext } from "../core/types.ts";
+import type { CanonicalChatSource, FailedAttachmentDescriptor, SourceContext } from "../core/types.ts";
 import type { Database } from "./database.ts";
 import { inTransaction } from "./database.ts";
 import type { DeliveryStore } from "./delivery-store.ts";
@@ -45,8 +45,11 @@ export interface AttemptSource {
 export interface ReservedSubmission extends AttemptSource {
   rawText: string;
   attachmentIds: readonly string[];
+  failedAttachments: readonly FailedAttachmentDescriptor[];
   binding?: ConversationBinding;
 }
+
+export interface ChatAcceptanceEffects { commitNativeCheckpoint?: () => void }
 
 export class ConversationStore {
   constructor(
@@ -55,7 +58,7 @@ export class ConversationStore {
     private readonly attachments?: AttachmentStore,
   ) {}
 
-  acceptChatSource(input: CanonicalChatSource, commitNativeCheckpoint?: () => void): { contextId: string; disposition: "pending" | "owner" | "queued" } {
+  acceptChatSource(input: CanonicalChatSource, effects: ChatAcceptanceEffects = {}): { contextId: string; disposition: "pending" | "owner" | "queued" } {
     return inTransaction(this.db, () => {
       const duplicate = this.db.prepare("SELECT id FROM source_contexts WHERE adapter_id = ? AND source_id = ?")
         .get(input.binding.adapterId, input.nativeSourceId) as { id: string } | undefined;
@@ -63,25 +66,43 @@ export class ConversationStore {
         const source = this.source(duplicate.id);
         const disposition = this.disposition(source);
         if (disposition === "queued") this.ensureQueueNotice(source);
-        commitNativeCheckpoint?.();
+        effects.commitNativeCheckpoint?.();
         return { contextId: source.id, disposition };
       }
+
+      if (!/^[a-z][a-z0-9_-]{0,31}$/u.test(input.binding.adapterId)) this.conflict("chat adapter identifier is invalid");
 
       const arrival = this.takeArrivalSequence();
       this.db.prepare(`INSERT INTO source_contexts
         (id, kind, source_id, raw_text, attachment_ids_json, state, created_at, adapter_id, conversation_key,
-          destination_json, native_reply_json, arrival_sequence, source_class, queue_notice_required)
-        VALUES (?, 'telegram', ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, 'chat', 0)`)
-        .run(input.id, input.nativeSourceId, input.rawText, JSON.stringify(input.attachmentIds), input.receivedAt,
+          destination_json, native_reply_json, arrival_sequence, source_class, queue_notice_required, failed_attachments_json)
+        VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, 'chat', 0, ?)`)
+        .run(input.id, input.binding.adapterId, input.nativeSourceId, input.rawText, JSON.stringify(input.attachmentIds), input.receivedAt,
           input.binding.adapterId, input.binding.conversationKey, JSON.stringify(input.binding.destination),
-          input.binding.reply === undefined ? null : JSON.stringify(input.binding.reply), arrival);
+          input.binding.reply === undefined ? null : JSON.stringify(input.binding.reply), arrival, JSON.stringify(input.failedAttachments ?? []));
       this.attachments?.retainAcceptedSourceInTransaction(input.id, input.attachmentIds as readonly FileHandleId[]);
+      this.db.prepare(`INSERT INTO latest_owner_route
+        (singleton, adapter_id, conversation_key, destination_json, reply_json, source_context_id, accepted_at)
+        VALUES (1, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(singleton) DO UPDATE SET
+          adapter_id = excluded.adapter_id,
+          conversation_key = excluded.conversation_key,
+          destination_json = excluded.destination_json,
+          reply_json = excluded.reply_json,
+          source_context_id = excluded.source_context_id,
+          accepted_at = excluded.accepted_at`)
+        .run(input.binding.adapterId, input.binding.conversationKey, JSON.stringify(input.binding.destination),
+          input.binding.reply === undefined ? null : JSON.stringify(input.binding.reply), input.id, Date.now());
       const source = this.source(input.id);
       const disposition = this.disposition(source);
       if (disposition === "queued") this.ensureQueueNotice(source);
-      commitNativeCheckpoint?.();
+      effects.commitNativeCheckpoint?.();
       return { contextId: input.id, disposition };
     });
+  }
+
+  hasChatSource(adapterId: string, nativeSourceId: string): boolean {
+    return this.db.prepare("SELECT 1 FROM source_contexts WHERE adapter_id = ? AND source_id = ?").get(adapterId, nativeSourceId) !== undefined;
   }
 
   createInternalSource(input: InternalSource): string {
@@ -232,6 +253,7 @@ export class ConversationStore {
       ...member,
       rawText: source.rawText,
       attachmentIds: source.attachmentIds,
+      failedAttachments: source.failedAttachments,
       ...(source.binding ? { binding: source.binding } : {}),
     };
   }
@@ -326,6 +348,7 @@ export class ConversationStore {
       ...this.membersForAttempt(lease.attemptId).find((member) => member.contextId === source.id)!,
       rawText: source.rawText,
       attachmentIds: source.attachmentIds,
+      failedAttachments: source.failedAttachments,
       ...(source.binding ? { binding: source.binding } : {}),
     };
   }
@@ -355,6 +378,7 @@ export class ConversationStore {
       sourceId: String(row.source_id),
       rawText: String(row.raw_text),
       attachmentIds: JSON.parse(String(row.attachment_ids_json)) as string[],
+      failedAttachments: JSON.parse(String(row.failed_attachments_json ?? "[]")) as FailedAttachmentDescriptor[],
       state: String(row.state) as StoredSource["state"],
       sourceClass: String(row.source_class) as "chat" | "internal",
       arrivalSequence: Number(row.arrival_sequence),
@@ -423,6 +447,7 @@ interface StoredSource {
   sourceId: string;
   rawText: string;
   attachmentIds: readonly string[];
+  failedAttachments: readonly FailedAttachmentDescriptor[];
   state: "pending" | "active" | "completed" | "superseded";
   sourceClass: "chat" | "internal";
   arrivalSequence: number;

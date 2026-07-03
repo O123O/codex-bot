@@ -350,4 +350,51 @@ export const migrations: readonly Migration[] = [
   CREATE UNIQUE INDEX operations_attempt_call_kind_idx
     ON operations(attempt_id, call_id, kind);
   `,
+  `
+  ALTER TABLE source_contexts ADD COLUMN failed_attachments_json TEXT NOT NULL DEFAULT '[]';
+
+  CREATE TABLE slack_inbox_sequence (
+    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+    next_value INTEGER NOT NULL
+  );
+  INSERT INTO slack_inbox_sequence(singleton, next_value) VALUES (1, 1);
+
+  CREATE TABLE slack_inbox (
+    event_id TEXT PRIMARY KEY,
+    team_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    channel_id TEXT NOT NULL,
+    message_ts TEXT NOT NULL,
+    thread_ts TEXT,
+    user_id TEXT NOT NULL,
+    text TEXT NOT NULL,
+    files_json TEXT NOT NULL,
+    file_state_json TEXT NOT NULL DEFAULT '{}',
+    arrival_sequence INTEGER NOT NULL UNIQUE,
+    state TEXT NOT NULL CHECK(state IN ('pending', 'processing', 'processed', 'retry')),
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    received_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+  );
+  CREATE INDEX slack_inbox_state_sequence_idx ON slack_inbox(state, arrival_sequence);
+
+  CREATE TABLE activated_chat_conversations (
+    adapter_id TEXT NOT NULL,
+    conversation_key TEXT NOT NULL,
+    destination_json TEXT NOT NULL,
+    activated_at INTEGER NOT NULL,
+    PRIMARY KEY(adapter_id, conversation_key)
+  );
+
+  CREATE TABLE latest_owner_route (
+    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+    adapter_id TEXT NOT NULL,
+    conversation_key TEXT NOT NULL,
+    destination_json TEXT NOT NULL,
+    reply_json TEXT,
+    source_context_id TEXT NOT NULL REFERENCES source_contexts(id),
+    accepted_at INTEGER NOT NULL
+  );
+  `,
 ];
