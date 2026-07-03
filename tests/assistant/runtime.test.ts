@@ -102,6 +102,28 @@ test("assistant context exists before turn/start dispatch and later binds the re
   assert.equal(runtime.activeAttempts()[0]?.turnId, "real-turn", "transport loss keeps the durable attempt active for reconciliation");
 });
 
+test("terminal handling prefers the active lease owner when historical attempts share a turn id", () => {
+  const db = createTestDatabase();
+  const operations = new OperationStore(db);
+  const deliveries = new DeliveryStore(db);
+  const conversations = new ConversationStore(db, deliveries);
+  conversations.createInternalSource({ id: "historical", kind: "event_batch", sourceId: "historical", rawText: "", attachmentIds: [], receivedAt: 1 });
+  conversations.createInternalSource({ id: "current", kind: "event_batch", sourceId: "current", rawText: "", attachmentIds: [], receivedAt: 2 });
+  db.prepare(`INSERT INTO assistant_attempts(id, context_id, turn_id, trigger_kind, state, created_at)
+    VALUES ('historical-attempt', 'historical', 'shared-turn', 'internal', 'failed', 1)`).run();
+  const lease = conversations.acquireLease({ kind: "internal", contextId: "current" }, "claim-current");
+  conversations.reserveStart("current");
+  conversations.markSubmitted(lease.attemptId, "current", "shared-turn");
+  const runtime = new AssistantRuntime(db, operations, deliveries, { binding });
+
+  assert.equal(runtime.contextForTurn("shared-turn")?.attemptId, lease.attemptId);
+  runtime.handleTerminal("shared-turn", "interrupted", undefined, new Error("interrupted"));
+
+  assert.equal(db.prepare("SELECT state FROM assistant_attempts WHERE id = ?").get(lease.attemptId)!.state, "failed");
+  assert.equal(conversations.lease(), undefined);
+  assert.equal(db.prepare("SELECT state FROM source_contexts WHERE id = 'current'").get()!.state, "pending");
+});
+
 test("successful read-only tools do not force a recovery context after a failed attempt", () => {
   const db = createTestDatabase();
   const operations = new OperationStore(db);

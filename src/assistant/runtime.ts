@@ -248,7 +248,8 @@ export class AssistantRuntime {
 
   private attemptRow(turnId: string): Record<string, unknown> | undefined {
     return this.db.prepare(`SELECT a.*, l.trigger_kind AS lease_trigger_kind FROM assistant_attempts a
-      LEFT JOIN assistant_turn_lease l ON l.attempt_id = a.id WHERE a.turn_id = ?`).get(turnId) as Record<string, unknown> | undefined;
+      LEFT JOIN assistant_turn_lease l ON l.attempt_id = a.id WHERE a.turn_id = ?
+      ORDER BY (l.singleton IS NOT NULL) DESC, (a.state = 'active') DESC, a.created_at DESC, a.id DESC LIMIT 1`).get(turnId) as Record<string, unknown> | undefined;
   }
 
   private memberContextIds(attempt: Record<string, unknown>): string[] {
