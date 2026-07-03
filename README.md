@@ -19,7 +19,7 @@ Read this before installing or launching:
 
 - Linux
 - Node.js 24 or newer
-- `codex-cli 0.142.4`
+- `codex-cli 0.142.5`
 - At least one chat adapter: Telegram owner credentials, Slack owner/workspace credentials, or both
 
 ## Install

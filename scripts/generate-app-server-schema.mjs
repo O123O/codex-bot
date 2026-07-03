@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import { readdir, readFile, writeFile, mkdir, rm } from "node:fs/promises";
 import { join, relative } from "node:path";
 
-const expected = "codex-cli 0.142.4";
+const expected = "codex-cli 0.142.5";
 const version = execFileSync("codex", ["--version"], { encoding: "utf8" }).trim();
 if (version !== expected) throw new Error(`Expected ${expected}, found ${version}`);
 

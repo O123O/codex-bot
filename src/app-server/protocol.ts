@@ -1,7 +1,7 @@
 import type { ServerRequest as GeneratedServerRequest } from "./generated/ServerRequest.ts";
 import type { ServerNotification as GeneratedServerNotification } from "./generated/ServerNotification.ts";
 
-export const SUPPORTED_CODEX_VERSION = "0.142.4";
+export const SUPPORTED_CODEX_VERSION = "0.142.5";
 
 export type ServerRequest = GeneratedServerRequest;
 export type ServerNotification = GeneratedServerNotification;
