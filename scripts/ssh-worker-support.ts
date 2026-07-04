@@ -122,10 +122,14 @@ function assertOwned(metadata: Stats, uid: number, label: string): void {
   if (metadata.uid !== uid) throw new Error(`${label} must be owned by the current user`);
 }
 
-function assertOwnerOnlyFile(metadata: Stats, uid: number, label: string): void {
+function assertOwnedRegularSingleLink(metadata: Stats, uid: number, label: string): void {
   if (!metadata.isFile()) throw new Error(`${label} must be a regular file`);
   assertOwned(metadata, uid, label);
   if (metadata.nlink !== 1) throw new Error(`${label} must have exactly one link`);
+}
+
+function assertOwnerOnlyFile(metadata: Stats, uid: number, label: string): void {
+  assertOwnedRegularSingleLink(metadata, uid, label);
   if ((metadata.mode & 0o077) !== 0) throw new Error(`${label} must not be group- or world-accessible`);
 }
 
@@ -269,6 +273,14 @@ async function generateKeyPair(paths: FixturePaths, runner: CommandRunner, uid: 
       throw new Error("SSH key generation failed");
     }
     if (result.code !== 0 || result.signal !== null) throw new Error("SSH key generation failed");
+
+    const stagedPublicMetadata = await optionalMetadata(stagedPublicKey);
+    if (stagedPublicMetadata === undefined) throw new Error("generated SSH keypair is incomplete");
+    assertOwnedRegularSingleLink(stagedPublicMetadata, uid, "generated public key");
+    if ((stagedPublicMetadata.mode & 0o777) !== 0o644) {
+      throw new Error("generated public key must have mode 0644 before normalization");
+    }
+    await chmod(stagedPublicKey, OWNER_ONLY_FILE_MODE);
     await validateKeyPair(stagedPrivateKey, stagedPublicKey, runner, uid, true);
 
     try {

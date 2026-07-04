@@ -56,7 +56,7 @@ function stagingRunner(calls: Array<{ command: string; args: readonly string[] }
 
     await writeFile(keyPath, "opaque-test-private-key", { mode: 0o600 });
     if (options.createPublicKey !== false) {
-      await writeFile(`${keyPath}.pub`, `${PUBLIC_KEY} qiyan-ssh-worker\n`, { mode: 0o600 });
+      await writeFile(`${keyPath}.pub`, `${PUBLIC_KEY} qiyan-ssh-worker\n`, { mode: 0o644 });
     }
     return successfulResult();
   };
@@ -170,6 +170,7 @@ test("stages, validates, and installs a new owner-only keypair", async (t) => {
     assert.equal(metadata.nlink, 1);
     assert.equal(metadata.mode & 0o777, 0o600);
   }
+  assert.equal((await lstat(paths.publicKey)).mode & 0o777, 0o600);
   const stagedPrivateKey = calls[0]?.args.at(-1);
   assert.ok(stagedPrivateKey);
   assert.deepEqual(calls, [
