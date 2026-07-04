@@ -3,7 +3,7 @@ import { z } from "zod";
 
 const positiveInt = z.coerce.number().int().positive();
 
-const configSchema = z.object({
+const configValueSchema = z.object({
   TELEGRAM_BOT_TOKEN: z.string().min(1).optional(),
   TELEGRAM_OWNER_ID: z.coerce.number().int().optional(),
   TELEGRAM_DESTINATION_CHAT_ID: z.coerce.number().int().optional(),
@@ -11,7 +11,7 @@ const configSchema = z.object({
   SLACK_BOT_TOKEN: z.string().regex(/^xoxb-.+/u).optional(),
   SLACK_USER_TOKEN: z.string().regex(/^xoxp-.+/u).optional(),
   SLACK_OWNER_USER_ID: z.string().regex(/^U[A-Z0-9]+$/u).optional(),
-  PRIMARY_CHAT_APP: z.enum(["telegram", "slack"]).optional(),
+  PRIMARY_CHAT_APP: z.enum(["telegram", "slack", "weixin"]).optional(),
   HOME: z.string().min(1),
   ASSISTANT_WORKDIR: z.string().min(1).optional(),
   DATA_DIR: z.string().min(1).optional(),
@@ -24,35 +24,47 @@ const configSchema = z.object({
   ATTACHMENT_MAX_BYTES: positiveInt.default(20 * 1024 * 1024),
   ATTACHMENT_STORE_MAX_BYTES: positiveInt.default(1024 * 1024 * 1024),
   ASSISTANT_SANDBOX_MODE: z.enum(["read-only", "workspace-write", "danger-full-access"]).default("danger-full-access"),
-}).superRefine((value, context) => {
-  const telegramFields = [value.TELEGRAM_BOT_TOKEN, value.TELEGRAM_OWNER_ID, value.TELEGRAM_DESTINATION_CHAT_ID];
-  const slackFields = [value.SLACK_APP_TOKEN, value.SLACK_BOT_TOKEN, value.SLACK_USER_TOKEN, value.SLACK_OWNER_USER_ID];
-  const telegramPresent = telegramFields.filter((field) => field !== undefined).length;
-  const slackPresent = slackFields.filter((field) => field !== undefined).length;
-  const telegram = telegramPresent === telegramFields.length;
-  const slack = slackPresent === slackFields.length;
-  if (telegramPresent > 0 && !telegram) context.addIssue({ code: "custom", path: ["TELEGRAM_BOT_TOKEN"], message: "Telegram credential group must be complete" });
-  if (slackPresent > 0 && !slack) context.addIssue({ code: "custom", path: ["SLACK_APP_TOKEN"], message: "Slack credential group must be complete" });
-  if (!telegram && !slack && telegramPresent === 0 && slackPresent === 0) {
-    context.addIssue({ code: "custom", path: ["PRIMARY_CHAT_APP"], message: "at least one complete chat adapter is required" });
-  }
-  if (telegram && value.TELEGRAM_DESTINATION_CHAT_ID !== value.TELEGRAM_OWNER_ID) {
-    context.addIssue({ code: "custom", path: ["TELEGRAM_DESTINATION_CHAT_ID"], message: "must equal TELEGRAM_OWNER_ID for the single-user private-chat MVP" });
-  }
-  if (telegram && slack && value.PRIMARY_CHAT_APP === undefined) {
-    context.addIssue({ code: "custom", path: ["PRIMARY_CHAT_APP"], message: "PRIMARY_CHAT_APP is required when multiple chat adapters are configured" });
-  }
-  if (value.PRIMARY_CHAT_APP === "telegram" && !telegram) {
-    context.addIssue({ code: "custom", path: ["PRIMARY_CHAT_APP"], message: "PRIMARY_CHAT_APP must name a configured chat adapter" });
-  }
-  if (value.PRIMARY_CHAT_APP === "slack" && !slack) {
-    context.addIssue({ code: "custom", path: ["PRIMARY_CHAT_APP"], message: "PRIMARY_CHAT_APP must name a configured chat adapter" });
-  }
 });
+
+function configSchema(weixinConfigured: boolean) {
+  return configValueSchema.superRefine((value, context) => {
+    const telegramFields = [value.TELEGRAM_BOT_TOKEN, value.TELEGRAM_OWNER_ID, value.TELEGRAM_DESTINATION_CHAT_ID];
+    const slackFields = [value.SLACK_APP_TOKEN, value.SLACK_BOT_TOKEN, value.SLACK_USER_TOKEN, value.SLACK_OWNER_USER_ID];
+    const telegramPresent = telegramFields.filter((field) => field !== undefined).length;
+    const slackPresent = slackFields.filter((field) => field !== undefined).length;
+    const telegram = telegramPresent === telegramFields.length;
+    const slack = slackPresent === slackFields.length;
+    if (telegramPresent > 0 && !telegram) context.addIssue({ code: "custom", path: ["TELEGRAM_BOT_TOKEN"], message: "Telegram credential group must be complete" });
+    if (slackPresent > 0 && !slack) context.addIssue({ code: "custom", path: ["SLACK_APP_TOKEN"], message: "Slack credential group must be complete" });
+    if (!telegram && !slack && !weixinConfigured && telegramPresent === 0 && slackPresent === 0) {
+      context.addIssue({ code: "custom", path: ["PRIMARY_CHAT_APP"], message: "at least one complete chat adapter is required" });
+    }
+    if (telegram && value.TELEGRAM_DESTINATION_CHAT_ID !== value.TELEGRAM_OWNER_ID) {
+      context.addIssue({ code: "custom", path: ["TELEGRAM_DESTINATION_CHAT_ID"], message: "must equal TELEGRAM_OWNER_ID for the single-user private-chat MVP" });
+    }
+    if ([telegram, slack, weixinConfigured].filter(Boolean).length > 1 && value.PRIMARY_CHAT_APP === undefined) {
+      context.addIssue({ code: "custom", path: ["PRIMARY_CHAT_APP"], message: "PRIMARY_CHAT_APP is required when multiple chat adapters are configured" });
+    }
+    if (value.PRIMARY_CHAT_APP === "telegram" && !telegram) {
+      context.addIssue({ code: "custom", path: ["PRIMARY_CHAT_APP"], message: "PRIMARY_CHAT_APP must name a configured chat adapter" });
+    }
+    if (value.PRIMARY_CHAT_APP === "slack" && !slack) {
+      context.addIssue({ code: "custom", path: ["PRIMARY_CHAT_APP"], message: "PRIMARY_CHAT_APP must name a configured chat adapter" });
+    }
+    if (value.PRIMARY_CHAT_APP === "weixin" && !weixinConfigured) {
+      context.addIssue({ code: "custom", path: ["PRIMARY_CHAT_APP"], message: "PRIMARY_CHAT_APP must name a configured chat adapter" });
+    }
+  });
+}
 
 export interface TelegramConfig { token: string; ownerId: number; destinationChatId: number }
 export interface SlackConfig { appToken: string; botToken: string; userToken: string; ownerUserId: string }
-export interface ChatConfig { primary: "telegram" | "slack"; telegram?: TelegramConfig; slack?: SlackConfig }
+export interface ChatConfig {
+  primary: "telegram" | "slack" | "weixin";
+  telegram?: TelegramConfig;
+  slack?: SlackConfig;
+  weixin?: { configured: true };
+}
 
 export interface BotConfig {
   qiyanHome: string;
@@ -71,7 +83,7 @@ export interface BotConfig {
   assistantSandboxMode: "read-only" | "workspace-write" | "danger-full-access";
 }
 
-export interface ConfigOverrides { qiyanHome: string; assistantWorkdir?: string }
+export interface ConfigOverrides { qiyanHome: string; assistantWorkdir?: string; weixinConfigured?: boolean }
 
 export interface AssistantLoginConfig { dataDir: string; codexBinary: string }
 
@@ -88,7 +100,7 @@ export function loadAssistantLoginConfig(env: Record<string, string | undefined>
 }
 
 export function loadConfig(env: Record<string, string | undefined>, overrides: ConfigOverrides): BotConfig {
-  const parsed = configSchema.parse(overrides.assistantWorkdir === undefined
+  const parsed = configSchema(overrides.weixinConfigured ?? false).parse(overrides.assistantWorkdir === undefined
     ? env
     : { ...env, ASSISTANT_WORKDIR: overrides.assistantWorkdir });
   const home = resolve(parsed.HOME);
@@ -105,13 +117,14 @@ export function loadConfig(env: Record<string, string | undefined>, overrides: C
     userToken: parsed.SLACK_USER_TOKEN!,
     ownerUserId: parsed.SLACK_OWNER_USER_ID!,
   };
-  const primary = parsed.PRIMARY_CHAT_APP ?? (telegram ? "telegram" : "slack");
+  const primary = parsed.PRIMARY_CHAT_APP ?? (telegram ? "telegram" : slack ? "slack" : "weixin");
   return {
     qiyanHome: defaultRoot,
     chat: {
       primary,
       ...(telegram ? { telegram } : {}),
       ...(slack ? { slack } : {}),
+      ...(overrides.weixinConfigured ? { weixin: { configured: true as const } } : {}),
     },
     userHome: home,
     assistantWorkdir: resolve(parsed.ASSISTANT_WORKDIR ?? join(defaultRoot, "qiyan-workdir")),

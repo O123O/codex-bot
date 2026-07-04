@@ -9,6 +9,7 @@ import { validateAssistantWorkspacePaths } from "./assistant/workspace.ts";
 import { WeixinAuthClient } from "./weixin/auth-client.ts";
 import { WeixinCredentialStore } from "./weixin/credential-store.ts";
 import { createNodeWeixinLoginTerminal, runWeixinLogin } from "./weixin/login.ts";
+import { bootstrapWeixin } from "./weixin/bootstrap.ts";
 
 export async function main(env = process.env, argv: readonly string[] = process.argv.slice(2)): Promise<void> {
   const command = parseCliArgs(argv);
@@ -53,16 +54,19 @@ export async function main(env = process.env, argv: readonly string[] = process.
     return;
   }
   const loaded = await loadConfigSource(env, command.qiyanHome === undefined ? {} : { cliHome: command.qiyanHome });
+  const weixin = await bootstrapWeixin(loaded.qiyanHome);
   if (command.command === "config-check") {
-    const config = loadConfig(loaded.values, { qiyanHome: loaded.qiyanHome });
+    const config = loadConfig(loaded.values, { qiyanHome: loaded.qiyanHome, weixinConfigured: weixin.configured });
     await validateAssistantWorkspacePaths({ workdir: config.assistantWorkdir, dataDir: config.dataDir, registryPath: config.sessionRegistryPath });
     process.stdout.write("Configuration OK.\n");
     return;
   }
-  const app = await createApp(loadConfig(loaded.values, {
+  const config = loadConfig(loaded.values, {
     qiyanHome: loaded.qiyanHome,
+    weixinConfigured: weixin.configured,
     ...(command.assistantWorkdir === undefined ? {} : { assistantWorkdir: command.assistantWorkdir }),
-  }));
+  });
+  const app = await createApp(config, weixin.configured ? { weixinCredential: weixin.credential } : {});
   await app.start();
   let stopping = false;
   const stop = () => {

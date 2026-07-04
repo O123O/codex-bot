@@ -1,7 +1,12 @@
 import type { BotConfig } from "./config.ts";
+import type { WeixinCredentialHandle } from "./weixin/credential-store.ts";
 
 export interface BotApp { start(): Promise<void>; stop(): Promise<void> }
 export interface AppPhase { name: string; start(): Promise<void>; stop(): Promise<void> }
+export interface AppRuntimeOptions {
+  phases?: readonly AppPhase[];
+  weixinCredential?: WeixinCredentialHandle;
+}
 
 export class TerminalInbox<T> {
   private readonly values = new Map<string, T>();
@@ -87,8 +92,8 @@ export function composeApp(
  * second half. Keeping the lifecycle primitive injectable makes startup ordering
  * and failure cleanup deterministic in tests.
  */
-export async function createApp(config: BotConfig, phases?: readonly AppPhase[]): Promise<BotApp> {
-  if (phases) return composeApp(phases);
+export async function createApp(config: BotConfig, options: AppRuntimeOptions = {}): Promise<BotApp> {
+  if (options.phases) return composeApp(options.phases);
   const { buildProductionApp } = await import("./production-app.ts");
-  return buildProductionApp(config);
+  return buildProductionApp(config, options.weixinCredential ? { weixinCredential: options.weixinCredential } : {});
 }

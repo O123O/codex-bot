@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { composeApp, TerminalInbox, type AppPhase } from "../src/app.ts";
+import { composeApp, createApp, TerminalInbox, type AppPhase } from "../src/app.ts";
+import type { BotConfig } from "../src/config.ts";
+import type { WeixinCredentialHandle } from "../src/weixin/credential-store.ts";
 
 test("composition starts in order, starts each worker once, and stops in reverse", async () => {
   const events: string[] = [];
@@ -58,4 +60,19 @@ test("shutdown attempts every phase and propagates the first cleanup failure", a
   await app.start();
   await assert.rejects(app.stop(), /cleanup failed/);
   assert.deepEqual(stopped, ["two", "one"]);
+});
+
+test("createApp keeps phase injection and opaque WeChat runtime options outside BotConfig", async () => {
+  const events: string[] = [];
+  const phase: AppPhase = {
+    name: "injected",
+    start: async () => { events.push("start"); },
+    stop: async () => { events.push("stop"); },
+  };
+  const credential = {} as WeixinCredentialHandle;
+  const app = await createApp({} as BotConfig, { phases: [phase], weixinCredential: credential });
+  await app.start();
+  await app.stop();
+  assert.deepEqual(events, ["start", "stop"]);
+  assert.equal("weixinCredential" in ({} as BotConfig), false);
 });

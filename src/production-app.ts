@@ -48,6 +48,7 @@ import { SessionDashboardStore } from "./storage/session-dashboard-store.ts";
 import { TelegramChatAdapter } from "./telegram/chat-adapter.ts";
 import type { SlackContextService } from "./slack/context-service.ts";
 import { SlackChatAdapter } from "./slack/chat-adapter.ts";
+import type { WeixinCredentialHandle } from "./weixin/credential-store.ts";
 
 const assistantAssetRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../assets/assistant");
 const fullAccessWarning = "QiYan assistant is running non-interactively with full filesystem access and approvals disabled.";
@@ -85,8 +86,9 @@ export function registryReloadPreservesWorkerMappings(current: RegistryDocument,
 
 export async function buildProductionApp(
   config: BotConfig,
-  options: { chdir?: (path: string) => void; chatAdapters?: readonly ChatAdapter[] } = {},
+  options: { chdir?: (path: string) => void; chatAdapters?: readonly ChatAdapter[]; weixinCredential?: WeixinCredentialHandle } = {},
 ): Promise<BotApp> {
+  void options.weixinCredential;
   const telegramConfig = config.chat.telegram;
   const token = randomBytes(32).toString("base64url");
   const telegramBinding: ConversationBinding | undefined = telegramConfig ? {

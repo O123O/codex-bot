@@ -57,6 +57,38 @@ test("loadConfig accepts Telegram-only and Slack-only adapter groups", () => {
   });
 });
 
+test("loadConfig accepts WeChat-only and requires an explicit configured primary with any multiple adapters", () => {
+  assert.deepEqual(loadConfig({ HOME: "/home/test-user" }, { qiyanHome, weixinConfigured: true }).chat, {
+    primary: "weixin",
+    weixin: { configured: true },
+  });
+
+  const telegramAndWeixin = baseEnv();
+  assert.throws(() => loadConfig(telegramAndWeixin, { qiyanHome, weixinConfigured: true }), /PRIMARY_CHAT_APP/u);
+  assert.equal(loadConfig(
+    { ...telegramAndWeixin, PRIMARY_CHAT_APP: "weixin" },
+    { qiyanHome, weixinConfigured: true },
+  ).chat.primary, "weixin");
+
+  const allThree = baseEnv({
+    SLACK_APP_TOKEN: "xapp-test",
+    SLACK_BOT_TOKEN: "xoxb-test",
+    SLACK_USER_TOKEN: "xoxp-test",
+    SLACK_OWNER_USER_ID: "U123",
+  });
+  assert.throws(() => loadConfig(allThree, { qiyanHome, weixinConfigured: true }), /PRIMARY_CHAT_APP/u);
+  for (const primary of ["telegram", "slack", "weixin"] as const) {
+    assert.equal(loadConfig(
+      { ...allThree, PRIMARY_CHAT_APP: primary },
+      { qiyanHome, weixinConfigured: true },
+    ).chat.primary, primary);
+  }
+  assert.throws(() => loadConfig(
+    { HOME: "/home/test-user", PRIMARY_CHAT_APP: "weixin" },
+    { qiyanHome },
+  ), /configured chat adapter/u);
+});
+
 test("loadConfig requires an exact configured primary when both adapters exist", () => {
   const both = baseEnv({
     SLACK_APP_TOKEN: "xapp-test",
