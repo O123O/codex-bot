@@ -8,7 +8,7 @@ import { AttachmentStore } from "../../src/attachments/store.ts";
 import { AppError } from "../../src/core/errors.ts";
 import { createTestDatabase } from "../../src/storage/database.ts";
 
-async function fixture(overrides: { maxFileBytes?: number; maxStoreBytes?: number } = {}) {
+async function fixture(overrides: { maxFileBytes?: number; maxStoreBytes?: number; beforeCleanupClaim?: (id: string) => void | Promise<void> } = {}) {
   const root = await mkdtemp(join(tmpdir(), "qiyan-bot-files-"));
   let now = 1_000;
   const db = createTestDatabase();
@@ -17,6 +17,7 @@ async function fixture(overrides: { maxFileBytes?: number; maxStoreBytes?: numbe
     maxStoreBytes: overrides.maxStoreBytes ?? 20,
     ttlMs: 100,
     clock: { now: () => now },
+    ...(overrides.beforeCleanupClaim ? { beforeCleanupClaim: overrides.beforeCleanupClaim } : {}),
   });
   await store.initialize();
   return { root, db, store, advance: (ms: number) => { now += ms; } };
@@ -93,6 +94,25 @@ test("expiry removes only unreferenced attachments", async () => {
   assert.equal(await store.cleanupExpired(), 1);
   assert.equal(await readFile(store.pathForTesting(kept.id), "utf8"), "a");
   await assert.rejects(readFile(store.pathForTesting(removed.id)));
+});
+
+test("cleanup cannot unlink an attachment retained after candidate selection", async () => {
+  let store!: AttachmentStore;
+  let retained = false;
+  const fixtureValue = await fixture({
+    beforeCleanupClaim: (id) => {
+      if (retained) return;
+      retained = true;
+      store.retain("ctx", id as `file_${string}`);
+    },
+  });
+  store = fixtureValue.store;
+  const saved = await store.ingest("ctx", Readable.from(["held"]), { displayName: "held", mediaType: "x" });
+  fixtureValue.advance(101);
+  assert.equal(await store.cleanupExpired(), 0);
+  assert.equal(await readFile(store.pathForTesting(saved.id), "utf8"), "held");
+  store.release("ctx", saved.id);
+  assert.equal(await store.cleanupExpired(), 1);
 });
 
 test("project-relative outbound preparation rejects traversal and symlinks, then snapshots bytes", async () => {

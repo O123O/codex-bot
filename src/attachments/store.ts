@@ -29,7 +29,13 @@ export class AttachmentStore {
   constructor(
     private readonly db: Database,
     private readonly root: string,
-    private readonly options: { maxFileBytes: number; maxStoreBytes: number; ttlMs?: number; clock?: Clock },
+    private readonly options: {
+      maxFileBytes: number;
+      maxStoreBytes: number;
+      ttlMs?: number;
+      clock?: Clock;
+      beforeCleanupClaim?: (id: string) => void | Promise<void>;
+    },
   ) {
     this.clock = options.clock ?? new SystemClock();
     this.ttlMs = options.ttlMs ?? 24 * 60 * 60_000;
@@ -124,6 +130,71 @@ export class AttachmentStore {
     }
   }
 
+  retainInboxAttachmentInTransaction(holdId: string, scopeId: string, id: FileHandleId): void {
+    this.required(scopeId, id);
+    const checkpoint = this.db.prepare(`SELECT generation_id, identity_kind, identity_value, hold_id
+      FROM weixin_inbox_media WHERE attachment_id = ? AND attachment_scope_id = ? AND state = 'completed'`)
+      .get(id, scopeId) as { generation_id: string; identity_kind: string; identity_value: string; hold_id: string } | undefined;
+    if (!checkpoint) this.invalid("WeChat inbox attachment checkpoint is missing");
+    if (checkpoint.hold_id !== holdId) this.invalid("WeChat inbox attachment hold is inconsistent");
+    const existing = this.db.prepare(`SELECT generation_id, identity_kind, identity_value, scope_id
+      FROM weixin_inbox_attachment_refs WHERE attachment_id = ?`).get(id) as {
+        generation_id: string; identity_kind: string; identity_value: string; scope_id: string;
+      } | undefined;
+    if (existing) this.invalid("WeChat inbox attachment hold is inconsistent");
+    this.db.prepare(`INSERT INTO weixin_inbox_attachment_refs
+      (hold_id, generation_id, identity_kind, identity_value, scope_id, attachment_id, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)`)
+      .run(holdId, checkpoint.generation_id, checkpoint.identity_kind, checkpoint.identity_value, scopeId, id, this.clock.now());
+    if (this.db.prepare("UPDATE attachments SET ref_count = ref_count + 1 WHERE id = ? AND scope_id = ?")
+      .run(id, scopeId).changes !== 1) this.invalid("WeChat inbox attachment refcount is inconsistent");
+  }
+
+  transferInboxAttachmentsToAcceptedSourceInTransaction(
+    holdId: string,
+    scopeId: string,
+    ids: readonly FileHandleId[],
+  ): void {
+    const held = this.db.prepare(`SELECT hold_id, generation_id, identity_kind, identity_value, scope_id, attachment_id
+      FROM weixin_inbox_attachment_refs WHERE hold_id = ? ORDER BY attachment_id`).all(holdId) as Array<{
+        hold_id: string; generation_id: string; identity_kind: string; identity_value: string; scope_id: string; attachment_id: FileHandleId;
+      }>;
+    const expected = [...new Set(ids)].sort();
+    if (held.length !== expected.length || held.some((row, index) => row.scope_id !== scopeId || row.attachment_id !== expected[index])) {
+      this.invalid("WeChat inbox attachment hold is inconsistent");
+    }
+    for (const row of held) {
+      this.requireExactInboxCheckpoint(row);
+      if (this.db.prepare(`UPDATE weixin_inbox_media SET attachment_id = NULL, attachment_scope_id = NULL
+        WHERE attachment_id = ? AND attachment_scope_id = ?`).run(row.attachment_id, scopeId).changes !== 1) {
+        this.invalid("WeChat inbox attachment checkpoint is inconsistent");
+      }
+      if (this.db.prepare("UPDATE attachments SET ref_count = ref_count - 1 WHERE id = ? AND ref_count > 0")
+        .run(row.attachment_id).changes !== 1) this.invalid("WeChat inbox attachment refcount is inconsistent");
+    }
+    this.db.prepare("DELETE FROM weixin_inbox_attachment_refs WHERE hold_id = ?").run(holdId);
+  }
+
+  releaseInboxAttachmentsInTransaction(holdId: string): void {
+    const held = this.db.prepare(`SELECT hold_id, generation_id, identity_kind, identity_value, scope_id, attachment_id
+      FROM weixin_inbox_attachment_refs WHERE hold_id = ? ORDER BY attachment_id`).all(holdId) as Array<{
+        hold_id: string; generation_id: string; identity_kind: string; identity_value: string; scope_id: string; attachment_id: FileHandleId;
+      }>;
+    const checkpoints = this.db.prepare(`SELECT attachment_id FROM weixin_inbox_media
+      WHERE hold_id = ? AND attachment_id IS NOT NULL ORDER BY attachment_id`).all(holdId) as Array<{ attachment_id: FileHandleId }>;
+    if (held.length !== checkpoints.length || held.some((row, index) => row.attachment_id !== checkpoints[index]?.attachment_id)) {
+      this.invalid("WeChat inbox attachment hold is inconsistent");
+    }
+    for (const row of held) {
+      this.requireExactInboxCheckpoint(row);
+      if (this.db.prepare("UPDATE weixin_inbox_media SET attachment_id = NULL, attachment_scope_id = NULL WHERE attachment_id = ?")
+        .run(row.attachment_id).changes !== 1) this.invalid("WeChat inbox attachment checkpoint is inconsistent");
+      if (this.db.prepare("UPDATE attachments SET ref_count = ref_count - 1 WHERE id = ? AND ref_count > 0")
+        .run(row.attachment_id).changes !== 1) this.invalid("WeChat inbox attachment refcount is inconsistent");
+    }
+    this.db.prepare("DELETE FROM weixin_inbox_attachment_refs WHERE hold_id = ?").run(holdId);
+  }
+
   release(scopeId: string, id: FileHandleId): void {
     this.required(scopeId, id);
     this.db.prepare("UPDATE attachments SET ref_count = MAX(ref_count - 1, 0) WHERE id = ?").run(id);
@@ -185,11 +256,17 @@ export class AttachmentStore {
 
   async cleanupExpired(): Promise<number> {
     const rows = this.db.prepare("SELECT id, local_path FROM attachments WHERE ref_count = 0 AND expires_at <= ?").all(this.clock.now()) as Array<{ id: string; local_path: string }>;
+    let removed = 0;
     for (const row of rows) {
+      await this.options.beforeCleanupClaim?.(row.id);
+      const claimed = inTransaction(this.db, () => this.db.prepare(
+        "DELETE FROM attachments WHERE id = ? AND ref_count = 0 AND expires_at <= ?",
+      ).run(row.id, this.clock.now()).changes === 1);
+      if (!claimed) continue;
       await unlink(row.local_path).catch(() => undefined);
-      this.db.prepare("DELETE FROM attachments WHERE id = ?").run(row.id);
+      removed += 1;
     }
-    return rows.length;
+    return removed;
   }
 
   async prepareOutbound(scopeId: string, ownerRoot: string, relativePath: string, displayName = basename(relativePath), mediaType = "application/octet-stream", requestedId?: FileHandleId): Promise<StoredAttachment> {
@@ -250,6 +327,25 @@ export class AttachmentStore {
     const row = this.db.prepare("SELECT * FROM attachments WHERE id = ? AND scope_id = ?").get(id, scopeId) as Record<string, unknown> | undefined;
     if (!row) this.invalid("unknown or out-of-scope attachment handle");
     return row;
+  }
+
+  private requireExactInboxCheckpoint(row: {
+    hold_id: string;
+    generation_id: string;
+    identity_kind: string;
+    identity_value: string;
+    scope_id: string;
+    attachment_id: FileHandleId;
+  }): void {
+    const checkpoint = this.db.prepare(`SELECT COUNT(*) AS count FROM weixin_inbox_media
+      WHERE generation_id = ? AND identity_kind = ? AND identity_value = ?
+        AND hold_id = ? AND attachment_id = ? AND attachment_scope_id = ? AND state = 'completed'`)
+      .get(row.generation_id, row.identity_kind, row.identity_value, row.hold_id, row.attachment_id, row.scope_id) as { count: number };
+    const attachment = this.db.prepare("SELECT ref_count FROM attachments WHERE id = ? AND scope_id = ?")
+      .get(row.attachment_id, row.scope_id) as { ref_count: number } | undefined;
+    if (checkpoint.count !== 1 || !attachment || attachment.ref_count < 1) {
+      this.invalid("WeChat inbox attachment hold is inconsistent");
+    }
   }
 
   private async remove(id: string): Promise<void> {

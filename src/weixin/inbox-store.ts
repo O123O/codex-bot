@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
+import type { AttachmentStore, FileHandleId, StoredAttachment } from "../attachments/store.ts";
 import type { Database } from "../storage/database.ts";
 import { inTransaction } from "../storage/database.ts";
 import { classifyWeixinMessage, type WeixinClassifiedItem, type WeixinOwnerIdentity } from "./event-classifier.ts";
@@ -23,6 +25,7 @@ export interface WeixinPollCommit {
 interface InboxStoreOptions {
   now?: () => number;
   beforeCursorUpdate?: () => void;
+  attachments?: AttachmentStore;
 }
 
 interface InboxRow {
@@ -126,6 +129,57 @@ export class WeixinInboxStore {
       WHERE generation_id = ? AND state = 'processing'`).run(this.now(), generationId);
   }
 
+  checkpointAttachment(
+    generationId: string,
+    identity: WeixinMessageIdentity,
+    itemOrdinal: number,
+    input: { scopeId: string; attachment: StoredAttachment; descriptor?: unknown },
+  ): void {
+    if (!this.options.attachments) throw new Error("WeChat attachment store is unavailable");
+    inTransaction(this.db, () => {
+      const inbox = this.get(generationId, identity);
+      if (!inbox || inbox.state !== "processing") throw new Error("WeChat inbox row is not processing");
+      const descriptor = JSON.stringify(input.descriptor ?? {});
+      const existing = this.db.prepare(`SELECT state, descriptor_json, attachment_id, attachment_scope_id
+        FROM weixin_inbox_media WHERE generation_id = ? AND identity_kind = ? AND identity_value = ? AND item_ordinal = ?`)
+        .get(generationId, identity.kind, identity.value, itemOrdinal) as {
+          state: string; descriptor_json: string; attachment_id: string | null; attachment_scope_id: string | null;
+        } | undefined;
+      if (existing) {
+        if (existing.state !== "completed" || existing.descriptor_json !== descriptor
+          || existing.attachment_id !== input.attachment.id || existing.attachment_scope_id !== input.scopeId) {
+          throw new Error("WeChat media checkpoint is inconsistent");
+        }
+        const hold = this.db.prepare(`SELECT COUNT(*) AS total,
+            SUM(CASE WHEN hold_id = ? AND generation_id = ? AND identity_kind = ? AND identity_value = ?
+              AND scope_id = ? THEN 1 ELSE 0 END) AS matching
+          FROM weixin_inbox_attachment_refs WHERE attachment_id = ?`)
+          .get(inboxHoldId(generationId, identity), generationId, identity.kind, identity.value,
+            input.scopeId, input.attachment.id) as { total: number; matching: number };
+        const retained = this.db.prepare("SELECT ref_count FROM attachments WHERE id = ? AND scope_id = ?")
+          .get(input.attachment.id, input.scopeId) as { ref_count: number } | undefined;
+        if (hold.total !== 1 || hold.matching !== 1 || !retained || retained.ref_count < 1) {
+          throw new Error("WeChat media checkpoint hold is inconsistent");
+        }
+        return;
+      }
+      this.db.prepare(`INSERT INTO weixin_inbox_media
+        (generation_id, identity_kind, identity_value, item_ordinal, hold_id, state, descriptor_json,
+          attachment_id, attachment_scope_id, updated_at)
+        VALUES (?, ?, ?, ?, ?, 'completed', ?, ?, ?, ?)`)
+        .run(generationId, identity.kind, identity.value, itemOrdinal, inboxHoldId(generationId, identity), descriptor,
+          input.attachment.id, input.scopeId, this.now());
+      this.options.attachments!.retainInboxAttachmentInTransaction(
+        inboxHoldId(generationId, identity), input.scopeId, input.attachment.id,
+      );
+    });
+  }
+
+  attachmentHoldCount(generationId: string, identity: WeixinMessageIdentity): number {
+    return Number((this.db.prepare("SELECT COUNT(*) AS count FROM weixin_inbox_attachment_refs WHERE hold_id = ?")
+      .get(inboxHoldId(generationId, identity)) as { count: number }).count);
+  }
+
   resolveRouteToken(generationId: string, routeTokenId?: string): string | undefined {
     const row = routeTokenId === undefined
       ? this.db.prepare(`SELECT token FROM weixin_route_tokens
@@ -184,6 +238,10 @@ export class WeixinInboxStore {
 
 export function weixinNativeSourceId(generationId: string, identity: WeixinMessageIdentity): string {
   return `weixin:${generationId}:${identity.kind}:${identity.value}`;
+}
+
+export function inboxHoldId(generationId: string, identity: WeixinMessageIdentity): string {
+  return `weixin-inbox-${createHash("sha256").update(JSON.stringify([generationId, identity.kind, identity.value])).digest("hex")}`;
 }
 
 function toRecord(row: InboxRow): WeixinInboxRecord {

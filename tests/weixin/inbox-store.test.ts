@@ -1,10 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createTestDatabase } from "../../src/storage/database.ts";
+import { createTestDatabase, inTransaction } from "../../src/storage/database.ts";
 import { DeliveryStore } from "../../src/storage/delivery-store.ts";
 import { WeixinAccountStore } from "../../src/weixin/account-store.ts";
-import { WeixinInboxStore, weixinNativeSourceId } from "../../src/weixin/inbox-store.ts";
+import { inboxHoldId, WeixinInboxStore, weixinNativeSourceId } from "../../src/weixin/inbox-store.ts";
 import { parseUpdates } from "../../src/weixin/protocol.ts";
+import { AttachmentStore } from "../../src/attachments/store.ts";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 function setup(options: { beforeCursorUpdate?: () => void } = {}) {
   const db = createTestDatabase();
@@ -108,4 +112,63 @@ test("derives generation- and identity-kind-separated canonical source IDs", () 
     weixinNativeSourceId("g1", { kind: "message", value: "7" }),
     weixinNativeSourceId("g2", { kind: "message", value: "7" }),
   );
+});
+
+test("checkpoints an attachment and its durable cleanup hold atomically", async (context) => {
+  const root = await mkdtemp(join(tmpdir(), "qiyan-weixin-hold-"));
+  context.after(() => rm(root, { recursive: true, force: true }));
+  const db = createTestDatabase();
+  const accounts = new WeixinAccountStore(db, new DeliveryStore(db));
+  accounts.activate({ accountGenerationId: "generation", credentialRevisionId: "revision", botId: "bot", ownerUserId: "owner", apiBaseUrl: "https://ilinkai.weixin.qq.com" });
+  let now = 1;
+  const attachments = new AttachmentStore(db, root, { maxFileBytes: 100, maxStoreBytes: 100, ttlMs: 1, clock: { now: () => now } });
+  await attachments.initialize();
+  const inbox = new WeixinInboxStore(db, { botId: "bot", ownerUserId: "owner" }, { attachments });
+  inbox.commitPoll("generation", "", parseUpdates(JSON.stringify({ ret: 0, msgs: [
+    { message_id: 1, from_user_id: "owner", to_user_id: "bot", item_list: [{ type: 2, image_item: {} }] },
+  ] })));
+  const row = inbox.claimHead("generation")!;
+  const attachment = await attachments.ingest("source", (async function* () { yield Buffer.from("image"); })(), { displayName: "image", mediaType: "image/png" });
+  const holdId = inboxHoldId("generation", row.identity);
+  db.prepare(`INSERT INTO weixin_inbox_attachment_refs
+    (hold_id, generation_id, identity_kind, identity_value, scope_id, attachment_id, created_at)
+    VALUES (?, 'generation', ?, ?, 'source', ?, 1)`)
+    .run("wrong-hold-id", row.identity.kind, row.identity.value, attachment.id);
+  db.prepare("UPDATE attachments SET ref_count = 1 WHERE id = ?").run(attachment.id);
+  assert.throws(
+    () => inbox.checkpointAttachment("generation", row.identity, 0, { scopeId: "source", attachment }),
+    /hold is inconsistent/u,
+  );
+  assert.equal(db.prepare("SELECT COUNT(*) AS count FROM weixin_inbox_media").get()!.count, 0);
+  db.prepare("DELETE FROM weixin_inbox_attachment_refs WHERE attachment_id = ?").run(attachment.id);
+  db.prepare("UPDATE attachments SET ref_count = 0 WHERE id = ?").run(attachment.id);
+  inbox.checkpointAttachment("generation", row.identity, 0, { scopeId: "source", attachment });
+  inbox.checkpointAttachment("generation", row.identity, 0, { scopeId: "source", attachment });
+  assert.equal(inbox.attachmentHoldCount("generation", row.identity), 1);
+  db.prepare("DELETE FROM weixin_inbox_attachment_refs WHERE hold_id = ?").run(holdId);
+  assert.throws(
+    () => inbox.checkpointAttachment("generation", row.identity, 0, { scopeId: "source", attachment }),
+    /hold is inconsistent/u,
+  );
+  assert.throws(
+    () => inTransaction(db, () => attachments.releaseInboxAttachmentsInTransaction(holdId)),
+    /hold is inconsistent/u,
+  );
+  db.prepare(`INSERT INTO weixin_inbox_attachment_refs
+    (hold_id, generation_id, identity_kind, identity_value, scope_id, attachment_id, created_at)
+    VALUES (?, 'generation', ?, ?, 'source', ?, 1)`)
+    .run(holdId, row.identity.kind, row.identity.value, attachment.id);
+  now = 3;
+  assert.equal(await attachments.cleanupExpired(), 0);
+  inTransaction(db, () => {
+    attachments.retainAcceptedSourceInTransaction("source", [attachment.id]);
+    attachments.transferInboxAttachmentsToAcceptedSourceInTransaction(
+      holdId, "source", [attachment.id],
+    );
+  });
+  assert.equal(inbox.attachmentHoldCount("generation", row.identity), 0);
+  assert.equal(db.prepare("SELECT ref_count FROM attachments WHERE id = ?").get(attachment.id)!.ref_count, 1);
+  attachments.release("source", attachment.id);
+  assert.equal(await attachments.cleanupExpired(), 1);
+  db.close();
 });

@@ -483,6 +483,7 @@ export const migrations: readonly Migration[] = [
     identity_kind TEXT NOT NULL,
     identity_value TEXT NOT NULL,
     item_ordinal INTEGER NOT NULL CHECK(item_ordinal >= 0),
+    hold_id TEXT NOT NULL,
     state TEXT NOT NULL CHECK(state IN ('pending', 'completed', 'failed')),
     descriptor_json TEXT NOT NULL,
     attachment_id TEXT REFERENCES attachments(id),
@@ -492,6 +493,8 @@ export const migrations: readonly Migration[] = [
     FOREIGN KEY(generation_id, identity_kind, identity_value)
       REFERENCES weixin_inbox(generation_id, identity_kind, identity_value)
   );
+  CREATE UNIQUE INDEX weixin_single_media_attachment_idx
+    ON weixin_inbox_media(attachment_id) WHERE attachment_id IS NOT NULL;
 
   CREATE TABLE weixin_inbox_attachment_refs (
     hold_id TEXT NOT NULL,
@@ -505,6 +508,8 @@ export const migrations: readonly Migration[] = [
     FOREIGN KEY(generation_id, identity_kind, identity_value)
       REFERENCES weixin_inbox(generation_id, identity_kind, identity_value)
   );
+  CREATE UNIQUE INDEX weixin_single_inbox_attachment_hold_idx
+    ON weixin_inbox_attachment_refs(attachment_id);
 
   CREATE TABLE weixin_outbound_steps (
     id TEXT PRIMARY KEY,
