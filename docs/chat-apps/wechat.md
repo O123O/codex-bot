@@ -1,8 +1,10 @@
 # Personal WeChat adapter
 
-Status: Implemented
+Status: Experimental
 
-QiYan supports one personal WeChat owner through Tencent's iLink bot interface. This is a direct personal owner adapter: it is not a public account, enterprise WeChat integration, group bot, or multi-user service.
+The adapter is implemented with automated-test coverage but not successfully live-tested. During the attempted live acceptance, an account registered with a non-mainland-China phone number could not complete Tencent's QR authorization. This records the observed limitation rather than claiming a complete WeChat account, phone-number, region, or client eligibility matrix.
+
+QiYan is designed to support one personal WeChat owner through Tencent's iLink bot interface. This is a direct personal owner adapter: it is not a public account, enterprise WeChat integration, group bot, or multi-user service.
 
 ## Security and capability limits
 

@@ -1,6 +1,6 @@
 # QiYan Bot
 
-QiYan Bot is a single-user, self-hosted, general-purpose personal assistant powered by Codex. It can answer and handle small filesystem tasks directly, or deliberately delegate sustained project work to ordinary, resumable Codex sessions. Telegram, Slack, and personal WeChat are implemented and can run together behind the same transport-neutral backend.
+QiYan Bot is a single-user, self-hosted, general-purpose personal assistant powered by Codex. It can answer and handle small filesystem tasks directly, or deliberately delegate sustained project work to ordinary, resumable Codex sessions. Telegram and Slack are implemented and live-tested. Personal WeChat is experimental: it is implemented with automated-test coverage but has not been successfully live-tested. Telegram, Slack, and WeChat can run together behind the same transport-neutral backend.
 
 QiYan keeps the assistant and project workers distinct. The assistant has its own HOME, CODEX_HOME, authentication, instructions, and app-server. Workers use your normal HOME, CODEX_HOME, configuration, credentials, skills, and app-server. Before opening a managed thread in another Codex client, run `unadopt_session`; adopt it again afterward if QiYan should resume management.
 
@@ -12,7 +12,7 @@ Read this before installing or launching:
 - Chat approvals are unsupported. Worker sessions receive no QiYan approval, sandbox, or shell override, so your normal Codex configuration must already be suitable for automatic, non-interactive operation. A remaining permission request is reported as blocked.
 - The Telegram adapter accepts only the configured owner and sends only to that owner's private chat. This is not a multi-user service.
 - The Slack adapter accepts only the configured owner. Its `xoxp-` user token is read-only by QiYan's code boundary but remains a powerful credential whose search coverage follows the owner's Slack permissions and workspace policy.
-- The personal WeChat adapter accepts only the owner authenticated by `weixin-login`; groups, history/search, untranscribed raw voice, and raw video are unsupported.
+- The experimental personal WeChat adapter has not been successfully live-tested. It accepts only the owner authenticated by `weixin-login`; groups, history/search, untranscribed raw voice, and raw video are unsupported.
 - The private `.env` is not propagated to assistant or worker child processes, but full filesystem access under the same OS user means QiYan can technically read it. Filesystem isolation requires a dedicated account or container.
 - Use a dedicated OS account or container if other same-account processes are outside your trust boundary.
 
@@ -48,7 +48,7 @@ Setup guides:
 - [Required fresh cutover for versions before v0.3.0](docs/upgrading-to-v0.3.md)
 - [Telegram — implemented](docs/chat-apps/telegram.md)
 - [Slack — implemented](docs/chat-apps/slack.md)
-- [Personal WeChat — implemented](docs/chat-apps/wechat.md)
+- [Personal WeChat — experimental](docs/chat-apps/wechat.md)
 
 ## Configure and run
 

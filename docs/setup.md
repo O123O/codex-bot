@@ -1,6 +1,6 @@
 # Shared setup
 
-This guide prepares QiYan's isolated assistant and the user's ordinary Codex workers. [Telegram](chat-apps/telegram.md), [Slack](chat-apps/slack.md), and [personal WeChat](chat-apps/wechat.md) are implemented and may run together.
+This guide prepares QiYan's isolated assistant and the user's ordinary Codex workers. [Telegram](chat-apps/telegram.md) and [Slack](chat-apps/slack.md) are implemented and live-tested. [Personal WeChat](chat-apps/wechat.md) is experimental: implemented with automated-test coverage but not successfully live-tested. All three adapters may run together.
 
 ## Understand the execution model
 

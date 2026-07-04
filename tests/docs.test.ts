@@ -167,11 +167,13 @@ test("packaged Slack manifest has the exact reviewed events and scopes", async (
 test("WeChat guide documents the implemented personal-owner adapter without environment credentials", async () => {
   const guide = await readFile(resolve("docs/chat-apps/wechat.md"), "utf8");
   for (const required of [
-    "Status: Implemented", "qiyan-bot weixin-login", "--home", "credentials/weixin.json", "PRIMARY_CHAT_APP=weixin",
+    "Status: Experimental", "qiyan-bot weixin-login", "--home", "credentials/weixin.json", "PRIMARY_CHAT_APP=weixin",
     "text", "image", "file", "voice transcription", "group", "raw voice", "raw video", "history", "search",
     "cef0bfc390393f716903e16d50408118047f87e0", "2.4.6", "MIT", "no endorsement",
     "QR", "attachment", "poll", "restart", "relogin", "backup", "revoke",
   ]) assert.equal(guide.toLowerCase().includes(required.toLowerCase()), true, `WeChat guide is missing: ${required}`);
+  assert.match(guide, /implemented.*automated-test(?:ed| coverage).*not successfully live-tested/isu);
+  assert.match(guide, /non-mainland-China.*phone number.*could not complete.*authorization/isu);
   assert.match(guide, /direct personal.*owner|owner.*direct personal/isu);
   assert.match(guide, /credentials\/weixin\.json.*(?:0600|owner-only)/isu);
   assert.match(guide, /not.*(?:\.env|environment)|(?:\.env|environment).*not/isu);
@@ -193,6 +195,8 @@ test("shared setup and upgrade docs treat WeChat as a managed-credential adapter
   const upgrade = await readFile(resolve("docs/upgrading-to-v0.3.md"), "utf8");
   const envExample = await readFile(resolve(".env.example"), "utf8");
   assert.match(readme, /Telegram.*Slack.*WeChat.*implemented/isu);
+  assert.match(readme, /personal WeChat.*experimental.*automated-test(?:ed| coverage).*(?:not|has not been) successfully live-tested/isu);
+  assert.match(readme, /Personal WeChat — experimental/iu);
   assert.doesNotMatch(readme, /WeChat[^\n]*(?:planned|deferred)|(?:planned|deferred)[^\n]*WeChat/iu);
   assert.match(setup, /PRIMARY_CHAT_APP=(?:telegram\|slack\|weixin|telegram, slack, or weixin)|PRIMARY_CHAT_APP.*weixin/iu);
   assert.match(setup, /qiyan-bot weixin-login/iu);
