@@ -1,0 +1,34 @@
+services:
+  ssh-worker:
+    build:
+      context: ../..
+      dockerfile: docker/ssh-worker/Dockerfile
+      args:
+        CODEX_VERSION: ${QIYAN_SSH_WORKER_CODEX_VERSION:-0.142.5}
+    ports:
+      - "127.0.0.1:${QIYAN_SSH_WORKER_PORT:-2222}:22"
+    volumes:
+      - type: bind
+        source: ${QIYAN_SSH_WORKER_PUBLIC_KEY:?set-QIYAN_SSH_WORKER_PUBLIC_KEY}
+        target: /run/qiyan/authorized_key.pub
+        read_only: true
+      - type: volume
+        source: codex-profile
+        target: /home/codex/.codex
+      - type: volume
+        source: projects
+        target: /home/codex/projects
+      - type: volume
+        source: ssh-host-keys
+        target: /var/lib/ssh-host-keys
+    healthcheck:
+      test: ["CMD-SHELL", "ssh-keyscan -T 5 -t ed25519 -p 22 127.0.0.1 2>/dev/null | grep -q 'ssh-ed25519'"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  codex-profile:
+  projects:
+  ssh-host-keys:

@@ -1,0 +1,13 @@
+Port 22
+HostKey /var/lib/ssh-host-keys/ssh_host_ed25519_key
+AuthorizedKeysFile .ssh/authorized_keys
+PubkeyAuthentication yes
+AuthenticationMethods publickey
+PermitRootLogin no
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitEmptyPasswords no
+AllowUsers codex
+DisableForwarding yes
+UsePAM no
+PidFile /run/sshd/sshd.pid
