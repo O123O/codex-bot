@@ -74,7 +74,7 @@ export class SessionLifecycle {
     await this.gate.run(endpointId, threadId, async () => {
       this.requireAvailable(nickname, endpointId, threadId);
       const before = await this.read(endpointId, threadId);
-      this.requireIdle(before.thread);
+      this.requireAdoptableBeforeResume(before.thread);
       const project = await this.workspaces.prepareExisting(before.thread.cwd);
       await this.workspaces.assertDispatchable(project);
       await this.verifyCwd(before.thread.cwd, project.path);
@@ -168,7 +168,7 @@ export class SessionLifecycle {
           await this.workspaces.assertDispatchable(project);
           if (project.path !== session.project_dir) throw new AppError("CWD_MISMATCH", "adopting project directory changed");
           const before = await this.read(session.endpoint, session.thread_id);
-          this.requireIdle(before.thread);
+          this.requireAdoptableBeforeResume(before.thread);
           await this.verifyCwd(before.thread.cwd, project.path);
           this.assertExact(nickname, expected, "adopting");
           await this.pool.request(session.endpoint, "thread/resume", { threadId: session.thread_id });
@@ -266,6 +266,12 @@ export class SessionLifecycle {
 
   private requireIdle(thread: ThreadView): void {
     if (thread.status.type !== "idle") throw new AppError("SESSION_BUSY", `thread ${thread.id} is ${thread.status.type}`);
+  }
+
+  private requireAdoptableBeforeResume(thread: ThreadView): void {
+    if (thread.status.type !== "idle" && thread.status.type !== "notLoaded") {
+      throw new AppError("SESSION_BUSY", `thread ${thread.id} is ${thread.status.type}`);
+    }
   }
 
   private async verifyCwd(actual: string, expected: string): Promise<void> {

@@ -94,6 +94,50 @@ test("adopt reserves before resume, uses only native cwd, and promotes after a s
   assert.equal(runtime.currentEpoch("local", "thread-1", session.mapping_id)?.baselineTurnId, "historical");
 });
 
+test("adopt resumes a disk-backed notLoaded thread before enforcing idle", async () => {
+  const { registry, endpoint, runtime, lifecycle } = await fixture();
+  endpoint.status = "notLoaded";
+  endpoint.onResume = () => {
+    assert.equal(required(registry).lifecycle_state, "adopting");
+    endpoint.status = "idle";
+  };
+
+  await lifecycle.adopt("payments", "local", "thread-1");
+
+  const session = required(registry);
+  assert.equal(session.lifecycle_state, "managed");
+  assert.equal(runtime.getSession("local", "thread-1", session.mapping_id)?.nativeStatus, "idle");
+  assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/read", "thread/resume", "thread/read"]);
+});
+
+test("adopt rejects active and systemError threads before reservation or resume", async (context) => {
+  for (const status of ["active", "systemError"]) await context.test(status, async () => {
+    const { registry, endpoint, lifecycle } = await fixture();
+    endpoint.status = status;
+
+    await assert.rejects(
+      lifecycle.adopt("payments", "local", "thread-1"),
+      (error: unknown) => error instanceof AppError && error.code === "SESSION_BUSY",
+    );
+
+    assert.equal(registry.get("payments"), undefined);
+    assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/read"]);
+  });
+});
+
+test("adopt rolls back a proven subscription when the resumed thread is active", async () => {
+  const { registry, endpoint, lifecycle } = await fixture();
+  endpoint.onResume = () => { endpoint.status = "active"; };
+
+  await assert.rejects(
+    lifecycle.adopt("payments", "local", "thread-1"),
+    (error: unknown) => error instanceof AppError && error.code === "SESSION_BUSY",
+  );
+
+  assert.equal(registry.get("payments"), undefined);
+  assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/read", "thread/resume", "thread/read", "thread/unsubscribe"]);
+});
+
 test("duplicate nickname or native identity fails before resume", async () => {
   const { registry, endpoint, lifecycle } = await fixture();
   await lifecycle.adopt("payments", "local", "thread-1");
@@ -113,6 +157,8 @@ test("an uncertain resume remains adopting and startup reconciliation promotes o
   assert.equal(runtime.getSession("local", "thread-1", reserved.mapping_id)?.managementState, "adopting");
 
   endpoint.failResume = false;
+  endpoint.status = "notLoaded";
+  endpoint.onResume = () => { endpoint.status = "idle"; };
   endpoint.calls.length = 0;
   await lifecycle.reconcileAdopting();
   assert.equal(required(registry).mapping_id, reserved.mapping_id);
