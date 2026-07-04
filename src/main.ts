@@ -6,6 +6,9 @@ import { runAssistantLogin } from "./assistant/login.ts";
 import { readPackageInfo } from "./distribution/package-info.ts";
 import { updateFromLatestRelease } from "./distribution/update.ts";
 import { validateAssistantWorkspacePaths } from "./assistant/workspace.ts";
+import { WeixinAuthClient } from "./weixin/auth-client.ts";
+import { WeixinCredentialStore } from "./weixin/credential-store.ts";
+import { createNodeWeixinLoginTerminal, runWeixinLogin } from "./weixin/login.ts";
 
 export async function main(env = process.env, argv: readonly string[] = process.argv.slice(2)): Promise<void> {
   const command = parseCliArgs(argv);
@@ -23,6 +26,30 @@ export async function main(env = process.env, argv: readonly string[] = process.
   if (command.command === "assistant-login") {
     const loaded = await loadConfigSource(env, command.qiyanHome === undefined ? {} : { cliHome: command.qiyanHome });
     await runAssistantLogin(loadAssistantLoginConfig(loaded.values, loaded.qiyanHome), loaded.hostEnv);
+    return;
+  }
+  if (command.command === "weixin-login") {
+    const loaded = await loadConfigSource(env, command.qiyanHome === undefined ? {} : { cliHome: command.qiyanHome });
+    const transport = { fetch: (url: URL, init: RequestInit) => fetch(url, init) };
+    const controller = new AbortController();
+    const abort = () => { controller.abort(); };
+    const terminal = createNodeWeixinLoginTerminal();
+    process.once("SIGINT", abort);
+    process.once("SIGTERM", abort);
+    try {
+      await runWeixinLogin({
+        store: new WeixinCredentialStore(loaded.qiyanHome),
+        auth: new WeixinAuthClient(transport),
+        terminal,
+        signal: controller.signal,
+      });
+    } catch (error) {
+      if (!controller.signal.aborted || !(error instanceof Error) || error.name !== "AbortError") throw error;
+      terminal.status("WeChat authorization cancelled; no changes were made.");
+    } finally {
+      process.removeListener("SIGINT", abort);
+      process.removeListener("SIGTERM", abort);
+    }
     return;
   }
   const loaded = await loadConfigSource(env, command.qiyanHome === undefined ? {} : { cliHome: command.qiyanHome });

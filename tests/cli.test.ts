@@ -11,6 +11,8 @@ test("parses an explicit assistant workdir", () => {
   });
   assert.deepEqual(parseCliArgs(["assistant-login"]), { command: "assistant-login" });
   assert.deepEqual(parseCliArgs(["assistant-login", "--home", "/srv/qiyan"]), { command: "assistant-login", qiyanHome: "/srv/qiyan" });
+  assert.deepEqual(parseCliArgs(["weixin-login"]), { command: "weixin-login" });
+  assert.deepEqual(parseCliArgs(["weixin-login", "--home", "/srv/qiyan"]), { command: "weixin-login", qiyanHome: "/srv/qiyan" });
   assert.deepEqual(parseCliArgs(["config-check", "--home", "/srv/qiyan"]), { command: "config-check", qiyanHome: "/srv/qiyan" });
   assert.deepEqual(parseCliArgs(["--version"]), { command: "version" });
   assert.deepEqual(parseCliArgs(["--update"]), { command: "update" });
@@ -23,6 +25,7 @@ test("rejects missing, repeated, and unknown CLI arguments", () => {
   assert.throws(() => parseCliArgs(["--home", "one", "--home", "two"]), /only once/);
   assert.throws(() => parseCliArgs(["--unknown"]), /unknown argument/);
   assert.throws(() => parseCliArgs(["assistant-login", "--workdir", "one"]), /unknown argument/);
+  assert.throws(() => parseCliArgs(["weixin-login", "--workdir", "one"]), /unknown argument/);
   assert.throws(() => parseCliArgs(["config-check", "--workdir", "one"]), /unknown argument/);
   assert.throws(() => parseCliArgs(["--version", "--workdir", "one"]), /unknown argument/);
   assert.throws(() => parseCliArgs(["--update", "--version"]), /unknown argument/);

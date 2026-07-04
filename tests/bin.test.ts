@@ -98,6 +98,15 @@ test("packed qiyan-bot runs without source files or installed dependencies", asy
   assert.equal(configCheck.stdout, "Configuration OK.\n");
   assert.equal(configCheck.stderr, "");
 
+  const weixinLogin = spawnSync(executable, ["weixin-login", "--home", "relative-home"], {
+    cwd: temp,
+    encoding: "utf8",
+    env: { PATH: process.env.PATH ?? "", HOME: temp },
+  });
+  assert.equal(weixinLogin.status, 1);
+  assert.equal(weixinLogin.stdout, "");
+  assert.match(weixinLogin.stderr, /QIYAN_HOME must be absolute/u);
+
   const overlappingHome = join(temp, "overlapping-qiyan-home");
   const overlappingState = join(overlappingHome, "shared-state");
   await mkdir(overlappingHome, { mode: 0o700 });

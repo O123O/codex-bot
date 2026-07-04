@@ -3,8 +3,10 @@ import {
   commonHeaders,
   encodeUin,
   requestWithRedirects,
+  WeixinApiClient,
   type WeixinHttpTransport,
 } from "./api-client.ts";
+import type { WeixinCredentialHandle } from "./credential-store.ts";
 import { validateTencentUrl } from "./endpoint-policy.ts";
 import { readBoundedJson } from "./protocol.ts";
 
@@ -43,6 +45,10 @@ export class WeixinAuthClient {
   constructor(private readonly transport: WeixinHttpTransport, options: AuthClientOptions = {}) {
     this.nextUin = options.nextUin ?? (() => crypto.getRandomValues(new Uint32Array(1))[0]!);
     this.timeoutMs = options.timeoutMs ?? QR_TIMEOUT_MS;
+  }
+
+  async probeCredential(credential: WeixinCredentialHandle, signal?: AbortSignal): Promise<void> {
+    await new WeixinApiClient(credential, this.transport).getConfig(signal);
   }
 
   async createQr(localToken?: string, signal?: AbortSignal): Promise<WeixinQrChallenge> {

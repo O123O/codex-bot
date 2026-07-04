@@ -4,6 +4,7 @@ import { AppError } from "./core/errors.ts";
 export type CliCommand =
   | { command: "run"; assistantWorkdir?: string; qiyanHome?: string }
   | { command: "assistant-login"; qiyanHome?: string }
+  | { command: "weixin-login"; qiyanHome?: string }
   | { command: "config-check"; qiyanHome?: string }
   | { command: "update" }
   | { command: "version" };
@@ -13,7 +14,7 @@ export function parseCliArgs(argv: readonly string[]): CliCommand {
     if (argv.length !== 1) throw new AppError("CONFIGURATION_ERROR", "unknown argument");
     return { command: argv[0] === "--update" ? "update" : "version" };
   }
-  if (argv[0] === "assistant-login" || argv[0] === "config-check") {
+  if (argv[0] === "assistant-login" || argv[0] === "weixin-login" || argv[0] === "config-check") {
     const command = argv[0];
     const options = parsePathOptions(argv.slice(1), false);
     return options.qiyanHome === undefined ? { command } : { command, qiyanHome: options.qiyanHome };
