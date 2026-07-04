@@ -46,6 +46,7 @@ export type CommandRunner = (
 
 export interface FixtureOwnershipOptions {
   currentUid?: number;
+  beforeStaleLeaseClaim?: () => Promise<void>;
 }
 
 export const DEFAULT_SSH_PORT = 2222;
@@ -58,6 +59,7 @@ const PRIVATE_DIRECTORY_MODE = 0o700;
 const KEY_STAGING_NAME = /^\.keygen-[A-Za-z0-9]{6}$/u;
 const OPERATION_LEASE_NAME = ".operation-lease";
 const OPERATION_LEASE_TEMPORARY_NAME = /^\.operation-lease-[A-Za-z0-9]{6}$/u;
+const OPERATION_LEASE_QUARANTINE_NAME = /^\.operation-lease-quarantine-[a-f0-9]{32}$/u;
 const OPERATION_LEASE_OWNER = "owner.json";
 const MAX_OPERATION_LEASE_OWNER_BYTES = 512;
 
@@ -511,6 +513,88 @@ async function removeFixedOperationLease(trust: FixtureTrust, expected: Operatio
   await revalidateFixtureTrust(trust);
 }
 
+function relocatedOperationLease(lease: OperationLease, directoryPath: string): OperationLease {
+  return {
+    directory: { ...lease.directory, path: directoryPath },
+    ownerFile: { ...lease.ownerFile, path: join(directoryPath, OPERATION_LEASE_OWNER) },
+    owner: lease.owner,
+  };
+}
+
+async function restoreUnexpectedQuarantine(trust: FixtureTrust, quarantinePath: string): Promise<never> {
+  await revalidateFixtureTrust(trust);
+  const fixedPath = fixedOperationLeasePath(trust);
+  if (await optionalMetadata(fixedPath) === undefined) {
+    try {
+      await rename(quarantinePath, fixedPath);
+    } catch {
+      // The unexpected entry remains quarantined when safe restoration loses a race.
+    }
+  }
+  await revalidateFixtureTrust(trust);
+  throw new Error("SSH fixture operation lease was replaced during stale recovery");
+}
+
+async function removeQuarantinedOperationLease(
+  trust: FixtureTrust,
+  expected: OperationLease,
+  heldLease?: OperationLease,
+): Promise<void> {
+  if (!OPERATION_LEASE_QUARANTINE_NAME.test(basename(expected.directory.path))) {
+    throw new Error("SSH fixture operation lease quarantine path is invalid");
+  }
+  if (heldLease !== undefined) await revalidateOperationLease(trust, heldLease);
+  await revalidateOperationLease(trust, expected);
+  if (heldLease !== undefined) await revalidateOperationLease(trust, heldLease);
+  await revalidateFixtureTrust(trust);
+  await rm(expected.directory.path, { recursive: true, force: false });
+  await revalidateFixtureTrust(trust);
+  if (heldLease !== undefined) await revalidateOperationLease(trust, heldLease);
+}
+
+async function claimAndRemoveStaleOperationLease(
+  trust: FixtureTrust,
+  stale: OperationLease,
+  beforeStaleLeaseClaim?: () => Promise<void>,
+): Promise<boolean> {
+  await beforeStaleLeaseClaim?.();
+  await revalidateFixtureTrust(trust);
+  const quarantinePath = join(
+    trust.state.path,
+    `.operation-lease-quarantine-${randomUUID().replaceAll("-", "")}`,
+  );
+  try {
+    await rename(stale.directory.path, quarantinePath);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    await revalidateFixtureTrust(trust);
+    if (code === "ENOENT" || code === "EEXIST" || code === "ENOTEMPTY") return false;
+    throw new Error("SSH fixture operation lease could not be claimed for recovery");
+  }
+  await revalidateFixtureTrust(trust);
+  const quarantineMetadata = await optionalMetadata(quarantinePath);
+  if (
+    quarantineMetadata === undefined
+    || quarantineMetadata.dev !== stale.directory.device
+    || quarantineMetadata.ino !== stale.directory.inode
+  ) {
+    return restoreUnexpectedQuarantine(trust, quarantinePath);
+  }
+
+  const expected = relocatedOperationLease(stale, quarantinePath);
+  let quarantined: OperationLease;
+  try {
+    quarantined = await inspectOperationLease(trust, quarantinePath);
+  } catch {
+    return restoreUnexpectedQuarantine(trust, quarantinePath);
+  }
+  if (!sameOperationLease(quarantined, expected)) {
+    return restoreUnexpectedQuarantine(trust, quarantinePath);
+  }
+  await removeQuarantinedOperationLease(trust, expected);
+  return true;
+}
+
 async function installOperationLeaseCandidate(
   trust: FixtureTrust,
   candidate: OperationLease,
@@ -537,20 +621,30 @@ async function installOperationLeaseCandidate(
   return installed;
 }
 
-async function acquireOperationLease(trust: FixtureTrust): Promise<OperationLease> {
+async function acquireOperationLease(
+  trust: FixtureTrust,
+  beforeStaleLeaseClaim?: () => Promise<void>,
+): Promise<OperationLease> {
   const candidate = await createOperationLeaseCandidate(trust);
   let installed: OperationLease | undefined;
   try {
-    for (let attempt = 0; attempt < 2; attempt += 1) {
+    for (let attempt = 0; attempt < 4; attempt += 1) {
       installed = await installOperationLeaseCandidate(trust, candidate);
       if (installed !== undefined) return installed;
 
-      const existing = await inspectOperationLease(trust, fixedOperationLeasePath(trust));
+      const fixedPath = fixedOperationLeasePath(trust);
+      let existing: OperationLease;
+      try {
+        existing = await inspectOperationLease(trust, fixedPath);
+      } catch (error) {
+        await revalidateFixtureTrust(trust);
+        if (await optionalMetadata(fixedPath) === undefined) continue;
+        throw error;
+      }
       if (!await operationLeaseIsStale(existing.owner)) {
         throw new Error("SSH fixture operation already running");
       }
-      if (attempt !== 0) throw new Error("SSH fixture operation lease could not be acquired");
-      await removeFixedOperationLease(trust, existing);
+      await claimAndRemoveStaleOperationLease(trust, existing, beforeStaleLeaseClaim);
     }
     throw new Error("SSH fixture operation lease could not be acquired");
   } finally {
@@ -570,10 +664,25 @@ async function cleanAbandonedLeaseTemporaries(trust: FixtureTrust, heldLease: Op
   }
 }
 
-async function withOperationLease<T>(trust: FixtureTrust, operation: (lease: OperationLease) => Promise<T>): Promise<T> {
-  const lease = await acquireOperationLease(trust);
+async function cleanAbandonedLeaseQuarantines(trust: FixtureTrust, heldLease: OperationLease): Promise<void> {
+  const names = await readdir(trust.state.path);
+  for (const name of names) {
+    if (!OPERATION_LEASE_QUARANTINE_NAME.test(name)) continue;
+    const quarantinePath = join(trust.state.path, name);
+    const quarantined = await inspectOperationLease(trust, quarantinePath);
+    await removeQuarantinedOperationLease(trust, quarantined, heldLease);
+  }
+}
+
+async function withOperationLease<T>(
+  trust: FixtureTrust,
+  operation: (lease: OperationLease) => Promise<T>,
+  beforeStaleLeaseClaim?: () => Promise<void>,
+): Promise<T> {
+  const lease = await acquireOperationLease(trust, beforeStaleLeaseClaim);
   try {
     await cleanAbandonedLeaseTemporaries(trust, lease);
+    await cleanAbandonedLeaseQuarantines(trust, lease);
     await revalidateOperationLease(trust, lease);
     return await operation(lease);
   } finally {
@@ -789,7 +898,7 @@ export async function ensureFixtureState(
       );
     };
     await validateKeyPair(paths.privateKey, paths.publicKey, runner, uid, false, revalidateKeyState);
-  });
+  }, options.beforeStaleLeaseClaim);
 }
 
 export function formatSshConfig(paths: FixturePaths, port = DEFAULT_SSH_PORT): string {
@@ -885,7 +994,7 @@ export async function writeSshConfig(
       await handle?.close();
       await removeConfigTemporaryFile(trust, temporaryPath, temporaryIdentity);
     }
-  });
+  }, options.beforeStaleLeaseClaim);
 }
 
 export function buildSshArgs(paths: FixturePaths, remoteCommand: readonly string[]): string[] {

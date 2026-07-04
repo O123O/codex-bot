@@ -503,11 +503,59 @@ test("reclaims a verifiably stale operation lease and removes abandoned lease te
   const abandoned = join(paths.stateDir, ".operation-lease-Ab12z9");
   await mkdir(abandoned, { mode: 0o700 });
   await chmod(abandoned, 0o500);
+  const abandonedQuarantine = join(paths.stateDir, `.operation-lease-quarantine-${"a".repeat(32)}`);
+  await mkdir(abandonedQuarantine, { mode: 0o700 });
+  await writeFile(
+    join(abandonedQuarantine, "owner.json"),
+    `${JSON.stringify({ pid: 2_147_483_647, startTime: "1" })}\n`,
+    { mode: 0o600 },
+  );
 
   await ensureFixtureState(paths, stagingRunner([]));
 
   await assert.rejects(lstat(operationLeasePath(paths)));
   assert.equal((await readdir(paths.stateDir)).some((name) => name.startsWith(".operation-lease-")), false);
+});
+
+test("atomically arbitrates two callers reclaiming the same stale operation lease", async (t) => {
+  const paths = resolveFixturePaths(await temporaryRepository(t));
+  await installOperationLease(paths, { pid: 2_147_483_647, startTime: "1" });
+  const releaseReclaim = gate();
+  let reclaimers = 0;
+  let bothInspected!: () => void;
+  const bothStaleInspected = new Promise<void>((resolve) => { bothInspected = resolve; });
+  const beforeStaleLeaseClaim = async (): Promise<void> => {
+    reclaimers += 1;
+    if (reclaimers === 2) bothInspected();
+    await releaseReclaim.wait;
+  };
+  let generationCalls = 0;
+  const countedRunner = (): CommandRunner => {
+    const base = stagingRunner([]);
+    return async (command, args, options) => {
+      if (command === "ssh-keygen" && !args.includes("-y")) generationCalls += 1;
+      return base(command, args, options);
+    };
+  };
+
+  const operations = [
+    ensureFixtureState(paths, countedRunner(), { beforeStaleLeaseClaim }),
+    ensureFixtureState(paths, countedRunner(), { beforeStaleLeaseClaim }),
+  ];
+  await bothStaleInspected;
+  releaseReclaim.release();
+  const results = await Promise.allSettled(operations);
+
+  assert.equal(generationCalls, 1);
+  assert.equal(results.filter(({ status }) => status === "fulfilled").length, 1);
+  const rejection = results.find(({ status }) => status === "rejected");
+  assert.ok(rejection?.status === "rejected");
+  assert.match(String(rejection.reason), /SSH fixture operation (?:already running|lease could not be acquired)/u);
+  await writeSshConfig(paths);
+  assert.equal((await lstat(paths.privateKey)).mode & 0o777, 0o600);
+  assert.equal((await lstat(paths.sshConfig)).mode & 0o777, 0o600);
+  const finalNames = await readdir(paths.stateDir);
+  assert.equal(finalNames.some((name) => name.startsWith(".operation-lease")), false);
 });
 
 test("does not remove an operation lease owned by the current process identity", async (t) => {
