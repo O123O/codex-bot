@@ -80,6 +80,7 @@ class WeixinLimitError extends TypeError {}
 export async function readBoundedJson(
   response: Response,
   limits: { maxBytes: number; maxDepth: number },
+  signal?: AbortSignal,
 ): Promise<string> {
   if (!Number.isSafeInteger(limits.maxBytes) || limits.maxBytes < 1) throw new TypeError("WeChat response size limit is invalid");
   if (!Number.isSafeInteger(limits.maxDepth) || limits.maxDepth < 1) throw new TypeError("WeChat response nesting limit is invalid");
@@ -94,7 +95,7 @@ export async function readBoundedJson(
   if (reader) {
     try {
       while (true) {
-        const result = await reader.read();
+        const result = await readWithAbort(reader, signal);
         if (result.done) break;
         total += result.value.byteLength;
         if (total > limits.maxBytes) {
@@ -116,6 +117,27 @@ export async function readBoundedJson(
   }
   assertJsonDepth(text, limits.maxDepth);
   return text;
+}
+
+async function readWithAbort(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  signal?: AbortSignal,
+): Promise<ReadableStreamReadResult<Uint8Array>> {
+  if (!signal) return reader.read();
+  if (signal.aborted) {
+    await reader.cancel().catch(() => undefined);
+    throw new DOMException("aborted", "AbortError");
+  }
+  let onAbort!: () => void;
+  const aborted = new Promise<never>((_resolve, reject) => {
+    onAbort = () => {
+      reject(new DOMException("aborted", "AbortError"));
+      void reader.cancel().catch(() => undefined);
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  try { return await Promise.race([reader.read(), aborted]); }
+  finally { signal.removeEventListener("abort", onAbort); }
 }
 
 export function parseUpdates(raw: string): ParsedUpdates {

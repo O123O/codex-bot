@@ -114,6 +114,23 @@ test("bounds JSON bytes and string-aware nesting before parsing", async () => {
   );
 });
 
+test("reports abort even when cancelling a pending read produces clean EOF", async () => {
+  const controller = new AbortController();
+  let markPulled!: () => void;
+  const pulled = new Promise<void>((resolve) => { markPulled = resolve; });
+  const response = new Response(new ReadableStream<Uint8Array>({
+    pull() {
+      markPulled();
+      return new Promise<void>(() => undefined);
+    },
+  }));
+
+  const pending = readBoundedJson(response, { maxBytes: 64, maxDepth: 2 }, controller.signal);
+  await pulled;
+  controller.abort();
+  await assert.rejects(pending, (error: unknown) => error instanceof Error && error.name === "AbortError");
+});
+
 test("rejects a non-success or malformed envelope without including response data", () => {
   assert.throws(() => parseUpdates('{"ret":-14,"errmsg":"secret server body"}'), (error: unknown) => {
     assert.equal(error instanceof Error, true);
