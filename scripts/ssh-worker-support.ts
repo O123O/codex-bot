@@ -49,6 +49,15 @@ export interface FixtureOwnershipOptions {
   beforeStaleLeaseClaim?: () => Promise<void>;
 }
 
+export type FixtureManagedStateFile = "trustedHostKey" | "knownHosts" | "sshConfig";
+
+export interface FixtureStateTransaction {
+  readOwnerOnlyFile(file: FixtureManagedStateFile): Promise<string | undefined>;
+  replaceOwnerOnlyFile(file: FixtureManagedStateFile, contents: string): Promise<void>;
+  withOwnerOnlyTemporaryFile<T>(contents: string, operation: (path: string) => Promise<T>): Promise<T>;
+  removeGeneratedState(): Promise<void>;
+}
+
 export const DEFAULT_SSH_PORT = 2222;
 export const DEFAULT_CODEX_VERSION = "0.142.5";
 export const SSH_ALIAS = "qiyan-ssh-worker";
@@ -62,6 +71,9 @@ const OPERATION_LEASE_TEMPORARY_NAME = /^\.operation-lease-[A-Za-z0-9]{6}$/u;
 const OPERATION_LEASE_QUARANTINE_NAME = /^\.operation-lease-quarantine-[a-f0-9]{32}$/u;
 const OPERATION_LEASE_OWNER = "owner.json";
 const MAX_OPERATION_LEASE_OWNER_BYTES = 512;
+const HOST_KEY_CANDIDATE_NAME = /^\.host-key-candidate-[a-f0-9]{32}\.tmp$/u;
+const CONFIG_TEMPORARY_NAME = /^\.config-[a-f0-9-]{36}\.tmp$/u;
+const STATE_FILE_TEMPORARY_NAME = /^\.state-file-[a-f0-9-]{36}\.tmp$/u;
 
 interface DirectoryIdentity {
   path: string;
@@ -994,6 +1006,185 @@ export async function writeSshConfig(
       await handle?.close();
       await removeConfigTemporaryFile(trust, temporaryPath, temporaryIdentity);
     }
+  }, options.beforeStaleLeaseClaim);
+}
+
+function managedStatePath(paths: FixturePaths, file: FixtureManagedStateFile): string {
+  return paths[file];
+}
+
+function assertManagedStateFile(metadata: Stats, uid: number, label: string): void {
+  assertOwnedRegularSingleLink(metadata, uid, label);
+  if ((metadata.mode & 0o777) !== OWNER_ONLY_FILE_MODE) {
+    throw new Error(`${label} must have mode 0600`);
+  }
+}
+
+async function removeManagedTemporary(
+  trust: FixtureTrust,
+  lease: OperationLease,
+  path: string,
+  expected: DirectoryIdentity | undefined,
+): Promise<void> {
+  if (expected === undefined) return;
+  await revalidateFixtureTrust(trust);
+  await revalidateOperationLease(trust, lease);
+  const metadata = await optionalMetadata(path);
+  if (metadata === undefined) return;
+  assertManagedStateFile(metadata, trust.uid, "SSH fixture temporary state file");
+  if (metadata.dev !== expected.device || metadata.ino !== expected.inode) {
+    throw new Error("SSH fixture temporary state file was replaced");
+  }
+  await rm(path, { force: true });
+  await revalidateFixtureTrust(trust);
+  await revalidateOperationLease(trust, lease);
+}
+
+async function replaceManagedStateFile(
+  paths: FixturePaths,
+  trust: FixtureTrust,
+  lease: OperationLease,
+  file: FixtureManagedStateFile,
+  contents: string,
+): Promise<void> {
+  const target = managedStatePath(paths, file);
+  const existing = await optionalMetadata(target);
+  if (existing !== undefined) assertManagedStateFile(existing, trust.uid, `SSH fixture ${file}`);
+  const existingIdentity = existing === undefined ? undefined : identity(target, existing);
+  const temporaryPath = join(paths.stateDir, `.state-file-${randomUUID()}.tmp`);
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  let temporaryIdentity: DirectoryIdentity | undefined;
+  try {
+    handle = await open(temporaryPath, "wx", OWNER_ONLY_FILE_MODE);
+    temporaryIdentity = identity(temporaryPath, await handle.stat());
+    await handle.chmod(OWNER_ONLY_FILE_MODE);
+    await handle.writeFile(contents, "utf8");
+    await handle.sync();
+    await handle.close();
+    handle = undefined;
+    assertManagedStateFile(await lstat(temporaryPath), trust.uid, "SSH fixture temporary state file");
+
+    const current = await optionalMetadata(target);
+    if (existingIdentity === undefined) {
+      if (current !== undefined) throw new Error(`SSH fixture ${file} appeared during replacement`);
+    } else {
+      if (current === undefined) throw new Error(`SSH fixture ${file} was replaced or removed`);
+      assertManagedStateFile(current, trust.uid, `SSH fixture ${file}`);
+      if (current.dev !== existingIdentity.device || current.ino !== existingIdentity.inode) {
+        throw new Error(`SSH fixture ${file} was replaced`);
+      }
+    }
+    await revalidateFixtureTrust(trust);
+    await revalidateOperationLease(trust, lease);
+    await rename(temporaryPath, target);
+    await revalidateFixtureTrust(trust);
+    await revalidateOperationLease(trust, lease);
+    assertManagedStateFile(await lstat(target), trust.uid, `SSH fixture ${file}`);
+  } finally {
+    await handle?.close();
+    await removeManagedTemporary(trust, lease, temporaryPath, temporaryIdentity);
+  }
+}
+
+async function cleanupManagedTemporaries(trust: FixtureTrust, lease: OperationLease): Promise<void> {
+  for (const name of await readdir(trust.state.path)) {
+    if (!HOST_KEY_CANDIDATE_NAME.test(name)
+      && !CONFIG_TEMPORARY_NAME.test(name)
+      && !STATE_FILE_TEMPORARY_NAME.test(name)) continue;
+    const path = join(trust.state.path, name);
+    const metadata = await lstat(path);
+    await removeManagedTemporary(trust, lease, path, identity(path, metadata));
+  }
+}
+
+async function removeGeneratedState(
+  paths: FixturePaths,
+  trust: FixtureTrust,
+  lease: OperationLease,
+): Promise<void> {
+  await cleanStaleStagingDirectories(trust, lease);
+  await cleanupManagedTemporaries(trust, lease);
+  for (const [file, label] of [
+    [paths.trustedHostKey, "trusted host key"],
+    [paths.knownHosts, "known hosts file"],
+    [paths.sshConfig, "SSH config"],
+  ] as const) {
+    const metadata = await optionalMetadata(file);
+    if (metadata === undefined) continue;
+    assertManagedStateFile(metadata, trust.uid, label);
+    await revalidateFixtureTrust(trust);
+    await revalidateOperationLease(trust, lease);
+    await rm(file, { force: false });
+  }
+
+  const keyDirectory = dirname(paths.privateKey);
+  const keyDirectoryMetadata = await optionalMetadata(keyDirectory);
+  if (keyDirectoryMetadata !== undefined) {
+    assertPrivateDirectory(keyDirectoryMetadata, trust.uid, "SSH client key directory");
+    const names = (await readdir(keyDirectory)).sort();
+    if (names.length !== 2 || names[0] !== "id_ed25519" || names[1] !== "id_ed25519.pub") {
+      throw new Error("SSH client key directory contains unexpected state");
+    }
+    await validateKeyFiles(paths.privateKey, paths.publicKey, trust.uid, false);
+    await revalidateFixtureTrust(trust);
+    await revalidateOperationLease(trust, lease);
+    await rm(keyDirectory, { recursive: true, force: false });
+  }
+
+  const remaining = (await readdir(paths.stateDir)).filter((name) => name !== OPERATION_LEASE_NAME);
+  if (remaining.length !== 0) throw new Error("SSH fixture state contains unexpected files");
+}
+
+export async function withFixtureStateTransaction<T>(
+  paths: FixturePaths,
+  operation: (transaction: FixtureStateTransaction) => Promise<T>,
+  options: FixtureOwnershipOptions = {},
+): Promise<T> {
+  validateFixturePaths(paths);
+  const uid = currentUid(options);
+  const trust = await establishFixtureTrust(paths, uid);
+  return withOperationLease(trust, async (lease) => {
+    await cleanStaleStagingDirectories(trust, lease);
+    await cleanupManagedTemporaries(trust, lease);
+    await validateOptionalFixtureFiles(paths, uid);
+    const transaction: FixtureStateTransaction = {
+      readOwnerOnlyFile: async (file) => {
+        await revalidateFixtureTrust(trust);
+        await revalidateOperationLease(trust, lease);
+        const path = managedStatePath(paths, file);
+        const metadata = await optionalMetadata(path);
+        if (metadata === undefined) return undefined;
+        assertManagedStateFile(metadata, uid, `SSH fixture ${file}`);
+        return readFile(path, "utf8");
+      },
+      replaceOwnerOnlyFile: (file, contents) => replaceManagedStateFile(paths, trust, lease, file, contents),
+      withOwnerOnlyTemporaryFile: async (contents, temporaryOperation) => {
+        const temporaryPath = join(
+          paths.stateDir,
+          `.host-key-candidate-${randomUUID().replaceAll("-", "")}.tmp`,
+        );
+        let handle: Awaited<ReturnType<typeof open>> | undefined;
+        let temporaryIdentity: DirectoryIdentity | undefined;
+        try {
+          handle = await open(temporaryPath, "wx", OWNER_ONLY_FILE_MODE);
+          temporaryIdentity = identity(temporaryPath, await handle.stat());
+          await handle.chmod(OWNER_ONLY_FILE_MODE);
+          await handle.writeFile(contents, "utf8");
+          await handle.sync();
+          await handle.close();
+          handle = undefined;
+          await revalidateFixtureTrust(trust);
+          await revalidateOperationLease(trust, lease);
+          assertManagedStateFile(await lstat(temporaryPath), uid, "SSH host key candidate");
+          return await temporaryOperation(temporaryPath);
+        } finally {
+          await handle?.close();
+          await removeManagedTemporary(trust, lease, temporaryPath, temporaryIdentity);
+        }
+      },
+      removeGeneratedState: () => removeGeneratedState(paths, trust, lease),
+    };
+    return operation(transaction);
   }, options.beforeStaleLeaseClaim);
 }
 
