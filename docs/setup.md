@@ -1,6 +1,6 @@
 # Shared setup
 
-This guide prepares QiYan's isolated assistant and the user's ordinary Codex workers. Chat credentials are adapter-specific; [Telegram](chat-apps/telegram.md) and [Slack](chat-apps/slack.md) are implemented and may run together.
+This guide prepares QiYan's isolated assistant and the user's ordinary Codex workers. [Telegram](chat-apps/telegram.md), [Slack](chat-apps/slack.md), and [personal WeChat](chat-apps/wechat.md) are implemented and may run together.
 
 ## Understand the execution model
 
@@ -43,11 +43,11 @@ qiyan-bot config-check
 qiyan-bot assistant-login
 ```
 
-`config-check` requires at least one complete adapter group and validates every configured group. Dual-adapter setups also require `PRIMARY_CHAT_APP=telegram` or `PRIMARY_CHAT_APP=slack`. `assistant-login` itself starts no bot and does not need chat credentials. The assistant profile is independent; QiYan never copies or symlinks your normal `auth.json`. If authentication later expires, stop the bot, run login again, and restart it yourself.
+`config-check` requires at least one configured adapter and validates every configured adapter. Multi-adapter setups require `PRIMARY_CHAT_APP=telegram`, `PRIMARY_CHAT_APP=slack`, or `PRIMARY_CHAT_APP=weixin`. `assistant-login` itself starts no bot and does not need chat credentials. The assistant profile is independent; QiYan never copies or symlinks your normal `auth.json`. If authentication later expires, stop the bot, run login again, and restart it yourself.
 
 ## Configure an adapter and launch
 
-Store adapter variables in `<QIYAN_HOME>/.env` as its guide describes. Before launching, remember: the assistant has non-interactive full filesystem access, and workers must already be configured for auto mode because chat approvals are unsupported. Child processes do not inherit bot secrets from `.env`, but QiYan has the same OS-user filesystem access and can technically read that file.
+Store Telegram and Slack adapter variables in `<QIYAN_HOME>/.env` as their guides describe. Personal WeChat is different: run `qiyan-bot weixin-login --home <QIYAN_HOME>` while the service is stopped; it creates the managed owner-only `<QIYAN_HOME>/credentials/weixin.json`, not an environment variable. Before launching, remember: the assistant has non-interactive full filesystem access, and workers must already be configured for auto mode because chat approvals are unsupported. Child processes do not inherit bot secrets from `.env`, but QiYan has the same OS-user filesystem access and can technically read that file.
 
 ```bash
 qiyan-bot
@@ -63,6 +63,6 @@ The backend permits one active QiYan conversation globally. Messages and attachm
 
 ## Backup
 
-Stop QiYan, then copy `DATA_DIR`, an external `SESSION_REGISTRY_PATH`, and `ASSISTANT_WORKDIR` together. The isolated profile contains authentication and thread history. Do not restore generated JSON independently from SQLite.
+Stop QiYan, then copy `DATA_DIR`, an external `SESSION_REGISTRY_PATH`, `ASSISTANT_WORKDIR`, and `<QIYAN_HOME>/credentials/weixin.json` (when present) together. The isolated profile and WeChat credential contain secrets. Do not restore generated JSON or one credential independently from the matching SQLite state.
 
 See the root [README](../README.md#troubleshooting) for direct/delegated behavior, protected project paths, `/pass`, `/collect`, recovery, and troubleshooting.

@@ -9,7 +9,8 @@
     "dist/qiyan-bot",
     "assets/assistant/AGENTS.md",
     "assets/assistant/session-status.example.json",
-    "assets/slack/manifest.yaml"
+    "assets/slack/manifest.yaml",
+    "docs/chat-apps/wechat.md"
   ],
   "engines": {
     "node": ">=24"

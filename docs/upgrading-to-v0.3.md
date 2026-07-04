@@ -2,7 +2,7 @@
 
 This procedure applies to every QiYan installation whose state was created before v0.3.0. v0.3 uses a new database marker and registry generation model. It intentionally does not migrate old managed sessions, operations, assistant history, or generated workspace files. The commands reset v0.3 to its default paths; old custom state paths are used only to locate optional isolated authentication and are not carried into the new configuration.
 
-The cutover is destructive. The only values carried forward are supported adapter configuration and, at your choice, the isolated QiYan assistant profile's own `auth.json`. Never copy or link your normal `~/.codex/auth.json`.
+The cutover is destructive. The only values carried forward are supported Telegram/Slack adapter configuration, the managed personal-WeChat credential at `credentials/weixin.json` when present, and, at your choice, the isolated QiYan assistant profile's own `auth.json`. Never copy or link your normal `~/.codex/auth.json`, and never translate the WeChat credential into environment variables.
 
 ## 1. Stop the whole old process tree
 
@@ -40,6 +40,7 @@ const fs = require("node:fs");
 const { parseEnv } = require("node:util");
 const retained = [
   "TELEGRAM_BOT_TOKEN", "TELEGRAM_OWNER_ID", "TELEGRAM_DESTINATION_CHAT_ID",
+  "SLACK_APP_TOKEN", "SLACK_BOT_TOKEN", "SLACK_USER_TOKEN", "SLACK_OWNER_USER_ID", "PRIMARY_CHAT_APP",
   "CODEX_BINARY", "MAX_CONCURRENT_TURNS", "MAX_COLLECT_COUNT", "MCP_HOST", "MCP_PORT",
   "ATTACHMENT_MAX_BYTES", "ATTACHMENT_STORE_MAX_BYTES", "ASSISTANT_SANDBOX_MODE",
 ];
@@ -56,7 +57,6 @@ try {
   fs.closeSync(fd);
 }
 const values = parseEnv(contents);
-for (const key of retained.slice(0, 3)) if (!values[key]) throw new Error(`missing ${key}`);
 const body = retained.filter((key) => values[key] !== undefined)
   .map((key) => `${key}=${JSON.stringify(values[key])}`).join("\n") + "\n";
 fs.writeFileSync(process.env.STAGED_ENV, body, { flag: "wx", mode: 0o600 });
@@ -90,6 +90,39 @@ NODE
   staged_auth_sha=$(sha256sum "$stage/auth.json" | cut -d' ' -f1)
 fi
 ```
+
+To retain a managed personal-WeChat login, stage its credential independently from `.env`. Skip this block when the file is absent or when you prefer to run `qiyan-bot weixin-login` after cutover. Do not stage or define `WEIXIN_BOT_TOKEN`, `WEIXIN_BOT_ID`, or `WEIXIN_OWNER_USER_ID`.
+
+```bash
+set -euo pipefail
+old_weixin="$old_home/credentials/weixin.json"
+if test -e "$old_weixin"; then
+  install -d -m 700 "$stage/credentials"
+  SOURCE_WEIXIN="$old_weixin" STAGED_WEIXIN="$stage/credentials/weixin.json" node <<'NODE'
+const fs = require("node:fs");
+const fd = fs.openSync(process.env.SOURCE_WEIXIN,
+  fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+let bytes;
+try {
+  const stat = fs.fstatSync(fd);
+  if (!stat.isFile() || stat.uid !== process.getuid() || stat.nlink !== 1 || (stat.mode & 0o077) !== 0 || stat.size > 65536) {
+    throw new Error("old WeChat credential is not a private current-user single-link regular file");
+  }
+  bytes = fs.readFileSync(fd);
+} finally {
+  fs.closeSync(fd);
+}
+const document = JSON.parse(bytes.toString("utf8"));
+for (const key of ["account_generation_id", "credential_revision_id", "ilink_bot_id", "ilink_user_id", "bot_token", "api_base_url"]) {
+  if (typeof document[key] !== "string" || document[key].length === 0) throw new Error("old WeChat credential is invalid");
+}
+fs.writeFileSync(process.env.STAGED_WEIXIN, bytes, { flag: "wx", mode: 0o600 });
+NODE
+  staged_weixin_sha=$(sha256sum "$stage/credentials/weixin.json" | cut -d' ' -f1)
+fi
+```
+
+This is a credential backup, not a revocation mechanism. Protect the staging directory as a live secret and delete it after the validated cutover.
 
 Abort on any failed check. Do not substitute a symlink, directory, normal Codex auth file, or unvalidated backup. Before deleting anything, run the actual v0.3 production configuration loader against staging:
 
@@ -155,6 +188,13 @@ if test -f "$stage/auth.json"; then
     "$new_home/data/assistant-profile/codex/auth.json"
   test "$staged_auth_sha" = \
     "$(sha256sum "$new_home/data/assistant-profile/codex/auth.json" | cut -d' ' -f1)"
+fi
+
+if test -f "$stage/credentials/weixin.json"; then
+  install -d -m 700 "$new_home/credentials"
+  install -m 600 "$stage/credentials/weixin.json" "$new_home/credentials/weixin.json"
+  test "$staged_weixin_sha" = \
+    "$(sha256sum "$new_home/credentials/weixin.json" | cut -d' ' -f1)"
 fi
 
 env -i HOME="$HOME" PATH="$PATH" qiyan-bot config-check --home "$new_home"

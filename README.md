@@ -1,6 +1,6 @@
 # QiYan Bot
 
-QiYan Bot is a single-user, self-hosted, general-purpose personal assistant powered by Codex. It can answer and handle small filesystem tasks directly, or deliberately delegate sustained project work to ordinary, resumable Codex sessions. Telegram and Slack can run together behind the same transport-neutral backend; WeChat is planned.
+QiYan Bot is a single-user, self-hosted, general-purpose personal assistant powered by Codex. It can answer and handle small filesystem tasks directly, or deliberately delegate sustained project work to ordinary, resumable Codex sessions. Telegram, Slack, and personal WeChat are implemented and can run together behind the same transport-neutral backend.
 
 QiYan keeps the assistant and project workers distinct. The assistant has its own HOME, CODEX_HOME, authentication, instructions, and app-server. Workers use your normal HOME, CODEX_HOME, configuration, credentials, skills, and app-server. Before opening a managed thread in another Codex client, run `unadopt_session`; adopt it again afterward if QiYan should resume management.
 
@@ -12,6 +12,7 @@ Read this before installing or launching:
 - Chat approvals are unsupported. Worker sessions receive no QiYan approval, sandbox, or shell override, so your normal Codex configuration must already be suitable for automatic, non-interactive operation. A remaining permission request is reported as blocked.
 - The Telegram adapter accepts only the configured owner and sends only to that owner's private chat. This is not a multi-user service.
 - The Slack adapter accepts only the configured owner. Its `xoxp-` user token is read-only by QiYan's code boundary but remains a powerful credential whose search coverage follows the owner's Slack permissions and workspace policy.
+- The personal WeChat adapter accepts only the owner authenticated by `weixin-login`; groups, history/search, untranscribed raw voice, and raw video are unsupported.
 - The private `.env` is not propagated to assistant or worker child processes, but full filesystem access under the same OS user means QiYan can technically read it. Filesystem isolation requires a dedicated account or container.
 - Use a dedicated OS account or container if other same-account processes are outside your trust boundary.
 
@@ -20,7 +21,7 @@ Read this before installing or launching:
 - Linux
 - Node.js 24 or newer
 - `codex-cli 0.142.5`
-- At least one chat adapter: Telegram owner credentials, Slack owner/workspace credentials, or both
+- At least one chat adapter: Telegram owner credentials, Slack owner/workspace credentials, a managed personal WeChat login, or any combination
 
 ## Install
 
@@ -47,7 +48,7 @@ Setup guides:
 - [Required fresh cutover for versions before v0.3.0](docs/upgrading-to-v0.3.md)
 - [Telegram — implemented](docs/chat-apps/telegram.md)
 - [Slack — implemented](docs/chat-apps/slack.md)
-- [WeChat — planned](docs/chat-apps/wechat.md)
+- [Personal WeChat — implemented](docs/chat-apps/wechat.md)
 
 ## Configure and run
 
@@ -64,7 +65,7 @@ EOF
 chmod 600 "$HOME/.qiyan-bot/.env"
 ```
 
-This is a Telegram example. Slack-only and dual-adapter dotenv examples are in the [Slack guide](docs/chat-apps/slack.md). At least one complete adapter group is required; dual mode requires `PRIMARY_CHAT_APP`. Validate the complete configuration, then authenticate the isolated assistant profile once:
+This is a Telegram example. Slack dotenv setup is in the [Slack guide](docs/chat-apps/slack.md); personal WeChat uses the managed credential created by `qiyan-bot weixin-login`, never an environment token. At least one adapter is required. When multiple adapters are configured, `PRIMARY_CHAT_APP` must be `telegram`, `slack`, or `weixin`. Validate the complete configuration, then authenticate the isolated assistant profile once:
 
 ```bash
 qiyan-bot config-check
@@ -138,7 +139,7 @@ This is the v0.3 fresh QiYan state format. State created before v0.3.0 is reject
 
 Inbound files are streamed into a private quota-limited store. Outbound project files are opened beneath a managed root with Linux no-follow checks and snapshotted before upload. Absolute outbound paths, traversal, symlinks, special files, and oversized content are rejected.
 
-Telegram and Slack delivery plus assistant tool effects are durable. Confirmed effects replay receipts; uncertain effects are reconciled against app-server or outbox state and are never blindly repeated. A visible recovery label identifies a mandatory delivery that must be retried after an ambiguous crash. Slack search bodies are transient, bounded, and never written to durable receipts or report files.
+Telegram, Slack, and WeChat delivery plus assistant tool effects are durable. Confirmed effects replay receipts; uncertain effects are reconciled against app-server or outbox state and are never blindly repeated. A visible recovery label identifies a mandatory delivery that must be retried after an ambiguous crash. Slack search bodies are transient, bounded, and never written to durable receipts or report files.
 
 ## Development
 
@@ -148,6 +149,7 @@ npm run check
 RUN_CODEX_INTEGRATION=1 npm test -- tests/integration/app-server.test.ts
 RUN_CODEX_INTEGRATION=1 npm test -- tests/integration/mcp-assistant.test.ts
 RUN_SLACK_INTEGRATION=1 npm test -- tests/integration/slack-live.test.ts
+QIYAN_WEIXIN_LIVE=1 npm test -- tests/integration/weixin-live.test.ts
 ```
 
 The Slack live test requires dedicated `SLACK_TEST_*` credentials, a designated channel with recent owner fixtures, and an exact `SLACK_TEST_ALLOW_WRITES=TEAM_ID:OWNER_USER_ID` guard. It is skipped by default and writes visible test messages/files.
@@ -162,5 +164,6 @@ The Slack live test requires dedicated `SLACK_TEST_*` credentials, a designated 
 - `OPERATION_UNCERTAIN` or `DELIVERY_UNCERTAIN`: inspect status before deciding whether a human-visible retry is safe.
 - No Telegram input: verify the numeric owner ID and ensure no second process is polling the same bot token.
 - No Slack input: verify owner/workspace IDs, invite QiYan to the channel, mention it once in the thread, and review the [Slack troubleshooting steps](docs/chat-apps/slack.md#troubleshooting-and-revocation).
+- No WeChat input: verify the service uses the same home as `weixin-login`, stop competing pollers, and review the [personal WeChat troubleshooting steps](docs/chat-apps/wechat.md#troubleshooting).
 
-SSH endpoints, WeChat, interactive approval UI, multi-user tenancy, and arbitrary remote recipients are deferred.
+SSH endpoints, interactive approval UI, multi-user tenancy, and arbitrary remote recipients are deferred.

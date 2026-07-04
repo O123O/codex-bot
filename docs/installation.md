@@ -64,4 +64,4 @@ The updater locates the Linux global prefix that owns the running executable and
 npm uninstall --global --prefix "$HOME/.local" qiyan-bot
 ```
 
-Uninstalling leaves state and assistant authentication untouched. Continue with [shared setup](setup.md), then the [Telegram adapter](chat-apps/telegram.md).
+Uninstalling leaves state, assistant authentication, and managed WeChat credentials untouched. Continue with [shared setup](setup.md), then choose the [Telegram adapter](chat-apps/telegram.md), [Slack adapter](chat-apps/slack.md), or [personal WeChat adapter](chat-apps/wechat.md).

@@ -52,6 +52,7 @@ jobs:
           package/assets/assistant/AGENTS.md
           package/assets/assistant/session-status.example.json
           package/assets/slack/manifest.yaml
+          package/docs/chat-apps/wechat.md
           package/dist/qiyan-bot
           package/package.json
           EOF
@@ -73,6 +74,21 @@ jobs:
             echo "release package contains a retired product identifier" >&2
             exit 1
           fi
+
+          (
+            cd extracted/package
+            env -i HOME="$HOME" PATH="$PATH" ./dist/qiyan-bot --version
+            smoke_home=$(mktemp -d)
+            chmod 700 "$smoke_home"
+            cat > "$smoke_home/.env" <<'EOF'
+          TELEGRAM_BOT_TOKEN=release-smoke-placeholder
+          TELEGRAM_OWNER_ID=1
+          TELEGRAM_DESTINATION_CHAT_ID=1
+          EOF
+            chmod 600 "$smoke_home/.env"
+            env -i HOME="$HOME" PATH="$PATH" ./dist/qiyan-bot config-check --home "$smoke_home"
+            rm -rf -- "$smoke_home"
+          )
 
       - name: Create release and upload package
         shell: bash

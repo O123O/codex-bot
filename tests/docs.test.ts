@@ -9,7 +9,7 @@ test("README links to all focused guides and every local guide target exists", a
   assert.ok(readme.indexOf("general-purpose personal assistant") < readme.indexOf("Telegram"));
   assert.match(readme, /handle small filesystem tasks directly/iu);
   assert.match(readme, /ordinary, resumable Codex sessions/iu);
-  assert.match(readme, /Telegram and Slack can run together/iu);
+  assert.match(readme, /Telegram.*Slack.*WeChat.*run together/iu);
   assert.match(readme, /fresh QiYan state format|fresh.*state format.*rejected without migration/isu);
   const firstInstall = readme.indexOf("npm install --global");
   assert.ok(firstInstall > 0);
@@ -125,7 +125,7 @@ test("primary guides document QiYan home precedence, private dotenv setup, and m
   assert.match(telegram, /cat > "?\$HOME\/\.qiyan-bot\/\.env"?/u);
   assert.doesNotMatch(telegram.split("## 4. Authenticate and start")[1] ?? "", /export\s+TELEGRAM_/u);
   assert.match(readme, /Before opening a managed thread.*unadopt_session.*adopt it again/isu);
-  assert.match(setup, /config-check.*at least one complete adapter group.*assistant-login.*does not need chat credentials/isu);
+  assert.match(setup, /config-check.*at least one configured adapter.*assistant-login.*does not need chat credentials/isu);
 });
 
 test("Slack guide covers the implemented single-user Socket Mode setup and limits", async () => {
@@ -162,9 +162,46 @@ test("packaged Slack manifest has the exact reviewed events and scopes", async (
   assert.deepEqual(list(events), ["app_mention", "message.channels", "message.groups", "message.im"]);
   assert.doesNotMatch(manifest, /incoming_webhooks|redirect_urls/u);
 
-  const wechat = await readFile(resolve("docs/chat-apps/wechat.md"), "utf8");
-  assert.match(wechat, /Status: Planned/u);
-  assert.match(wechat, /not implemented/iu);
+});
+
+test("WeChat guide documents the implemented personal-owner adapter without environment credentials", async () => {
+  const guide = await readFile(resolve("docs/chat-apps/wechat.md"), "utf8");
+  for (const required of [
+    "Status: Implemented", "qiyan-bot weixin-login", "--home", "credentials/weixin.json", "PRIMARY_CHAT_APP=weixin",
+    "text", "image", "file", "voice transcription", "group", "raw voice", "raw video", "history", "search",
+    "cef0bfc390393f716903e16d50408118047f87e0", "2.4.6", "MIT", "no endorsement",
+    "QR", "attachment", "poll", "restart", "relogin", "backup", "revoke",
+  ]) assert.equal(guide.toLowerCase().includes(required.toLowerCase()), true, `WeChat guide is missing: ${required}`);
+  assert.match(guide, /direct personal.*owner|owner.*direct personal/isu);
+  assert.match(guide, /credentials\/weixin\.json.*(?:0600|owner-only)/isu);
+  assert.match(guide, /not.*(?:\.env|environment)|(?:\.env|environment).*not/isu);
+  assert.match(guide, /groups?.*(?:unsupported|not supported)|(?:unsupported|not supported).*groups?/isu);
+  assert.match(guide, /voice transcription.*supported/isu);
+  assert.match(guide, /raw voice.*(?:unsupported|not supported)/isu);
+  assert.match(guide, /raw video.*(?:unsupported|not supported)/isu);
+  assert.match(guide, /raw video.*explicit unsupported-media descriptor/isu);
+  assert.match(guide, /history.*search.*(?:unsupported|not supported)|(?:unsupported|not supported).*history.*search/isu);
+  assert.doesNotMatch(guide, /Status: Planned|not implemented in this release/iu);
+  assert.doesNotMatch(guide, /^WEIXIN_(?:BOT_TOKEN|BOT_ID|OWNER_USER_ID)=/mu);
+  assert.doesNotMatch(guide, /\]\(\.\.\/(?:installation|setup)\.md\)/u);
+});
+
+test("shared setup and upgrade docs treat WeChat as a managed-credential adapter", async () => {
+  const readme = await readFile(resolve("README.md"), "utf8");
+  const setup = await readFile(resolve("docs/setup.md"), "utf8");
+  const install = await readFile(resolve("docs/installation.md"), "utf8");
+  const upgrade = await readFile(resolve("docs/upgrading-to-v0.3.md"), "utf8");
+  const envExample = await readFile(resolve(".env.example"), "utf8");
+  assert.match(readme, /Telegram.*Slack.*WeChat.*implemented/isu);
+  assert.doesNotMatch(readme, /WeChat[^\n]*(?:planned|deferred)|(?:planned|deferred)[^\n]*WeChat/iu);
+  assert.match(setup, /PRIMARY_CHAT_APP=(?:telegram\|slack\|weixin|telegram, slack, or weixin)|PRIMARY_CHAT_APP.*weixin/iu);
+  assert.match(setup, /qiyan-bot weixin-login/iu);
+  assert.match(install, /WeChat adapter|chat-apps\/wechat\.md/iu);
+  assert.match(upgrade, /credentials\/weixin\.json/iu);
+  assert.match(upgrade, /WEIXIN_BOT_TOKEN.*WEIXIN_BOT_ID.*WEIXIN_OWNER_USER_ID/isu);
+  assert.match(envExample, /WeChat credentials.*not.*\.env/iu);
+  assert.match(envExample, /PRIMARY_CHAT_APP=.*weixin/iu);
+  assert.doesNotMatch(envExample, /^WEIXIN_(?:BOT_TOKEN|BOT_ID|OWNER_USER_ID)=/mu);
 });
 
 test("shared docs explain conversation-bound native steering and ordinary safeguards", async () => {

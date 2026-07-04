@@ -24,6 +24,7 @@ test("packed qiyan-bot runs without source files or installed dependencies", asy
     "package/assets/assistant/AGENTS.md",
     "package/assets/assistant/session-status.example.json",
     "package/assets/slack/manifest.yaml",
+    "package/docs/chat-apps/wechat.md",
     "package/dist/qiyan-bot",
     "package/package.json",
   ]);
@@ -58,7 +59,7 @@ test("packed qiyan-bot runs without source files or installed dependencies", asy
   const manifest = JSON.parse(await readFile(join(packageRoot, "package.json"), "utf8")) as { dependencies?: Record<string, string> };
   assert.deepEqual(manifest.dependencies ?? {}, {});
   const installedEntries = await readdir(packageRoot);
-  const requiredEntries = ["README.md", "assets", "dist", "package.json"];
+  const requiredEntries = ["README.md", "assets", "dist", "docs", "package.json"];
   for (const entry of requiredEntries) assert.equal(installedEntries.includes(entry), true, `missing installed entry: ${entry}`);
   assert.deepEqual(installedEntries.filter((entry) => !requiredEntries.includes(entry) && !/^(?:licen[cs]e|notice)(?:\..*)?$/iu.test(entry)), []);
   await assert.rejects(stat(join(packageRoot, "node_modules")));

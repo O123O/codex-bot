@@ -11,6 +11,7 @@ test("release workflow validates, checks, packs, and uploads only a versioned ru
     "npm ci", "GITHUB_REF_NAME", "package.json", "package-lock.json", "npm run check", "npm pack --silent", "qiyan-bot.tgz",
     "expected-package-files.txt", "diff -u", "tar -xzf", "retired_role", "retired_product", "retired_compact", "retired_spaced",
     "package/assets/slack/manifest.yaml",
+    "package/docs/chat-apps/wechat.md", "env -i", "./dist/qiyan-bot --version", "config-check --home",
     "gh release create", "gh release upload", "--clobber", "GH_TOKEN: ${{ github.token }}",
     "asset_digest", "sha256:", "gh api",
   ]) {
