@@ -80,17 +80,28 @@ export class DeliveryStore {
 
   confirm(id: string, receipt: JsonValue): void {
     inTransaction(this.db, () => {
+      const prior = this.db.prepare("SELECT state, mandatory FROM deliveries WHERE id = ?").get(id) as
+        { state: string; mandatory: number } | undefined;
+      if (!prior || prior.state === "confirmed" || prior.state === "failed") return;
       const changed = this.db.prepare("UPDATE deliveries SET state = 'confirmed', receipt_json = ?, updated_at = ? WHERE id = ? AND state <> 'confirmed'")
         .run(JSON.stringify(receipt), Date.now(), id).changes;
-      if (changed) this.releaseAttachment(id);
+      if (changed && !(prior.state === "uncertain" && prior.mandatory === 0)) this.releaseAttachment(id);
     });
   }
 
   fail(id: string): void {
-    inTransaction(this.db, () => {
-      const changed = this.db.prepare("UPDATE deliveries SET state = 'failed', updated_at = ? WHERE id = ? AND state <> 'failed'").run(Date.now(), id).changes;
-      if (changed) this.releaseAttachment(id);
-    });
+    inTransaction(this.db, () => { this.failInTransaction(id); });
+  }
+
+  failInTransaction(id: string): boolean {
+    const prior = this.db.prepare("SELECT state, mandatory FROM deliveries WHERE id = ?").get(id) as
+      { state: string; mandatory: number } | undefined;
+    if (!prior || prior.state === "failed" || prior.state === "confirmed") return false;
+    const changed = this.db.prepare("UPDATE deliveries SET state = 'failed', updated_at = ? WHERE id = ? AND state = ?")
+      .run(Date.now(), id, prior.state).changes;
+    if (changed !== 1) return false;
+    if (!(prior.state === "uncertain" && prior.mandatory === 0)) this.releaseAttachment(id);
+    return true;
   }
 
   markUncertain(id: string): void {

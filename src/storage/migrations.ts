@@ -403,4 +403,129 @@ export const migrations: readonly Migration[] = [
     team_id TEXT NOT NULL
   );
   `,
+  `
+  CREATE TABLE weixin_account_generations (
+    generation_id TEXT PRIMARY KEY,
+    credential_revision_id TEXT NOT NULL,
+    bot_id TEXT NOT NULL,
+    owner_user_id TEXT NOT NULL,
+    api_base_url TEXT NOT NULL,
+    authorization_state TEXT NOT NULL
+      CHECK(authorization_state IN ('active', 'relogin_required', 'credential_changed')),
+    active INTEGER NOT NULL CHECK(active IN (0, 1)),
+    activated_at INTEGER NOT NULL,
+    retired_at INTEGER
+  );
+  CREATE UNIQUE INDEX weixin_single_active_generation_idx
+    ON weixin_account_generations(active) WHERE active = 1;
+
+  CREATE TABLE weixin_auth_incidents (
+    incident_id TEXT PRIMARY KEY,
+    generation_id TEXT NOT NULL REFERENCES weixin_account_generations(generation_id),
+    authorization_state TEXT NOT NULL
+      CHECK(authorization_state IN ('relogin_required', 'credential_changed')),
+    category TEXT NOT NULL,
+    warning_delivery_id TEXT REFERENCES deliveries(id),
+    no_route INTEGER NOT NULL DEFAULT 0 CHECK(no_route IN (0, 1)),
+    created_at INTEGER NOT NULL,
+    CHECK(no_route = 0 OR warning_delivery_id IS NULL)
+  );
+  CREATE INDEX weixin_auth_incidents_unwarned_idx
+    ON weixin_auth_incidents(created_at, incident_id)
+    WHERE warning_delivery_id IS NULL;
+
+  CREATE TABLE weixin_sync_state (
+    generation_id TEXT PRIMARY KEY REFERENCES weixin_account_generations(generation_id),
+    cursor TEXT NOT NULL DEFAULT ''
+  );
+
+  CREATE TABLE weixin_inbox_sequence (
+    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+    next_value INTEGER NOT NULL CHECK(next_value > 0)
+  );
+  INSERT INTO weixin_inbox_sequence(singleton, next_value) VALUES (1, 1);
+
+  CREATE TABLE weixin_route_tokens (
+    id TEXT PRIMARY KEY,
+    generation_id TEXT NOT NULL REFERENCES weixin_account_generations(generation_id),
+    token TEXT NOT NULL,
+    is_current INTEGER NOT NULL DEFAULT 0 CHECK(is_current IN (0, 1)),
+    created_at INTEGER NOT NULL
+  );
+  CREATE UNIQUE INDEX weixin_current_route_token_idx
+    ON weixin_route_tokens(generation_id) WHERE is_current = 1;
+  CREATE UNIQUE INDEX weixin_route_token_generation_idx
+    ON weixin_route_tokens(generation_id, id);
+
+  CREATE TABLE weixin_inbox (
+    generation_id TEXT NOT NULL REFERENCES weixin_account_generations(generation_id),
+    identity_kind TEXT NOT NULL CHECK(identity_kind IN ('message', 'client')),
+    identity_value TEXT NOT NULL,
+    arrival_sequence INTEGER NOT NULL UNIQUE,
+    state TEXT NOT NULL CHECK(state IN ('pending', 'processing', 'retry', 'processed', 'fenced')),
+    normalized_json TEXT NOT NULL,
+    route_token_id TEXT,
+    attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
+    last_error_category TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY(generation_id, identity_kind, identity_value),
+    FOREIGN KEY(generation_id, route_token_id)
+      REFERENCES weixin_route_tokens(generation_id, id)
+  );
+  CREATE INDEX weixin_inbox_state_sequence_idx
+    ON weixin_inbox(generation_id, state, arrival_sequence);
+  CREATE UNIQUE INDEX weixin_single_processing_head_idx
+    ON weixin_inbox(generation_id) WHERE state = 'processing';
+
+  CREATE TABLE weixin_inbox_media (
+    generation_id TEXT NOT NULL,
+    identity_kind TEXT NOT NULL,
+    identity_value TEXT NOT NULL,
+    item_ordinal INTEGER NOT NULL CHECK(item_ordinal >= 0),
+    state TEXT NOT NULL CHECK(state IN ('pending', 'completed', 'failed')),
+    descriptor_json TEXT NOT NULL,
+    attachment_id TEXT REFERENCES attachments(id),
+    attachment_scope_id TEXT,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY(generation_id, identity_kind, identity_value, item_ordinal),
+    FOREIGN KEY(generation_id, identity_kind, identity_value)
+      REFERENCES weixin_inbox(generation_id, identity_kind, identity_value)
+  );
+
+  CREATE TABLE weixin_inbox_attachment_refs (
+    hold_id TEXT NOT NULL,
+    generation_id TEXT NOT NULL,
+    identity_kind TEXT NOT NULL,
+    identity_value TEXT NOT NULL,
+    scope_id TEXT NOT NULL,
+    attachment_id TEXT NOT NULL REFERENCES attachments(id),
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY(hold_id, attachment_id),
+    FOREIGN KEY(generation_id, identity_kind, identity_value)
+      REFERENCES weixin_inbox(generation_id, identity_kind, identity_value)
+  );
+
+  CREATE TABLE weixin_outbound_steps (
+    id TEXT PRIMARY KEY,
+    delivery_id TEXT NOT NULL REFERENCES deliveries(id) ON DELETE CASCADE,
+    generation_id TEXT NOT NULL REFERENCES weixin_account_generations(generation_id),
+    ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+    kind TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('prepared', 'dispatching', 'succeeded', 'uncertain')),
+    request_hash TEXT NOT NULL,
+    request_json TEXT NOT NULL,
+    receipt_json TEXT,
+    route_token_id TEXT,
+    client_id TEXT,
+    plan_json TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    UNIQUE(delivery_id, ordinal),
+    FOREIGN KEY(generation_id, route_token_id)
+      REFERENCES weixin_route_tokens(generation_id, id)
+  );
+  CREATE INDEX weixin_outbound_generation_idx
+    ON weixin_outbound_steps(generation_id, delivery_id, ordinal);
+  `,
 ];

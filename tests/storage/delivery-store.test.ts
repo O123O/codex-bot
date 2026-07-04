@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { createTestDatabase } from "../../src/storage/database.ts";
 import { DeliveryStore } from "../../src/storage/delivery-store.ts";
+import { inTransaction } from "../../src/storage/database.ts";
 
 const binding = { adapterId: "telegram", conversationKey: "telegram:42", destination: { chatId: "42" } } as const;
 
@@ -20,4 +21,29 @@ test("confirmed deliveries are never recovered as uncertain", () => {
   store.confirm(delivery.id, { messageId: 9 });
   store.recoverAfterCrash();
   assert.equal(store.get(delivery.id)?.state, "confirmed");
+});
+
+test("failInTransaction applies terminal failure and releases an attachment exactly once", () => {
+  const db = createTestDatabase();
+  db.prepare(`INSERT INTO attachments
+    (id, scope_id, display_name, media_type, local_path, size, sha256, ref_count, expires_at, created_at)
+    VALUES ('attachment', 'scope', 'file', 'text/plain', '/tmp/file', 1, 'hash', 0, 999, 1)`).run();
+  const store = new DeliveryStore(db);
+  const first = store.prepareAttachment({
+    id: "first", kind: "file", binding, body: "", mandatory: false,
+    attachmentId: "attachment", attachmentScopeId: "scope",
+  });
+  store.prepareAttachment({
+    id: "second", kind: "file", binding, body: "", mandatory: true,
+    attachmentId: "attachment", attachmentScopeId: "scope",
+  });
+  assert.equal(db.prepare("SELECT ref_count FROM attachments WHERE id = 'attachment'").get()!.ref_count, 2);
+  store.markUncertain(first.id);
+  assert.equal(db.prepare("SELECT ref_count FROM attachments WHERE id = 'attachment'").get()!.ref_count, 1);
+  assert.equal(inTransaction(db, () => store.failInTransaction(first.id)), true);
+  assert.equal(db.prepare("SELECT ref_count FROM attachments WHERE id = 'attachment'").get()!.ref_count, 1);
+  assert.equal(inTransaction(db, () => store.failInTransaction("second")), true);
+  assert.equal(inTransaction(db, () => store.failInTransaction("second")), false);
+  assert.equal(db.prepare("SELECT ref_count FROM attachments WHERE id = 'attachment'").get()!.ref_count, 0);
+  db.close();
 });
