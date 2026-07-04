@@ -13,6 +13,9 @@ export const BOT_SECRET_ENV_NAMES = new Set([
   "SLACK_USER_TOKEN",
   "SLACK_TEAM_ID",
   "SLACK_OWNER_USER_ID",
+  "WEIXIN_BOT_TOKEN",
+  "WEIXIN_BOT_ID",
+  "WEIXIN_OWNER_USER_ID",
   "PRIMARY_CHAT_APP",
   "QIYAN_BOT_MCP_TOKEN",
 ]);
@@ -43,6 +46,9 @@ export const SUPPORTED_DOTENV_KEYS = new Set([
 export const SERVICE_UNSET_ENV_NAMES = new Set([
   "QIYAN_HOME",
   ...[...SUPPORTED_DOTENV_KEYS].filter((name) => name !== "SLACK_TEAM_ID"),
+  "WEIXIN_BOT_TOKEN",
+  "WEIXIN_BOT_ID",
+  "WEIXIN_OWNER_USER_ID",
   "QIYAN_BOT_MCP_TOKEN",
 ]);
 

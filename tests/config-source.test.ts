@@ -3,7 +3,7 @@ import { chmod, mkdir, mkdtemp, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { loadConfigSource } from "../src/config-source.ts";
+import { BOT_SECRET_ENV_NAMES, loadConfigSource, SERVICE_UNSET_ENV_NAMES, SUPPORTED_DOTENV_KEYS } from "../src/config-source.ts";
 
 async function fixture() {
   const root = await mkdtemp(join(tmpdir(), "qiyan-config-source-"));
@@ -145,4 +145,12 @@ test("requires an existing QiYan home to be a private owner directory", async ()
   await mkdir(value.qiyanHome, { mode: 0o755 });
   await chmod(value.qiyanHome, 0o755);
   await assert.rejects(loadConfigSource({ HOME: value.home }), /permission|private|mode/iu);
+});
+
+test("WeChat credentials are stripped from children and never accepted from dotenv", () => {
+  for (const name of ["WEIXIN_BOT_TOKEN", "WEIXIN_BOT_ID", "WEIXIN_OWNER_USER_ID"]) {
+    assert.equal(BOT_SECRET_ENV_NAMES.has(name), true);
+    assert.equal(SERVICE_UNSET_ENV_NAMES.has(name), true);
+    assert.equal(SUPPORTED_DOTENV_KEYS.has(name), false);
+  }
 });
