@@ -78,7 +78,7 @@ test("packed qiyan-bot runs without source files or installed dependencies", asy
     env: { PATH: process.env.PATH ?? "" },
   });
   assert.equal(version.status, 0);
-  assert.equal(version.stdout, "0.3.0\n");
+  assert.equal(version.stdout, "0.4.0\n");
   assert.equal(version.stderr, "");
 
   const checkedHome = join(temp, "checked-qiyan-home");
@@ -212,7 +212,7 @@ writeFileSync(join(process.env.HOME, "update-record.json"), JSON.stringify({ arg
   });
   assert.equal(update.status, 0);
   assert.equal(update.stderr, "");
-  assert.equal(update.stdout, `Updated qiyan-bot to 0.3.0 in ${globalRoot}.\nRestart any running qiyan-bot process to use this version.\n`);
+  assert.equal(update.stdout, `Updated qiyan-bot to 0.4.0 in ${globalRoot}.\nRestart any running qiyan-bot process to use this version.\n`);
   const updateRecord = JSON.parse(await readFile(join(fakeHome, "update-record.json"), "utf8")) as {
     argv: string[];
     env: NodeJS.ProcessEnv;
