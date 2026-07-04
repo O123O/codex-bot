@@ -43,6 +43,7 @@ function successfulResult(stdout = "") {
 function stagingRunner(calls: Array<{ command: string; args: readonly string[] }>, options: {
   createPublicKey?: boolean;
   derivedPublicKey?: string;
+  generatedPublicMode?: number;
 } = {}): CommandRunner {
   return async (command, args) => {
     calls.push({ command, args: [...args] });
@@ -56,7 +57,12 @@ function stagingRunner(calls: Array<{ command: string; args: readonly string[] }
 
     await writeFile(keyPath, "opaque-test-private-key", { mode: 0o600 });
     if (options.createPublicKey !== false) {
-      await writeFile(`${keyPath}.pub`, `${PUBLIC_KEY} qiyan-ssh-worker\n`, { mode: 0o644 });
+      const publicKeyPath = `${keyPath}.pub`;
+      const publicKeyMode = options.generatedPublicMode ?? 0o644;
+      await writeFile(publicKeyPath, `${PUBLIC_KEY} qiyan-ssh-worker\n`, {
+        mode: publicKeyMode,
+      });
+      await chmod(publicKeyPath, publicKeyMode);
     }
     return successfulResult();
   };
@@ -186,6 +192,26 @@ test("stages, validates, and installs a new owner-only keypair", async (t) => {
     "id_ed25519.pub",
   ]);
 });
+
+for (const generatedPublicMode of [0o644, 0o640, 0o600]) {
+  test(`normalizes umask-reduced generated public mode ${generatedPublicMode.toString(8)} to 0600`, async (t) => {
+    const paths = resolveFixturePaths(await temporaryRepository(t));
+    await ensureFixtureState(paths, stagingRunner([], { generatedPublicMode }));
+    assert.equal((await lstat(paths.publicKey)).mode & 0o777, 0o600);
+  });
+}
+
+for (const generatedPublicMode of [0o664, 0o645]) {
+  test(`rejects generated public mode ${generatedPublicMode.toString(8)} with bits outside 0644`, async (t) => {
+    const paths = resolveFixturePaths(await temporaryRepository(t));
+    await assert.rejects(
+      ensureFixtureState(paths, stagingRunner([], { generatedPublicMode })),
+      /generated public key.*mode/u,
+    );
+    await assert.rejects(lstat(paths.privateKey));
+    await assert.rejects(lstat(paths.publicKey));
+  });
+}
 
 test("validates an existing pair by algorithm and blob while ignoring its comment", async (t) => {
   const paths = resolveFixturePaths(await temporaryRepository(t));

@@ -277,8 +277,9 @@ async function generateKeyPair(paths: FixturePaths, runner: CommandRunner, uid: 
     const stagedPublicMetadata = await optionalMetadata(stagedPublicKey);
     if (stagedPublicMetadata === undefined) throw new Error("generated SSH keypair is incomplete");
     assertOwnedRegularSingleLink(stagedPublicMetadata, uid, "generated public key");
-    if ((stagedPublicMetadata.mode & 0o777) !== 0o644) {
-      throw new Error("generated public key must have mode 0644 before normalization");
+    const stagedPublicMode = stagedPublicMetadata.mode & 0o777;
+    if ((stagedPublicMode & ~0o644) !== 0) {
+      throw new Error("generated public key mode must not contain permission bits outside 0644");
     }
     await chmod(stagedPublicKey, OWNER_ONLY_FILE_MODE);
     await validateKeyPair(stagedPrivateKey, stagedPublicKey, runner, uid, true);
