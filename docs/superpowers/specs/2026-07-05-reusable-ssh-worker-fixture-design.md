@@ -99,7 +99,7 @@ The opt-in live check will:
 6. complete a bounded JSONL `initialize` request/response exchange; and
 7. query authentication state without printing credentials.
 
-Before device login, the live check may report `authentication required` only after the SSH, environment, Codex, and App Server transport checks pass. After the user completes device login, the whole acceptance check must pass. The check will not create a Codex thread or send a model task.
+Before device login, the live check may report `authentication required` only after the SSH, environment, Codex, and App Server transport checks pass and only when `account/read` reports a null account while OpenAI authentication is required. After the user completes device login, the whole acceptance check must pass even though `requiresOpenaiAuth` remains true for a logged-in ChatGPT account. The check will not create a Codex thread or send a model task.
 
 Before commit, `npm run check` must pass. The Docker-backed acceptance command will also be run on the current development machine, first far enough to prove the unauthenticated boundary and then fully after interactive device authorization.
 

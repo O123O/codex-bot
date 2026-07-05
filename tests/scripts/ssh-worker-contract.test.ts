@@ -30,8 +30,10 @@ test("SSH worker image pins its base, packages, account, and copied inputs", asy
   assert.equal(copies[0], "COPY sshd_config /etc/ssh/sshd_config");
   assert.equal(
     copies[1],
-    "COPY --chmod=0755 entrypoint.sh /usr/local/bin/ssh-worker-entrypoint",
+    "COPY entrypoint.sh /usr/local/bin/ssh-worker-entrypoint",
   );
+  assert.doesNotMatch(dockerfile, /COPY --chmod/u);
+  assert.match(dockerfile, /^RUN chmod 0755 \/usr\/local\/bin\/ssh-worker-entrypoint$/mu);
   assert.doesNotMatch(copies.join("\n"), /auth\.json|\.codex|QIYAN_HOME/u);
   assert.match(dockerfile, /^ENTRYPOINT \["\/usr\/local\/bin\/ssh-worker-entrypoint"\]$/mu);
 });

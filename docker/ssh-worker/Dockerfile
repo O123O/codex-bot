@@ -18,7 +18,8 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 COPY sshd_config /etc/ssh/sshd_config
-COPY --chmod=0755 entrypoint.sh /usr/local/bin/ssh-worker-entrypoint
+COPY entrypoint.sh /usr/local/bin/ssh-worker-entrypoint
+RUN chmod 0755 /usr/local/bin/ssh-worker-entrypoint
 
 EXPOSE 22
 

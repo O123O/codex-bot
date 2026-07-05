@@ -374,7 +374,7 @@ Add tests proving `checkFixture`:
 - sends one schema-typed JSONL `initialize` request containing `clientInfo`, `experimentalApi: true`, and `requestAttestation: false`;
 - validates response ID, `userAgent`, `codexHome`, `platformFamily`, and `platformOs`;
 - sends the schema-typed parameterless `initialized` notification, then requests `account/read` with `{ refreshToken: false }`;
-- reports `authentication required` when `requiresOpenaiAuth` is true or `account` is null;
+- reports `authentication required` only when `requiresOpenaiAuth` is true and `account` is null;
 - bounds process startup, initialize, account read, and shutdown independently, and terminates the SSH child on success, timeout, malformed JSON, oversized lines, protocol error, stream error, or unexpected exit; and
 - never returns or logs account details, JSON-RPC error data/messages, stderr, message bodies, or credentials.
 

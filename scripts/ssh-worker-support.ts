@@ -1689,7 +1689,7 @@ function accountIsAuthenticated(value: unknown): boolean {
     throw new Error("App Server account response is invalid");
   }
   const response = value as unknown as GetAccountResponse;
-  return !response.requiresOpenaiAuth && response.account !== null;
+  return response.account !== null || !response.requiresOpenaiAuth;
 }
 
 const PLAN_TYPES = new Set([

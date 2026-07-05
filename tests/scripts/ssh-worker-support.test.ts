@@ -306,7 +306,7 @@ test("checks the fixed remote environment and authenticated App Server without c
       id: 2,
       result: {
         account: { type: "chatgpt", email: null, planType: "plus" },
-        requiresOpenaiAuth: false,
+        requiresOpenaiAuth: true,
       },
     })}\n`);
   }
