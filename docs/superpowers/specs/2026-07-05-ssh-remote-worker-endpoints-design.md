@@ -19,7 +19,7 @@ The user should be able to ask QiYan to work locally or on a named SSH host with
 - Reconnect to the same detached remote App Server after tunnel loss or QiYan restart.
 - Resume persisted native threads with a new App Server after remote reboot or process loss.
 - Preserve current native-cwd, idle-state, generation, rollback, and duplicate-identity session safeguards.
-- Give remote endpoints the same safe project-placement and round-trip attachment behavior as local endpoints.
+- Give remote endpoints the same safe project-placement and explicit `send_to_session`/`prepare_chat_attachment` behavior as local endpoints.
 - Keep SSH trust, host preparation, Codex installation, Codex authentication, and operating-system administration under user control.
 - Keep chat adapters, App Server transports, session policy, endpoint persistence, and host operations behind separate interfaces.
 
@@ -99,7 +99,7 @@ Higher-level services resolve an `EndpointRuntime` composed of three narrow capa
 
 - `AppServerTransport`: request/response messages, server notifications, permission events, initialization, health, and connection generations.
 - `WorkspaceHost`: home discovery, canonical path identity, safe directory creation, project-root validation, and protected-root checks.
-- `AttachmentTransport`: bounded upload from QiYan's retained local store and bounded download into that store.
+- `WorkerFileBridge`: bounded transfer for the existing QiYan-owned `send_to_session` and `prepare_chat_attachment` operations.
 
 Session lifecycle, session registry, goals, status, model selection, notification routing, and chat adapters depend on these interfaces rather than on endpoint type. They must not contain scattered `local` versus `ssh` behavior.
 
@@ -126,7 +126,7 @@ An SSH runtime contains separately testable components:
 - an SSH Unix-socket tunnel;
 - an App Server WebSocket transport over the locally forwarded Unix socket;
 - fixed remote Linux filesystem operations; and
-- streaming remote attachment transfer operations.
+- streaming remote worker-file transfer operations.
 
 Codex documents Unix-socket App Server listeners through `codex app-server --listen unix:///absolute/path.sock`. The socket uses the App Server's WebSocket framing without opening a network listener. The SSH implementation converts those frames to the same request and notification abstractions used by the local JSONL transport.
 
@@ -162,17 +162,15 @@ No SSH configuration file is modified. Socket paths are length-checked before us
 
 ## Persistent remote App Server
 
-Remote work must not depend on the lifetime of an SSH channel. Each SSH endpoint therefore has one detached App Server owned by the current QiYan installation.
-
-QiYan persists an installation identifier locally. The installation ID and endpoint ID are hashed into short remote runtime names so two QiYan installations using the same remote account do not collide.
-
-The backend creates a private remote runtime directory and uses an explicit tmux socket:
+Remote work must not depend on the lifetime of an SSH channel. Each SSH endpoint therefore has one detached App Server in QiYan's alternate tmux server. Every tmux command uses the fixed socket label `qiyan-bot`:
 
 ```text
-tmux -S /tmp/qiyan-1000/a1b2c3d4/tmux.sock list-sessions
+tmux -L qiyan-bot list-sessions
 ```
 
-Every `tmux` lifecycle command includes this `-S` path. Normal `tmux ls` uses the user's default socket and cannot see or modify QiYan's tmux server. QiYan never issues `kill-server` against the default tmux socket. The user can deliberately inspect the QiYan server using the documented private path.
+Normal `tmux ls` uses the user's default socket and cannot see or modify QiYan's alternate server. The user can deliberately inspect it with `tmux -L qiyan-bot list-sessions`. QiYan stops only its endpoint session and never issues `kill-server` against the user's default tmux server.
+
+Each endpoint uses a deterministic, safely encoded session name and a short private App Server runtime path. The App Server runtime directory is mode 0700 and its socket is owner-only. The first release assumes one QiYan deployment manages the `qiyan-bot` tmux server for a given remote operating-system account.
 
 The tmux session launches the remote login environment and then:
 
@@ -180,7 +178,7 @@ The tmux session launches the remote login environment and then:
 codex app-server --listen unix://<private-runtime>/app-server.sock
 ```
 
-The runtime directory is mode 0700 and its sockets are owner-only. The App Server exposes no TCP port. The tmux pane is not used as a protocol channel and is not automatically captured or logged by QiYan.
+The App Server exposes no TCP port. The tmux pane is not used as a protocol channel and is not automatically captured or logged by QiYan.
 
 ### Connection flow
 
@@ -188,7 +186,7 @@ When activating an SSH endpoint, the backend:
 
 1. validates the catalog entry and resolved destination binding;
 2. completes the SSH, Linux, command, Codex, auth, and `tmux` preflight;
-3. checks the dedicated tmux server/session using its explicit socket;
+3. checks the endpoint session through `tmux -L qiyan-bot`;
 4. removes an owned stale App Server socket only when the private tmux session is proven absent;
 5. starts the detached App Server if absent;
 6. creates a private local Unix socket forwarded to the remote App Server socket;
@@ -216,7 +214,7 @@ Worker tools accept an optional endpoint and normalize an omitted value to `loca
 - Defaults to `local`.
 - Proves all managed turns on the endpoint are idle. If the endpoint is unreachable and idleness cannot be proven, it refuses rather than risking active work.
 - For `local`, shuts down the existing worker App Server.
-- For SSH, closes the tunnel and stops the App Server through the dedicated private tmux socket.
+- For SSH, closes the tunnel and stops the endpoint session through `tmux -L qiyan-bot`.
 - Preserves native Codex threads, catalog data, endpoint bindings, and managed session mappings.
 - Is a runtime disconnect, not a persistent disable. A later endpoint operation, or startup recovery for managed sessions, may activate it again.
 
@@ -247,30 +245,53 @@ If the user does not provide a suitable remote project location, QiYan uses that
 
 The first SSH implementation supports Linux hosts only. Remote filesystem operations are fixed and audited. Paths and operation parameters are transported as data and are never interpolated into arbitrary user-controlled shell commands.
 
-## Attachments
+## Explicit QiYan-managed worker file transfers
 
-Chat adapters and the retained local attachment store remain unchanged. `AttachmentTransport` bridges endpoint-local paths.
+Chat attachment ingress and delivery remain owned by QiYan. Workers do not call chat tools, and the backend does not copy every chat attachment or every worker-created file automatically. `WorkerFileBridge` exists only behind two current QiYan tool paths.
 
-### Incoming attachments
+### `send_to_session` attachments
 
-For `local`, existing retained paths are passed to Codex directly.
+When a user sends files through a chat adapter, QiYan ingests them into its existing private retained attachment store. The assistant may explicitly select attachment IDs from its active attempt in:
 
-For SSH, QiYan:
+```json
+{
+  "nickname": "novel-56",
+  "content": "Read the attached requirements.",
+  "attachment_ids": ["file_abc123"],
+  "mode": "start"
+}
+```
 
-1. validates the retained local object and existing size limits;
-2. streams it to a private remote staging directory owned by the QiYan installation;
-3. writes to a temporary file with restrictive permissions;
-4. verifies byte count and SHA-256;
-5. atomically promotes it to a content-addressed path; and
-6. passes that verified remote path to Codex.
+The existing attempt-scope checks continue to reject invented, expired, or unrelated attachment IDs. `/pass` continues to require the exact source attachment IDs in their original order.
 
-Repeated use of the same content may reuse a verified staged object. Interrupted temporary files and expired objects are cleaned up best-effort. Remote staging follows the local retention lifecycle and does not enter the remote Codex profile or project unless Codex or the user explicitly copies it.
+For a local worker, the retained local path is passed to Codex as it is today. For an SSH worker, `WorkerFileBridge` uploads only the selected IDs to a private remote staging directory, writes each file atomically with restrictive permissions, verifies byte count and SHA-256, and passes the verified remote path to Codex. Repeated use may reuse a verified content-addressed object. Interrupted temporary files and expired staged objects are cleaned up best-effort.
 
-### Outgoing attachments
+The flow is:
 
-`prepare_chat_attachment` resolves the requested path through the selected endpoint's `WorkspaceHost`. It accepts only a regular file canonically contained by that session's project workspace, rejects traversal and symlink escapes, and enforces existing file-size limits.
+```text
+chat attachment -> QiYan attachment store -> send_to_session -> selected worker
+```
 
-For SSH, the file is streamed through SSH into a temporary object in QiYan's local attachment store. QiYan verifies the expected size before atomic local promotion. Chat adapters then deliver the normal retained local attachment exactly as they do today.
+### `prepare_chat_attachment` from a worker project
+
+When QiYan wants to send a project file to the user, it explicitly calls:
+
+```json
+{
+  "owner": "novel-56",
+  "relative_path": "output/report.txt"
+}
+```
+
+`owner` is either `assistant` or a managed worker nickname. The backend resolves a worker owner to that session's endpoint and project root. It accepts only a regular file canonically contained by the project, rejects traversal and symlink escapes, and enforces existing file-size limits.
+
+For the assistant or a local worker, QiYan snapshots the local file as it does today. For an SSH worker, `WorkerFileBridge` streams that one selected remote file into a temporary object in QiYan's local attachment store, verifies its size, and atomically promotes it. The existing `send_chat_attachment({"file_handle":"file_def456","caption":"Here is the report."})` operation then delivers the ordinary retained local handle and requires no endpoint-specific behavior.
+
+The reverse flow is:
+
+```text
+selected worker project file -> prepare_chat_attachment -> QiYan attachment store -> send_chat_attachment -> chat
+```
 
 ## Notification and delivery recovery
 
@@ -296,7 +317,7 @@ Managed `AGENTS.md` guidance explains:
 - that remote project sessions use the remote user's Codex config and skills;
 - that QiYan asks when the intended endpoint is ambiguous;
 - how `disconnect_endpoint` and `restart_endpoint` behave; and
-- how to inspect the dedicated tmux runtime deliberately without confusing it with normal user tmux sessions.
+- how to inspect `tmux -L qiyan-bot` deliberately without confusing it with normal user tmux sessions.
 
 A typical flow is:
 
@@ -339,9 +360,9 @@ The ordinary repository suite remains offline and credential-free.
 - Resolved SSH destination binding and safe rebinding only without managed sessions.
 - SSH argument construction, batch/host-key policy, timeouts, and shell-injection resistance.
 - User-configured versus QiYan-owned ControlMaster behavior without SSH-config writes.
-- Dedicated `tmux -S` command construction and proof that no command touches the default tmux socket.
+- Consistent `tmux -L qiyan-bot` command construction and proof that no command touches the default tmux server.
 - Local and SSH `WorkspaceHost` contract suites covering canonical identity, safe creation, symlinks, protected roots, and reservation races.
-- Atomic remote attachment upload, content reuse, checksum mismatch, interruption cleanup, bounded download, traversal, and symlink rejection.
+- Explicit `send_to_session` upload and `prepare_chat_attachment` download, including content reuse, checksum mismatch, interruption cleanup, bounds, traversal, and symlink rejection.
 - Lazy endpoint creation, startup activation for managed sessions, generation fencing, backoff, and failure isolation.
 - `disconnect_endpoint` and `restart_endpoint` local/SSH behavior, including active and unprovable-idle rejection.
 - Delivery reconciliation and deduplication across repeated reconnects.
@@ -365,7 +386,7 @@ Integration coverage proves:
 10. QiYan-process restart followed by reconnection to the same remote runtime;
 11. remote runtime loss followed by a new App Server and native-thread resume;
 12. explicit endpoint restart and disconnect; and
-13. proof that QiYan's private tmux socket is invisible to and does not alter the user's default tmux server.
+13. proof that `tmux -L qiyan-bot` is invisible to and does not alter the user's default tmux server.
 
 Malformed catalog, changed destination, untrusted host, missing auth, missing `tmux`, and remote-unavailable scenarios are also exercised without taking down local functionality.
 
@@ -380,7 +401,8 @@ The distributable package adds the endpoint example and remote-worker documentat
 - endpoint catalog format;
 - local-default behavior;
 - remote project roots;
-- persistent runtime and private tmux inspection;
+- persistent runtime and `tmux -L qiyan-bot` inspection;
+- exact examples for sending a chat attachment to a worker and sending a selected worker project file back to chat;
 - disconnect, restart, recovery, and failure semantics;
 - attachment behavior and storage; and
 - troubleshooting without exposing secrets.
