@@ -35,12 +35,14 @@
     "@slack/web-api": "7.18.0",
     "@types/node": "26.0.1",
     "@types/qrcode-terminal": "0.12.2",
+    "@types/ws": "^8.18.1",
     "esbuild": "0.28.1",
     "lossless-json": "4.3.0",
     "qrcode-terminal": "0.12.0",
     "tsx": "4.22.4",
     "typescript": "6.0.3",
     "undici": "8.5.0",
+    "ws": "^8.21.0",
     "zod": "4.4.3"
   }
 }
