@@ -27,7 +27,7 @@ export interface ManagedAppServerEndpoint extends AppServerEndpoint {
 }
 
 const identitySchema = z.discriminatedUnion("kind", [
-  z.object({ kind: z.literal("local"), pid: z.number().int().positive(), startTime: z.string().min(1) }).strict(),
+  z.object({ kind: z.literal("local"), pid: z.number().int().positive(), startTime: z.string().regex(/^\d+$/u) }).strict(),
   z.object({
     kind: z.literal("ssh"), token: z.string().regex(/^[a-f0-9]{32}$/u), pid: z.number().int().positive(),
     linuxStartTime: z.string().regex(/^\d+$/u), processGroupId: z.number().int().positive(),

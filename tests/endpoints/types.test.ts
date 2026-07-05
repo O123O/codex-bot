@@ -8,5 +8,6 @@ test("validates strict serializable local and SSH runtime identities", () => {
     kind: "ssh", token: "a".repeat(32), pid: 10, linuxStartTime: "20", processGroupId: 10,
   });
   assert.throws(() => parseRuntimeIdentity({ kind: "ssh", token: "secret", pid: 10, linuxStartTime: "20", processGroupId: 10 }));
+  assert.throws(() => parseRuntimeIdentity({ kind: "local", pid: 10, startTime: "start-20" }));
   assert.throws(() => parseRuntimeIdentity({ kind: "local", pid: 10, startTime: "20", extra: true }));
 });

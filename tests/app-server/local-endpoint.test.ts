@@ -164,16 +164,16 @@ test("a delayed exit from an old child cannot close a restarted endpoint", async
     });
   }
   let index = 0;
-  const endpoint = new LocalEndpoint({ codexBinary: "codex", spawn: () => children[index++] as never, resolveMcpClientIdentity: async (pid) => ({ pid: pid + 1_000, startTime: `start-${pid}` }) });
+  const endpoint = new LocalEndpoint({ codexBinary: "codex", spawn: () => children[index++] as never, resolveMcpClientIdentity: async (pid) => ({ pid: pid + 1_000, startTime: String(pid) }) });
   await endpoint.start();
-  assert.deepEqual(endpoint.mcpClientIdentity, { pid: 1_101, startTime: "start-101" });
-  assert.deepEqual(await endpoint.runtimeIdentity(), { kind: "local", pid: 1_101, startTime: "start-101" });
+  assert.deepEqual(endpoint.mcpClientIdentity, { pid: 1_101, startTime: "101" });
+  assert.deepEqual(await endpoint.runtimeIdentity(), { kind: "local", pid: 1_101, startTime: "101" });
   await endpoint.stop();
   assert.equal(endpoint.mcpClientIdentity, undefined);
   await endpoint.start();
-  assert.deepEqual(endpoint.mcpClientIdentity, { pid: 1_102, startTime: "start-102" });
+  assert.deepEqual(endpoint.mcpClientIdentity, { pid: 1_102, startTime: "102" });
   children[0]!.exitNow();
-  assert.deepEqual(endpoint.mcpClientIdentity, { pid: 1_102, startTime: "start-102" });
+  assert.deepEqual(endpoint.mcpClientIdentity, { pid: 1_102, startTime: "102" });
   assert.deepEqual(await endpoint.request("model/list", {}), { data: [], nextCursor: null });
   assert.equal(endpoint.state, "ready");
   await endpoint.stop();
@@ -204,7 +204,7 @@ test("exit or stop during process resolution cannot publish a stale ready genera
     await resolutionStarted;
     if (action === "exit") child.exitNow();
     else await endpoint.stop();
-    release({ pid: child.pid! + 1_000, startTime: `start-${child.pid}` });
+    release({ pid: child.pid! + 1_000, startTime: String(child.pid) });
     await assert.rejects(starting, /generation changed/);
     assert.notEqual(endpoint.state, "ready");
     assert.equal(endpoint.mcpClientIdentity, undefined);

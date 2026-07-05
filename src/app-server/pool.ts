@@ -42,6 +42,8 @@ function isTerminal(status: string): boolean {
 
 export class AppServerPool {
   private readonly endpoints = new Map<string, AppServerEndpoint>();
+  private readonly endpointGenerations = new Map<string, number>();
+  private readonly endpointUnavailableSubscriptions = new Map<string, () => void>();
   private readonly claims = new Map<string, ClaimState>();
   private readonly terminalBeforeStart = new Set<string>();
   private readonly terminalClaims = new Map<string, TerminalClaim>();
@@ -52,7 +54,7 @@ export class AppServerPool {
   private nextClaimGeneration = 1;
 
   constructor(endpoints: readonly AppServerEndpoint[], private readonly options: { maxConcurrentTurns: number; reconciliationTimeoutMs?: number; reconciliationPollMs?: number; sleep?: (ms: number) => Promise<void>; resolveEndpoint?: (id: string) => Promise<ManagedAppServerEndpoint> }) {
-    for (const endpoint of endpoints) this.endpoints.set(endpoint.id, endpoint);
+    for (const endpoint of endpoints) this.publishEndpoint(endpoint);
   }
 
   endpoint(id: string): AppServerEndpoint {
@@ -61,21 +63,48 @@ export class AppServerPool {
     return endpoint;
   }
 
+  endpointGeneration(id: string): { endpoint: AppServerEndpoint; generation: number } {
+    const endpoint = this.endpoints.get(id);
+    const generation = this.endpointGenerations.get(id);
+    if (!endpoint || generation === undefined) throw new AppError("ENDPOINT_UNAVAILABLE", `app-server endpoint is unavailable: ${id}`);
+    return { endpoint, generation };
+  }
+
+  replaceEndpoint(endpoint: AppServerEndpoint): number {
+    this.endpointStarts.delete(endpoint.id);
+    return this.publishEndpoint(endpoint);
+  }
+
   private async ensureEndpoint(id: string): Promise<AppServerEndpoint> {
     const existing = this.endpoints.get(id);
     if (existing?.state === "ready") return existing;
     const pending = this.endpointStarts.get(id);
     if (pending) return pending;
     if (!this.options.resolveEndpoint) throw new AppError("ENDPOINT_UNAVAILABLE", `app-server endpoint is unavailable: ${id}`);
-    const start = (async () => {
+    const initialGeneration = this.endpointGenerations.get(id) ?? 0;
+    let start!: Promise<AppServerEndpoint>;
+    start = (async () => {
       const endpoint = existing ?? await this.options.resolveEndpoint!(id);
       if (endpoint.id !== id) throw new AppError("OPERATION_CONFLICT", "resolved endpoint identity changed");
-      this.endpoints.set(id, endpoint);
       if (!("start" in endpoint) || typeof endpoint.start !== "function") throw new AppError("ENDPOINT_UNAVAILABLE", `app-server endpoint cannot be started: ${id}`);
       await endpoint.start();
       if (endpoint.state !== "ready") throw new AppError("ENDPOINT_UNAVAILABLE", `app-server endpoint is unavailable: ${id}`);
+      const currentGeneration = this.endpointGenerations.get(id) ?? 0;
+      const currentEndpoint = this.endpoints.get(id);
+      const unchanged = existing
+        ? currentGeneration === initialGeneration && currentEndpoint === existing
+        : currentGeneration === initialGeneration && currentEndpoint === undefined;
+      if (!unchanged) {
+        if ("closeConnection" in endpoint && typeof endpoint.closeConnection === "function") {
+          await endpoint.closeConnection().catch(() => undefined);
+        }
+        throw new AppError("ENDPOINT_UNAVAILABLE", `app-server endpoint generation changed while starting: ${id}`);
+      }
+      if (!existing) this.publishEndpoint(endpoint);
       return endpoint;
-    })().finally(() => this.endpointStarts.delete(id));
+    })().finally(() => {
+      if (this.endpointStarts.get(id) === start) this.endpointStarts.delete(id);
+    });
     this.endpointStarts.set(id, start);
     return start;
   }
@@ -212,6 +241,7 @@ export class AppServerPool {
           this.resolved(state.id);
           this.releaseClaimState(state);
         } else {
+          this.resolved(state.id);
           this.bindTurnCapacityClaim(state, turn.id);
         }
       }
@@ -229,19 +259,17 @@ export class AppServerPool {
     if (claim.endpointId !== endpointId || claim.threadId !== params.threadId) this.conflict("turn start does not match its capacity claim");
 
     let response: T;
+    const callerSuppliedCorrelation = typeof params.clientUserMessageId === "string";
+    const clientUserMessageId = callerSuppliedCorrelation ? params.clientUserMessageId as string : crypto.randomUUID();
+    const startParams = callerSuppliedCorrelation ? params : { ...params, clientUserMessageId };
     try {
       try {
-        const clientUserMessageId = typeof params.clientUserMessageId === "string" ? params.clientUserMessageId : undefined;
         const state = this.claims.get(claim.id);
-        if (state && clientUserMessageId) state.clientUserMessageId = clientUserMessageId;
-        response = await this.request<T>(endpointId, "turn/start", params);
+        if (state) state.clientUserMessageId = clientUserMessageId;
+        response = await this.request<T>(endpointId, "turn/start", startParams);
       } catch (startError) {
-        if (typeof params.clientUserMessageId !== "string") {
-          this.releaseTurnCapacityClaim(claim);
-          throw startError;
-        }
         try {
-          const actual = await this.findStartedTurn(endpointId, params.threadId, params.clientUserMessageId);
+          const actual = await this.findStartedTurn(endpointId, params.threadId, clientUserMessageId);
           response = { turn: actual } as unknown as T;
         } catch (reconciliationError) {
           if (reconciliationError instanceof StartProvenAbsentError) {
@@ -252,9 +280,9 @@ export class AppServerPool {
         }
       }
 
-      if (typeof params.clientUserMessageId === "string") {
+      if (callerSuppliedCorrelation) {
         try {
-          response = { ...response, turn: await this.findStartedTurn(endpointId, params.threadId, params.clientUserMessageId, response.turn.id) } as T;
+          response = { ...response, turn: await this.findStartedTurn(endpointId, params.threadId, clientUserMessageId, response.turn.id) } as T;
         } catch (error) {
           if (error instanceof StartProvenAbsentError) {
             this.releaseTurnCapacityClaim(claim);
@@ -415,5 +443,21 @@ export class AppServerPool {
 
   private conflict(message: string): never {
     throw new AppError("OPERATION_CONFLICT", `OPERATION_CONFLICT: ${message}`);
+  }
+
+  private publishEndpoint(endpoint: AppServerEndpoint): number {
+    const generation = (this.endpointGenerations.get(endpoint.id) ?? 0) + 1;
+    this.endpointUnavailableSubscriptions.get(endpoint.id)?.();
+    this.endpointUnavailableSubscriptions.delete(endpoint.id);
+    this.endpoints.set(endpoint.id, endpoint);
+    this.endpointGenerations.set(endpoint.id, generation);
+    if ("onUnavailable" in endpoint && typeof endpoint.onUnavailable === "function") {
+      const unsubscribe = endpoint.onUnavailable((kind: EndpointLossKind) => {
+        if (this.endpointGenerations.get(endpoint.id) !== generation || this.endpoints.get(endpoint.id) !== endpoint) return;
+        this.markEndpointUnavailable(endpoint.id, kind);
+      });
+      this.endpointUnavailableSubscriptions.set(endpoint.id, unsubscribe);
+    }
+    return generation;
   }
 }

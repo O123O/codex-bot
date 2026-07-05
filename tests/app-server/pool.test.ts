@@ -34,16 +34,43 @@ test("turn permits remain reserved until terminal completion", async () => {
   assert.equal((await pool.startTurn("local", { threadId: "t2", input: [] })).turn.id, "turn-2");
 });
 
-test("failed starts and endpoint loss release capacity", async () => {
-  const endpoint = new FakeEndpoint();
+test("a failed start releases capacity only after full idle history proves it absent", async () => {
+  const endpoint: AppServerEndpoint = {
+    id: "local", state: "ready",
+    request: async <T>(method: string) => {
+      if (method === "turn/start") throw new Error("start failed");
+      return { thread: { status: "idle", turns: [] } } as T;
+    },
+  };
+  const pool = new AppServerPool([endpoint], { maxConcurrentTurns: 1, reconciliationTimeoutMs: 0 });
+  await assert.rejects(pool.startTurn("local", { threadId: "t1", input: [] }), /start failed/u);
+  assert.equal(pool.activeTurnCount, 0);
+});
+
+test("implicit starts send a correlation and retain capacity when a response is lost", async () => {
+  let sent: Record<string, unknown> | undefined;
+  const endpoint: AppServerEndpoint = {
+    id: "local", state: "ready",
+    request: async <T>(method: string, params: unknown) => {
+      if (method === "turn/start") {
+        sent = params as Record<string, unknown>;
+        throw new Error("response lost");
+      }
+      throw new Error("connection lost");
+    },
+  };
   const pool = new AppServerPool([endpoint], { maxConcurrentTurns: 1 });
-  endpoint.fail = true;
-  await assert.rejects(pool.startTurn("local", { threadId: "t1", input: [] }));
-  endpoint.fail = false;
-  await pool.startTurn("local", { threadId: "t1", input: [] });
-  pool.markEndpointUnavailable("local");
-  endpoint.state = "ready";
-  await pool.startTurn("local", { threadId: "t2", input: [] });
+  await assert.rejects(
+    pool.startTurn("local", { threadId: "t1", input: [] }),
+    (error: unknown) => error instanceof AppError && error.code === "OPERATION_UNCERTAIN",
+  );
+  assert.equal(typeof sent?.clientUserMessageId, "string");
+  assert.notEqual(sent?.clientUserMessageId, "");
+  assert.equal(pool.activeTurnCount, 1);
+  pool.markEndpointUnavailable("local", "connection-lost");
+  assert.equal(pool.activeTurnCount, 1);
+  pool.markEndpointUnavailable("local", "runtime-lost");
+  assert.equal(pool.activeTurnCount, 0);
 });
 
 test("a terminal notification that arrives before turn/start responds does not leak capacity", async () => {
@@ -293,6 +320,37 @@ test("lazily resolves and starts one endpoint generation", async () => {
   assert.equal(remote.starts, 1);
 });
 
+test("a replacement generation ignores stale endpoint callbacks", () => {
+  class Managed extends FakeEndpoint implements ManagedAppServerEndpoint {
+    override readonly id = "devbox";
+    private readonly unavailable = new Set<(kind: "connection-lost" | "runtime-lost") => void>();
+    async start() { this.state = "ready"; }
+    async closeConnection() { this.state = "stopped"; }
+    async shutdownRuntime() { this.state = "stopped"; }
+    async runtimeIdentity() { return { kind: "ssh" as const, token: "a".repeat(32), pid: 10, linuxStartTime: "20", processGroupId: 10 }; }
+    onNotification() { return () => undefined; }
+    onReady() { return () => undefined; }
+    onUnavailable(listener: (kind: "connection-lost" | "runtime-lost") => void) {
+      this.unavailable.add(listener);
+      return () => { this.unavailable.delete(listener); };
+    }
+    onPermissionBlocked() { return () => undefined; }
+    emitUnavailable(kind: "connection-lost" | "runtime-lost" = "runtime-lost") {
+      for (const listener of this.unavailable) listener(kind);
+    }
+  }
+  const first = new Managed();
+  const second = new Managed();
+  const pool = new AppServerPool([first], { maxConcurrentTurns: 1 });
+  const old = pool.endpointGeneration("devbox");
+  pool.replaceEndpoint(second);
+  first.emitUnavailable();
+  const current = pool.endpointGeneration("devbox");
+  assert.equal(old.endpoint, first);
+  assert.equal(current.endpoint, second);
+  assert.equal(current.generation, old.generation + 1);
+});
+
 test("connection loss retains and coalesces cold active and provisional claims", async () => {
   let terminal = false;
   const endpoint: AppServerEndpoint = {
@@ -314,6 +372,26 @@ test("connection loss retains and coalesces cold active and provisional claims",
   await pool.reconcileEndpointClaims("devbox");
   assert.equal(pool.activeTurnCount, 0);
   await pool.reconcileEndpointClaims("devbox");
+  assert.equal(pool.activeTurnCount, 0);
+});
+
+test("a provisional claim bound during recovery stays resolved after its turn terminates", async () => {
+  let terminal = false;
+  const endpoint: AppServerEndpoint = {
+    id: "devbox", state: "ready",
+    request: async <T>() => ({ thread: {
+      status: terminal ? "idle" : "active",
+      turns: [{ id: "turn-a", status: terminal ? "completed" : "inProgress", itemsView: "full", items: [{ type: "userMessage", clientId: "message-a" }] }],
+    } }) as T,
+  };
+  const pool = new AppServerPool([endpoint], { maxConcurrentTurns: 1 });
+  pool.restoreProvisionalTurnCapacity("devbox", "thread-a", "recovered:op-a", "message-a");
+  await pool.reconcileEndpointClaims("devbox");
+  assert.equal(pool.activeTurnCount, 1);
+  terminal = true;
+  await pool.reconcileEndpointClaims("devbox");
+  assert.equal(pool.activeTurnCount, 0);
+  assert.equal(pool.restoreProvisionalTurnCapacity("devbox", "thread-a", "recovered:op-a", "message-a"), undefined);
   assert.equal(pool.activeTurnCount, 0);
 });
 
