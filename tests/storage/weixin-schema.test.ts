@@ -6,6 +6,9 @@ import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { createTestDatabase, openDatabase } from "../../src/storage/database.ts";
 import { migrations } from "../../src/storage/migrations.ts";
+
+const weixinMigrationVersion = migrations.findIndex((migration) =>
+  typeof migration === "string" && migration.includes("CREATE TABLE weixin_account_generations")) + 1;
 import { DeliveryStore } from "../../src/storage/delivery-store.ts";
 
 test("installs constrained WeChat lifecycle, inbox, route, media, and outbound tables", () => {
@@ -63,6 +66,7 @@ test("installs constrained WeChat lifecycle, inbox, route, media, and outbound t
 });
 
 test("appends the WeChat migration to completed state-version 2 and 3 databases", async (context) => {
+  assert.ok(weixinMigrationVersion > 0);
   const root = await mkdtemp(join(tmpdir(), "qiyan-weixin-migration-"));
   context.after(() => rm(root, { recursive: true, force: true }));
   for (const stateVersion of [2, 3]) {
@@ -71,6 +75,7 @@ test("appends the WeChat migration to completed state-version 2 and 3 databases"
     const old = new DatabaseSync(path);
     old.exec(`
       PRAGMA foreign_keys = OFF;
+      DROP TABLE endpoint_bindings;
       DROP TABLE delivery_attachment_releases;
       DROP TABLE weixin_outbound_steps;
       DROP TABLE weixin_inbox_attachment_refs;
@@ -81,7 +86,7 @@ test("appends the WeChat migration to completed state-version 2 and 3 databases"
       DROP TABLE weixin_sync_state;
       DROP TABLE weixin_auth_incidents;
       DROP TABLE weixin_account_generations;
-      DELETE FROM schema_migrations WHERE version >= ${migrations.length - 1};
+      DELETE FROM schema_migrations WHERE version >= ${weixinMigrationVersion};
       UPDATE qiyan_state SET state_version = ${stateVersion};
       UPDATE conversation_cutover SET phase = 'complete' WHERE singleton = 1;
     `);

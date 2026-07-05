@@ -8,6 +8,7 @@ import type { MappingIdentity, SessionRegistry } from "../registry/session-regis
 import type { EndpointManager } from "./manager.ts";
 import type { RemoteTransferClient } from "./ssh-runtime.ts";
 import type { EndpointWorkLease } from "./types.ts";
+import type { WorkspaceRouter } from "./workspace-router.ts";
 
 interface RemoteFileContext {
   remote: RemoteTransferClient;
@@ -30,6 +31,7 @@ export class WorkerFileBridge {
     attachments: AttachmentStore;
     registry: Pick<SessionRegistry, "getByIdentity">;
     endpoints: Pick<EndpointManager, "validateWorkLease" | "withWorkLease">;
+    workspaces: Pick<WorkspaceRouter, "prepareExisting" | "assertDispatchable">;
     remote(endpointId: string): RemoteFileContext | undefined;
     maxFileBytes: number;
   }) {}
@@ -73,33 +75,33 @@ export class WorkerFileBridge {
     requestedId: FileHandleId;
   }): Promise<StoredAttachment> {
     this.assertCurrent(input.mapping, input.projectRoot);
+    if (input.mapping.endpoint !== input.endpointId) throw new AppError("SESSION_DETACHED", "managed session endpoint changed");
     const existing = this.options.attachments.get(input.scopeId, input.requestedId);
     if (existing) return existing;
     if (input.endpointId === "local") {
       return this.options.endpoints.withWorkLease(input.endpointId, "file-transfer", async (_endpoint, lease) => {
         this.assertCurrent(input.mapping, input.projectRoot);
         this.assertLease(lease, input.endpointId);
-        let promoted = false;
-        try {
-          const stored = await this.options.attachments.prepareOutbound(input.scopeId, input.projectRoot, input.relativePath, undefined, undefined, input.requestedId);
-          promoted = true;
-          this.assertCurrent(input.mapping, input.projectRoot);
-          this.assertLease(lease, input.endpointId);
-          return stored;
-        } catch (error) {
-          if (promoted) await this.options.attachments.discard(input.scopeId, input.requestedId).catch(() => undefined);
-          throw error;
-        }
+        const project = await this.prepareProject(input.endpointId, input.projectRoot, lease);
+        return this.options.attachments.prepareOutbound(
+          input.scopeId, project.path, input.relativePath, undefined, undefined, input.requestedId,
+          async () => {
+            await this.options.workspaces.assertDispatchable(input.endpointId, project, lease);
+            this.assertCurrent(input.mapping, input.projectRoot);
+            this.assertLease(lease, input.endpointId);
+          },
+          project.identity,
+        );
       });
     }
-    if (input.mapping.endpoint !== input.endpointId) throw new AppError("SESSION_DETACHED", "managed session endpoint changed");
     return this.options.endpoints.withWorkLease(input.endpointId, "file-transfer", async (_endpoint, lease) => {
       this.assertCurrent(input.mapping, input.projectRoot);
       this.assertLease(lease, input.endpointId);
+      const project = await this.prepareProject(input.endpointId, input.projectRoot, lease);
       const candidate = this.projectPath(input.projectRoot, input.relativePath);
       const context = this.requireRemote(input.endpointId);
       const result = remoteFileSchema.parse(await context.remote.invokeTransfer("read-file", [JSON.stringify({
-        path: candidate, root: input.projectRoot, maxBytes: this.options.maxFileBytes,
+        path: candidate, root: project.path, rootDevice: project.identity.device, rootInode: project.identity.inode, maxBytes: this.options.maxFileBytes,
       })], { maxOutputBytes: Math.ceil(this.options.maxFileBytes * 4 / 3) + 64 * 1024 }, context.helperPath));
       if (result.size > this.options.maxFileBytes) throw new AppError("ATTACHMENT_INVALID", "remote file exceeds limit");
       const data = Buffer.from(result.dataBase64, "base64");
@@ -109,17 +111,17 @@ export class WorkerFileBridge {
       }
       this.assertCurrent(input.mapping, input.projectRoot);
       this.assertLease(lease, input.endpointId);
-      let promoted = false;
+      await this.options.workspaces.assertDispatchable(input.endpointId, project, lease);
+      const staged = await this.options.attachments.stage(input.scopeId, Readable.from([data]), {
+        displayName: basename(input.relativePath), mediaType: "application/octet-stream", declaredSize: result.size,
+      }, input.requestedId);
       try {
-        const stored = await this.options.attachments.ingest(input.scopeId, Readable.from([data]), {
-          displayName: basename(input.relativePath), mediaType: "application/octet-stream", declaredSize: result.size,
-        }, input.requestedId);
-        promoted = true;
+        await this.options.workspaces.assertDispatchable(input.endpointId, project, lease);
         this.assertCurrent(input.mapping, input.projectRoot);
         this.assertLease(lease, input.endpointId);
-        return stored;
+        return await staged.promote();
       } catch (error) {
-        if (promoted) await this.options.attachments.discard(input.scopeId, input.requestedId).catch(() => undefined);
+        await staged.discard();
         throw error;
       }
     });
@@ -148,5 +150,12 @@ export class WorkerFileBridge {
     const projected = posix.relative(root, candidate);
     if (projected === ".." || projected.startsWith("../") || posix.isAbsolute(projected)) throw new AppError("ATTACHMENT_INVALID", "outbound path escapes the project root");
     return candidate;
+  }
+
+  private async prepareProject(endpointId: string, projectRoot: string, lease: EndpointWorkLease) {
+    const project = await this.options.workspaces.prepareExisting(endpointId, projectRoot, lease);
+    if (project.path !== projectRoot) throw new AppError("CWD_MISMATCH", "managed project directory changed during file transfer");
+    await this.options.workspaces.assertDispatchable(endpointId, project, lease);
+    return project;
   }
 }

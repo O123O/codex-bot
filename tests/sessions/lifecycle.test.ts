@@ -167,6 +167,18 @@ test("an uncertain resume remains adopting and startup reconciliation promotes o
   assert.deepEqual(endpoint.calls[1]?.params, { threadId: "thread-1" });
 });
 
+test("startup reconciliation can isolate one unavailable transitional mapping", async () => {
+  const { dir, registry, endpoint, runtime, lifecycle } = await fixture();
+  const adopting = { endpoint: "local", thread_id: "thread-1", project_dir: dir, mapping_id: "mapping-offline", lifecycle_state: "adopting" as const };
+  await registry.reserve("offline", adopting);
+  runtime.setSession("local", "thread-1", adopting.mapping_id, "adopting", "notLoaded");
+  endpoint.failResume = true;
+  const failures: string[] = [];
+  await lifecycle.reconcileAdopting({ onError: (nickname) => { failures.push(nickname); } });
+  assert.deepEqual(failures, ["offline"]);
+  assert.equal(registry.get("offline")?.lifecycle_state, "adopting");
+});
+
 test("startup reconstructs a missing runtime row for an exact managed generation", async () => {
   const { dir, registry, endpoint, runtime, lifecycle } = await fixture();
   const managed = { endpoint: "local", thread_id: "thread-1", project_dir: dir, mapping_id: "mapping-durable" };

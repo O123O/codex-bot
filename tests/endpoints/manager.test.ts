@@ -11,16 +11,19 @@ class FakeEndpoint implements ManagedAppServerEndpoint {
   connectionCloses = 0;
   runtimeStops = 0;
   failStart = false;
+  identityAvailable = true;
+  identityToken = "a".repeat(32);
   threadStatus: "idle" | "active" | "systemError" = "idle";
   private readonly events = new EventEmitter();
   constructor(readonly id: string) {}
   async start() { this.starts += 1; if (this.failStart) throw new Error("offline"); this.state = "ready"; this.events.emit("ready"); }
   async closeConnection() { this.connectionCloses += 1; this.state = "stopped"; }
   async shutdownRuntime() { this.runtimeStops += 1; this.state = "stopped"; }
-  async runtimeIdentity(): Promise<RuntimeIdentity> {
+  async runtimeIdentity(): Promise<RuntimeIdentity | undefined> {
+    if (!this.identityAvailable) return undefined;
     return this.id === "local"
       ? { kind: "local", pid: 10, startTime: "20" }
-      : { kind: "ssh", token: "a".repeat(32), pid: 10, linuxStartTime: "20", processGroupId: 10 };
+      : { kind: "ssh", token: this.identityToken, pid: 10, linuxStartTime: "20", processGroupId: 10 };
   }
   async request<T>(method: string): Promise<T> {
     if (method === "thread/read") return { thread: { status: { type: this.threadStatus }, turns: [] } } as T;
@@ -87,6 +90,28 @@ test("startup activation isolates an unavailable referenced endpoint", async () 
   assert.equal(value.manager.endpointGeneration("healthy").endpoint.state, "ready");
 });
 
+test("an unavailable referenced endpoint keeps retrying without blocking startup", async () => {
+  const local = new FakeEndpoint("local");
+  const remote = new FakeEndpoint("offline");
+  remote.failStart = true;
+  const scheduled: Array<() => void> = [];
+  const manager = new EndpointManager({
+    localEndpoint: local,
+    catalog: { reload: async () => undefined, require: () => ({ id: "offline", type: "ssh" as const, projectsRoot: "~/qiyan-projects" }) },
+    createRemote: async () => ({ endpoint: remote }),
+    hasIdentityReferences: () => true,
+    managedThreadIds: () => [],
+    schedule: (_delay, run) => { scheduled.push(run); return { cancel: () => undefined }; },
+  });
+  assert.deepEqual(await manager.activateReferenced(["offline"]), { unavailable: ["offline"] });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(scheduled.length, 1);
+  remote.failStart = false;
+  scheduled.shift()!();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(manager.endpointGeneration("offline").endpoint.state, "ready");
+});
+
 test("disconnect drains admitted work, rejects new work, proves idle, and stops only that runtime", async () => {
   const value = fixture();
   await value.manager.ensureReady("devbox");
@@ -118,6 +143,65 @@ test("concurrent disconnects serialize and stop one exact runtime generation", a
   ]);
   assert.equal(value.remotes.get("devbox")!.runtimeStops, 1);
   assert.deepEqual(checkpoints.map((item) => (item as { phase: string }).phase), ["draining", "idle_proven", "runtime_stopped"]);
+});
+
+test("disconnect stops an attested unavailable orphan without requiring a ready connection", async () => {
+  const value = fixture();
+  const orphan = await value.manager.ensureReady("orphan") as FakeEndpoint;
+  orphan.state = "unavailable";
+  await value.manager.disconnect("orphan");
+  assert.equal(orphan.starts, 1);
+  assert.equal(orphan.runtimeStops, 1);
+  assert.equal(value.manager.desiredState("orphan"), "disconnected");
+});
+
+test("shutdown fences a reconnect whose identity-reference check resolves late", async () => {
+  const local = new FakeEndpoint("local");
+  const remote = new FakeEndpoint("devbox");
+  let resolveReferences!: (value: boolean) => void;
+  const references = new Promise<boolean>((resolve) => { resolveReferences = resolve; });
+  let referenceChecks = 0;
+  const scheduled: Array<() => void> = [];
+  const manager = new EndpointManager({
+    localEndpoint: local,
+    catalog: { reload: async () => undefined, require: () => ({ id: "devbox", type: "ssh" as const, projectsRoot: "~/qiyan-projects" }) },
+    createRemote: async () => ({ endpoint: remote }),
+    hasIdentityReferences: () => referenceChecks++ === 0 ? true : references,
+    managedThreadIds: () => [],
+    schedule: (_delay, run) => { scheduled.push(run); return { cancel: () => undefined }; },
+  });
+  await manager.ensureReady("devbox");
+  remote.fail();
+  await manager.closeConnections();
+  resolveReferences(true);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(scheduled, []);
+  assert.equal(remote.starts, 1);
+});
+
+test("disconnect recovery confirms an already-absent exact runtime without starting a replacement", async () => {
+  const value = fixture();
+  const remote = new FakeEndpoint("orphan");
+  remote.identityAvailable = false;
+  value.remotes.set("orphan", remote);
+  await value.manager.recoverDisconnect("orphan", { kind: "ssh", token: "a".repeat(32), pid: 10, linuxStartTime: "20", processGroupId: 10 });
+  assert.equal(remote.starts, 0);
+  assert.equal(remote.runtimeStops, 0);
+  assert.equal(value.manager.desiredState("orphan"), "disconnected");
+});
+
+test("restart recovery accepts the checkpointed replacement without restarting it again", async () => {
+  const value = fixture();
+  const remote = await value.manager.ensureReady("devbox") as FakeEndpoint;
+  const identity = await remote.runtimeIdentity();
+  assert.ok(identity);
+  await value.manager.recoverRestart("devbox", "runtime_started", identity);
+  assert.equal(remote.starts, 1);
+  assert.equal(remote.runtimeStops, 0);
+
+  remote.identityToken = "b".repeat(32);
+  await assert.rejects(value.manager.recoverRestart("devbox", "runtime_started", identity), /identity changed/u);
+  assert.equal(remote.runtimeStops, 0);
 });
 
 test("restart prepares the replacement before stopping the current runtime", async () => {

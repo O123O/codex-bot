@@ -23,6 +23,7 @@ test("packed qiyan-bot runs without source files or installed dependencies", asy
     "package/README.md",
     "package/assets/assistant/AGENTS.md",
     "package/assets/assistant/session-status.example.json",
+    "package/assets/endpoints.example.jsonc",
     "package/assets/slack/manifest.yaml",
     "package/docs/chat-apps/wechat.md",
     "package/docs/ssh-workers.md",

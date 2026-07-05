@@ -50,8 +50,12 @@ test("Docker SSH endpoint reconnects to the same detached App Server incarnation
     const uploaded = await remote.invokeTransfer<{ path: string }>("write-file", [JSON.stringify({
       runtimeDir: runtime.remoteRuntimeDir, size: transferBytes.byteLength, sha256: transferSha,
     })], { input: Readable.from([transferBytes]), maxOutputBytes: 64 * 1024 }, runtime.remoteHelperPath);
+    const rootIdentity = await remote.invoke<{ device: string; inode: string }>("workspace", [JSON.stringify({
+      action: "lstat", path: runtime.remoteRuntimeDir,
+    })], runtime.remoteHelperPath);
     const downloaded = await remote.invokeTransfer<{ dataBase64: string; sha256: string }>("read-file", [JSON.stringify({
-      path: uploaded.path, root: runtime.remoteRuntimeDir, maxBytes: 1024,
+      path: uploaded.path, root: runtime.remoteRuntimeDir,
+      rootDevice: rootIdentity.device, rootInode: rootIdentity.inode, maxBytes: 1024,
     })], { maxOutputBytes: 64 * 1024 }, runtime.remoteHelperPath);
     assert.equal(Buffer.from(downloaded.dataBase64, "base64").toString(), "ssh-file-bridge");
     assert.equal(downloaded.sha256, transferSha);

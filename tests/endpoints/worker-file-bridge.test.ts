@@ -29,10 +29,22 @@ function fixture() {
       ingested.push({ scopeId, data, ...(requestedId ? { requestedId } : {}) });
       return { id: requestedId ?? "file_generated", displayName: "report.txt", mediaType: "application/octet-stream", size: data.length, sha256: createHash("sha256").update(data).digest("hex") };
     },
+    stage: async (scopeId: string, stream: AsyncIterable<Uint8Array | string>, meta: unknown, requestedId?: FileHandleId) => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of stream) chunks.push(Buffer.from(chunk));
+      const data = Buffer.concat(chunks);
+      return {
+        attachment: { id: requestedId ?? "file_generated", displayName: "report.txt", mediaType: "application/octet-stream", size: data.length, sha256: createHash("sha256").update(data).digest("hex") },
+        promote: () => attachments.ingest(scopeId, Readable.from([data]), meta, requestedId),
+        discard: async () => undefined,
+      };
+    },
     discard: async (_scopeId: string, id: FileHandleId) => { discarded.push(id); },
   };
   let corruptDownload = false;
   let mutateAfterRead = false;
+  let rejectWorkspace = false;
+  let remoteReads = 0;
   const remote = {
     invokeTransfer: async <T>(operation: string, _args: readonly string[], options: { input?: AsyncIterable<Uint8Array | string> }) => {
       if (operation === "write-file") {
@@ -40,6 +52,7 @@ function fixture() {
         return { path: `/tmp/qiyan-1000/0123456789abcdef01234567/files/${sha256}`, size: bytes.length, sha256 } as T;
       }
       if (operation === "read-file") {
+        remoteReads += 1;
         if (mutateAfterRead) current = { ...current, mapping_id: "mapping-2" };
         return {
           device: "1", inode: "2", size: bytes.length, mtimeNs: "3",
@@ -57,10 +70,23 @@ function fixture() {
       validateWorkLease: (candidate: EndpointWorkLease, endpointId: string) => candidate === lease && endpointId === "devbox",
       withWorkLease: async (_id: string, _kind: "file-transfer", run: (endpoint: unknown, value: EndpointWorkLease) => Promise<unknown>) => run({}, lease),
     } as never,
+    workspaces: {
+      prepareExisting: async () => {
+        if (rejectWorkspace) throw new Error("project workspace changed unexpectedly");
+        return { path: "/home/xin/project", created: false, fallback: false, identity: { device: "1", inode: "2" } };
+      },
+      assertDispatchable: async () => { if (rejectWorkspace) throw new Error("project workspace changed unexpectedly"); },
+    } as never,
     remote: () => ({ remote, helperPath: "/tmp/qiyan-1000/0123456789abcdef01234567/qiyan-ssh-helper.mjs", runtimeDir: "/tmp/qiyan-1000/0123456789abcdef01234567" }),
     maxFileBytes: 1024,
   });
-  return { bridge, uploaded, ingested, discarded, corrupt: () => { corruptDownload = true; }, mutateAfterRead: () => { mutateAfterRead = true; } };
+  return {
+    bridge, uploaded, ingested, discarded,
+    corrupt: () => { corruptDownload = true; },
+    mutateAfterRead: () => { mutateAfterRead = true; },
+    replaceWorkspace: () => { rejectWorkspace = true; },
+    remoteReads: () => remoteReads,
+  };
 }
 
 test("uploads only the selected attachment under the caller's endpoint lease", async () => {
@@ -97,4 +123,14 @@ test("rejects corrupt remote downloads without promoting attachment state", asyn
   }), /digest/u);
   assert.equal(value.ingested.length, 0);
   assert.deepEqual(value.discarded, []);
+});
+
+test("rejects a replaced project root before opening a remote file", async () => {
+  const value = fixture();
+  value.replaceWorkspace();
+  await assert.rejects(value.bridge.prepareProjectFile({
+    endpointId: "devbox", projectRoot: "/home/xin/project", mapping,
+    scopeId: "scope", relativePath: "report.txt", requestedId: "file_replaced",
+  }), /workspace changed/u);
+  assert.equal(value.remoteReads(), 0);
 });

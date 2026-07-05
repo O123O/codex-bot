@@ -163,10 +163,12 @@ export class SessionLifecycle {
     });
   }
 
-  async reconcileAdopting(): Promise<void> {
-    const entries = Object.entries(this.registry.snapshot().sessions).filter(([, session]) => session.lifecycle_state === "adopting");
+  async reconcileAdopting(options: { endpointId?: string; nickname?: string; onError?(nickname: string, session: RegistrySession, error: unknown): void | Promise<void> } = {}): Promise<void> {
+    const entries = Object.entries(this.registry.snapshot().sessions).filter(([nickname, session]) => session.lifecycle_state === "adopting"
+      && (options.endpointId === undefined || session.endpoint === options.endpointId)
+      && (options.nickname === undefined || nickname === options.nickname));
     for (const [nickname, expected] of entries) {
-      await this.withMutationLease(expected.endpoint, (lease) => this.gate.run(expected.endpoint, expected.thread_id, async () => {
+      try { await this.withMutationLease(expected.endpoint, (lease) => this.gate.run(expected.endpoint, expected.thread_id, async () => {
         const session = this.assertExact(nickname, expected, "adopting");
         const project = await this.prepareExisting(session.endpoint, session.project_dir, lease);
         let resumed = false;
@@ -202,7 +204,10 @@ export class SessionLifecycle {
           }
           throw error;
         }
-      }));
+      })); } catch (error) {
+        if (!options.onError) throw error;
+        await options.onError(nickname, expected, error);
+      }
     }
   }
 
@@ -229,10 +234,18 @@ export class SessionLifecycle {
     }));
   }
 
-  async reconcileRemovals(): Promise<void> {
+  async reconcileRemovals(options: { endpointId?: string; nickname?: string; onError?(nickname: string, session: RegistrySession, error: unknown): void | Promise<void> } = {}): Promise<void> {
     const entries = Object.entries(this.registry.snapshot().sessions)
-      .filter(([, session]) => session.lifecycle_state === "unadopting" || session.lifecycle_state === "archiving");
-    for (const [nickname, session] of entries) await this.reconcileRemoval(nickname, session);
+      .filter(([nickname, session]) => (session.lifecycle_state === "unadopting" || session.lifecycle_state === "archiving")
+        && (options.endpointId === undefined || session.endpoint === options.endpointId)
+        && (options.nickname === undefined || nickname === options.nickname));
+    for (const [nickname, session] of entries) {
+      try { await this.reconcileRemoval(nickname, session); }
+      catch (error) {
+        if (!options.onError) throw error;
+        await options.onError(nickname, session, error);
+      }
+    }
   }
 
   async reconcileRemoval(nickname: string, expected: RegistrySession): Promise<void> {

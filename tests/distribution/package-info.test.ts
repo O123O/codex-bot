@@ -55,6 +55,7 @@ test("release package contract includes chat assets and bundles SDK dependencies
     devDependencies: Record<string, string>;
   };
   assert.ok(manifest.files.includes("assets/slack/manifest.yaml"));
+  assert.ok(manifest.files.includes("assets/endpoints.example.jsonc"));
   assert.ok(manifest.files.includes("docs/chat-apps/wechat.md"));
   assert.ok(manifest.files.includes("dist/qiyan-bot"));
   assert.deepEqual(manifest.dependencies ?? {}, {});

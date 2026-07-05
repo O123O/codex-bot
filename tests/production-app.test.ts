@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createChatHistoryAction, isUncertainAssistantTransportFailure, registryReloadPreservesWorkerMappings, removalRecoveryDecision } from "../src/production-app.ts";
+import { createChatHistoryAction, isUncertainAssistantTransportFailure, parseEndpointLifecycleCheckpoint, registryReloadPreservesWorkerMappings, removalRecoveryDecision } from "../src/production-app.ts";
 import { AppError } from "../src/core/errors.ts";
 import { ChatAdapterRegistry } from "../src/chat/adapter-registry.ts";
 
@@ -8,6 +8,14 @@ test("assistant uncertainty is preserved even while the endpoint still reports r
   assert.equal(isUncertainAssistantTransportFailure(new AppError("OPERATION_UNCERTAIN", "shutdown"), "ready"), true);
   assert.equal(isUncertainAssistantTransportFailure(new Error("ordinary failure"), "ready"), false);
   assert.equal(isUncertainAssistantTransportFailure(new Error("transport failed"), "unavailable"), true);
+});
+
+test("endpoint lifecycle recovery checkpoints require an exact phase and runtime identity", () => {
+  const checkpoint = { endpoint: "devbox", phase: "runtime_started", identity: { kind: "ssh", token: "a".repeat(32), pid: 10, linuxStartTime: "20", processGroupId: 10 } };
+  assert.deepEqual(parseEndpointLifecycleCheckpoint(checkpoint), checkpoint);
+  assert.equal(parseEndpointLifecycleCheckpoint({ ...checkpoint, extra: true }), undefined);
+  assert.equal(parseEndpointLifecycleCheckpoint({ ...checkpoint, phase: "unknown" }), undefined);
+  assert.equal(parseEndpointLifecycleCheckpoint({ ...checkpoint, identity: { ...checkpoint.identity, token: "bad" } }), undefined);
 });
 
 test("removal recovery follows the checkpointed mapping generation across crash windows and nickname reuse", () => {

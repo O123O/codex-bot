@@ -9,6 +9,7 @@
     "dist/qiyan-bot",
     "assets/assistant/AGENTS.md",
     "assets/assistant/session-status.example.json",
+    "assets/endpoints.example.jsonc",
     "assets/remote/qiyan-app-server-launcher.sh",
     "assets/remote/qiyan-ssh-helper.mjs",
     "assets/slack/manifest.yaml",

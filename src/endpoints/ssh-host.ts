@@ -1,4 +1,6 @@
-import { chmod, lstat, mkdir, realpath } from "node:fs/promises";
+import { constants } from "node:fs";
+import { chmod, lstat, mkdir, open, realpath } from "node:fs/promises";
+import { resolve } from "node:path/posix";
 import { z } from "zod";
 import { AppError } from "../core/errors.ts";
 import type { RemoteRuntimeClient } from "./ssh-runtime.ts";
@@ -30,7 +32,7 @@ export class LocalWorkspaceHost implements WorkspaceHost {
     return { kind, device: state.dev.toString(10), inode: state.ino.toString(10) };
   }
   realpath(path: string): Promise<string> { return realpath(path); }
-  mkdir(path: string, options: { recursive: boolean; mode: number }): Promise<void> { return mkdir(path, options).then(() => undefined); }
+  mkdir(path: string, options: { recursive: boolean; mode: number }): Promise<void> { return mkdirAbsoluteNoFollow(path, options); }
   chmod(path: string, mode: number): Promise<void> { return chmod(path, mode); }
 }
 
@@ -74,3 +76,27 @@ export class SshHost implements WorkspaceHost {
 }
 
 function isErrno(error: unknown, code: string): error is NodeJS.ErrnoException { return error instanceof Error && "code" in error && error.code === code; }
+
+async function mkdirAbsoluteNoFollow(path: string, options: { recursive: boolean; mode: number }): Promise<void> {
+  const normalized = resolve(path);
+  if (normalized !== path || options.mode !== 0o700) throw new Error("invalid workspace mkdir request");
+  const components = normalized.split("/").filter(Boolean);
+  let parent = await open("/", constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+  try {
+    if (components.length === 0 && !options.recursive) throw Object.assign(new Error("workspace exists"), { code: "EEXIST" });
+    for (let index = 0; index < components.length; index += 1) {
+      const childPath = `/proc/self/fd/${parent.fd}/${components[index]}`;
+      const last = index === components.length - 1;
+      let exists = true;
+      try { await lstat(childPath); } catch (error) { if (isErrno(error, "ENOENT")) exists = false; else throw error; }
+      if (exists && last && !options.recursive) throw Object.assign(new Error("workspace exists"), { code: "EEXIST" });
+      if (!exists) {
+        if (!options.recursive && !last) throw Object.assign(new Error("workspace parent is missing"), { code: "ENOENT" });
+        await mkdir(childPath, { mode: options.mode });
+      }
+      const child = await open(childPath, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+      await parent.close();
+      parent = child;
+    }
+  } finally { await parent.close().catch(() => undefined); }
+}

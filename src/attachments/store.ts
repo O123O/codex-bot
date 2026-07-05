@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
-import { mkdir, open, realpath, unlink, type FileHandle } from "node:fs/promises";
+import { mkdir, open, realpath, rename, unlink, type FileHandle } from "node:fs/promises";
 import { basename, isAbsolute, relative, resolve } from "node:path";
 import { Readable } from "node:stream";
 import type { Clock } from "../core/clock.ts";
@@ -17,6 +17,12 @@ export interface StoredAttachment {
   mediaType: string;
   size: number;
   sha256: string;
+}
+
+export interface StagedAttachment {
+  readonly attachment: StoredAttachment;
+  promote(): Promise<StoredAttachment>;
+  discard(): Promise<void>;
 }
 
 interface IngestMeta { displayName: string; mediaType: string; declaredSize?: number }
@@ -44,15 +50,24 @@ export class AttachmentStore {
   async initialize(): Promise<void> { await mkdir(this.root, { recursive: true, mode: 0o700 }); }
 
   async ingest(scopeId: string, stream: AsyncIterable<Uint8Array | string>, meta: IngestMeta, requestedId?: FileHandleId): Promise<StoredAttachment> {
+    const staged = await this.stage(scopeId, stream, meta, requestedId);
+    try { return await staged.promote(); }
+    catch (error) { await staged.discard(); throw error; }
+  }
+
+  async stage(scopeId: string, stream: AsyncIterable<Uint8Array | string>, meta: IngestMeta, requestedId?: FileHandleId): Promise<StagedAttachment> {
     if (meta.declaredSize !== undefined && meta.declaredSize > this.options.maxFileBytes) this.invalid("declared attachment size exceeds limit");
     const id = requestedId ?? `file_${crypto.randomUUID()}` as FileHandleId;
     const path = resolve(this.root, id);
     if (requestedId) {
       const existing = this.get(scopeId, requestedId);
-      if (existing) return existing;
+      if (existing) return { attachment: existing, promote: async () => existing, discard: async () => undefined };
+      const conflicting = this.db.prepare("SELECT 1 FROM attachments WHERE id = ?").get(id);
+      if (conflicting) this.invalid("attachment handle belongs to another scope");
       await unlink(path).catch((error: NodeJS.ErrnoException) => { if (error.code !== "ENOENT") throw error; });
     }
-    const file = await open(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600);
+    const temporary = resolve(this.root, `.${id}.${crypto.randomUUID()}.tmp`);
+    const file = await open(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
     const hash = createHash("sha256");
     let size = 0;
     try {
@@ -67,25 +82,42 @@ export class AttachmentStore {
       await file.sync();
     } catch (error) {
       await file.close().catch(() => undefined);
-      await unlink(path).catch(() => undefined);
+      await unlink(temporary).catch(() => undefined);
       throw error;
     }
     await file.close();
     const displayName = this.sanitizeName(meta.displayName);
     const sha256 = hash.digest("hex");
-    try {
-      const inserted = this.db.prepare(`INSERT INTO attachments
-        (id, scope_id, display_name, media_type, local_path, size, sha256, ref_count, expires_at, created_at)
-        SELECT ?, ?, ?, ?, ?, ?, ?, 0, ?, ?
-        WHERE (SELECT COALESCE(SUM(size), 0) FROM attachments) + ? <= ?`)
-        .run(id, scopeId, displayName, meta.mediaType || "application/octet-stream", path, size, sha256,
-          this.clock.now() + this.ttlMs, this.clock.now(), size, this.options.maxStoreBytes).changes;
-      if (inserted !== 1) this.invalid("attachment store quota exceeded");
-    } catch (error) {
-      await unlink(path).catch(() => undefined);
-      throw error;
-    }
-    return { id, displayName, mediaType: meta.mediaType || "application/octet-stream", size, sha256 };
+    const attachment = { id, displayName, mediaType: meta.mediaType || "application/octet-stream", size, sha256 };
+    let state: "staged" | "promoted" | "discarded" = "staged";
+    return {
+      attachment,
+      promote: async () => {
+        if (state === "promoted") return attachment;
+        if (state === "discarded") this.invalid("staged attachment was discarded");
+        try {
+          await rename(temporary, path);
+          const inserted = this.db.prepare(`INSERT INTO attachments
+            (id, scope_id, display_name, media_type, local_path, size, sha256, ref_count, expires_at, created_at)
+            SELECT ?, ?, ?, ?, ?, ?, ?, 0, ?, ?
+            WHERE (SELECT COALESCE(SUM(size), 0) FROM attachments) + ? <= ?`)
+            .run(id, scopeId, displayName, attachment.mediaType, path, size, sha256,
+              this.clock.now() + this.ttlMs, this.clock.now(), size, this.options.maxStoreBytes).changes;
+          if (inserted !== 1) this.invalid("attachment store quota exceeded");
+          state = "promoted";
+          return attachment;
+        } catch (error) {
+          await unlink(path).catch(() => undefined);
+          state = "discarded";
+          throw error;
+        }
+      },
+      discard: async () => {
+        if (state !== "staged") return;
+        state = "discarded";
+        await unlink(temporary).catch(() => undefined);
+      },
+    };
   }
 
   get(scopeId: string, id: FileHandleId): StoredAttachment | undefined {
@@ -269,28 +301,58 @@ export class AttachmentStore {
     return removed;
   }
 
-  async prepareOutbound(scopeId: string, ownerRoot: string, relativePath: string, displayName = basename(relativePath), mediaType = "application/octet-stream", requestedId?: FileHandleId): Promise<StoredAttachment> {
+  async prepareOutbound(
+    scopeId: string,
+    ownerRoot: string,
+    relativePath: string,
+    displayName = basename(relativePath),
+    mediaType = "application/octet-stream",
+    requestedId?: FileHandleId,
+    beforePromote?: () => void | Promise<void>,
+    expectedRootIdentity?: { device: string; inode: string },
+  ): Promise<StoredAttachment> {
     if (process.platform !== "linux") this.invalid("race-safe outbound attachments require Linux");
     if (isAbsolute(relativePath) || relativePath.split(/[\\/]+/u).includes("..")) this.invalid("outbound path must remain below the project root");
-    const canonicalRoot = await realpath(ownerRoot);
-    const candidate = resolve(canonicalRoot, relativePath);
-    if (!this.isWithin(canonicalRoot, candidate)) this.invalid("outbound path escapes the project root");
     if (requestedId) {
       const existing = this.get(scopeId, requestedId);
       if (existing) return existing;
     }
+    let root: FileHandle;
+    try { root = await open(ownerRoot, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW); }
+    catch { return this.invalid("outbound project root must be a non-symlink directory"); }
+    const rootState = await root.stat({ bigint: true });
+    const canonicalRoot = await realpath(`/proc/self/fd/${root.fd}`);
+    if (!rootState.isDirectory() || canonicalRoot !== resolve(ownerRoot)
+      || (expectedRootIdentity && (rootState.dev.toString(10) !== expectedRootIdentity.device || rootState.ino.toString(10) !== expectedRootIdentity.inode))) {
+      await root.close().catch(() => undefined);
+      return this.invalid("outbound project root changed unexpectedly");
+    }
+    const candidate = resolve(canonicalRoot, relativePath);
+    if (!this.isWithin(canonicalRoot, candidate)) {
+      await root.close().catch(() => undefined);
+      this.invalid("outbound path escapes the project root");
+    }
     let source: FileHandle;
-    try { source = await open(candidate, constants.O_RDONLY | constants.O_NOFOLLOW); }
-    catch { return this.invalid("outbound path must be a non-symlink file"); }
+    try { source = await open(`/proc/self/fd/${root.fd}/${relativePath}`, constants.O_RDONLY | constants.O_NOFOLLOW); }
+    catch { await root.close().catch(() => undefined); return this.invalid("outbound path must be a non-symlink file"); }
     try {
+      if (await realpath(`/proc/self/fd/${root.fd}`) !== canonicalRoot) this.invalid("outbound project root changed unexpectedly");
       const stat = await source.stat();
       if (!stat.isFile()) this.invalid("outbound path is not a regular file");
       if (stat.size > this.options.maxFileBytes) this.invalid("outbound file exceeds limit");
       const actual = await realpath(`/proc/self/fd/${source.fd}`);
       if (!this.isWithin(canonicalRoot, actual)) this.invalid("opened file escapes the project root");
-      return await this.ingest(scopeId, source.createReadStream({ autoClose: false }), { displayName, mediaType, declaredSize: stat.size }, requestedId);
+      const staged = await this.stage(scopeId, source.createReadStream({ autoClose: false }), { displayName, mediaType, declaredSize: stat.size }, requestedId);
+      try {
+        await beforePromote?.();
+        return await staged.promote();
+      } catch (error) {
+        await staged.discard();
+        throw error;
+      }
     } finally {
       await source.close().catch(() => undefined);
+      await root.close().catch(() => undefined);
     }
   }
 

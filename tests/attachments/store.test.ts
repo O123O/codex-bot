@@ -40,6 +40,25 @@ test("streams bytes into randomized mode-0600 files and ignores false size metad
   );
 });
 
+test("staged bytes remain invisible until an explicit final promotion fence", async () => {
+  const { store } = await fixture();
+  const pending = await store.stage("ctx", Readable.from(["pending"]), {
+    displayName: "pending.txt", mediaType: "text/plain", declaredSize: 7,
+  }, "file_pending");
+  assert.equal(store.get("ctx", "file_pending"), undefined);
+  await assert.rejects(readFile(store.pathForTesting("file_pending")));
+  const promoted = await pending.promote();
+  assert.equal(promoted.id, "file_pending");
+  assert.equal(await readFile(store.pathForTesting("file_pending"), "utf8"), "pending");
+
+  const discarded = await store.stage("ctx", Readable.from(["discard"]), {
+    displayName: "discard.txt", mediaType: "text/plain",
+  }, "file_discard");
+  await discarded.discard();
+  assert.equal(store.get("ctx", "file_discard"), undefined);
+  await assert.rejects(readFile(store.pathForTesting("file_discard")));
+});
+
 test("enforces per-message and total quotas before retaining partial files", async () => {
   const { store } = await fixture({ maxFileBytes: 10, maxStoreBytes: 7 });
   await store.ingest("one", Readable.from([Buffer.alloc(5)]), { displayName: "one", mediaType: "x" });

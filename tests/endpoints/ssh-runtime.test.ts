@@ -16,7 +16,7 @@ class FakeRemote implements RemoteRuntimeClient {
   async invoke<T>(operation: string, args: readonly string[]): Promise<T> {
     this.calls.push({ operation, args: [...args] });
     if (operation === "preflight") return { uid: 1000, home: "/home/test", shell: "/bin/bash", codexPath: "/usr/bin/codex", tmuxPath: "/usr/bin/tmux" } as T;
-    if (operation === "inspect") return { status: this.status, ...(this.status === "healthy" ? { identity: this.identity } : {}) } as T;
+    if (operation === "inspect") return { status: this.status, ...(this.status === "healthy" || this.status === "unhealthy" ? { identity: this.identity } : {}) } as T;
     if (operation === "start") { this.status = "healthy"; return { identity: this.identity } as T; }
     if (operation === "stop") { this.status = "absent"; return { stopped: true } as T; }
     throw new Error(`unexpected operation ${operation}`);
@@ -57,6 +57,7 @@ test("starts and stops only its endpoint runtime and refuses unhealthy replaceme
   assert.equal(remote.calls.filter((call) => call.operation === "stop").length, 1);
 
   remote.status = "unhealthy";
+  assert.deepEqual(await runtime.runtimeIdentity(), remote.identity);
   await assert.rejects(runtime.ensureStarted(), /unhealthy/u);
   assert.equal(remote.calls.filter((call) => call.operation === "stop").length, 1);
 });

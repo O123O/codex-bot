@@ -1,5 +1,5 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { chmod, mkdir, readFile, realpath } from "node:fs/promises";
+import { chmod, mkdir, readFile } from "node:fs/promises";
 import { dirname, join, posix, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
@@ -72,7 +72,7 @@ import { openSshUnixTunnel, SshEndpoint } from "./endpoints/ssh-endpoint.ts";
 import { WebSocketWire } from "./app-server/websocket-wire.ts";
 import { SshHost } from "./endpoints/ssh-host.ts";
 import { WorkspaceRouter } from "./endpoints/workspace-router.ts";
-import type { EndpointLossKind, ManagedAppServerEndpoint } from "./endpoints/types.ts";
+import { parseRuntimeIdentity, type EndpointLossKind, type ManagedAppServerEndpoint, type RuntimeIdentity } from "./endpoints/types.ts";
 import { WorkerFileBridge } from "./endpoints/worker-file-bridge.ts";
 import { EndpointCapacityRecovery, recoverableCapacityHint } from "./endpoints/capacity-recovery.ts";
 
@@ -109,6 +109,16 @@ export function removalRecoveryDecision(
 
 export function registryReloadPreservesWorkerMappings(current: RegistryDocument, candidate: RegistryDocument): boolean {
   return isDeepStrictEqual(current.sessions, candidate.sessions);
+}
+
+export function parseEndpointLifecycleCheckpoint(value: unknown): { endpoint: string; phase: "draining" | "idle_proven" | "runtime_stopped" | "runtime_started"; identity: RuntimeIdentity } | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const item = value as Record<string, unknown>;
+  if (Object.keys(item).some((key) => !new Set(["endpoint", "phase", "identity"]).has(key))) return undefined;
+  if (typeof item.endpoint !== "string" || !new Set(["draining", "idle_proven", "runtime_stopped", "runtime_started"]).has(String(item.phase))) return undefined;
+  try {
+    return { endpoint: item.endpoint, phase: item.phase as "draining" | "idle_proven" | "runtime_stopped" | "runtime_started", identity: parseRuntimeIdentity(item.identity) };
+  } catch { return undefined; }
 }
 
 export async function buildProductionApp(
@@ -173,7 +183,9 @@ export async function buildProductionApp(
   const unsubscribers: Array<() => void> = [];
   const projectEndpointSubscriptions = new Map<string, Array<() => void>>();
   const projectEndpointRecoveries = new Map<string, Promise<void>>();
-  const remoteContexts = new Map<string, { runtime: SshRuntime; remote: SshRemoteClient; projectsRoot: string }>();
+  type RemoteContext = { runtime: SshRuntime; remote: SshRemoteClient; projectsRoot: string };
+  const remoteContexts = new Map<string, RemoteContext>();
+  const remoteCandidateContexts = new WeakMap<ManagedAppServerEndpoint, RemoteContext>();
   const reconnectTimers = new Map<string, ReturnType<typeof setTimeout>>();
   const reconnectAttempts = new Map<string, number>();
   const terminalProcessing = new Map<string, Promise<void>>();
@@ -427,7 +439,7 @@ export async function buildProductionApp(
               openTunnel: (remoteSocketPath) => openSshUnixTunnel({ plan: generation.plan, localSocketPath: localSocket, remoteSocketPath }),
               connectWire: () => WebSocketWire.connect(localSocket, { timeoutMs: 10_000, trustedRoot: socketRoot }),
             });
-            remoteContexts.set(definition.id, { runtime: remoteRuntime, remote, projectsRoot: definition.projectsRoot });
+            remoteCandidateContexts.set(remoteEndpoint, { runtime: remoteRuntime, remote, projectsRoot: definition.projectsRoot });
             return { endpoint: remoteEndpoint, pendingBinding: generation.pendingBinding };
           },
           hasIdentityReferences: (id) => hasEndpointIdentityReferences(id),
@@ -467,6 +479,7 @@ export async function buildProductionApp(
           attachments,
           registry,
           endpoints: endpointManager,
+          workspaces: workspaceRouter,
           remote: (id) => {
             const context = remoteContexts.get(id);
             return context ? { remote: context.remote, helperPath: context.runtime.remoteHelperPath, runtimeDir: context.runtime.remoteRuntimeDir } : undefined;
@@ -590,12 +603,17 @@ export async function buildProductionApp(
           ...Object.values(registry.snapshot().sessions).map((session) => session.endpoint),
           ...recoveredEndpointIds,
         ])].filter((id) => id !== "local" && id !== assistantEndpoint.id);
-        await endpointManager.activateReferenced(referencedEndpoints);
+        const activation = await endpointManager.activateReferenced(referencedEndpoints);
         await reconcileOperations();
         conversations.repairQueueNotices();
-        await lifecycle.reconcileAdopting();
-        await lifecycle.reconcileRemovals();
+        await lifecycle.reconcileAdopting({ onError: isolateLifecycleRecoveryFailure });
+        await lifecycle.reconcileRemovals({ onError: isolateLifecycleRecoveryFailure });
         await resumeManagedSessions();
+        for (const endpointId of [...new Set(recoveredEndpointIds)]) {
+          if (endpointId === assistantEndpoint.id || activation.unavailable.includes(endpointId)) continue;
+          await pool.reconcileEndpointClaims(endpointId);
+          await relay.reconcileEndpoint(endpointId);
+        }
         deliveries.recoverAfterCrash();
         reconcileDeliveryEvents();
         acceptingReadyEvents = true;
@@ -1027,6 +1045,8 @@ export async function buildProductionApp(
         return value.endpoint === target && value.generation === generation;
       } catch { return false; }
     };
+    const remoteContext = remoteCandidateContexts.get(target);
+    if (remoteContext) remoteContexts.set(target.id, remoteContext);
     pool.replaceEndpoint(target);
     const subscriptions = [
       target.onNotification((method, params) => {
@@ -1177,11 +1197,17 @@ export async function buildProductionApp(
           operations.succeed(operation.id, { file_handle: prepared.id, display_name: prepared.displayName, media_type: prepared.mediaType, size: prepared.size, sha256: prepared.sha256 });
         } else if (operation.kind === "disconnect_endpoint") {
           const endpointId = projectEndpoint(args.endpoint);
-          await endpointManager.disconnect(endpointId, (checkpoint) => operations.checkpoint(operation.id, { endpoint: endpointId, ...(checkpoint as object) }));
+          const saved = parseEndpointLifecycleCheckpoint(operation.receipt);
+          if (operation.receipt !== undefined && (!saved || saved.endpoint !== endpointId)) continue;
+          if (saved) await endpointManager.recoverDisconnect(endpointId, saved.identity);
+          else await endpointManager.disconnect(endpointId, (checkpoint) => operations.checkpoint(operation.id, { endpoint: endpointId, ...(checkpoint as object) }));
           operations.succeed(operation.id, { endpoint: endpointId, state: "disconnected" });
         } else if (operation.kind === "restart_endpoint") {
           const endpointId = projectEndpoint(args.endpoint);
-          await endpointManager.restart(endpointId, (checkpoint) => operations.checkpoint(operation.id, { endpoint: endpointId, ...(checkpoint as object) }));
+          const saved = parseEndpointLifecycleCheckpoint(operation.receipt);
+          if (operation.receipt !== undefined && (!saved || saved.endpoint !== endpointId)) continue;
+          if (saved) await endpointManager.recoverRestart(endpointId, saved.phase, saved.identity);
+          else await endpointManager.restart(endpointId, (checkpoint) => operations.checkpoint(operation.id, { endpoint: endpointId, ...(checkpoint as object) }));
           operations.succeed(operation.id, { endpoint: endpointId, state: "ready" });
         } else if (operation.kind === "collect_messages") {
           const checkpoint = operation.receipt as { messageIds?: string[] } | undefined;
@@ -1241,7 +1267,12 @@ export async function buildProductionApp(
           let session = registry.get(args.nickname);
           const checkpoint = operation.receipt as ({ endpoint?: string; threadId?: string; mappingId?: string; dispatchStarted?: boolean } & Record<string, unknown>) | undefined;
           const project = operation.kind === "create_session" && checkpoint ? preparedProjectWorkspaceFromCheckpoint(checkpoint) : undefined;
-          if (project) await projectWorkspaces.assertDispatchable(project);
+          if (project) {
+            const recoveryEndpointId = projectEndpoint(checkpoint?.endpoint ?? args.endpoint);
+            await endpointManager.withWorkLease(recoveryEndpointId, "session-mutation", async (_endpoint, lease) => {
+              await workspaceRouter.assertDispatchable(recoveryEndpointId, project, lease);
+            });
+          }
           const expectedThread = args.thread_id as string | undefined ?? (operation.kind === "create_session" ? checkpoint?.threadId : undefined);
           const expectedDir = project?.path;
           if (!session && operation.kind === "create_session" && checkpoint?.dispatchStarted === false) {
@@ -1270,7 +1301,7 @@ export async function buildProductionApp(
             session = registry.get(args.nickname);
           }
           if (session?.lifecycle_state === "adopting" && session.mapping_id === checkpoint?.mappingId) {
-            await lifecycle.reconcileAdopting();
+            await lifecycle.reconcileAdopting({ nickname: args.nickname });
             session = registry.get(args.nickname);
           }
           if (session?.lifecycle_state === "managed" && session.mapping_id === checkpoint?.mappingId
@@ -1279,7 +1310,7 @@ export async function buildProductionApp(
             const native = state?.managementState !== "managed" || !runtime.currentEpoch(session.endpoint, session.thread_id, session.mapping_id)
               ? await lifecycle.reconcileManaged(args.nickname, session)
               : await pool.request<any>(session.endpoint, "thread/read", { threadId: session.thread_id, includeTurns: true });
-            await verifySessionCwd(native.thread.cwd, session.project_dir);
+            await verifySessionCwd(session.endpoint, native.thread.cwd, session.project_dir);
             hydrateThreadOrder(session.endpoint, native.thread);
             await succeedRecovered(operation, { nickname: args.nickname, mapping_id: session.mapping_id }, () => {
               advanceNativeWatermark(args.nickname);
@@ -1432,6 +1463,8 @@ export async function buildProductionApp(
     const existing = projectEndpointRecoveries.get(endpointId);
     if (existing) return existing;
     const recovery = (async () => {
+      await lifecycle.reconcileAdopting({ endpointId, onError: isolateLifecycleRecoveryFailure });
+      await lifecycle.reconcileRemovals({ endpointId, onError: isolateLifecycleRecoveryFailure });
       await resumeManagedSessions(endpointId);
       await reconcileOperations();
       deliveries.prepare({
@@ -1493,8 +1526,8 @@ export async function buildProductionApp(
     if (stopping) return;
     if (target.id === endpoint.id) {
       await target.start();
-      await lifecycle.reconcileAdopting();
-      await lifecycle.reconcileRemovals();
+      await lifecycle.reconcileAdopting({ endpointId: target.id, onError: isolateLifecycleRecoveryFailure });
+      await lifecycle.reconcileRemovals({ endpointId: target.id, onError: isolateLifecycleRecoveryFailure });
       await resumeManagedSessions(endpoint.id);
       await reconcileOperations();
       await renderDashboardSafely();
@@ -1520,8 +1553,20 @@ export async function buildProductionApp(
     await enqueuePendingEvents();
   }
 
-  async function verifySessionCwd(actual: string, expected: string): Promise<void> {
-    if (await realpath(actual) !== await realpath(expected)) throw new Error("registered project directory does not match thread cwd");
+  async function isolateLifecycleRecoveryFailure(nickname: string, session: RegistrySession): Promise<void> {
+    const current = registry.get(nickname);
+    if (!current || current.mapping_id !== session.mapping_id || current.endpoint !== session.endpoint || current.thread_id !== session.thread_id) return;
+    runtime.setSession(session.endpoint, session.thread_id, session.mapping_id, "unavailable", "notLoaded");
+    dashboardStore.observeLifecycle({ endpointId: session.endpoint, threadId: session.thread_id }, Date.now());
+    warnSessionUnavailable(nickname, session.endpoint, session.thread_id);
+  }
+
+  async function verifySessionCwd(endpointId: string, actual: string, expected: string): Promise<void> {
+    await endpointManager.withWorkLease(endpointId, "session-mutation", async (_endpoint, lease) => {
+      const prepared = await workspaceRouter.prepareExisting(endpointId, actual, lease);
+      await workspaceRouter.assertDispatchable(endpointId, prepared, lease);
+      if (prepared.path !== expected) throw new Error("registered project directory does not match thread cwd");
+    });
   }
 
   function warnSessionUnavailable(nickname: string, endpointId: string, threadId: string): void {

@@ -8,7 +8,7 @@ import { buildControlMasterExitArgs, buildSshRemoteArgs, type SshConnectionPlan 
 import { runBoundedProcess, type BoundedProcessResult } from "./ssh-process.ts";
 import { parseRuntimeIdentity, type EndpointLossKind, type RuntimeIdentity } from "./types.ts";
 
-export const REMOTE_HELPER_SHA256 = "3389db2c782ce29ee7137d534fb39f18ae66d3dd6939c7ad8dfdeea86d763db2";
+export const REMOTE_HELPER_SHA256 = "0181f4def349c3fbb89b8a11b391ae22508f828547da8ffd63329893e9473708";
 export const REMOTE_LAUNCHER_SHA256 = "db138ff3173f9b72d1fa8cc5fbc94c4958247691a401232d84edf0e3417bd334";
 
 const MAX_REMOTE_ARGUMENT_BYTES = 16 * 1024;

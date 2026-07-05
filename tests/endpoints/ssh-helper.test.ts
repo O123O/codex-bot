@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash, randomBytes } from "node:crypto";
-import { readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { Readable } from "node:stream";
 import test from "node:test";
 import {
@@ -63,15 +63,37 @@ test("the packaged helper bootstraps owner-only assets and inspects an absent is
 
   const source = `${runtimeDir}/report.txt`;
   await writeFile(source, "descriptor-safe");
-  const readArg = encodeRemoteArgument(JSON.stringify({ path: source, root: runtimeDir, maxBytes: 1024 }));
+  const rootState = await stat(runtimeDir, { bigint: true });
+  const rootIdentity = { rootDevice: rootState.dev.toString(10), rootInode: rootState.ino.toString(10) };
+  const readArg = encodeRemoteArgument(JSON.stringify({ path: source, root: runtimeDir, ...rootIdentity, maxBytes: 1024 }));
   const read = await runBoundedProcess(process.execPath, [`${runtimeDir}/qiyan-ssh-helper.mjs`, "read-file", readArg], { timeoutMs: 5_000, maxOutputBytes: 64 * 1024 });
   assert.equal(Buffer.from(JSON.parse(read.stdout.toString("utf8")).dataBase64, "base64").toString(), "descriptor-safe");
   await symlink(source, `${runtimeDir}/report-link.txt`);
-  const linkArg = encodeRemoteArgument(JSON.stringify({ path: `${runtimeDir}/report-link.txt`, root: runtimeDir, maxBytes: 1024 }));
+  const linkArg = encodeRemoteArgument(JSON.stringify({ path: `${runtimeDir}/report-link.txt`, root: runtimeDir, ...rootIdentity, maxBytes: 1024 }));
   await assert.rejects(
     runBoundedProcess(process.execPath, [`${runtimeDir}/qiyan-ssh-helper.mjs`, "read-file", linkArg], { timeoutMs: 5_000, maxOutputBytes: 64 * 1024 }),
     /failed/u,
   );
+  const rootLink = `${runtimeDir}/root-link`;
+  await symlink(runtimeDir, rootLink, "dir");
+  const replacedRootArg = encodeRemoteArgument(JSON.stringify({
+    path: `${rootLink}/report.txt`, root: rootLink, ...rootIdentity, maxBytes: 1024,
+  }));
+  await assert.rejects(
+    runBoundedProcess(process.execPath, [`${runtimeDir}/qiyan-ssh-helper.mjs`, "read-file", replacedRootArg], { timeoutMs: 5_000, maxOutputBytes: 64 * 1024 }),
+    /failed/u,
+  );
+
+  const outside = `${runtimeDir}/outside`;
+  const swappedParent = `${runtimeDir}/swapped-parent`;
+  await mkdir(outside);
+  await symlink(outside, swappedParent, "dir");
+  const mkdirArg = encodeRemoteArgument(JSON.stringify({ action: "mkdir", path: `${swappedParent}/escaped`, recursive: true, mode: 0o700 }));
+  await assert.rejects(
+    runBoundedProcess(process.execPath, [`${runtimeDir}/qiyan-ssh-helper.mjs`, "workspace", mkdirArg], { timeoutMs: 5_000, maxOutputBytes: 64 * 1024 }),
+    /failed/u,
+  );
+  await assert.rejects(stat(`${outside}/escaped`));
 
   const upload = Buffer.from("streamed-upload");
   const uploadSha = createHash("sha256").update(upload).digest("hex");

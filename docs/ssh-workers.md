@@ -53,6 +53,14 @@ Attachments cross the SSH boundary only through explicit tools. Files selected i
 
 QiYan resolves `ssh -G` on every connection generation and pins the resulting host, user, and port. If that destination changes while sessions or unresolved work still reference the endpoint, activation is rejected instead of silently moving thread IDs to another machine.
 
+Ordinary `tmux ls` does not inspect QiYan's isolated server. To inspect its detached App Servers without loading user tmux configuration, run this on the worker host:
+
+```bash
+tmux -L qiyan-bot -f /dev/null list-sessions
+```
+
+On QiYan startup, only endpoints referenced by managed sessions or unresolved work are contacted. An unavailable SSH endpoint does not prevent local sessions or other endpoints from starting; its sessions remain marked unavailable and reconnect automatically. Active and provisionally dispatched turn capacity stays reserved until full native history proves it terminal or absent. Normal QiYan shutdown closes SSH transports but intentionally leaves detached remote App Servers running; `disconnect_endpoint` is the explicit idle-only runtime shutdown.
+
 ## Development fixture
 
 The repository’s [Docker SSH fixture](development/ssh-worker-fixture.md) provides a reusable localhost server with persistent but image-external Codex authentication. It is suitable for tunnel-loss and restart testing without a second physical machine.

@@ -195,8 +195,13 @@ export async function openSshUnixTunnel(options: {
       }).catch(() => undefined);
     },
   });
-  await tunnel.listen();
-  return tunnel;
+  try {
+    await tunnel.listen();
+    return tunnel;
+  } catch (error) {
+    await tunnel.close().catch(() => undefined);
+    throw error;
+  }
 }
 
 class ProcessSshTunnel implements SshTunnel {

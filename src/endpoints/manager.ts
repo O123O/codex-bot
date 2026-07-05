@@ -101,7 +101,8 @@ export class EndpointManager {
   async activateReferenced(ids: readonly string[]): Promise<{ unavailable: string[] }> {
     const unavailable: string[] = [];
     for (const id of [...new Set(ids)]) {
-      try { await this.ensureReady(id); } catch { unavailable.push(id); }
+      try { await this.ensureReady(id); }
+      catch { unavailable.push(id); this.scheduleColdReconnect(id, this.record(id)); }
     }
     return { unavailable };
   }
@@ -134,6 +135,72 @@ export class EndpointManager {
     const endpointId = this.normalize(id);
     const record = this.record(endpointId);
     return this.enqueueLifecycle(record, () => this.restartInternal(endpointId, record, checkpoint));
+  }
+
+  async recoverDisconnect(id: string, expectedIdentity: RuntimeIdentity): Promise<void> {
+    const record = this.record(id);
+    return this.enqueueLifecycle(record, async () => {
+      if (record.gate.desiredState === "disconnected") return;
+      this.cancelReconnect(record);
+      const drain = await record.gate.beginDrain();
+      try {
+        const candidate = record.endpoint ? { endpoint: record.endpoint } : await this.prepareCandidate(id);
+        const actual = await candidate.endpoint.runtimeIdentity();
+        if (!actual) {
+          await candidate.endpoint.closeConnection();
+          drain.disconnect();
+          return;
+        }
+        if (!sameRuntimeIdentity(actual, expectedIdentity)) throw new AppError("OPERATION_UNCERTAIN", `checkpointed runtime identity changed: ${id}`);
+        let endpoint = candidate.endpoint;
+        if ((await this.options.managedThreadIds(id)).length > 0 && endpoint.state !== "ready") endpoint = await this.startCandidate(record, candidate);
+        await this.requireManagedThreadsIdle(id, endpoint);
+        await endpoint.shutdownRuntime(actual);
+        drain.disconnect();
+      } catch (error) {
+        drain.reopen();
+        throw error;
+      }
+    });
+  }
+
+  async recoverRestart(id: string, phase: "draining" | "idle_proven" | "runtime_stopped" | "runtime_started", expectedIdentity: RuntimeIdentity): Promise<void> {
+    if (phase === "runtime_started") {
+      const endpoint = await this.ensureReady(id);
+      const actual = await endpoint.runtimeIdentity();
+      if (!actual || !sameRuntimeIdentity(actual, expectedIdentity)) throw new AppError("OPERATION_UNCERTAIN", `checkpointed replacement runtime identity changed: ${id}`);
+      return;
+    }
+    if (phase === "runtime_stopped") {
+      await this.ensureReady(id);
+      return;
+    }
+    const record = this.record(id);
+    return this.enqueueLifecycle(record, async () => {
+      this.cancelReconnect(record);
+      const replacement = await this.prepareCandidate(id);
+      const drain = await record.gate.beginDrain();
+      try {
+        const target = record.endpoint ? { endpoint: record.endpoint } : await this.prepareCandidate(id);
+        const actual = await target.endpoint.runtimeIdentity();
+        if (!actual) {
+          await target.endpoint.closeConnection();
+          await this.startCandidate(record, replacement);
+          drain.reopen();
+          return;
+        }
+        if (!sameRuntimeIdentity(actual, expectedIdentity)) throw new AppError("OPERATION_UNCERTAIN", `checkpointed runtime identity changed: ${id}`);
+        let endpoint = target.endpoint;
+        if ((await this.options.managedThreadIds(id)).length > 0 && endpoint.state !== "ready") endpoint = await this.startCandidate(record, target);
+        await this.requireManagedThreadsIdle(id, endpoint);
+        await endpoint.shutdownRuntime(actual);
+        await this.startCandidate(record, replacement);
+        drain.reopen();
+      } catch (error) {
+        drain.reopen();
+        throw error;
+      }
+    });
   }
 
   private async restartInternal(endpointId: string, record: EndpointRecord, checkpoint?: (value: unknown) => void): Promise<void> {
@@ -255,6 +322,25 @@ export class EndpointManager {
     }).catch(() => undefined);
   }
 
+  private scheduleColdReconnect(endpointId: string, record: EndpointRecord): void {
+    if (this.closing || record.gate.desiredState !== "automatic" || record.reconnect) return;
+    void Promise.resolve(this.options.hasIdentityReferences(endpointId)).then((referenced) => {
+      if (this.closing || !referenced || record.endpoint || record.gate.desiredState !== "automatic" || record.reconnect) return;
+      const delay = Math.min(30_000, 1_000 * 2 ** Math.min(record.reconnectAttempt, 5));
+      record.reconnectAttempt += 1;
+      const schedule = this.options.schedule ?? ((delayMs: number, run: () => void) => {
+        const timer = setTimeout(run, delayMs);
+        timer.unref?.();
+        return { cancel: () => clearTimeout(timer) };
+      });
+      record.reconnect = schedule(delay, () => {
+        delete record.reconnect;
+        if (this.closing || record.endpoint || record.gate.desiredState !== "automatic") return;
+        void this.ensureReady(endpointId).catch(() => this.scheduleColdReconnect(endpointId, record));
+      });
+    }).catch(() => undefined);
+  }
+
   private cancelReconnect(record: EndpointRecord): void {
     record.reconnect?.cancel();
     delete record.reconnect;
@@ -298,4 +384,11 @@ export class EndpointManager {
   private newRecord(id: string, endpoint?: ManagedAppServerEndpoint): EndpointRecord {
     return { gate: new EndpointAdmissionGate(id), ...(endpoint ? { endpoint } : {}), generation: 0, subscriptions: [], reconnectAttempt: 0 };
   }
+}
+
+function sameRuntimeIdentity(left: RuntimeIdentity, right: RuntimeIdentity): boolean {
+  return left.kind === right.kind && (left.kind === "local"
+    ? right.kind === "local" && left.pid === right.pid && left.startTime === right.startTime
+    : right.kind === "ssh" && left.token === right.token && left.pid === right.pid
+      && left.linuxStartTime === right.linuxStartTime && left.processGroupId === right.processGroupId);
 }

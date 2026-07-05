@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
+import { mkdir, mkdtemp, readFile, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
-import { SshHost } from "../../src/endpoints/ssh-host.ts";
+import { LocalWorkspaceHost, SshHost } from "../../src/endpoints/ssh-host.ts";
 import type { RemoteRuntimeClient } from "../../src/endpoints/ssh-runtime.ts";
 
 test("SSH workspace paths are passed as encoded helper data, not command tokens", async () => {
@@ -21,4 +24,17 @@ test("SSH workspace paths are passed as encoded helper data, not command tokens"
   await host.mkdir(hostile, { recursive: true, mode: 0o700 });
   await host.chmod(hostile, 0o700);
   assert.equal((values[0] as { path: string }).path, hostile);
+});
+
+test("local workspace creation never follows a symlinked parent", async () => {
+  const root = await mkdtemp(join(tmpdir(), "qiyan-safe-mkdir-"));
+  const outside = join(root, "outside");
+  const project = join(root, "project");
+  await Promise.all([mkdir(outside), mkdir(project)]);
+  await writeFile(join(outside, "sentinel"), "safe");
+  await symlink(outside, join(project, "swapped"), "dir");
+  const host = new LocalWorkspaceHost(root);
+  await assert.rejects(host.mkdir(join(project, "swapped", "created"), { recursive: true, mode: 0o700 }));
+  assert.equal(await readFile(join(outside, "sentinel"), "utf8"), "safe");
+  await assert.rejects(readFile(join(outside, "created")));
 });

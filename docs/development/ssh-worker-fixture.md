@@ -2,7 +2,7 @@
 
 ## Development fixture for remote-worker support
 
-This Docker Compose fixture models a separate Linux machine for testing QiYan's SSH endpoint pool. It provides key-only SSH, an independently authenticated Codex profile, and persistent remote projects. QiYan's production endpoint uses a detached tmux App Server and Unix-socket tunnel; the fixture check retains a short stdio probe as a prerequisite diagnostic.
+This Docker Compose fixture models a separate Linux machine for testing QiYan's SSH endpoint pool. It provides key-only SSH, an independently authenticated Codex profile, and persistent remote projects. QiYan's production endpoint uses a detached tmux App Server and an SSH byte-stream bridge to its private Unix socket; the fixture check retains a short stdio probe as a prerequisite diagnostic.
 
 The fixture is **source checkout only**. Its Docker files, TypeScript helpers, and npm development commands are not included in the QiYan release archive.
 

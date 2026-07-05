@@ -1,8 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
 import { constants, lstatSync, readdirSync, readFileSync, renameSync, unlinkSync } from "node:fs";
-import { chmod, mkdir, open, readFile, realpath, rm, stat, unlink } from "node:fs/promises";
+import { chmod, lstat, mkdir, open, readFile, realpath, rm, stat, unlink } from "node:fs/promises";
 import { userInfo } from "node:os";
-import { dirname, isAbsolute, join, relative } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { createConnection } from "node:net";
 
@@ -102,7 +102,9 @@ async function inspect(value) {
     return { status: "absent" };
   }
   if (!identity || !identityMatches(identity)) return { status: "unhealthy", ...(identity ? { identity, ownedGroup, groupSize: group.length } : {}) };
-  if (!socketFile?.isSocket() || socketFile.uid !== process.getuid?.() || (socketFile.mode & 0o077) !== 0) return { status: "unhealthy" };
+  if (!socketFile?.isSocket() || socketFile.uid !== process.getuid?.() || (socketFile.mode & 0o077) !== 0) {
+    return { status: "unhealthy", identity, ownedGroup, groupSize: group.length };
+  }
   return { status: "healthy", identity };
 }
 
@@ -155,30 +157,45 @@ async function stop(value) {
 async function readFileDescriptor(value) {
   const path = value?.path;
   const root = value?.root;
+  const rootDevice = value?.rootDevice;
+  const rootInode = value?.rootInode;
   const maxBytes = value?.maxBytes;
   if (typeof path !== "string" || !isAbsolute(path) || typeof root !== "string" || !isAbsolute(root)
+    || !DECIMAL.test(rootDevice ?? "") || !DECIMAL.test(rootInode ?? "")
     || !Number.isSafeInteger(maxBytes) || maxBytes < 0 || maxBytes > 64 * 1024 * 1024) throw new Error("invalid read request");
-  const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  const projected = relative(root, path);
+  if (projected === "" || projected === ".." || projected.startsWith("../") || isAbsolute(projected)) throw new Error("invalid read request");
+  const rootHandle = await open(root, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
   try {
-    const before = await file.stat({ bigint: true });
-    if (!before.isFile() || before.size > BigInt(maxBytes)) throw new Error("invalid source file");
-    const canonicalRoot = await realpath(root);
-    const actual = await realpath(`/proc/self/fd/${file.fd}`);
-    if (!pathWithin(canonicalRoot, actual)) throw new Error("source file escapes project root");
-    const bytes = Buffer.alloc(Number(before.size));
-    let offset = 0;
-    while (offset < bytes.byteLength) {
-      const result = await file.read(bytes, offset, bytes.byteLength - offset, offset);
-      if (result.bytesRead === 0) throw new Error("source file changed");
-      offset += result.bytesRead;
+    const rootBefore = await rootHandle.stat({ bigint: true });
+    const canonicalRoot = await realpath(`/proc/self/fd/${rootHandle.fd}`);
+    if (!rootBefore.isDirectory() || rootBefore.dev.toString(10) !== rootDevice || rootBefore.ino.toString(10) !== rootInode || canonicalRoot !== root) {
+      throw new Error("project root changed");
     }
-    const after = await file.stat({ bigint: true });
-    if (before.dev !== after.dev || before.ino !== after.ino || before.size !== after.size || before.mtimeNs !== after.mtimeNs) throw new Error("source file changed");
-    return {
-      device: before.dev.toString(10), inode: before.ino.toString(10), size: Number(before.size), mtimeNs: before.mtimeNs.toString(10),
-      sha256: sha256(bytes), dataBase64: bytes.toString("base64"),
-    };
-  } finally { await file.close(); }
+    const file = await open(`/proc/self/fd/${rootHandle.fd}/${projected}`, constants.O_RDONLY | constants.O_NOFOLLOW);
+    try {
+      const before = await file.stat({ bigint: true });
+      if (!before.isFile() || before.size > BigInt(maxBytes)) throw new Error("invalid source file");
+      const actual = await realpath(`/proc/self/fd/${file.fd}`);
+      if (!pathWithin(canonicalRoot, actual)) throw new Error("source file escapes project root");
+      const bytes = Buffer.alloc(Number(before.size));
+      let offset = 0;
+      while (offset < bytes.byteLength) {
+        const result = await file.read(bytes, offset, bytes.byteLength - offset, offset);
+        if (result.bytesRead === 0) throw new Error("source file changed");
+        offset += result.bytesRead;
+      }
+      const after = await file.stat({ bigint: true });
+      const rootAfter = await rootHandle.stat({ bigint: true });
+      const rootAfterPath = await realpath(`/proc/self/fd/${rootHandle.fd}`);
+      if (before.dev !== after.dev || before.ino !== after.ino || before.size !== after.size || before.mtimeNs !== after.mtimeNs
+        || rootAfter.dev !== rootBefore.dev || rootAfter.ino !== rootBefore.ino || rootAfterPath !== canonicalRoot) throw new Error("source file changed");
+      return {
+        device: before.dev.toString(10), inode: before.ino.toString(10), size: Number(before.size), mtimeNs: before.mtimeNs.toString(10),
+        sha256: sha256(bytes), dataBase64: bytes.toString("base64"),
+      };
+    } finally { await file.close(); }
+  } finally { await rootHandle.close(); }
 }
 
 async function writeFileDescriptor(value) {
@@ -251,13 +268,36 @@ async function workspace(value) {
   if (action === "realpath") return { path: await import("node:fs/promises").then(({ realpath }) => realpath(path)) };
   if (action === "mkdir") {
     if (typeof value.recursive !== "boolean" || value.mode !== 0o700) throw new Error("invalid mkdir request");
-    await mkdir(path, { recursive: value.recursive, mode: value.mode }); return { ok: true };
+    await mkdirAbsoluteNoFollow(path, { recursive: value.recursive, mode: value.mode }); return { ok: true };
   }
   if (action === "chmod") {
     if (value.mode !== 0o700) throw new Error("invalid chmod request");
     await chmod(path, value.mode); return { ok: true };
   }
   throw new Error("invalid workspace operation");
+}
+
+async function mkdirAbsoluteNoFollow(path, options) {
+  if (!isAbsolute(path) || resolve(path) !== path || options.mode !== 0o700) throw new Error("invalid workspace mkdir request");
+  const components = path.split("/").filter(Boolean);
+  let parent = await open("/", constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+  try {
+    if (components.length === 0 && !options.recursive) throw Object.assign(new Error("workspace exists"), { code: "EEXIST" });
+    for (let index = 0; index < components.length; index += 1) {
+      const childPath = `/proc/self/fd/${parent.fd}/${components[index]}`;
+      const last = index === components.length - 1;
+      let exists = true;
+      try { await lstat(childPath); } catch (error) { if (error?.code === "ENOENT") exists = false; else throw error; }
+      if (exists && last && !options.recursive) throw Object.assign(new Error("workspace exists"), { code: "EEXIST" });
+      if (!exists) {
+        if (!options.recursive && !last) throw Object.assign(new Error("workspace parent is missing"), { code: "ENOENT" });
+        await mkdir(childPath, { mode: options.mode });
+      }
+      const child = await open(childPath, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+      await parent.close();
+      parent = child;
+    }
+  } finally { await parent.close().catch(() => undefined); }
 }
 
 function runtimePaths(value) {

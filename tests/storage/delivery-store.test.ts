@@ -11,6 +11,9 @@ import { migrations } from "../../src/storage/migrations.ts";
 
 const binding = { adapterId: "telegram", conversationKey: "telegram:42", destination: { chatId: "42" } } as const;
 
+const releaseLedgerMigrationVersion = migrations.findIndex((migration) =>
+  typeof migration === "string" && migration.includes("CREATE TABLE delivery_attachment_releases")) + 1;
+
 test("dispatched deliveries become uncertain during startup recovery", () => {
   const store = new DeliveryStore(createTestDatabase());
   const delivery = store.prepare({ kind: "worker_final", binding, body: "done", mandatory: true });
@@ -77,7 +80,12 @@ test("release-ledger migration backfills historical optional uncertainty without
   store.prepareAttachment({ id: "still-held", kind: "file", binding, body: "", mandatory: true, attachmentId: "attachment", attachmentScopeId: "scope" });
   db.prepare("UPDATE deliveries SET state = 'uncertain' WHERE id = ?").run(historical.id);
   db.prepare("UPDATE attachments SET ref_count = 1 WHERE id = 'attachment'").run();
-  db.exec(`DROP TABLE delivery_attachment_releases; DELETE FROM schema_migrations WHERE version = ${migrations.length}`);
+  assert.ok(releaseLedgerMigrationVersion > 0);
+  db.exec(`
+    DROP TABLE endpoint_bindings;
+    DROP TABLE delivery_attachment_releases;
+    DELETE FROM schema_migrations WHERE version >= ${releaseLedgerMigrationVersion};
+  `);
   db.close();
 
   const migrated = openDatabase(path);
