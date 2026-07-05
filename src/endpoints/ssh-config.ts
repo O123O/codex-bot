@@ -46,7 +46,7 @@ export function parseSshConfig(output: string): EffectiveSshConfig {
 export function planSshConnection(alias: string, effective: EffectiveSshConfig, runtimeDir: string): SshConnectionPlan {
   if (!/^[a-z0-9][a-z0-9_-]{0,63}$/u.test(alias)) throw new AppError("CONFIGURATION_ERROR", "invalid SSH endpoint alias");
   const userMaster = effective.controlPath !== undefined
-    && new Set(["yes", "ask", "auto", "autoask"]).has(effective.controlMaster)
+    && new Set(["yes", "auto"]).has(effective.controlMaster)
     && usableControlPath(effective.controlPath);
   const ownedPath = join(runtimeDir, "ssh", createHash("sha256").update(`${alias}\0${effective.hostname}\0${effective.user}\0${effective.port}`).digest("hex").slice(0, 24));
   if (!userMaster && Buffer.byteLength(ownedPath) > 100) throw new AppError("CONFIGURATION_ERROR", "QiYan SSH control path is too long");

@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
 import { createHash, randomBytes } from "node:crypto";
-import { readFile, rm, stat } from "node:fs/promises";
+import { readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import test from "node:test";
 import {
   REMOTE_HELPER_SHA256,
   REMOTE_LAUNCHER_SHA256,
   buildInstalledHelperCommand,
+  encodeRemoteBootstrapArgument,
   encodeRemoteArgument,
 } from "../../src/endpoints/ssh-runtime.ts";
 import { runBoundedProcess } from "../../src/endpoints/ssh-process.ts";
@@ -41,7 +42,7 @@ test("the packaged helper bootstraps owner-only assets and inspects an absent is
   t.after(() => rm(runtimeDir, { recursive: true, force: true }));
   const helper = await readFile(helperPath);
   const launcher = await readFile(launcherPath);
-  const bootstrap = encodeRemoteArgument(JSON.stringify({
+  const bootstrap = encodeRemoteBootstrapArgument(JSON.stringify({
     runtimeDir,
     helperBase64: helper.toString("base64url"),
     helperSha256: REMOTE_HELPER_SHA256,
@@ -55,4 +56,22 @@ test("the packaged helper bootstraps owner-only assets and inspects an absent is
   const inspectArg = encodeRemoteArgument(JSON.stringify({ runtimeDir, session: `qiyan-${runtimeDir.slice(-24)}` }));
   const inspected = await runBoundedProcess(process.execPath, [`${runtimeDir}/qiyan-ssh-helper.mjs`, "inspect", inspectArg], { timeoutMs: 5_000, maxOutputBytes: 64 * 1024 });
   assert.deepEqual(JSON.parse(inspected.stdout.toString("utf8")), { status: "absent" });
+
+  const source = `${runtimeDir}/report.txt`;
+  await writeFile(source, "descriptor-safe");
+  const readArg = encodeRemoteArgument(JSON.stringify({ path: source, maxBytes: 1024 }));
+  const read = await runBoundedProcess(process.execPath, [`${runtimeDir}/qiyan-ssh-helper.mjs`, "read-file", readArg], { timeoutMs: 5_000, maxOutputBytes: 64 * 1024 });
+  assert.equal(Buffer.from(JSON.parse(read.stdout.toString("utf8")).dataBase64, "base64").toString(), "descriptor-safe");
+  await symlink(source, `${runtimeDir}/report-link.txt`);
+  const linkArg = encodeRemoteArgument(JSON.stringify({ path: `${runtimeDir}/report-link.txt`, maxBytes: 1024 }));
+  await assert.rejects(
+    runBoundedProcess(process.execPath, [`${runtimeDir}/qiyan-ssh-helper.mjs`, "read-file", linkArg], { timeoutMs: 5_000, maxOutputBytes: 64 * 1024 }),
+    /failed/u,
+  );
+});
+
+test("published packages include both remote runtime assets", async () => {
+  const manifest = JSON.parse(await readFile(new URL("../../package.json", import.meta.url), "utf8")) as { files: string[] };
+  assert.ok(manifest.files.includes("assets/remote/qiyan-ssh-helper.mjs"));
+  assert.ok(manifest.files.includes("assets/remote/qiyan-app-server-launcher.sh"));
 });

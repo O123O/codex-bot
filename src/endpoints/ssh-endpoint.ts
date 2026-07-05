@@ -70,6 +70,8 @@ export class SshEndpoint {
       if (account.account === null && account.requiresOpenaiAuth === true) {
         throw new AppError("CONFIGURATION_ERROR", `Codex is not authenticated on SSH endpoint ${this.id}`);
       }
+      const confirmedIdentity = await this.options.runtime.runtimeIdentity();
+      if (!sameRuntimeIdentity(identity, confirmedIdentity)) throw new AppError("ENDPOINT_UNAVAILABLE", `SSH runtime identity changed during connection: ${this.id}`);
       if (this.generation !== generation || this.state !== "starting") throw this.changed();
       this.state = "ready";
       this.events.emit("ready");
@@ -77,6 +79,7 @@ export class SshEndpoint {
       if (this.generation === generation) {
         this.state = "unavailable";
         await this.disposeConnection();
+        await this.options.runtime.closeTransport?.();
       }
       throw error;
     }
@@ -86,6 +89,7 @@ export class SshEndpoint {
     this.generation += 1;
     this.state = "stopped";
     await this.disposeConnection();
+    await this.options.runtime.closeTransport?.();
   }
 
   async shutdownRuntime(): Promise<void> {
@@ -130,6 +134,7 @@ export class SshEndpoint {
       if (this.options.runtime.classifyLoss) kind = await this.options.runtime.classifyLoss();
       else if (await this.options.runtime.runtimeIdentity() === undefined) kind = "runtime-lost";
     } catch { /* inability to prove loss remains connection-only */ }
+    finally { await this.options.runtime.closeTransport?.(); }
     if (this.generation === generation && this.state === "unavailable") this.events.emit("unavailable", kind);
   }
 
@@ -237,3 +242,9 @@ async function waitForTunnelSocket(child: ChildProcessWithoutNullStreams, path: 
 }
 
 function isErrno(error: unknown, code: string): error is NodeJS.ErrnoException { return error instanceof Error && "code" in error && error.code === code; }
+
+function sameRuntimeIdentity(expected: RuntimeIdentity, actual: RuntimeIdentity | undefined): boolean {
+  return expected.kind === "ssh" && actual?.kind === "ssh"
+    && expected.token === actual.token && expected.pid === actual.pid
+    && expected.linuxStartTime === actual.linuxStartTime && expected.processGroupId === actual.processGroupId;
+}

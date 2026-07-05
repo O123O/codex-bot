@@ -4,15 +4,15 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { AppError } from "../core/errors.ts";
-import { buildSshRemoteArgs, type SshConnectionPlan } from "./ssh-config.ts";
+import { buildControlMasterExitArgs, buildSshRemoteArgs, type SshConnectionPlan } from "./ssh-config.ts";
 import { runBoundedProcess, type BoundedProcessResult } from "./ssh-process.ts";
 import { parseRuntimeIdentity, type EndpointLossKind, type RuntimeIdentity } from "./types.ts";
 
-export const REMOTE_HELPER_SHA256 = "56b02c7b807ab9ad4f4ee89e4d44ebbb0a2783a1c8274fdbe207ab75edc5c7e7";
+export const REMOTE_HELPER_SHA256 = "0b46b29c413f81d0b6768e8d7965b1287d7a6cd20a7bf00c7324a27ff71ad8eb";
 export const REMOTE_LAUNCHER_SHA256 = "051e003f215d28cad899d8ab27777a04c627f825a385b32383d47f35037dc630";
 
 const MAX_REMOTE_ARGUMENT_BYTES = 16 * 1024;
-const helperOperations = new Set(["preflight", "bootstrap", "inspect", "start", "stop"]);
+const helperOperations = new Set(["preflight", "bootstrap", "inspect", "start", "stop", "read-file"]);
 const preflightSchema = z.object({
   uid: z.number().int().positive(),
   home: z.string().startsWith("/"),
@@ -34,6 +34,7 @@ export interface RemoteAssets {
 export interface RemoteRuntimeClient {
   bootstrap(payload: RemoteBootstrapPayload): Promise<void>;
   invoke<T>(operation: string, args: readonly string[], installedHelperPath?: string): Promise<T>;
+  closeControlMaster?(): Promise<void>;
 }
 
 export interface RemoteBootstrapPayload {
@@ -47,6 +48,7 @@ export interface SshRuntimeController {
   ensureStarted(): Promise<RuntimeIdentity>;
   runtimeIdentity(): Promise<RuntimeIdentity | undefined>;
   classifyLoss?(): Promise<EndpointLossKind>;
+  closeTransport?(): Promise<void>;
   stop(): Promise<void>;
 }
 
@@ -89,8 +91,11 @@ export class SshRuntime implements SshRuntimeController {
 
   async stop(): Promise<void> {
     const prepared = await this.prepare();
-    await this.options.remote.invoke("stop", [JSON.stringify({ runtimeDir: prepared.runtimeDir, session: prepared.session })], prepared.helperPath);
+    try { await this.options.remote.invoke("stop", [JSON.stringify({ runtimeDir: prepared.runtimeDir, session: prepared.session })], prepared.helperPath); }
+    finally { await this.closeTransport(); }
   }
+
+  async closeTransport(): Promise<void> { await this.options.remote.closeControlMaster?.(); }
 
   private async prepare(): Promise<NonNullable<SshRuntime["prepared"]>> {
     const preflight = preflightSchema.parse(await this.options.remote.invoke("preflight", []));
@@ -135,7 +140,7 @@ export class SshRemoteClient implements RemoteRuntimeClient {
       launcherBase64: payload.launcher.toString("base64url"),
       launcherSha256: REMOTE_LAUNCHER_SHA256,
     });
-    await this.execute(["node", "-", "bootstrap", encodeRemoteArgument(value)], this.options.helperSource);
+    await this.execute(["node", "-", "bootstrap", encodeRemoteBootstrapArgument(value)], this.options.helperSource);
   }
 
   async invoke<T>(operation: string, args: readonly string[], installedHelperPath?: string): Promise<T> {
@@ -146,6 +151,14 @@ export class SshRemoteClient implements RemoteRuntimeClient {
     const result = await this.execute(command, installedHelperPath ? undefined : this.options.helperSource);
     try { return JSON.parse(result.stdout.toString("utf8")) as T; }
     catch { throw new AppError("ENDPOINT_UNAVAILABLE", "SSH helper returned an invalid response"); }
+  }
+
+  async closeControlMaster(): Promise<void> {
+    if (!this.options.plan.ownsControlMaster) return;
+    const run = this.options.run ?? runBoundedProcess;
+    await run(this.options.sshBinary ?? "ssh", buildControlMasterExitArgs(this.options.plan), {
+      timeoutMs: 5_000, maxOutputBytes: 64 * 1024,
+    }).catch(() => undefined);
   }
 
   private execute(command: readonly string[], input?: Buffer): Promise<BoundedProcessResult> {
@@ -161,6 +174,12 @@ export class SshRemoteClient implements RemoteRuntimeClient {
 export function encodeRemoteArgument(value: string): string {
   const bytes = Buffer.from(value, "utf8");
   if (bytes.byteLength === 0 || bytes.byteLength > MAX_REMOTE_ARGUMENT_BYTES) throw new AppError("CONFIGURATION_ERROR", "remote argument is too large");
+  return bytes.toString("base64url");
+}
+
+export function encodeRemoteBootstrapArgument(value: string): string {
+  const bytes = Buffer.from(value, "utf8");
+  if (bytes.byteLength === 0 || bytes.byteLength > 64 * 1024) throw new AppError("CONFIGURATION_ERROR", "remote bootstrap argument is too large");
   return bytes.toString("base64url");
 }
 

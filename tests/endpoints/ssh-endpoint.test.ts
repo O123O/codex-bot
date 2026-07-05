@@ -107,3 +107,14 @@ test("rejects old versions and remote profiles that require missing auth", async
   }
   await assert.rejects(create(new MissingAuthWire()).start(), /not authenticated/u);
 });
+
+test("refuses to publish a connection when the detached runtime incarnation changes", async () => {
+  const replacement: RuntimeIdentity = { kind: "ssh", token: "b".repeat(32), pid: 11, linuxStartTime: "21", processGroupId: 11 };
+  const endpoint = new SshEndpoint({
+    id: "devbox", minimumVersion: "0.142.5",
+    runtime: { ensureStarted: async () => identity, runtimeIdentity: async () => replacement, stop: async () => undefined, remoteSocketPath: "/remote.sock" },
+    openTunnel: async () => new FakeTunnel(), connectWire: async () => new FakeWire(),
+  });
+  await assert.rejects(endpoint.start(), /identity changed/u);
+  assert.equal(endpoint.state, "unavailable");
+});

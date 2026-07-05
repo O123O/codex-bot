@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { constants, readdirSync, readFileSync, renameSync, unlinkSync } from "node:fs";
+import { constants, lstatSync, readdirSync, readFileSync, renameSync, unlinkSync } from "node:fs";
 import { chmod, mkdir, open, readFile, rm, stat } from "node:fs/promises";
 import { userInfo } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
@@ -23,6 +23,7 @@ try {
     case "inspect": result = await inspect(decodeJson(encoded, 1)); break;
     case "start": result = await start(decodeJson(encoded, 1)); break;
     case "stop": result = await stop(decodeJson(encoded, 1)); break;
+    case "read-file": result = await readFileDescriptor(decodeJson(encoded, 1)); break;
     default: throw new Error("unsupported helper operation");
   }
   process.stdout.write(`${JSON.stringify(result)}\n`);
@@ -44,12 +45,13 @@ function preflight() {
   const uid = process.getuid?.();
   const shell = account.shell || process.env.SHELL;
   if (!Number.isSafeInteger(uid) || uid < 1 || !isAbsolute(account.homedir) || !shell || !SAFE_PATH.test(shell)) throw new Error("invalid account environment");
-  const check = spawnSync(shell, ["-lc", "command -v codex; command -v tmux"], { encoding: "utf8", timeout: 10_000, maxBuffer: 64 * 1024 });
+  if (!SAFE_PATH.test(process.execPath)) throw new Error("invalid Node.js executable");
+  const check = spawnSync(shell, ["-lc", "command -v codex; command -v tmux; command -v cut; command -v ps; command -v tr; command -v mv; command -v chmod"], { encoding: "utf8", timeout: 10_000, maxBuffer: 64 * 1024 });
   if (check.status !== 0) throw new Error("required remote command is unavailable");
   const paths = check.stdout.split(/\r?\n/u).map((value) => value.trim()).filter((value) => SAFE_PATH.test(value));
-  const codexPath = paths.at(-2);
-  const tmuxPath = paths.at(-1);
-  if (!codexPath || !tmuxPath) throw new Error("required remote command is unavailable");
+  const required = paths.slice(-7);
+  const [codexPath, tmuxPath] = required;
+  if (required.length !== 7 || !codexPath || !tmuxPath) throw new Error("required remote command is unavailable");
   return { uid, home: account.homedir, shell, codexPath, tmuxPath };
 }
 
@@ -59,10 +61,8 @@ async function bootstrap(value) {
   if (![helperSha256, launcherSha256].every((item) => typeof item === "string" && /^[a-f0-9]{64}$/u.test(item))) throw new Error("invalid asset digest");
   const helper = decodeAsset(helperBase64, helperSha256);
   const launcher = decodeAsset(launcherBase64, launcherSha256);
-  await mkdir(dirname(runtimeDir), { recursive: true, mode: 0o700 });
-  await chmod(dirname(runtimeDir), 0o700);
-  await mkdir(runtimeDir, { recursive: true, mode: 0o700 });
-  await chmod(runtimeDir, 0o700);
+  await ensurePrivateDirectory(dirname(runtimeDir));
+  await ensurePrivateDirectory(runtimeDir);
   await atomicWrite(join(runtimeDir, "qiyan-ssh-helper.mjs"), helper, 0o700);
   await atomicWrite(join(runtimeDir, "qiyan-app-server-launcher.sh"), launcher, 0o700);
   return { installed: true };
@@ -108,10 +108,9 @@ async function start(value) {
 async function stop(value) {
   const paths = runtimePaths(value);
   const inspected = await inspect(value);
-  if (inspected.status === "unhealthy") throw new Error("runtime identity cannot be proven");
   const identity = await readIdentity(paths.identityPath);
+  if (inspected.status === "unhealthy" && !identity) throw new Error("runtime identity cannot be proven");
   if (identity) {
-    if (!identityMatches(identity) && membersOfGroup(identity.processGroupId).length > 0) throw new Error("runtime identity cannot be proven");
     if (membersOfGroup(identity.processGroupId).length > 0) {
       try { process.kill(-identity.processGroupId, "SIGTERM"); } catch (error) { if (error?.code !== "ESRCH") throw error; }
       await waitForEmptyGroup(identity.processGroupId, 2_000);
@@ -126,6 +125,30 @@ async function stop(value) {
   await rm(paths.socketPath, { force: true });
   await rm(paths.identityPath, { force: true });
   return { stopped: true };
+}
+
+async function readFileDescriptor(value) {
+  const path = value?.path;
+  const maxBytes = value?.maxBytes;
+  if (typeof path !== "string" || !isAbsolute(path) || !Number.isSafeInteger(maxBytes) || maxBytes < 0 || maxBytes > 16 * 1024 * 1024) throw new Error("invalid read request");
+  const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const before = await file.stat({ bigint: true });
+    if (!before.isFile() || before.size > BigInt(maxBytes)) throw new Error("invalid source file");
+    const bytes = Buffer.alloc(Number(before.size));
+    let offset = 0;
+    while (offset < bytes.byteLength) {
+      const result = await file.read(bytes, offset, bytes.byteLength - offset, offset);
+      if (result.bytesRead === 0) throw new Error("source file changed");
+      offset += result.bytesRead;
+    }
+    const after = await file.stat({ bigint: true });
+    if (before.dev !== after.dev || before.ino !== after.ino || before.size !== after.size || before.mtimeNs !== after.mtimeNs) throw new Error("source file changed");
+    return {
+      device: before.dev.toString(10), inode: before.ino.toString(10), size: Number(before.size), mtimeNs: before.mtimeNs.toString(10),
+      sha256: sha256(bytes), dataBase64: bytes.toString("base64"),
+    };
+  } finally { await file.close(); }
 }
 
 function runtimePaths(value) {
@@ -143,7 +166,14 @@ function runtimePaths(value) {
 }
 
 function requireRuntimeDir(value) {
-  if (typeof value !== "string" || !/^\/tmp\/qiyan-\d+\/[a-f0-9]{24}$/u.test(value)) throw new Error("invalid runtime directory");
+  if (typeof value !== "string" || value.split("/")[2] !== `qiyan-${process.getuid?.()}` || !/^\/tmp\/qiyan-\d+\/[a-f0-9]{24}$/u.test(value)) throw new Error("invalid runtime directory");
+}
+
+async function ensurePrivateDirectory(path) {
+  try { await mkdir(path, { mode: 0o700 }); }
+  catch (error) { if (error?.code !== "EEXIST") throw error; }
+  const state = lstatSync(path);
+  if (!state.isDirectory() || state.isSymbolicLink() || state.uid !== process.getuid?.() || (state.mode & 0o077) !== 0) throw new Error("unsafe runtime directory");
 }
 
 function decodeAsset(value, expected) {

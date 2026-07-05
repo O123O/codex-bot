@@ -46,6 +46,13 @@ test("falls back to an owned master when the effective ControlPath is unsafe", (
   }
 });
 
+test("interactive ControlMaster modes use QiYan's noninteractive fallback", () => {
+  for (const controlMaster of ["ask", "autoask"]) {
+    const plan = planSshConnection("devbox", { ...parseSshConfig(parsed), controlMaster, controlPath: "/tmp/user-master" }, "/private/runtime");
+    assert.equal(plan.ownsControlMaster, true);
+  }
+});
+
 test("re-resolves SSH configuration and checks the durable binding on every generation", async () => {
   let hostname = "host-one";
   const checked: Array<{ endpointId: string; hostname: string; references: boolean }> = [];
