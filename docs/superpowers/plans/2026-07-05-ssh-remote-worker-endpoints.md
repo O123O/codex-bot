@@ -166,7 +166,7 @@ commitAfterActivation(endpointId: string, destination: SshDestination, hasRefere
 get(endpointId: string): { destinationSha256: string } | undefined;
 ```
 
-`checkExisting` is read-only: an absent binding passes, the same binding passes, a change with managed/transitional references fails before any connection, and a change without references is eligible but not written. `commitAfterActivation` runs in a serialized SQLite transaction after successful App Server/account preflight, repeats the same conflict rules against current state, and inserts/replaces only then. Thus failed first activation writes nothing, while a referenced endpoint is never contacted at a changed destination.
+`checkExisting` is read-only: an absent binding passes, the same binding passes, a change with any identity reference fails before any connection, and a change without references is eligible but not written. Identity references include managed/transitional mappings, retained capacity claims, and unresolved durable capacity hints; Task 7 injects the provider and Task 11 supplies its durable implementation. `commitAfterActivation` runs in a serialized SQLite transaction after successful App Server/account preflight, repeats the same conflict rules against current state, and inserts/replaces only then. Thus failed first activation writes nothing, while a referenced endpoint is never contacted at a changed destination.
 
 - [ ] **Step 7: Run focused tests and commit**
 
@@ -391,6 +391,22 @@ test("cold recovery restores observed active turns even above the configured lim
   assert.equal(pool.activeTurnCount, 2);
   assert.throws(() => pool.claimTurnCapacity("local", "thread-c", "new"), /at most 1 turn/u);
 });
+
+test("authoritative history coalesces overlapping active and provisional cold claims", async () => {
+  const pool = fixturePool({ maxConcurrentTurns: 1 });
+  pool.restoreObservedActiveTurn("devbox", "thread-a", "turn-a");
+  pool.restoreProvisionalTurnCapacity("devbox", "thread-a", "recovered:op-a", "message-a");
+  assert.equal(pool.activeTurnCount, 2);
+  let wakes = 0;
+  pool.onCapacityAvailable(() => { wakes += 1; });
+  await pool.reconcileEndpointClaims("devbox"); // message-a belongs to turn-a
+  assert.equal(pool.activeTurnCount, 1);
+  pool.markTurnTerminal("devbox", "thread-a", "turn-a");
+  pool.markTurnTerminal("devbox", "thread-a", "turn-a");
+  await Promise.resolve();
+  assert.equal(pool.activeTurnCount, 0);
+  assert.equal(wakes, 1);
+});
 ```
 
 - [ ] **Step 2: Run pool tests and verify RED**
@@ -437,8 +453,11 @@ Make `AppServerPool.request()` await a deduplicated resolver/start promise. Exis
 - `reconcileEndpointClaims(endpointId)` reads full authoritative histories after reconnect, binds matching provisional starts, retains active/incomplete claims, and releases a claim exactly once only for a terminal turn or a full-idle proof that its client message is absent.
 - `restoreObservedActiveTurn(endpointId, threadId, turnId)` rebuilds a deterministic active claim from cold-start history, deduplicates by endpoint/thread/turn, and deliberately bypasses the admission ceiling for already-running work; `claims.size >= maxConcurrentTurns` still rejects every new claim until enough recovered turns finish.
 - `restoreProvisionalTurnCapacity(endpointId, threadId, claimId, clientUserMessageId)` rebuilds a durable unresolved start hint, deduplicates by stable operation claim ID, bypasses the ceiling conservatively, and is later bound or released by `reconcileEndpointClaims`.
+- `hasClaims(endpointId)` reports any retained logical claim for destination-identity reference checks without exposing claim contents.
 
-Test active and provisional claims across tunnel loss, incomplete reconnect history, later terminal/absent proof, repeated reconciliation, and one capacity-available signal.
+Replace the `selfOwned` boolean with an explicit origin such as `caller`, `implicit`, `cold-active`, or `cold-provisional`. The two cold origins are backend-owned for proven `runtime-lost` cleanup. During authoritative reconciliation, if a provisional correlation maps to an endpoint/thread/turn already held by an active claim, merge it into that logical claim, remember the provisional claim ID as resolved, and remove only the duplicate slot. Repeated restore/reconcile must not recreate it. Terminal handling and runtime-loss handling release each remaining logical claim once; capacity listeners fire only on the single full-to-available threshold crossing.
+
+Test active and provisional claims across tunnel loss, incomplete reconnect history, later terminal/absent proof, cross-kind coalescing, repeated reconciliation, one capacity-available signal, and proven `runtime-lost` release of both cold origins without changing caller-owned uncertainty semantics.
 
 - [ ] **Step 4: Run pool/local tests and commit**
 
@@ -696,6 +715,16 @@ test("explicit disconnect cancels a scheduled reconnect", async () => {
   assert.equal(manager.desiredState("devbox"), "disconnected");
 });
 
+test("a hint-only endpoint rejects destination rebind before contact", async () => {
+  references.set("devbox", { durableCapacityHints: 1 });
+  pool.restoreProvisionalTurnCapacity("devbox", "thread-a", "recovered:op-a", "message-a");
+  bindingStore.commitAfterActivation("devbox", oldDestination, false);
+  sshConfig.setDestination("devbox", changedDestination);
+  await assert.rejects(manager.ensureReady("devbox"), /destination identity changed/u);
+  assert.equal(sshRunner.contacts.length, 0);
+  assert.equal(pool.hasClaims("devbox"), true);
+});
+
 test("a drain does not reject nested RPCs from an already-admitted lease", async () => {
   const outer = manager.withWorkLease("devbox", "session-mutation", async (_endpoint, lease) => {
     workspaceCheckpoint.arrive();
@@ -744,7 +773,7 @@ export class EndpointManager {
 
 Each endpoint tracks an explicit process-local desired state: `automatic`, `draining`, or `disconnected`, plus a lifecycle generation. Before disconnect/restart, transition to `draining`, cancel and generation-fence scheduled reconnects, drain existing leases, then read every managed thread directly and prove idle. If connection cannot be restored or any status is active/systemError/unprovable, reopen admission in `automatic` state and return a no-effect error. Keep the gate closed from the final idle proof through stop/restart. A later normal endpoint operation changes `disconnected` back to `automatic`; a stale reconnect timer cannot do so.
 
-Serialize endpoint activation. Before contact, require the read-only `checkExisting` result from Task 1 and use Task 5's pinned destination. Only after initialize and account preflight succeed, call `commitAfterActivation` with a fresh registry-reference check, then publish the endpoint as ready. A failed activation or a commit conflict closes the new connection and publishes no ready generation.
+Serialize endpoint activation. Inject `hasIdentityReferences(endpointId)`, whose final production implementation unions registry managed/transitional mappings, pool-retained claims, and unresolved durable capacity hints. Before contact, require the read-only `checkExisting` result from Task 1 using that provider and use Task 5's pinned destination. Only after initialize and account preflight succeed, call `commitAfterActivation` with a fresh union reference check, then publish the endpoint as ready. A failed activation or a commit conflict closes the new connection and publishes no ready generation. Rebinding becomes eligible only after mappings, hints, and claims have all been authoritatively cleared.
 
 Checkpoint the old validated discriminated `RuntimeIdentity` and stopped/started phases so operation recovery can distinguish tunnel reconnection from a replacement runtime and finish idempotently.
 
@@ -1043,6 +1072,17 @@ test("unavailable remote durable hints reserve capacity before all ingress", asy
   assert.equal(app.internalDispatcher.startedAfterCapacityRecovery, true);
   assert.equal(app.chatAdapters.startedAfterCapacityRecovery, true);
 });
+
+test("durable hints keep destination binding pinned until authoritative clearance", async () => {
+  const recovery = capacityRecoveryFixture({ hint: provisionalHint("devbox", "t1", "message-1") });
+  recovery.restoreBeforeIngress();
+  assert.equal(recovery.hasIdentityReferences("devbox"), true);
+  await assert.rejects(recovery.manager.ensureReady("devbox"), /destination identity changed/u);
+  assert.equal(recovery.sshContacts, 0);
+  recovery.proveHintAbsentAndCompleteOperation();
+  assert.equal(recovery.hasIdentityReferences("devbox"), false);
+  await recovery.manager.ensureReady("devbox");
+});
 ```
 
 - [ ] **Step 2: Run production tests and verify RED**
@@ -1057,7 +1097,9 @@ Replace the single project `endpoint` variable with `localEndpoint` plus `Endpoi
 
 Generalize unavailable/reconnect handlers to `ManagedAppServerEndpoint` and pass their typed `EndpointLossKind` into the pool; keep assistant recovery separate. Remove the `session.endpoint === local` filter from managed-session recovery. Group registry sessions by endpoint, activate each endpoint, reconcile successes, and warn failures without throwing application startup.
 
-Implement `restoreDurableEndpointCapacity` before any internal scheduler, assistant dispatcher, or chat adapter starts. It iterates current managed remote mappings and restores every non-null `RuntimeStore.activeTurn` as an observed active claim. It then scans `OperationStore.listRecoverable()` for `send_to_session` records with a strictly valid provisional-start capacity hint, restores one provisional claim keyed by operation ID, and adds its endpoint to startup activation even if no current mapping references it. It stores no message text or attachment data. Missing/malformed hints are ignored only when native dispatch was never checkpointed; an invalid present hint is quarantined as an operation recovery error.
+Implement `EndpointCapacityRecovery.restoreBeforeIngress()` before any internal scheduler, assistant dispatcher, or chat adapter starts. It iterates current managed remote mappings and restores every non-null `RuntimeStore.activeTurn` as an observed active claim. It then scans `OperationStore.listRecoverable()` for `send_to_session` records with a strictly valid provisional-start capacity hint, restores one provisional claim keyed by operation ID, and adds its endpoint to startup activation even if no current mapping references it. It stores no message text or attachment data. Missing hints mean native dispatch never passed the pre-dispatch checkpoint; an invalid present hint is quarantined as an operation recovery error.
+
+Expose `hasIdentityReferences(endpointId)`, which returns true while the pool retains any claim or `OperationStore.listRecoverable()` contains any valid unresolved capacity hint for that endpoint. Production combines this with current registry managed/transitional mappings and injects the union into `EndpointManager` for both preconnection check and post-success commit. The result is evaluated fresh, not cached. An authoritative absent/terminal proof must clear/merge the claim and complete/fail the operation before the hint stops pinning the destination.
 
 After conservative seeding, activate the union of registry and capacity-hint endpoints. For successfully reconnected endpoints, managed-session reconciliation returns authoritative histories; call `restoreObservedActiveTurn` for every nonterminal turn and `reconcileEndpointClaims` to bind/release seeded hints. For unavailable endpoints, retain hints while allowing application startup to continue. Only after this phase starts the internal scheduler/assistant dispatcher and chat adapters. Recovered claims may place the pool above its configured maximum. After an in-process connection returns, call `reconcileEndpointClaims` before normal capacity wakeup. In both paths, use existing `EventRelay.reconcileEndpoint` plus its runtime delivery cursor instead of adding a second final-delivery ledger. An incomplete claim reconciliation keeps capacity reserved but does not block message/session-state reconciliation.
 
@@ -1220,11 +1262,13 @@ git commit -m "docs: add SSH worker setup"
 - [ ] Runtime loss and stale cleanup require the attested App Server PID/process group to be empty; explicit shutdown terminates and verifies the whole group without orphaning Codex.
 - [ ] Cold startup rebuilds capacity from authoritative active managed turns before accepting input, including recovered counts above the configured limit.
 - [ ] An unavailable remote restores last-known active and checkpointed provisional-start claims before internal/chat ingress and retains them until authoritative reconciliation.
+- [ ] Overlapping active/provisional recovery records coalesce to one logical capacity slot and release/wake once.
 - [ ] Remote reboot/process loss starts a new App Server and resumes native threads.
 - [ ] Every backend tmux command uses `tmux -L qiyan-bot -f /dev/null`; normal tmux and user tmux configuration remain untouched.
 - [ ] Host trust, package installation, and authentication remain user-owned.
 - [ ] Local and SSH workers accept Codex `0.142.5` or newer, reject older/unparseable versions, and do not treat the generated schema version as an exact runtime pin.
 - [ ] Destination rebinding is rejected while sessions reference the endpoint.
+- [ ] Retained claims and unresolved durable capacity hints also pin destination identity, including hint-only endpoints.
 - [ ] Every fresh SSH generation revalidates and pins host/user/port; failed first activation persists no binding.
 - [ ] Remote and local workspace policy share the same safety algorithm.
 - [ ] Only explicit `send_to_session` attachments upload and only explicit `prepare_chat_attachment` files download.
