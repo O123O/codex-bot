@@ -72,7 +72,7 @@ import { openSshUnixTunnel, SshEndpoint } from "./endpoints/ssh-endpoint.ts";
 import { WebSocketWire } from "./app-server/websocket-wire.ts";
 import { SshHost } from "./endpoints/ssh-host.ts";
 import { WorkspaceRouter } from "./endpoints/workspace-router.ts";
-import { parseRuntimeIdentity, type EndpointLossKind, type ManagedAppServerEndpoint, type RuntimeIdentity } from "./endpoints/types.ts";
+import { parseRuntimeIdentity, type EndpointLossKind, type EndpointWorkLease, type ManagedAppServerEndpoint, type RuntimeIdentity } from "./endpoints/types.ts";
 import { WorkerFileBridge } from "./endpoints/worker-file-bridge.ts";
 import { EndpointCapacityRecovery, recoverableCapacityHint } from "./endpoints/capacity-recovery.ts";
 
@@ -119,6 +119,25 @@ export function parseEndpointLifecycleCheckpoint(value: unknown): { endpoint: st
   try {
     return { endpoint: item.endpoint, phase: item.phase as "draining" | "idle_proven" | "runtime_stopped" | "runtime_started", identity: parseRuntimeIdentity(item.identity) };
   } catch { return undefined; }
+}
+
+export function withRecoveredSessionLease<T>(
+  endpoints: Pick<EndpointManager, "withWorkLease">,
+  endpointId: string,
+  recover: (lease: EndpointWorkLease) => Promise<T>,
+): Promise<T> {
+  return endpoints.withWorkLease(endpointId, "session-mutation", (_endpoint, lease) => recover(lease));
+}
+
+type LifecycleRecoveryFailure = (nickname: string, session: RegistrySession, error: unknown) => void | Promise<void>;
+
+export async function reconcileLifecycleTransitions(
+  lifecycle: Pick<SessionLifecycle, "reconcileAdopting" | "reconcileRemovals">,
+  onError: LifecycleRecoveryFailure,
+  filter: { endpointId?: string; nickname?: string } = {},
+): Promise<void> {
+  await lifecycle.reconcileAdopting({ ...filter, onError });
+  await lifecycle.reconcileRemovals({ ...filter, onError });
 }
 
 export async function buildProductionApp(
@@ -606,8 +625,7 @@ export async function buildProductionApp(
         const activation = await endpointManager.activateReferenced(referencedEndpoints);
         await reconcileOperations();
         conversations.repairQueueNotices();
-        await lifecycle.reconcileAdopting({ onError: isolateLifecycleRecoveryFailure });
-        await lifecycle.reconcileRemovals({ onError: isolateLifecycleRecoveryFailure });
+        await reconcileLifecycleTransitions(lifecycle, isolateLifecycleRecoveryFailure);
         await resumeManagedSessions();
         for (const endpointId of [...new Set(recoveredEndpointIds)]) {
           if (endpointId === assistantEndpoint.id || activation.unavailable.includes(endpointId)) continue;
@@ -1199,14 +1217,19 @@ export async function buildProductionApp(
           const endpointId = projectEndpoint(args.endpoint);
           const saved = parseEndpointLifecycleCheckpoint(operation.receipt);
           if (operation.receipt !== undefined && (!saved || saved.endpoint !== endpointId)) continue;
-          if (saved) await endpointManager.recoverDisconnect(endpointId, saved.identity);
+          if (saved) {
+            if (saved.phase === "runtime_started") continue;
+            await endpointManager.recoverDisconnect(endpointId, saved.phase, saved.identity,
+              (checkpoint) => operations.checkpoint(operation.id, { endpoint: endpointId, ...(checkpoint as object) }));
+          }
           else await endpointManager.disconnect(endpointId, (checkpoint) => operations.checkpoint(operation.id, { endpoint: endpointId, ...(checkpoint as object) }));
           operations.succeed(operation.id, { endpoint: endpointId, state: "disconnected" });
         } else if (operation.kind === "restart_endpoint") {
           const endpointId = projectEndpoint(args.endpoint);
           const saved = parseEndpointLifecycleCheckpoint(operation.receipt);
           if (operation.receipt !== undefined && (!saved || saved.endpoint !== endpointId)) continue;
-          if (saved) await endpointManager.recoverRestart(endpointId, saved.phase, saved.identity);
+          if (saved) await endpointManager.recoverRestart(endpointId, saved.phase, saved.identity,
+            (checkpoint) => operations.checkpoint(operation.id, { endpoint: endpointId, ...(checkpoint as object) }));
           else await endpointManager.restart(endpointId, (checkpoint) => operations.checkpoint(operation.id, { endpoint: endpointId, ...(checkpoint as object) }));
           operations.succeed(operation.id, { endpoint: endpointId, state: "ready" });
         } else if (operation.kind === "collect_messages") {
@@ -1264,63 +1287,61 @@ export async function buildProductionApp(
           if (proven) await succeedRecovered(operation, { pending: true }, () => observeLifecycle(args.nickname, operation.createdAt));
           else failRecoveredNoEffect(operation.id, "pending session setting was not committed");
         } else if (["create_session", "adopt_session"].includes(operation.kind)) {
-          let session = registry.get(args.nickname);
           const checkpoint = operation.receipt as ({ endpoint?: string; threadId?: string; mappingId?: string; dispatchStarted?: boolean } & Record<string, unknown>) | undefined;
           const project = operation.kind === "create_session" && checkpoint ? preparedProjectWorkspaceFromCheckpoint(checkpoint) : undefined;
-          if (project) {
-            const recoveryEndpointId = projectEndpoint(checkpoint?.endpoint ?? args.endpoint);
-            await endpointManager.withWorkLease(recoveryEndpointId, "session-mutation", async (_endpoint, lease) => {
+          const recoveryEndpointId = projectEndpoint(checkpoint?.endpoint ?? args.endpoint);
+          await withRecoveredSessionLease(endpointManager, recoveryEndpointId, async (lease) => {
+            let session = registry.get(args.nickname);
+            if (project) {
               await workspaceRouter.assertDispatchable(recoveryEndpointId, project, lease);
-            });
-          }
-          const expectedThread = args.thread_id as string | undefined ?? (operation.kind === "create_session" ? checkpoint?.threadId : undefined);
-          const expectedDir = project?.path;
-          if (!session && operation.kind === "create_session" && checkpoint?.dispatchStarted === false) {
-            failRecoveredNoEffect(operation.id, "project workspace was prepared before worker dispatch began");
-            continue;
-          }
-          if (!session && operation.kind === "create_session" && checkpoint?.dispatchStarted === true && !checkpoint.threadId && project) {
-            const endpointId = projectEndpoint(checkpoint.endpoint ?? args.endpoint);
-            const candidates = (await discovery.list({ endpointId, cwd: project.path, limit: 100 })).sessions
-              .filter((candidate) => candidate.threadSource === operation.id && !candidate.archived);
-            if (candidates.length === 0) {
-              failRecoveredNoEffect(operation.id, "worker discovery proved the requested thread was not created");
-              continue;
             }
-            if (candidates.length !== 1) continue;
-            checkpoint.threadId = candidates[0]!.id;
-            operations.checkpoint(operation.id, checkpoint);
-          }
-          if (!session && operation.kind === "create_session" && checkpoint?.threadId && project) {
-            const endpointId = projectEndpoint(checkpoint.endpoint ?? args.endpoint);
-            if (!checkpoint.mappingId) continue;
-            await lifecycle.adopt(args.nickname, endpointId, checkpoint.threadId, (thread) => {
-              if (thread.threadSource !== operation.id) throw new AppError("OPERATION_UNCERTAIN", "recovered worker thread has the wrong creation source");
-              hydrateThreadOrder(endpointId, thread);
-            }, checkpoint.mappingId);
-            session = registry.get(args.nickname);
-          }
-          if (session?.lifecycle_state === "adopting" && session.mapping_id === checkpoint?.mappingId) {
-            await lifecycle.reconcileAdopting({ nickname: args.nickname });
-            session = registry.get(args.nickname);
-          }
-          if (session?.lifecycle_state === "managed" && session.mapping_id === checkpoint?.mappingId
-            && (!expectedThread || session.thread_id === expectedThread) && (!expectedDir || session.project_dir === expectedDir)) {
-            const state = runtime.getSession(session.endpoint, session.thread_id, session.mapping_id);
-            const native = state?.managementState !== "managed" || !runtime.currentEpoch(session.endpoint, session.thread_id, session.mapping_id)
-              ? await lifecycle.reconcileManaged(args.nickname, session)
-              : await pool.request<any>(session.endpoint, "thread/read", { threadId: session.thread_id, includeTurns: true });
-            await verifySessionCwd(session.endpoint, native.thread.cwd, session.project_dir);
-            hydrateThreadOrder(session.endpoint, native.thread);
-            await succeedRecovered(operation, { nickname: args.nickname, mapping_id: session.mapping_id }, () => {
-              advanceNativeWatermark(args.nickname);
-              observeLifecycle(args.nickname);
-              const currentSettings = (checkpoint as any)?.currentSettings;
-              if (currentSettings) observeCurrentSettings(args.nickname, currentSettings, operation.createdAt, (checkpoint as any)?.settingsObservationSequence);
-            });
-          } else if (!session && operation.kind !== "create_session") {
-            failRecoveredNoEffect(operation.id, "atomic session registry mapping was not committed");
-          }
+            const expectedThread = args.thread_id as string | undefined ?? (operation.kind === "create_session" ? checkpoint?.threadId : undefined);
+            const expectedDir = project?.path;
+            if (!session && operation.kind === "create_session" && checkpoint?.dispatchStarted === false) {
+              failRecoveredNoEffect(operation.id, "project workspace was prepared before worker dispatch began");
+              return;
+            }
+            if (!session && operation.kind === "create_session" && checkpoint?.dispatchStarted === true && !checkpoint.threadId && project) {
+              const candidates = (await discovery.list({ endpointId: recoveryEndpointId, cwd: project.path, limit: 100 }, lease)).sessions
+                .filter((candidate) => candidate.threadSource === operation.id && !candidate.archived);
+              if (candidates.length === 0) {
+                failRecoveredNoEffect(operation.id, "worker discovery proved the requested thread was not created");
+                return;
+              }
+              if (candidates.length !== 1) return;
+              checkpoint.threadId = candidates[0]!.id;
+              operations.checkpoint(operation.id, checkpoint);
+            }
+            if (!session && operation.kind === "create_session" && checkpoint?.threadId && project) {
+              if (!checkpoint.mappingId) return;
+              await lifecycle.adopt(args.nickname, recoveryEndpointId, checkpoint.threadId, (thread) => {
+                if (thread.threadSource !== operation.id) throw new AppError("OPERATION_UNCERTAIN", "recovered worker thread has the wrong creation source");
+                hydrateThreadOrder(recoveryEndpointId, thread);
+              }, checkpoint.mappingId, lease);
+              session = registry.get(args.nickname);
+            }
+            if (session?.lifecycle_state === "adopting" && session.mapping_id === checkpoint?.mappingId && session.endpoint === recoveryEndpointId) {
+              await lifecycle.reconcileAdopting({ nickname: args.nickname, endpointId: recoveryEndpointId, existingLease: lease });
+              session = registry.get(args.nickname);
+            }
+            if (session?.lifecycle_state === "managed" && session.mapping_id === checkpoint?.mappingId && session.endpoint === recoveryEndpointId
+              && (!expectedThread || session.thread_id === expectedThread) && (!expectedDir || session.project_dir === expectedDir)) {
+              const state = runtime.getSession(session.endpoint, session.thread_id, session.mapping_id);
+              const native = state?.managementState !== "managed" || !runtime.currentEpoch(session.endpoint, session.thread_id, session.mapping_id)
+                ? await lifecycle.reconcileManaged(args.nickname, session, lease)
+                : await pool.request<any>(session.endpoint, "thread/read", { threadId: session.thread_id, includeTurns: true }, undefined, lease);
+              await verifySessionCwd(session.endpoint, native.thread.cwd, session.project_dir, lease);
+              hydrateThreadOrder(session.endpoint, native.thread);
+              await succeedRecovered(operation, { nickname: args.nickname, mapping_id: session.mapping_id }, () => {
+                advanceNativeWatermark(args.nickname);
+                observeLifecycle(args.nickname);
+                const currentSettings = (checkpoint as any)?.currentSettings;
+                if (currentSettings) observeCurrentSettings(args.nickname, currentSettings, operation.createdAt, (checkpoint as any)?.settingsObservationSequence);
+              });
+            } else if (!session && operation.kind !== "create_session") {
+              failRecoveredNoEffect(operation.id, "atomic session registry mapping was not committed");
+            }
+          });
         } else if (operation.kind === "rename_session") {
           const saved = operation.receipt as Partial<RegistrySession> | undefined;
           const oldMapping = registry.get(args.old_nickname);
@@ -1463,8 +1484,7 @@ export async function buildProductionApp(
     const existing = projectEndpointRecoveries.get(endpointId);
     if (existing) return existing;
     const recovery = (async () => {
-      await lifecycle.reconcileAdopting({ endpointId, onError: isolateLifecycleRecoveryFailure });
-      await lifecycle.reconcileRemovals({ endpointId, onError: isolateLifecycleRecoveryFailure });
+      await reconcileLifecycleTransitions(lifecycle, isolateLifecycleRecoveryFailure, { endpointId });
       await resumeManagedSessions(endpointId);
       await reconcileOperations();
       deliveries.prepare({
@@ -1526,8 +1546,7 @@ export async function buildProductionApp(
     if (stopping) return;
     if (target.id === endpoint.id) {
       await target.start();
-      await lifecycle.reconcileAdopting({ endpointId: target.id, onError: isolateLifecycleRecoveryFailure });
-      await lifecycle.reconcileRemovals({ endpointId: target.id, onError: isolateLifecycleRecoveryFailure });
+      await reconcileLifecycleTransitions(lifecycle, isolateLifecycleRecoveryFailure, { endpointId: target.id });
       await resumeManagedSessions(endpoint.id);
       await reconcileOperations();
       await renderDashboardSafely();
@@ -1561,8 +1580,8 @@ export async function buildProductionApp(
     warnSessionUnavailable(nickname, session.endpoint, session.thread_id);
   }
 
-  async function verifySessionCwd(endpointId: string, actual: string, expected: string): Promise<void> {
-    await endpointManager.withWorkLease(endpointId, "session-mutation", async (_endpoint, lease) => {
+  async function verifySessionCwd(endpointId: string, actual: string, expected: string, existingLease?: EndpointWorkLease): Promise<void> {
+    await endpointManager.runWithWorkLease(endpointId, existingLease, async (lease) => {
       const prepared = await workspaceRouter.prepareExisting(endpointId, actual, lease);
       await workspaceRouter.assertDispatchable(endpointId, prepared, lease);
       if (prepared.path !== expected) throw new Error("registered project directory does not match thread cwd");
@@ -1645,8 +1664,7 @@ export async function buildProductionApp(
       return;
     }
     registryInvalid = false;
-    await lifecycle.reconcileAdopting();
-    await lifecycle.reconcileRemovals();
+    await reconcileLifecycleTransitions(lifecycle, isolateLifecycleRecoveryFailure);
     await reconcileDashboard();
   }
 

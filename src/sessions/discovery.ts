@@ -5,6 +5,7 @@ import type { Clock } from "../core/clock.ts";
 import { SystemClock } from "../core/clock.ts";
 import { AppError } from "../core/errors.ts";
 import type { Database } from "../storage/database.ts";
+import type { EndpointWorkLease } from "../endpoints/types.ts";
 
 export const DISCOVERY_SOURCE_KINDS: readonly ThreadSourceKind[] = [
   "cli", "vscode", "exec", "appServer", "subAgent", "subAgentReview", "subAgentCompact", "subAgentThreadSpawn", "subAgentOther", "unknown",
@@ -32,7 +33,7 @@ export class SessionDiscovery {
     this.snapshotTtlMs = options.snapshotTtlMs ?? 5 * 60_000;
   }
 
-  async list(query: { endpointId: string; search?: string; cwd?: string; limit?: number; cursor?: string }): Promise<{ sessions: DiscoveredSession[]; nextCursor?: string }> {
+  async list(query: { endpointId: string; search?: string; cwd?: string; limit?: number; cursor?: string }, lease?: EndpointWorkLease): Promise<{ sessions: DiscoveredSession[]; nextCursor?: string }> {
     const limit = query.limit ?? 20;
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) throw new RangeError("limit must be between 1 and 100");
     const queryHash = this.queryHash(query.endpointId, query.search, query.cwd, limit);
@@ -50,7 +51,7 @@ export class SessionDiscovery {
       offset = cursor.offset;
       rows = JSON.parse(String(record.rows_json)) as DiscoveredSession[];
     } else {
-      rows = await this.fetchAll(query.endpointId, query.cwd);
+      rows = await this.fetchAll(query.endpointId, query.cwd, lease);
       if (query.search) {
         const needle = query.search.toLocaleLowerCase();
         rows = rows.filter((row) => `${row.id}\n${row.cwd}\n${row.preview}`.toLocaleLowerCase().includes(needle));
@@ -72,7 +73,7 @@ export class SessionDiscovery {
     return Number(this.db.prepare("DELETE FROM discovery_snapshots WHERE expires_at <= ?").run(this.clock.now()).changes);
   }
 
-  private async fetchAll(endpointId: string, cwd?: string): Promise<DiscoveredSession[]> {
+  private async fetchAll(endpointId: string, cwd?: string, lease?: EndpointWorkLease): Promise<DiscoveredSession[]> {
     const rows = new Map<string, DiscoveredSession>();
     for (const archived of [false, true]) {
       let cursor: string | null = null;
@@ -88,7 +89,7 @@ export class SessionDiscovery {
         };
         if (cursor === null) delete params.cursor;
         if (cwd !== undefined) params.cwd = cwd;
-        const page = await this.pool.request<ListResponse>(endpointId, "thread/list", params);
+        const page = await this.pool.request<ListResponse>(endpointId, "thread/list", params, undefined, lease);
         for (const raw of page.data) {
           if (raw.ephemeral === true || raw.parentThreadId != null) continue;
           const id = String(raw.id);

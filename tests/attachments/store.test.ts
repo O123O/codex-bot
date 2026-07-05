@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, lstat, mkdir, mkdtemp, readFile, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Readable } from "node:stream";
@@ -57,6 +57,56 @@ test("staged bytes remain invisible until an explicit final promotion fence", as
   await discarded.discard();
   assert.equal(store.get("ctx", "file_discard"), undefined);
   await assert.rejects(readFile(store.pathForTesting("file_discard")));
+});
+
+test("same-handle concurrent promotion cannot orphan the committed attachment", async () => {
+  const { store } = await fixture();
+  const first = await store.stage("ctx", Readable.from(["same"]), { displayName: "same.txt", mediaType: "text/plain" }, "file_same");
+  const second = await store.stage("ctx", Readable.from(["same"]), { displayName: "same.txt", mediaType: "text/plain" }, "file_same");
+
+  const outcomes = await Promise.allSettled([first.promote(), second.promote()]);
+
+  assert.equal(outcomes.filter(({ status }) => status === "fulfilled").length, 2);
+  assert.equal(store.get("ctx", "file_same")?.sha256, first.attachment.sha256);
+  assert.equal(await readFile(store.pathForTesting("file_same"), "utf8"), "same");
+});
+
+test("a conflicting same-handle promotion rejects without leaking its staged file", async () => {
+  const { root, store } = await fixture();
+  const first = await store.stage("ctx", Readable.from(["first"]), { displayName: "same.txt", mediaType: "text/plain" }, "file_conflict");
+  const second = await store.stage("ctx", Readable.from(["other"]), { displayName: "same.txt", mediaType: "text/plain" }, "file_conflict");
+  await first.promote();
+
+  await assert.rejects(second.promote(), /different bytes/u);
+
+  assert.deepEqual(await readdir(root), ["file_conflict"]);
+  assert.equal(await readFile(store.pathForTesting("file_conflict"), "utf8"), "first");
+});
+
+test("promotion runs its final fence after filesystem publication but before database visibility", async () => {
+  const { store } = await fixture();
+  const staged = await store.stage("ctx", Readable.from(["fenced"]), { displayName: "fenced.txt", mediaType: "text/plain" }, "file_fenced");
+  let fenced = false;
+
+  await staged.promote(async () => {
+    assert.equal(await readFile(store.pathForTesting("file_fenced"), "utf8"), "fenced");
+    assert.equal(store.get("ctx", "file_fenced"), undefined);
+    fenced = true;
+  });
+
+  assert.equal(fenced, true);
+  assert.ok(store.get("ctx", "file_fenced"));
+});
+
+test("initialization removes crashed staged and unpublished attachment files", async () => {
+  const { root, store } = await fixture();
+  await store.stage("ctx", Readable.from(["staged"]), { displayName: "staged.txt", mediaType: "text/plain" }, "file_staged");
+  await writeFile(join(root, "file_orphan"), "orphan", { mode: 0o600 });
+  assert.ok((await readdir(root)).length >= 2);
+
+  await store.initialize();
+
+  assert.deepEqual(await readdir(root), []);
 });
 
 test("enforces per-message and total quotas before retaining partial files", async () => {

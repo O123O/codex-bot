@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
-import { mkdir, open, realpath, rename, unlink, type FileHandle } from "node:fs/promises";
+import { link, mkdir, open, readdir, realpath, unlink, type FileHandle } from "node:fs/promises";
 import { basename, isAbsolute, relative, resolve } from "node:path";
 import { Readable } from "node:stream";
 import type { Clock } from "../core/clock.ts";
@@ -21,7 +21,7 @@ export interface StoredAttachment {
 
 export interface StagedAttachment {
   readonly attachment: StoredAttachment;
-  promote(): Promise<StoredAttachment>;
+  promote(beforeCommit?: () => void | Promise<void>): Promise<StoredAttachment>;
   discard(): Promise<void>;
 }
 
@@ -31,6 +31,7 @@ interface IngestPart extends IngestMeta { stream: AsyncIterable<Uint8Array | str
 export class AttachmentStore {
   private readonly clock: Clock;
   private readonly ttlMs: number;
+  private readonly promotionTails = new Map<FileHandleId, Promise<void>>();
 
   constructor(
     private readonly db: Database,
@@ -47,7 +48,15 @@ export class AttachmentStore {
     this.ttlMs = options.ttlMs ?? 24 * 60 * 60_000;
   }
 
-  async initialize(): Promise<void> { await mkdir(this.root, { recursive: true, mode: 0o700 }); }
+  async initialize(): Promise<void> {
+    await mkdir(this.root, { recursive: true, mode: 0o700 });
+    const retained = new Set((this.db.prepare("SELECT local_path FROM attachments").all() as Array<{ local_path: string }>).map((row) => basename(row.local_path)));
+    for (const entry of await readdir(this.root, { withFileTypes: true })) {
+      if (retained.has(entry.name)) continue;
+      if (!entry.name.startsWith("file_") && !(entry.name.startsWith(".file_") && entry.name.endsWith(".tmp"))) continue;
+      if (entry.isFile() || entry.isSymbolicLink()) await unlink(resolve(this.root, entry.name)).catch(() => undefined);
+    }
+  }
 
   async ingest(scopeId: string, stream: AsyncIterable<Uint8Array | string>, meta: IngestMeta, requestedId?: FileHandleId): Promise<StoredAttachment> {
     const staged = await this.stage(scopeId, stream, meta, requestedId);
@@ -64,7 +73,6 @@ export class AttachmentStore {
       if (existing) return { attachment: existing, promote: async () => existing, discard: async () => undefined };
       const conflicting = this.db.prepare("SELECT 1 FROM attachments WHERE id = ?").get(id);
       if (conflicting) this.invalid("attachment handle belongs to another scope");
-      await unlink(path).catch((error: NodeJS.ErrnoException) => { if (error.code !== "ENOENT") throw error; });
     }
     const temporary = resolve(this.root, `.${id}.${crypto.randomUUID()}.tmp`);
     const file = await open(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
@@ -92,11 +100,35 @@ export class AttachmentStore {
     let state: "staged" | "promoted" | "discarded" = "staged";
     return {
       attachment,
-      promote: async () => {
+      promote: (beforeCommit) => this.withPromotionLock(id, async () => {
         if (state === "promoted") return attachment;
         if (state === "discarded") this.invalid("staged attachment was discarded");
+        const existing = this.get(scopeId, id);
+        if (existing) {
+          if (existing.sha256 !== sha256 || existing.size !== size) {
+            await unlink(temporary).catch(() => undefined);
+            state = "discarded";
+            this.invalid("attachment handle was committed with different bytes");
+          }
+          await unlink(temporary).catch(() => undefined);
+          state = "promoted";
+          return existing;
+        }
+        if (this.db.prepare("SELECT 1 FROM attachments WHERE id = ?").get(id)) {
+          await unlink(temporary).catch(() => undefined);
+          state = "discarded";
+          this.invalid("attachment handle belongs to another scope");
+        }
+        let published = false;
         try {
-          await rename(temporary, path);
+          try { await link(temporary, path); }
+          catch (error) {
+            if (!(error instanceof Error && "code" in error && error.code === "EEXIST")) throw error;
+            await unlink(path);
+            await link(temporary, path);
+          }
+          published = true;
+          await beforeCommit?.();
           const inserted = this.db.prepare(`INSERT INTO attachments
             (id, scope_id, display_name, media_type, local_path, size, sha256, ref_count, expires_at, created_at)
             SELECT ?, ?, ?, ?, ?, ?, ?, 0, ?, ?
@@ -104,20 +136,35 @@ export class AttachmentStore {
             .run(id, scopeId, displayName, attachment.mediaType, path, size, sha256,
               this.clock.now() + this.ttlMs, this.clock.now(), size, this.options.maxStoreBytes).changes;
           if (inserted !== 1) this.invalid("attachment store quota exceeded");
+          await unlink(temporary).catch(() => undefined);
           state = "promoted";
           return attachment;
         } catch (error) {
-          await unlink(path).catch(() => undefined);
+          if (published) await unlink(path).catch(() => undefined);
+          await unlink(temporary).catch(() => undefined);
           state = "discarded";
           throw error;
         }
-      },
+      }),
       discard: async () => {
         if (state !== "staged") return;
         state = "discarded";
         await unlink(temporary).catch(() => undefined);
       },
     };
+  }
+
+  private async withPromotionLock<T>(id: FileHandleId, run: () => Promise<T>): Promise<T> {
+    const previous = this.promotionTails.get(id) ?? Promise.resolve();
+    let release!: () => void;
+    const tail = new Promise<void>((resolveTail) => { release = resolveTail; });
+    this.promotionTails.set(id, tail);
+    await previous;
+    try { return await run(); }
+    finally {
+      release();
+      if (this.promotionTails.get(id) === tail) this.promotionTails.delete(id);
+    }
   }
 
   get(scopeId: string, id: FileHandleId): StoredAttachment | undefined {
@@ -344,8 +391,7 @@ export class AttachmentStore {
       if (!this.isWithin(canonicalRoot, actual)) this.invalid("opened file escapes the project root");
       const staged = await this.stage(scopeId, source.createReadStream({ autoClose: false }), { displayName, mediaType, declaredSize: stat.size }, requestedId);
       try {
-        await beforePromote?.();
-        return await staged.promote();
+        return await staged.promote(beforePromote);
       } catch (error) {
         await staged.discard();
         throw error;

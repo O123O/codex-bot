@@ -10,6 +10,7 @@ class FakeEndpoint implements ManagedAppServerEndpoint {
   starts = 0;
   connectionCloses = 0;
   runtimeStops = 0;
+  rotateIdentityOnStop = false;
   failStart = false;
   identityAvailable = true;
   identityToken = "a".repeat(32);
@@ -18,7 +19,11 @@ class FakeEndpoint implements ManagedAppServerEndpoint {
   constructor(readonly id: string) {}
   async start() { this.starts += 1; if (this.failStart) throw new Error("offline"); this.state = "ready"; this.events.emit("ready"); }
   async closeConnection() { this.connectionCloses += 1; this.state = "stopped"; }
-  async shutdownRuntime() { this.runtimeStops += 1; this.state = "stopped"; }
+  async shutdownRuntime() {
+    this.runtimeStops += 1;
+    this.state = "stopped";
+    if (this.rotateIdentityOnStop && this.id !== "local") this.identityToken = "b".repeat(32);
+  }
   async runtimeIdentity(): Promise<RuntimeIdentity | undefined> {
     if (!this.identityAvailable) return undefined;
     return this.id === "local"
@@ -184,10 +189,12 @@ test("disconnect recovery confirms an already-absent exact runtime without start
   const remote = new FakeEndpoint("orphan");
   remote.identityAvailable = false;
   value.remotes.set("orphan", remote);
-  await value.manager.recoverDisconnect("orphan", { kind: "ssh", token: "a".repeat(32), pid: 10, linuxStartTime: "20", processGroupId: 10 });
+  const checkpoints: unknown[] = [];
+  await value.manager.recoverDisconnect("orphan", "draining", { kind: "ssh", token: "a".repeat(32), pid: 10, linuxStartTime: "20", processGroupId: 10 }, (checkpoint) => checkpoints.push(checkpoint));
   assert.equal(remote.starts, 0);
   assert.equal(remote.runtimeStops, 0);
   assert.equal(value.manager.desiredState("orphan"), "disconnected");
+  assert.deepEqual(checkpoints, [{ phase: "runtime_stopped", identity: { kind: "ssh", token: "a".repeat(32), pid: 10, linuxStartTime: "20", processGroupId: 10 } }]);
 });
 
 test("restart recovery accepts the checkpointed replacement without restarting it again", async () => {
@@ -204,6 +211,28 @@ test("restart recovery accepts the checkpointed replacement without restarting i
   assert.equal(remote.runtimeStops, 0);
 });
 
+test("restart recovery durably checkpoints the stopped and replacement runtime identities", async () => {
+  const value = fixture();
+  const remote = await value.manager.ensureReady("devbox") as FakeEndpoint;
+  const identity = await remote.runtimeIdentity();
+  assert.ok(identity);
+  remote.rotateIdentityOnStop = true;
+  const checkpoints: unknown[] = [];
+
+  await value.manager.recoverRestart("devbox", "draining", identity, (checkpoint) => checkpoints.push(checkpoint));
+
+  assert.deepEqual(checkpoints.map((checkpoint) => (checkpoint as { phase: string }).phase), ["runtime_stopped", "runtime_started"]);
+});
+
+test("runtime-stopped restart recovery refuses to relabel the old runtime as its replacement", async () => {
+  const value = fixture();
+  const remote = await value.manager.ensureReady("devbox") as FakeEndpoint;
+  const identity = await remote.runtimeIdentity();
+  assert.ok(identity);
+
+  await assert.rejects(value.manager.recoverRestart("devbox", "runtime_stopped", identity), /replacement|identity changed/u);
+});
+
 test("restart prepares the replacement before stopping the current runtime", async () => {
   const value = fixture();
   const current = await value.manager.ensureReady("devbox") as FakeEndpoint;
@@ -218,6 +247,13 @@ test("restart prepares the replacement before stopping the current runtime", asy
   await assert.rejects(value.manager.restart("devbox"), /preflight failed/u);
   assert.equal(current.runtimeStops, 0);
   failPreparation = false;
+});
+
+test("restart refuses a replacement that retains the stopped runtime identity", async () => {
+  const value = fixture();
+  await value.manager.ensureReady("devbox");
+
+  await assert.rejects(value.manager.restart("devbox"), /replacement|identity/u);
 });
 
 test("active history prevents disconnect and reopens admission without stopping", async () => {

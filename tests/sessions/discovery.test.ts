@@ -5,6 +5,7 @@ import { AppServerPool } from "../../src/app-server/pool.ts";
 import { AppError } from "../../src/core/errors.ts";
 import { createTestDatabase } from "../../src/storage/database.ts";
 import { SessionDiscovery, DISCOVERY_SOURCE_KINDS } from "../../src/sessions/discovery.ts";
+import type { EndpointWorkLease } from "../../src/endpoints/types.ts";
 
 type Row = { id: string; updatedAt: number; cwd: string; ephemeral: boolean; parentThreadId: string | null; preview: string };
 
@@ -71,4 +72,20 @@ test("discovery search filters the combined snapshot by id, cwd, or preview", as
   endpoint.pages.set("true:first", { data: [], nextCursor: null });
   const discovery = new SessionDiscovery(createTestDatabase(), new AppServerPool([endpoint], { maxConcurrentTurns: 2 }));
   assert.deepEqual((await discovery.list({ endpointId: "local", search: "payments" })).sessions.map((item) => item.id), ["one"]);
+});
+
+test("recovery discovery reuses the caller's endpoint lease for every native page", async () => {
+  const endpoint = new DiscoveryEndpoint();
+  endpoint.pages.set("false:first", { data: [], nextCursor: null });
+  endpoint.pages.set("true:first", { data: [], nextCursor: null });
+  const lease: EndpointWorkLease = { endpointId: "local", lifecycleGeneration: 1, endpointGeneration: 2, leaseId: "lease-1" };
+  const seen: Array<EndpointWorkLease | undefined> = [];
+  const pool = new AppServerPool([endpoint], {
+    maxConcurrentTurns: 2,
+    workLeaseProvider: async (_endpointId, existing, run) => { seen.push(existing); return run(existing); },
+  });
+
+  await new SessionDiscovery(createTestDatabase(), pool).list({ endpointId: "local" }, lease);
+
+  assert.deepEqual(seen, [lease, lease]);
 });

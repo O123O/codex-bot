@@ -116,10 +116,11 @@ export class WorkerFileBridge {
         displayName: basename(input.relativePath), mediaType: "application/octet-stream", declaredSize: result.size,
       }, input.requestedId);
       try {
-        await this.options.workspaces.assertDispatchable(input.endpointId, project, lease);
-        this.assertCurrent(input.mapping, input.projectRoot);
-        this.assertLease(lease, input.endpointId);
-        return await staged.promote();
+        return await staged.promote(async () => {
+          await this.options.workspaces.assertDispatchable(input.endpointId, project, lease);
+          this.assertCurrent(input.mapping, input.projectRoot);
+          this.assertLease(lease, input.endpointId);
+        });
       } catch (error) {
         await staged.discard();
         throw error;

@@ -10,13 +10,14 @@ import {
 class FakeRemote implements RemoteRuntimeClient {
   readonly calls: Array<{ operation: string; args: string[] }> = [];
   status: "absent" | "healthy" | "unhealthy" = "absent";
+  exposeIdentity = true;
   identity = { kind: "ssh" as const, token: "a".repeat(32), pid: 101, linuxStartTime: "202", processGroupId: 101 };
 
   async bootstrap(): Promise<void> { this.calls.push({ operation: "bootstrap", args: [] }); }
   async invoke<T>(operation: string, args: readonly string[]): Promise<T> {
     this.calls.push({ operation, args: [...args] });
     if (operation === "preflight") return { uid: 1000, home: "/home/test", shell: "/bin/bash", codexPath: "/usr/bin/codex", tmuxPath: "/usr/bin/tmux" } as T;
-    if (operation === "inspect") return { status: this.status, ...(this.status === "healthy" || this.status === "unhealthy" ? { identity: this.identity } : {}) } as T;
+    if (operation === "inspect") return { status: this.status, ...((this.status === "healthy" || this.status === "unhealthy") && this.exposeIdentity ? { identity: this.identity } : {}) } as T;
     if (operation === "start") { this.status = "healthy"; return { identity: this.identity } as T; }
     if (operation === "stop") { this.status = "absent"; return { stopped: true } as T; }
     throw new Error(`unexpected operation ${operation}`);
@@ -60,4 +61,13 @@ test("starts and stops only its endpoint runtime and refuses unhealthy replaceme
   assert.deepEqual(await runtime.runtimeIdentity(), remote.identity);
   await assert.rejects(runtime.ensureStarted(), /unhealthy/u);
   assert.equal(remote.calls.filter((call) => call.operation === "stop").length, 1);
+});
+
+test("does not report an unhealthy runtime with missing identity metadata as absent", async () => {
+  const remote = new FakeRemote();
+  remote.status = "unhealthy";
+  remote.exposeIdentity = false;
+  const runtime = new SshRuntime({ endpointId: "devbox", remote });
+
+  await assert.rejects(runtime.runtimeIdentity(), /unhealthy|identity/iu);
 });

@@ -35,7 +35,11 @@ function fixture() {
       const data = Buffer.concat(chunks);
       return {
         attachment: { id: requestedId ?? "file_generated", displayName: "report.txt", mediaType: "application/octet-stream", size: data.length, sha256: createHash("sha256").update(data).digest("hex") },
-        promote: () => attachments.ingest(scopeId, Readable.from([data]), meta, requestedId),
+        promote: async (beforeCommit?: () => void | Promise<void>) => {
+          if (mutateDuringPromote) current = { ...current, mapping_id: "mapping-2" };
+          await beforeCommit?.();
+          return attachments.ingest(scopeId, Readable.from([data]), meta, requestedId);
+        },
         discard: async () => undefined,
       };
     },
@@ -43,6 +47,7 @@ function fixture() {
   };
   let corruptDownload = false;
   let mutateAfterRead = false;
+  let mutateDuringPromote = false;
   let rejectWorkspace = false;
   let remoteReads = 0;
   const remote = {
@@ -84,6 +89,7 @@ function fixture() {
     bridge, uploaded, ingested, discarded,
     corrupt: () => { corruptDownload = true; },
     mutateAfterRead: () => { mutateAfterRead = true; },
+    mutateDuringPromote: () => { mutateDuringPromote = true; },
     replaceWorkspace: () => { rejectWorkspace = true; },
     remoteReads: () => remoteReads,
   };
@@ -112,6 +118,17 @@ test("downloads a selected remote project file and promotes it only for the same
     scopeId: "scope", relativePath: "out/report.txt", requestedId: "file_raced",
   }), /mapping changed/u);
   assert.equal(raced.ingested.length, 0);
+});
+
+test("rejects a mapping change at the attachment database promotion fence", async () => {
+  const value = fixture();
+  value.mutateDuringPromote();
+
+  await assert.rejects(value.bridge.prepareProjectFile({
+    endpointId: "devbox", projectRoot: "/home/xin/project", mapping,
+    scopeId: "scope", relativePath: "out/report.txt", requestedId: "file_promote_race",
+  }), /mapping changed/u);
+  assert.equal(value.ingested.length, 0);
 });
 
 test("rejects corrupt remote downloads without promoting attachment state", async () => {

@@ -137,7 +137,12 @@ export class EndpointManager {
     return this.enqueueLifecycle(record, () => this.restartInternal(endpointId, record, checkpoint));
   }
 
-  async recoverDisconnect(id: string, expectedIdentity: RuntimeIdentity): Promise<void> {
+  async recoverDisconnect(
+    id: string,
+    phase: "draining" | "idle_proven" | "runtime_stopped",
+    expectedIdentity: RuntimeIdentity,
+    checkpoint?: (value: unknown) => void,
+  ): Promise<void> {
     const record = this.record(id);
     return this.enqueueLifecycle(record, async () => {
       if (record.gate.desiredState === "disconnected") return;
@@ -148,6 +153,7 @@ export class EndpointManager {
         const actual = await candidate.endpoint.runtimeIdentity();
         if (!actual) {
           await candidate.endpoint.closeConnection();
+          if (phase !== "runtime_stopped") checkpoint?.({ phase: "runtime_stopped", identity: expectedIdentity });
           drain.disconnect();
           return;
         }
@@ -156,6 +162,7 @@ export class EndpointManager {
         if ((await this.options.managedThreadIds(id)).length > 0 && endpoint.state !== "ready") endpoint = await this.startCandidate(record, candidate);
         await this.requireManagedThreadsIdle(id, endpoint);
         await endpoint.shutdownRuntime(actual);
+        checkpoint?.({ phase: "runtime_stopped", identity: actual });
         drain.disconnect();
       } catch (error) {
         drain.reopen();
@@ -164,7 +171,12 @@ export class EndpointManager {
     });
   }
 
-  async recoverRestart(id: string, phase: "draining" | "idle_proven" | "runtime_stopped" | "runtime_started", expectedIdentity: RuntimeIdentity): Promise<void> {
+  async recoverRestart(
+    id: string,
+    phase: "draining" | "idle_proven" | "runtime_stopped" | "runtime_started",
+    expectedIdentity: RuntimeIdentity,
+    checkpoint?: (value: unknown) => void,
+  ): Promise<void> {
     if (phase === "runtime_started") {
       const endpoint = await this.ensureReady(id);
       const actual = await endpoint.runtimeIdentity();
@@ -172,7 +184,9 @@ export class EndpointManager {
       return;
     }
     if (phase === "runtime_stopped") {
-      await this.ensureReady(id);
+      const endpoint = await this.ensureReady(id);
+      const identity = await this.requireReplacementIdentity(endpoint, expectedIdentity);
+      checkpoint?.({ phase: "runtime_started", identity });
       return;
     }
     const record = this.record(id);
@@ -185,7 +199,10 @@ export class EndpointManager {
         const actual = await target.endpoint.runtimeIdentity();
         if (!actual) {
           await target.endpoint.closeConnection();
-          await this.startCandidate(record, replacement);
+          checkpoint?.({ phase: "runtime_stopped", identity: expectedIdentity });
+          const started = await this.startCandidate(record, replacement);
+          const identity = await this.requireReplacementIdentity(started, expectedIdentity);
+          checkpoint?.({ phase: "runtime_started", identity });
           drain.reopen();
           return;
         }
@@ -194,7 +211,10 @@ export class EndpointManager {
         if ((await this.options.managedThreadIds(id)).length > 0 && endpoint.state !== "ready") endpoint = await this.startCandidate(record, target);
         await this.requireManagedThreadsIdle(id, endpoint);
         await endpoint.shutdownRuntime(actual);
-        await this.startCandidate(record, replacement);
+        checkpoint?.({ phase: "runtime_stopped", identity: actual });
+        const started = await this.startCandidate(record, replacement);
+        const identity = await this.requireReplacementIdentity(started, expectedIdentity);
+        checkpoint?.({ phase: "runtime_started", identity });
         drain.reopen();
       } catch (error) {
         drain.reopen();
@@ -216,7 +236,8 @@ export class EndpointManager {
       await endpoint.shutdownRuntime(identity);
       checkpoint?.({ phase: "runtime_stopped", identity });
       const replacement = await this.startCandidate(record, preparedReplacement);
-      checkpoint?.({ phase: "runtime_started", identity: await this.requireRuntimeIdentity(replacement) });
+      const replacementIdentity = await this.requireReplacementIdentity(replacement, identity);
+      checkpoint?.({ phase: "runtime_started", identity: replacementIdentity });
       drain.reopen();
     } catch (error) {
       drain.reopen();
@@ -349,6 +370,12 @@ export class EndpointManager {
   private async requireRuntimeIdentity(endpoint: ManagedAppServerEndpoint): Promise<RuntimeIdentity> {
     const identity = await endpoint.runtimeIdentity();
     if (!identity) throw new AppError("OPERATION_UNCERTAIN", `runtime identity is unavailable: ${endpoint.id}`);
+    return identity;
+  }
+
+  private async requireReplacementIdentity(endpoint: ManagedAppServerEndpoint, previous: RuntimeIdentity): Promise<RuntimeIdentity> {
+    const identity = await this.requireRuntimeIdentity(endpoint);
+    if (sameRuntimeIdentity(identity, previous)) throw new AppError("OPERATION_UNCERTAIN", `replacement runtime retained the stopped identity: ${endpoint.id}`);
     return identity;
   }
 

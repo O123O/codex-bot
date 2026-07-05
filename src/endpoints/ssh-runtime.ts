@@ -102,7 +102,9 @@ export class SshRuntime implements SshRuntimeController {
   async runtimeIdentity(): Promise<RuntimeIdentity | undefined> {
     const prepared = await this.prepare();
     const current = await this.inspectPrepared(prepared);
-    return current.status === "healthy" || (current.status === "unhealthy" && current.identity) ? current.identity : undefined;
+    if (current.status === "healthy" || (current.status === "unhealthy" && current.identity)) return current.identity;
+    if (current.status === "unhealthy") throw new AppError("OPERATION_UNCERTAIN", `SSH runtime identity is unavailable: ${this.options.endpointId}`);
+    return undefined;
   }
 
   async classifyLoss(): Promise<EndpointLossKind> {

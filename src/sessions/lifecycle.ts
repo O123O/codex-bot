@@ -76,6 +76,7 @@ export class SessionLifecycle {
     threadId: string,
     onThreadRead?: (thread: ThreadView) => void,
     mappingId = `mapping_${randomUUID()}`,
+    existingLease?: EndpointWorkLease,
   ): Promise<void> {
     await this.withMutationLease(endpointId, (lease) => this.gate.run(endpointId, threadId, async () => {
       this.requireAvailable(nickname, endpointId, threadId);
@@ -116,7 +117,7 @@ export class SessionLifecycle {
         }
         throw error;
       }
-    }));
+    }), existingLease);
   }
 
   async unadopt(nickname: string, checkpoint?: (value: LifecycleCheckpoint) => void): Promise<void> {
@@ -163,7 +164,7 @@ export class SessionLifecycle {
     });
   }
 
-  async reconcileAdopting(options: { endpointId?: string; nickname?: string; onError?(nickname: string, session: RegistrySession, error: unknown): void | Promise<void> } = {}): Promise<void> {
+  async reconcileAdopting(options: { endpointId?: string; nickname?: string; existingLease?: EndpointWorkLease; onError?(nickname: string, session: RegistrySession, error: unknown): void | Promise<void> } = {}): Promise<void> {
     const entries = Object.entries(this.registry.snapshot().sessions).filter(([nickname, session]) => session.lifecycle_state === "adopting"
       && (options.endpointId === undefined || session.endpoint === options.endpointId)
       && (options.nickname === undefined || nickname === options.nickname));
@@ -204,14 +205,14 @@ export class SessionLifecycle {
           }
           throw error;
         }
-      })); } catch (error) {
+      }), options.existingLease); } catch (error) {
         if (!options.onError) throw error;
         await options.onError(nickname, expected, error);
       }
     }
   }
 
-  async reconcileManaged(nickname: string, expected: RegistrySession): Promise<ThreadResponse> {
+  async reconcileManaged(nickname: string, expected: RegistrySession, existingLease?: EndpointWorkLease): Promise<ThreadResponse> {
     return this.withMutationLease(expected.endpoint, (lease) => this.gate.run(expected.endpoint, expected.thread_id, async () => {
       const session = this.assertExact(nickname, expected, "managed");
       const project = await this.prepareExisting(session.endpoint, session.project_dir, lease);
@@ -231,7 +232,7 @@ export class SessionLifecycle {
         this.runtime.beginEpoch(current.endpoint, current.thread_id, current.mapping_id, this.baseline(authoritative.thread), this.clock.now());
       }
       return { ...resumed, thread: authoritative.thread };
-    }));
+    }), existingLease);
   }
 
   async reconcileRemovals(options: { endpointId?: string; nickname?: string; onError?(nickname: string, session: RegistrySession, error: unknown): void | Promise<void> } = {}): Promise<void> {

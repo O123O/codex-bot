@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createChatHistoryAction, isUncertainAssistantTransportFailure, parseEndpointLifecycleCheckpoint, registryReloadPreservesWorkerMappings, removalRecoveryDecision } from "../src/production-app.ts";
+import { createChatHistoryAction, isUncertainAssistantTransportFailure, parseEndpointLifecycleCheckpoint, reconcileLifecycleTransitions, registryReloadPreservesWorkerMappings, removalRecoveryDecision, withRecoveredSessionLease } from "../src/production-app.ts";
 import { AppError } from "../src/core/errors.ts";
 import { ChatAdapterRegistry } from "../src/chat/adapter-registry.ts";
+import type { EndpointWorkLease } from "../src/endpoints/types.ts";
 
 test("assistant uncertainty is preserved even while the endpoint still reports ready", () => {
   assert.equal(isUncertainAssistantTransportFailure(new AppError("OPERATION_UNCERTAIN", "shutdown"), "ready"), true);
@@ -62,4 +63,27 @@ test("production chat history resolves the immutable assistant-attempt binding",
   const action = createChatHistoryAction(() => registry, (attemptId) => { assert.equal(attemptId, "attempt-1"); return binding; });
   assert.deepEqual(await action({ scope: "channel", count: 5 }, { attemptId: "attempt-1" }), { messages: [] });
   assert.deepEqual(seen, [{ actualBinding: binding, request: { scope: "channel", count: 5 } }]);
+});
+
+test("session operation recovery holds one endpoint lease for its complete callback", async () => {
+  const lease: EndpointWorkLease = { endpointId: "devbox", lifecycleGeneration: 1, endpointGeneration: 2, leaseId: "lease-1" };
+  let acquisitions = 0;
+  const result = await withRecoveredSessionLease({
+    withWorkLease: async (_id, _kind, run) => { acquisitions += 1; return run({} as never, lease); },
+  }, "devbox", async (actual) => {
+    assert.equal(actual, lease);
+    return "recovered";
+  });
+  assert.equal(result, "recovered");
+  assert.equal(acquisitions, 1);
+});
+
+test("periodic lifecycle reconciliation supplies per-session failure isolation to both phases", async () => {
+  const seen: unknown[] = [];
+  const onError = async () => undefined;
+  await reconcileLifecycleTransitions({
+    reconcileAdopting: async (options) => { seen.push(options); },
+    reconcileRemovals: async (options) => { seen.push(options); },
+  }, onError);
+  assert.deepEqual(seen, [{ onError }, { onError }]);
 });
