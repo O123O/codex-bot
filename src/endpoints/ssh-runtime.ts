@@ -8,11 +8,11 @@ import { buildControlMasterExitArgs, buildSshRemoteArgs, type SshConnectionPlan 
 import { runBoundedProcess, type BoundedProcessResult } from "./ssh-process.ts";
 import { parseRuntimeIdentity, type EndpointLossKind, type RuntimeIdentity } from "./types.ts";
 
-export const REMOTE_HELPER_SHA256 = "0181f4def349c3fbb89b8a11b391ae22508f828547da8ffd63329893e9473708";
+export const REMOTE_HELPER_SHA256 = "88761a88962a87615b8214bb8e05a5d6012c3ab58673f09dc95e352a9cf2a6c9";
 export const REMOTE_LAUNCHER_SHA256 = "db138ff3173f9b72d1fa8cc5fbc94c4958247691a401232d84edf0e3417bd334";
 
 const MAX_REMOTE_ARGUMENT_BYTES = 16 * 1024;
-const helperOperations = new Set(["preflight", "bootstrap", "inspect", "start", "stop", "read-file", "write-file", "workspace", "tunnel"]);
+const helperOperations = new Set(["preflight", "bootstrap", "inspect", "start", "stop", "read-file", "write-file", "rollout-scan", "workspace", "tunnel"]);
 const preflightSchema = z.object({
   uid: z.number().int().positive(),
   home: z.string().startsWith("/"),

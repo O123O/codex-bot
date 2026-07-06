@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createChatHistoryAction, isUncertainAssistantTransportFailure, parseEndpointLifecycleCheckpoint, reconcileLifecycleTransitions, registryReloadPreservesWorkerMappings, removalRecoveryDecision, withRecoveredSessionLease } from "../src/production-app.ts";
+import { createChatHistoryAction, isUncertainAssistantTransportFailure, managedSessionNeedsRecovery, parseEndpointLifecycleCheckpoint, reconcileLifecycleAndOwnership, reconcileLifecycleTransitions, reconcileOwnershipBeforeRelay, reconcileOwnershipBeforeRelayWithLease, registryReloadPreservesWorkerMappings, removalRecoveryDecision, withRecoveredSessionLease } from "../src/production-app.ts";
 import { AppError } from "../src/core/errors.ts";
 import { ChatAdapterRegistry } from "../src/chat/adapter-registry.ts";
 import type { EndpointWorkLease } from "../src/endpoints/types.ts";
@@ -86,4 +86,64 @@ test("periodic lifecycle reconciliation supplies per-session failure isolation t
     reconcileRemovals: async (options) => { seen.push(options); },
   }, onError);
   assert.deepEqual(seen, [{ onError }, { onError }]);
+});
+
+test("lifecycle recovery reconciles durable ownership completion after removal recovery", async () => {
+  const seen: string[] = [];
+  const registry = { getByIdentity: () => undefined };
+  const inserted = await reconcileLifecycleAndOwnership(
+    {
+      reconcileAdopting: async () => { seen.push("adopting"); },
+      reconcileRemovals: async () => { seen.push("removals"); },
+    },
+    async () => undefined,
+    { reconcileReleased: (actual) => { assert.equal(actual, registry); seen.push("ownership-events"); return 1; } },
+    registry,
+  );
+  assert.equal(inserted, 1);
+  assert.deepEqual(seen, ["adopting", "removals", "ownership-events"]);
+});
+
+test("project reconciliation fences external ownership before reading authoritative history", async () => {
+  const seen: string[] = [];
+  await reconcileOwnershipBeforeRelay(
+    {
+      detectEndpoint: async (endpointId) => { seen.push(`detect:${endpointId}`); return []; },
+      release: async () => { seen.push("release"); },
+    },
+    { reconcileEndpoint: async (endpointId) => { seen.push(`relay:${endpointId}`); } },
+    "devbox",
+  );
+  assert.deepEqual(seen, ["detect:devbox", "relay:devbox", "detect:devbox", "release"]);
+});
+
+test("startup and reconnect reconciliation hold one endpoint generation lease across scan-read-scan", async () => {
+  const lease: EndpointWorkLease = { endpointId: "devbox", lifecycleGeneration: 1, endpointGeneration: 2, leaseId: "lease-2" };
+  const seen: unknown[] = [];
+  await reconcileOwnershipBeforeRelayWithLease(
+    { withWorkLease: async (endpointId, kind, run) => {
+      seen.push({ endpointId, kind });
+      return run({} as never, lease);
+    } },
+    {
+      detectEndpoint: async (_endpointId, actualLease) => { seen.push(actualLease); return []; },
+      release: async () => { seen.push("release"); },
+    },
+    { reconcileEndpoint: async (_endpointId, actualLease) => { seen.push(actualLease); } },
+    "devbox",
+  );
+  assert.deepEqual(seen, [
+    { endpointId: "devbox", kind: "rpc" },
+    lease,
+    lease,
+    lease,
+    "release",
+  ]);
+});
+
+test("periodic managed recovery retries a session left unavailable by a transient ownership boundary", () => {
+  assert.equal(managedSessionNeedsRecovery({ managementState: "unavailable" }, true), true);
+  assert.equal(managedSessionNeedsRecovery({ managementState: "managed" }, true), false);
+  assert.equal(managedSessionNeedsRecovery(undefined, true), false);
+  assert.equal(managedSessionNeedsRecovery({ managementState: "managed" }, false), true);
 });

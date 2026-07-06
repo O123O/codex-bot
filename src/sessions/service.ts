@@ -10,6 +10,11 @@ import type { ThreadGate } from "./thread-gate.ts";
 import { WorkspaceRouter } from "../endpoints/workspace-router.ts";
 import type { EndpointManager } from "../endpoints/manager.ts";
 import type { EndpointWorkLease } from "../endpoints/types.ts";
+import type { OwnershipInspection } from "./rollout-ownership.ts";
+
+interface SessionOwnershipCheck {
+  inspect(identity: Pick<RegistrySession, "endpoint" | "thread_id" | "mapping_id">, lease?: EndpointWorkLease): Promise<OwnershipInspection>;
+}
 
 export class SessionService {
   constructor(
@@ -21,6 +26,7 @@ export class SessionService {
     private readonly workspaces: Pick<ProjectWorkspacePolicy, "prepareExisting" | "assertDispatchable"> | WorkspaceRouter,
     private readonly gate: ThreadGate,
     private readonly endpoints?: Pick<EndpointManager, "withWorkLease">,
+    private readonly ownership?: SessionOwnershipCheck,
   ) {}
 
   async send(nickname: string, text: string, options: {
@@ -44,6 +50,8 @@ export class SessionService {
       if (activeTurn) {
         await options.onBeforeNativeDispatch?.({ session, mode: "steer", activeTurnId: activeTurn, ...(lease ? { lease } : {}) });
         this.assertExactManaged(nickname, session.mapping_id);
+        await this.assertOwned(nickname, session, lease);
+        this.assertExactManaged(nickname, session.mapping_id);
         try {
           const response = await this.pool.request<{ turnId: string }>(session.endpoint, "turn/steer", {
             threadId: session.thread_id, ...(options.clientUserMessageId ? { clientUserMessageId: options.clientUserMessageId } : {}), input, expectedTurnId: activeTurn,
@@ -61,6 +69,8 @@ export class SessionService {
       this.assertExactManaged(nickname, session.mapping_id);
       await options.onBeforeNativeDispatch?.({ session, mode: "start", ...(lease ? { lease } : {}) });
       this.assertExactManaged(nickname, session.mapping_id);
+      await this.assertOwned(nickname, session, lease);
+      this.assertExactManaged(nickname, session.mapping_id);
       const response = await this.pool.startTurn<{ turn: { id: string; status?: string } }>(session.endpoint, {
         threadId: session.thread_id, cwd, ...(options.clientUserMessageId ? { clientUserMessageId: options.clientUserMessageId } : {}), input, ...settings,
       }, undefined, lease);
@@ -72,12 +82,17 @@ export class SessionService {
   }
 
   async interrupt(nickname: string, turnId?: string): Promise<void> {
-    const session = this.required(nickname);
-    const active = this.runtime.activeTurn(session.endpoint, session.thread_id, session.mapping_id);
-    if (!active) throw new AppError("SESSION_IDLE", `${nickname} has no active turn`);
-    if (turnId && turnId !== active) throw new AppError("OPERATION_CONFLICT", `active turn is ${active}, not ${turnId}`);
-    await this.pool.interrupt(session.endpoint, session.thread_id, active);
-    this.runtime.setActiveTurn(session.endpoint, session.thread_id, session.mapping_id, undefined);
+    const expected = this.managed(nickname);
+    await this.withMutationLease(expected.endpoint, (lease) => this.gate.run(expected.endpoint, expected.thread_id, async () => {
+      const session = this.assertExactManaged(nickname, expected.mapping_id);
+      await this.assertOwned(nickname, session, lease);
+      this.assertExactManaged(nickname, expected.mapping_id);
+      const active = this.runtime.activeTurn(session.endpoint, session.thread_id, session.mapping_id);
+      if (!active) throw new AppError("SESSION_IDLE", `${nickname} has no active turn`);
+      if (turnId && turnId !== active) throw new AppError("OPERATION_CONFLICT", `active turn is ${active}, not ${turnId}`);
+      await this.pool.interrupt(session.endpoint, session.thread_id, active, lease);
+      this.runtime.clearActiveTurn(session.endpoint, session.thread_id, session.mapping_id, active);
+    }));
   }
 
   activeTurnId(nickname: string): string {
@@ -214,6 +229,8 @@ export class SessionService {
     const expected = this.managed(nickname);
     return this.withMutationLease(expected.endpoint, (lease) => this.gate.run(expected.endpoint, expected.thread_id, async () => {
       const session = this.assertExactManaged(nickname, expected.mapping_id);
+      await this.assertOwned(nickname, session, lease);
+      this.assertExactManaged(nickname, expected.mapping_id);
       const native = await this.pool.request<any>(session.endpoint, "thread/read", { threadId: session.thread_id, includeTurns: false }, undefined, lease);
       const project = await this.prepareExisting(session.endpoint, String(native.thread.cwd), lease);
       await this.assertDispatchable(session.endpoint, project, lease);
@@ -227,6 +244,13 @@ export class SessionService {
     return this.endpoints
       ? this.endpoints.withWorkLease(endpointId, "session-mutation", (_endpoint, lease) => run(lease))
       : run(undefined);
+  }
+
+  private async assertOwned(nickname: string, session: RegistrySession, lease?: EndpointWorkLease): Promise<void> {
+    if (!this.ownership) return;
+    const ownership = await this.ownership.inspect(session, lease);
+    if (ownership.state === "external") throw new AppError("SESSION_DETACHED", `${nickname} is being used outside QiYan`);
+    if (ownership.state === "unclassified") throw new AppError("SESSION_BUSY", `${nickname} has a turn whose ownership is not yet classified`);
   }
 
   private prepareExisting(endpointId: string, path: string, lease?: EndpointWorkLease) {

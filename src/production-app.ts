@@ -23,6 +23,7 @@ import { composeApp, type AppPhase, type BotApp } from "./app.ts";
 import type { BotConfig } from "./config.ts";
 import { AppError } from "./core/errors.ts";
 import { runBackground } from "./core/background.ts";
+import type { ManagementState } from "./core/types.ts";
 import { SessionDashboard } from "./assistant/session-dashboard.ts";
 import { activateAssistantProfileIdentity, resumeAssistantIdentity } from "./assistant/identity.ts";
 import { recordAssistantAuthenticationFailure } from "./assistant/auth-recovery.ts";
@@ -41,6 +42,9 @@ import { SessionRegistry, type RegistryDocument, type RegistrySession } from "./
 import { SessionDiscovery } from "./sessions/discovery.ts";
 import { FinalMessageStore } from "./sessions/final-messages.ts";
 import { SessionLifecycle } from "./sessions/lifecycle.ts";
+import { OwnershipEventStore } from "./sessions/ownership-event-store.ts";
+import { SessionOwnershipWatcher } from "./sessions/ownership-watcher.ts";
+import { SessionOwnershipGuard } from "./sessions/rollout-ownership.ts";
 import { preparedProjectWorkspaceFromCheckpoint, ProjectWorkspacePolicy, type PreparedProjectWorkspace } from "./sessions/project-workspace.ts";
 import { SessionService } from "./sessions/service.ts";
 import { ThreadGate } from "./sessions/thread-gate.ts";
@@ -75,6 +79,7 @@ import { WorkspaceRouter } from "./endpoints/workspace-router.ts";
 import { parseRuntimeIdentity, type EndpointLossKind, type EndpointWorkLease, type ManagedAppServerEndpoint, type RuntimeIdentity } from "./endpoints/types.ts";
 import { WorkerFileBridge } from "./endpoints/worker-file-bridge.ts";
 import { EndpointCapacityRecovery, recoverableCapacityHint } from "./endpoints/capacity-recovery.ts";
+import { RolloutAccessRouter } from "./endpoints/rollout-access.ts";
 
 const assistantAssetRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../assets/assistant");
 const remoteAssetRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../assets/remote");
@@ -111,6 +116,13 @@ export function registryReloadPreservesWorkerMappings(current: RegistryDocument,
   return isDeepStrictEqual(current.sessions, candidate.sessions);
 }
 
+export function managedSessionNeedsRecovery(
+  state: { managementState: ManagementState } | undefined,
+  unavailableOnly: boolean,
+): boolean {
+  return unavailableOnly ? state?.managementState === "unavailable" : true;
+}
+
 export function parseEndpointLifecycleCheckpoint(value: unknown): { endpoint: string; phase: "draining" | "idle_proven" | "runtime_stopped" | "runtime_started"; identity: RuntimeIdentity } | undefined {
   if (!value || typeof value !== "object") return undefined;
   const item = value as Record<string, unknown>;
@@ -138,6 +150,43 @@ export async function reconcileLifecycleTransitions(
 ): Promise<void> {
   await lifecycle.reconcileAdopting({ ...filter, onError });
   await lifecycle.reconcileRemovals({ ...filter, onError });
+}
+
+export async function reconcileLifecycleAndOwnership(
+  lifecycle: Pick<SessionLifecycle, "reconcileAdopting" | "reconcileRemovals">,
+  onError: LifecycleRecoveryFailure,
+  ownershipEvents: Pick<OwnershipEventStore, "reconcileReleased">,
+  registry: Pick<SessionRegistry, "getByIdentity">,
+  filter: { endpointId?: string; nickname?: string } = {},
+): Promise<number> {
+  await reconcileLifecycleTransitions(lifecycle, onError, filter);
+  return ownershipEvents.reconcileReleased(registry);
+}
+
+export async function reconcileOwnershipBeforeRelay(
+  ownership: Pick<SessionOwnershipWatcher, "detectEndpoint" | "release">,
+  relay: Pick<EventRelay, "reconcileEndpoint">,
+  endpointId: string,
+  lease?: EndpointWorkLease,
+  beforeRelay?: (lease: EndpointWorkLease | undefined) => Promise<void>,
+): Promise<void> {
+  const before = await ownership.detectEndpoint(endpointId, lease);
+  await beforeRelay?.(lease);
+  await relay.reconcileEndpoint(endpointId, lease);
+  const after = await ownership.detectEndpoint(endpointId, lease);
+  await ownership.release([...before, ...after]);
+}
+
+export function reconcileOwnershipBeforeRelayWithLease(
+  endpoints: Pick<EndpointManager, "withWorkLease">,
+  ownership: Pick<SessionOwnershipWatcher, "detectEndpoint" | "release">,
+  relay: Pick<EventRelay, "reconcileEndpoint">,
+  endpointId: string,
+  beforeRelay?: (lease: EndpointWorkLease) => Promise<void>,
+): Promise<void> {
+  return endpoints.withWorkLease(endpointId, "rpc", (_endpoint, lease) => reconcileOwnershipBeforeRelay(
+    ownership, relay, endpointId, lease, beforeRelay ? () => beforeRelay(lease) : undefined,
+  ));
 }
 
 export async function buildProductionApp(
@@ -177,6 +226,9 @@ export async function buildProductionApp(
   let pool!: AppServerPool;
   let discovery!: SessionDiscovery;
   let lifecycle!: SessionLifecycle;
+  let ownership!: SessionOwnershipGuard;
+  let ownershipEvents!: OwnershipEventStore;
+  let ownershipWatcher!: SessionOwnershipWatcher;
   let threadGate!: ThreadGate;
   let projectWorkspaces!: ProjectWorkspacePolicy;
   let workspaceRouter!: WorkspaceRouter;
@@ -257,6 +309,7 @@ export async function buildProductionApp(
         preflightConversationCutover(databasePath, telegramBinding !== undefined);
         db = openDatabase(databasePath);
         operations = new OperationStore(db); deliveries = new DeliveryStore(db); runtime = new RuntimeStore(db); finals = new FinalMessageStore(db);
+        ownershipEvents = new OwnershipEventStore(db);
         dashboardStore = new SessionDashboardStore(db);
         endpointBindings = new EndpointBindingStore(db);
         endpointCatalog = await EndpointCatalog.open(config.endpointCatalogPath);
@@ -516,8 +569,16 @@ export async function buildProductionApp(
         }
         discovery = new SessionDiscovery(db, pool);
         threadGate = new ThreadGate();
-        lifecycle = new SessionLifecycle(pool, registry, runtime, { now: () => Date.now() }, workspaceRouter as never, threadGate, endpointManager);
-        sessions = new SessionService(pool, registry, runtime, finals, deliveries, workspaceRouter, threadGate, endpointManager);
+        const rolloutAccess = new RolloutAccessRouter({
+          remote: (id) => {
+            const context = remoteContexts.get(id);
+            return context ? { remote: context.remote, helperPath: context.runtime.remoteHelperPath } : undefined;
+          },
+          validateLease: (id, lease) => endpointManager.validateWorkLease(lease, id),
+        });
+        ownership = new SessionOwnershipGuard(db, runtime, operations, rolloutAccess);
+        lifecycle = new SessionLifecycle(pool, registry, runtime, { now: () => Date.now() }, workspaceRouter as never, threadGate, endpointManager, ownership);
+        sessions = new SessionService(pool, registry, runtime, finals, deliveries, workspaceRouter, threadGate, endpointManager, ownership);
         observations = new SessionObservationProcessor(dashboardStore, registry, runtime, {
           now: () => Date.now(),
           readThread: async (endpointId, threadId) => (await pool.request<any>(endpointId, "thread/read", { threadId, includeTurns: true })).thread,
@@ -529,7 +590,33 @@ export async function buildProductionApp(
           binding: currentOwnerBinding,
           clock: { now: () => Date.now() },
           onTerminal: (event) => observations.observeTerminal(event),
-        }, attachments);
+        }, attachments, ownership, threadGate);
+        ownershipWatcher = new SessionOwnershipWatcher(registry, ownership, lifecycle, {
+          isInspectable: (identity) => {
+            const state = runtime.getSession(identity.endpoint, identity.thread_id, identity.mapping_id)?.managementState;
+            return state === "managed" || state === "unadopting";
+          },
+          onExternal: async (incident) => {
+            const id = `external-turn:${incident.endpoint}:${incident.thread_id}:${incident.mapping_id}:${incident.turnId}`;
+            deliveries.prepare({
+              id,
+              kind: "worker_warning",
+              binding: currentOwnerBinding(),
+              body: `[${incident.nickname}] another Codex client started a turn; QiYan is releasing this session`,
+              mandatory: true,
+            });
+            ownershipEvents.record(incident, "pending");
+            dashboardStore.observeLifecycle({ endpointId: incident.endpoint, threadId: incident.thread_id }, Date.now());
+            await renderDashboardSafely();
+            if (schedulerAccepting) enqueuePendingEvents();
+          },
+          onReleased: async (incident) => {
+            ownershipEvents.record(incident, "completed");
+            dashboardStore.observeLifecycle({ endpointId: incident.endpoint, threadId: incident.thread_id }, Date.now());
+            await renderDashboardSafely();
+            if (schedulerAccepting) enqueuePendingEvents();
+          },
+        }, threadGate);
         scheduler = new AssistantScheduler();
         unsubscribers.push(endpointManager.onEndpoint((target, generation) => bindProjectEndpoint(target, generation)));
         unsubscribers.push(assistantEndpoint.onNotification((method, params) => runBackground(() => onNotification(assistantEndpoint.id, method, params), () => recordBackgroundFailure("assistant notification"))));
@@ -625,12 +712,13 @@ export async function buildProductionApp(
         const activation = await endpointManager.activateReferenced(referencedEndpoints);
         await reconcileOperations();
         conversations.repairQueueNotices();
-        await reconcileLifecycleTransitions(lifecycle, isolateLifecycleRecoveryFailure);
+        await reconcileLifecycleState();
         await resumeManagedSessions();
         for (const endpointId of [...new Set(recoveredEndpointIds)]) {
           if (endpointId === assistantEndpoint.id || activation.unavailable.includes(endpointId)) continue;
-          await pool.reconcileEndpointClaims(endpointId);
-          await relay.reconcileEndpoint(endpointId);
+          await reconcileOwnershipBeforeRelayWithLease(endpointManager, ownershipWatcher, relay, endpointId, async () => {
+            await pool.reconcileEndpointClaims(endpointId);
+          });
         }
         deliveries.recoverAfterCrash();
         reconcileDeliveryEvents();
@@ -744,6 +832,7 @@ export async function buildProductionApp(
         if (!session) throw new AppError("UNKNOWN_SESSION", `unknown session: ${args.nickname}`);
         context.checkpoint({ nickname: args.nickname, ...session, step: "prepared" });
         await lifecycle.unadopt(args.nickname, (checkpoint) => context.checkpoint(checkpoint));
+        reconcileExternalOwnershipReleases();
         await reconcileDashboard();
         return { nickname: args.nickname, mapping_id: session.mapping_id };
       },
@@ -752,6 +841,7 @@ export async function buildProductionApp(
         if (!session) throw new AppError("UNKNOWN_SESSION", `unknown session: ${args.nickname}`);
         context.checkpoint({ nickname: args.nickname, ...session, step: "prepared" });
         await lifecycle.archive(args.nickname, (checkpoint) => context.checkpoint(checkpoint));
+        reconcileExternalOwnershipReleases();
         await reconcileDashboard();
         return { nickname: args.nickname, mapping_id: session.mapping_id };
       },
@@ -1098,7 +1188,16 @@ export async function buildProductionApp(
       await processAssistantTerminal(params);
       return;
     }
-    await relay.handleNotification(endpointId, method, params);
+    if (method === "turn/completed") {
+      await endpointManager.withWorkLease(endpointId, "rpc", async (_endpoint, lease) => {
+        const before = await ownershipWatcher.detectEndpoint(endpointId, lease);
+        await relay.handleNotification(endpointId, method, params, lease);
+        const after = await ownershipWatcher.detectEndpoint(endpointId, lease);
+        await ownershipWatcher.release([...before, ...after]);
+      });
+    } else {
+      await relay.handleNotification(endpointId, method, params);
+    }
     await enqueuePendingEvents();
   }
 
@@ -1435,20 +1534,23 @@ export async function buildProductionApp(
     };
   }
 
-  async function resumeManagedSessions(endpointFilter?: string): Promise<void> {
-    for (const session of Object.values(registry.managedSnapshot().sessions)) {
-      if (endpointFilter && session.endpoint !== endpointFilter) continue;
-      const state = runtime.getSession(session.endpoint, session.thread_id, session.mapping_id);
-      if (state?.managementState === "managed") {
-        runtime.setSession(session.endpoint, session.thread_id, session.mapping_id, "unavailable", state.nativeStatus);
+  async function resumeManagedSessions(endpointFilter?: string, unavailableOnly = false): Promise<void> {
+    if (!unavailableOnly) {
+      for (const session of Object.values(registry.managedSnapshot().sessions)) {
+        if (endpointFilter && session.endpoint !== endpointFilter) continue;
+        const state = runtime.getSession(session.endpoint, session.thread_id, session.mapping_id);
+        if (state?.managementState === "managed") {
+          runtime.setSession(session.endpoint, session.thread_id, session.mapping_id, "unavailable", state.nativeStatus);
+        }
       }
     }
     const reconciledEndpoints = new Set<string>();
     for (const [nickname, session] of Object.entries(registry.managedSnapshot().sessions)) {
       if (endpointFilter && session.endpoint !== endpointFilter) continue;
+      if (!managedSessionNeedsRecovery(runtime.getSession(session.endpoint, session.thread_id, session.mapping_id), unavailableOnly)) continue;
+      reconciledEndpoints.add(session.endpoint);
       try {
         const response = await lifecycle.reconcileManaged(nickname, session);
-        reconciledEndpoints.add(session.endpoint);
         const activeTurn = [...(response.thread.turns ?? [])].reverse().find((turn: any) => !isTerminalStatus(turn.status));
         if (activeTurn) pool.restoreObservedActiveTurn(session.endpoint, session.thread_id, activeTurn.id);
         const resumeObservationSequence = dashboardStore.allocateObservationSequence();
@@ -1463,20 +1565,24 @@ export async function buildProductionApp(
         const current = registry.get(nickname);
         if (current?.mapping_id === session.mapping_id && current.endpoint === session.endpoint
           && current.thread_id === session.thread_id && current.lifecycle_state === "managed") {
-          runtime.setSession(session.endpoint, session.thread_id, session.mapping_id, "unavailable", "notLoaded");
+          const state = runtime.getSession(session.endpoint, session.thread_id, session.mapping_id);
+          if (state?.managementState !== "unadopting") {
+            runtime.setSession(session.endpoint, session.thread_id, session.mapping_id, "unavailable", "notLoaded");
+            warnSessionUnavailable(nickname, session.endpoint, session.thread_id);
+          }
           dashboardStore.observeLifecycle({ endpointId: session.endpoint, threadId: session.thread_id }, Date.now());
-          warnSessionUnavailable(nickname, session.endpoint, session.thread_id);
         }
       }
     }
-    if (endpointFilter && !reconciledEndpoints.has(endpointFilter)
+    if (!unavailableOnly && endpointFilter && !reconciledEndpoints.has(endpointFilter)
       && !Object.values(registry.managedSnapshot().sessions).some((session) => session.endpoint === endpointFilter)) {
       reconciledEndpoints.add(endpointFilter);
     }
     for (const endpointId of reconciledEndpoints) {
-      await pool.reconcileEndpointClaims(endpointId);
-      await observations.drain(endpointId);
-      await relay.reconcileEndpoint(endpointId);
+      await reconcileOwnershipBeforeRelayWithLease(endpointManager, ownershipWatcher, relay, endpointId, async () => {
+        await pool.reconcileEndpointClaims(endpointId);
+        await observations.drain(endpointId);
+      });
     }
   }
 
@@ -1484,7 +1590,7 @@ export async function buildProductionApp(
     const existing = projectEndpointRecoveries.get(endpointId);
     if (existing) return existing;
     const recovery = (async () => {
-      await reconcileLifecycleTransitions(lifecycle, isolateLifecycleRecoveryFailure, { endpointId });
+      await reconcileLifecycleState({ endpointId });
       await resumeManagedSessions(endpointId);
       await reconcileOperations();
       deliveries.prepare({
@@ -1546,7 +1652,7 @@ export async function buildProductionApp(
     if (stopping) return;
     if (target.id === endpoint.id) {
       await target.start();
-      await reconcileLifecycleTransitions(lifecycle, isolateLifecycleRecoveryFailure, { endpointId: target.id });
+      await reconcileLifecycleState({ endpointId: target.id });
       await resumeManagedSessions(endpoint.id);
       await reconcileOperations();
       await renderDashboardSafely();
@@ -1608,6 +1714,17 @@ export async function buildProductionApp(
     if (reconcileDeliveryStateEvents(db, deliveries) > 0 && schedulerAccepting) enqueuePendingEvents();
   }
 
+  function reconcileExternalOwnershipReleases(): number {
+    const inserted = ownershipEvents.reconcileReleased(registry);
+    if (inserted > 0 && schedulerAccepting) enqueuePendingEvents();
+    return inserted;
+  }
+
+  async function reconcileLifecycleState(filter: { endpointId?: string; nickname?: string } = {}): Promise<void> {
+    const inserted = await reconcileLifecycleAndOwnership(lifecycle, isolateLifecycleRecoveryFailure, ownershipEvents, registry, filter);
+    if (inserted > 0 && schedulerAccepting) enqueuePendingEvents();
+  }
+
   function failRecoveredNoEffect(operationId: string, message: string): void {
     operations.failAndUnbind(operationId, { message });
   }
@@ -1638,10 +1755,17 @@ export async function buildProductionApp(
     discovery.cleanupExpired();
     reconcileDeliveryEvents();
     await reconcileOperations();
-    await observations.drain(endpoint.id);
-    if (endpoint.state === "ready") {
-      try { await relay.reconcileEndpoint(endpoint.id); }
-      catch { recordBackgroundFailure("periodic project reconciliation"); }
+    const managedEndpointIds = [...new Set(Object.values(registry.managedSnapshot().sessions).map((session) => session.endpoint))];
+    for (const endpointId of managedEndpointIds) {
+      let target: ManagedAppServerEndpoint;
+      try { target = endpointManager.endpointGeneration(endpointId).endpoint; }
+      catch { continue; }
+      if (target.state !== "ready") continue;
+      try {
+        await reconcileOwnershipBeforeRelayWithLease(endpointManager, ownershipWatcher, relay, endpointId, async () => {
+          await observations.drain(endpointId);
+        });
+      } catch { recordBackgroundFailure("periodic project reconciliation"); }
     }
     await renderDashboardSafely();
     if (assistantEndpoint.state === "ready") {
@@ -1664,7 +1788,15 @@ export async function buildProductionApp(
       return;
     }
     registryInvalid = false;
-    await reconcileLifecycleTransitions(lifecycle, isolateLifecycleRecoveryFailure);
+    await reconcileLifecycleState();
+    for (const endpointId of managedEndpointIds) {
+      let target: ManagedAppServerEndpoint;
+      try { target = endpointManager.endpointGeneration(endpointId).endpoint; }
+      catch { continue; }
+      if (target.state !== "ready") continue;
+      try { await resumeManagedSessions(endpointId, true); }
+      catch { recordBackgroundFailure("periodic managed session recovery"); }
+    }
     await reconcileDashboard();
   }
 

@@ -20,13 +20,20 @@ class LifecycleEndpoint implements AppServerEndpoint {
   status = "idle";
   threadId = "thread-1";
   turns = [{ id: "historical" }];
+  path = "/tmp/rollout-thread-1.jsonl";
+  pathOnStart: string | null | undefined;
   failResume = false;
   onResume: (() => void) | undefined;
 
   async request<T>(method: string, params: any): Promise<T> {
     this.calls.push({ method, params });
-    const thread = { id: this.threadId, cwd: this.cwd, threadSource: params?.threadSource ?? null, status: { type: this.status }, turns: this.turns };
-    if (method === "thread/start") return { thread, cwd: this.cwd, model: "gpt-5", reasoningEffort: "high" } as T;
+    const thread = { id: this.threadId, cwd: this.cwd, path: this.path, threadSource: params?.threadSource ?? null, status: { type: this.status }, turns: this.turns };
+    if (method === "thread/start") return {
+      thread: { ...thread, path: this.pathOnStart === undefined ? this.path : this.pathOnStart },
+      cwd: this.cwd,
+      model: "gpt-5",
+      reasoningEffort: "high",
+    } as T;
     if (method === "thread/read") return { thread } as T;
     if (method === "thread/resume") {
       this.onResume?.();
@@ -37,7 +44,11 @@ class LifecycleEndpoint implements AppServerEndpoint {
   }
 }
 
-async function fixture() {
+async function fixture(ownership?: {
+  initialize(identity: { endpoint: string; thread_id: string; mapping_id: string }, path: string): Promise<void>;
+  inspectIfInitialized?(identity: { endpoint: string; thread_id: string; mapping_id: string }): Promise<{ state: "uninitialized" | "owned" } | { state: "external"; turnId: string }>;
+  release(identity: { endpoint: string; thread_id: string; mapping_id: string }): void;
+}) {
   const dir = await realpath(await mkdtemp(join(tmpdir(), "qiyan-bot-life-")));
   const registry = await SessionRegistry.open(join(dir, "sessions.json"), {
     version: 3,
@@ -60,6 +71,8 @@ async function fixture() {
       assertDispatchable: async (prepared) => { checked.push(prepared.path); },
     },
     gate,
+    undefined,
+    ownership,
   );
   return { dir, registry, endpoint, runtime, lifecycle, project, checked, gate };
 }
@@ -79,6 +92,20 @@ test("create establishes one generation-safe managed epoch", async () => {
   assert.match(session.mapping_id, /^mapping_/u);
   assert.equal(runtime.getSession("local", endpoint.threadId, session.mapping_id)?.managementState, "managed");
   assert.equal(runtime.currentEpoch("local", endpoint.threadId, session.mapping_id)?.baselineTurnId, "historical");
+});
+
+test("create resolves a nullable start-response rollout path before managing the thread", async () => {
+  const initialized: string[] = [];
+  const { endpoint, lifecycle, project } = await fixture({
+    initialize: async (_identity, path) => { initialized.push(path); },
+    release: () => undefined,
+  });
+  endpoint.pathOnStart = null;
+
+  await lifecycle.create("payments", "local", project, "operation-1");
+
+  assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/start", "thread/read"]);
+  assert.deepEqual(initialized, [endpoint.path]);
 });
 
 test("adopt reserves before resume, uses only native cwd, and promotes after a second idle read", async () => {
@@ -138,6 +165,23 @@ test("adopt rolls back a proven subscription when the resumed thread is active",
   assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/read", "thread/resume", "thread/read", "thread/unsubscribe"]);
 });
 
+test("adopt rolls back when rollout ownership finds an external active turn", async () => {
+  const released: string[] = [];
+  const { registry, endpoint, lifecycle } = await fixture({
+    initialize: async () => { throw new AppError("SESSION_BUSY", "external turn"); },
+    release: (identity) => { released.push(identity.mapping_id); },
+  });
+
+  await assert.rejects(
+    lifecycle.adopt("payments", "local", "thread-1"),
+    (error: unknown) => error instanceof AppError && error.code === "SESSION_BUSY",
+  );
+
+  assert.equal(registry.get("payments"), undefined);
+  assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/read", "thread/resume", "thread/read", "thread/unsubscribe"]);
+  assert.equal(released.length, 1);
+});
+
 test("duplicate nickname or native identity fails before resume", async () => {
   const { registry, endpoint, lifecycle } = await fixture();
   await lifecycle.adopt("payments", "local", "thread-1");
@@ -191,6 +235,24 @@ test("startup reconstructs a missing runtime row for an exact managed generation
   assert.equal(resumed.thread.id, "thread-1");
   assert.equal(runtime.getSession("local", "thread-1", "mapping-durable")?.managementState, "managed");
   assert.equal(runtime.currentEpoch("local", "thread-1", "mapping-durable")?.baselineTurnId, "historical");
+});
+
+test("managed recovery checks an existing rollout guard before reading native history", async () => {
+  const seen: string[] = [];
+  const { dir, registry, endpoint, lifecycle } = await fixture({
+    initialize: async () => undefined,
+    inspectIfInitialized: async () => { seen.push("ownership"); return { state: "external", turnId: "external-active" }; },
+    release: () => undefined,
+  });
+  await registry.createManaged("payments", { endpoint: "local", thread_id: "thread-1", project_dir: dir, mapping_id: "mapping-durable" });
+
+  await assert.rejects(lifecycle.reconcileManaged("payments", required(registry)), (error: unknown) => {
+    assert.equal((error as { code?: string }).code, "SESSION_BUSY");
+    return true;
+  });
+
+  assert.deepEqual(seen, ["ownership"]);
+  assert.deepEqual(endpoint.calls, []);
 });
 
 test("adopting reconciliation validates native cwd before resuming", async () => {

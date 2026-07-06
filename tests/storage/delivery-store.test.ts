@@ -82,6 +82,8 @@ test("release-ledger migration backfills historical optional uncertainty without
   db.prepare("UPDATE attachments SET ref_count = 1 WHERE id = 'attachment'").run();
   assert.ok(releaseLedgerMigrationVersion > 0);
   db.exec(`
+    DROP TABLE session_rollout_owned_turns;
+    DROP TABLE session_rollout_ownership;
     DROP TABLE endpoint_bindings;
     DROP TABLE delivery_attachment_releases;
     DELETE FROM schema_migrations WHERE version >= ${releaseLedgerMigrationVersion};

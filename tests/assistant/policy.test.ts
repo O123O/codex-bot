@@ -59,6 +59,9 @@ test("packaged assistant policy is concise and reserves examples for exact direc
   assert.match(policy, /read a worker body only when the user asks, a supervision decision needs it, or compacted context must be recovered/iu);
   assert.match(policy, /for monitoring.*follow up until the requested outcome is genuinely resolved/isu);
   assert.match(policy, /worker notification wakes you.*does not itself justify another user message/isu);
+  assert.match(policy, /external_worker_turn_detected.*release.*pending/isu);
+  assert.match(policy, /external_worker_session_released.*confirms.*unadopt/isu);
+  assert.match(policy, /backend.*user warning.*do not.*duplicate/isu);
   assert.match(policy, /ask when more than one target remains plausible/iu);
   assert.match(policy, /never silently repoint a nickname/iu);
   assert.match(policy, /state change happened only when its tool receipt proves it/iu);

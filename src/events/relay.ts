@@ -7,9 +7,17 @@ import type { DeliveryStore } from "../storage/delivery-store.ts";
 import type { RuntimeStore } from "../storage/runtime-store.ts";
 import type { AttachmentStore } from "../attachments/store.ts";
 import type { ConversationBinding } from "../chat/binding.ts";
+import type { EndpointWorkLease } from "../endpoints/types.ts";
+import type { MappingIdentity } from "../registry/session-registry.ts";
+import type { ThreadGate } from "../sessions/thread-gate.ts";
+import type { OwnershipInspection } from "../sessions/rollout-ownership.ts";
 
 interface TerminalTurn { id: string; status: string; startedAt?: number | null; completedAt: number | null; items: Array<{ type: string; id: string; text?: string; phase?: string | null }> }
 interface ExpectedGeneration { mappingId: string; epochId: string }
+interface TerminalOwnership {
+  inspect(identity: MappingIdentity, lease?: EndpointWorkLease): Promise<OwnershipInspection>;
+  ownsTurn(identity: MappingIdentity, turnId: string): boolean;
+}
 export interface TerminalObservation {
   endpointId: string;
   threadId: string;
@@ -30,10 +38,20 @@ export class EventRelay {
     private readonly deliveries: DeliveryStore,
     private readonly options: { binding(): ConversationBinding; clock: Clock; onTerminal?(event: TerminalObservation): void | Promise<void> },
     private readonly attachments?: Pick<AttachmentStore, "releaseTurn">,
+    private readonly ownership?: TerminalOwnership,
+    private readonly gate?: ThreadGate,
   ) {}
 
-  async handleNotification(endpointId: string, method: string, params: any): Promise<void> {
-    if (method === "turn/completed") await this.handleTerminal(endpointId, params.threadId, params.turn as TerminalTurn);
+  async handleNotification(endpointId: string, method: string, params: any, lease?: EndpointWorkLease): Promise<void> {
+    if (method !== "turn/completed") return;
+    const mapping = this.mapping(endpointId, params.threadId);
+    if (!mapping || !this.gate) {
+      await this.handleTerminal(endpointId, params.threadId, params.turn as TerminalTurn, undefined, false, undefined, lease);
+      return;
+    }
+    await this.gate.run(endpointId, params.threadId, () => this.handleTerminal(
+      endpointId, params.threadId, params.turn as TerminalTurn, undefined, false, undefined, lease,
+    ));
   }
 
   async handlePermissionBlocked(endpointId: string, event: { threadId?: string; turnId?: string; method: string; params: unknown }): Promise<void> {
@@ -48,27 +66,39 @@ export class EventRelay {
     this.runtime.setSession(endpointId, event.threadId, mapping.session.mapping_id, "managed", "permissionBlocked");
   }
 
-  async reconcileEndpoint(endpointId: string): Promise<void> {
+  async reconcileEndpoint(endpointId: string, lease?: EndpointWorkLease): Promise<void> {
     for (const [nickname, session] of Object.entries(this.registry.managedSnapshot().sessions)) {
       if (session.endpoint !== endpointId) continue;
-      const state = this.runtime.getSession(endpointId, session.thread_id, session.mapping_id);
-      const epoch = this.runtime.currentEpoch(endpointId, session.thread_id, session.mapping_id);
-      if (state?.managementState !== "managed" || !epoch) continue;
-      const expected = { mappingId: session.mapping_id, epochId: epoch.id };
-      const response = await this.pool.request<{ thread: { turns: TerminalTurn[] } }>(endpointId, "thread/read", { threadId: session.thread_id, includeTurns: true });
-      if (!this.isCurrentGeneration(endpointId, session.thread_id, expected)) continue;
-      const turns = response.thread.turns;
-      let index = epoch.baselineTurnId ? turns.findIndex((turn) => turn.id === epoch.baselineTurnId) + 1 : 0;
-      if (epoch.baselineTurnId && index === 0) continue;
-      if (state.deliveryCursor) {
-        const cursorIndex = turns.findIndex((turn) => turn.id === state.deliveryCursor);
-        if (cursorIndex >= 0) index = Math.max(index, cursorIndex + 1);
-      }
-      for (const turn of turns.slice(index)) {
-        if (!new Set(["completed", "failed", "interrupted"]).has(turn.status)) break;
-        if (!await this.handleTerminal(endpointId, session.thread_id, turn, nickname, true, expected)) break;
-        this.runtime.setDeliveryCursor(endpointId, session.thread_id, session.mapping_id, turn.id);
-      }
+      const reconcile = async () => {
+        const state = this.runtime.getSession(endpointId, session.thread_id, session.mapping_id);
+        const epoch = this.runtime.currentEpoch(endpointId, session.thread_id, session.mapping_id);
+        if (!state || !this.isDeliverableState(state.managementState) || !epoch) return;
+        const expected = { mappingId: session.mapping_id, epochId: epoch.id };
+        if (!await this.ownershipClassified(session, lease)) return;
+        const response = await this.pool.request<{ thread: { turns: TerminalTurn[] } }>(
+          endpointId, "thread/read", { threadId: session.thread_id, includeTurns: true }, undefined, lease,
+        );
+        if (!await this.ownershipClassified(session, lease)) return;
+        if (!this.isDeliverableGeneration(endpointId, session.thread_id, expected)) return;
+        const turns = response.thread.turns;
+        let index = epoch.baselineTurnId ? turns.findIndex((turn) => turn.id === epoch.baselineTurnId) + 1 : 0;
+        if (epoch.baselineTurnId && index === 0) return;
+        if (state.deliveryCursor) {
+          const cursorIndex = turns.findIndex((turn) => turn.id === state.deliveryCursor);
+          if (cursorIndex >= 0) index = Math.max(index, cursorIndex + 1);
+        }
+        for (const turn of turns.slice(index)) {
+          if (!new Set(["completed", "failed", "interrupted"]).has(turn.status)) break;
+          if (this.ownership && !this.ownership.ownsTurn(session, turn.id)) {
+            this.runtime.setDeliveryCursor(endpointId, session.thread_id, session.mapping_id, turn.id);
+            continue;
+          }
+          if (!await this.handleTerminal(endpointId, session.thread_id, turn, nickname, true, expected)) break;
+          this.runtime.setDeliveryCursor(endpointId, session.thread_id, session.mapping_id, turn.id);
+        }
+      };
+      if (this.gate) await this.gate.run(endpointId, session.thread_id, reconcile);
+      else await reconcile();
     }
   }
 
@@ -79,16 +109,21 @@ export class EventRelay {
     knownNickname?: string,
     authoritative = false,
     expected?: ExpectedGeneration,
+    lease?: EndpointWorkLease,
   ): Promise<boolean> {
     const mapping = this.mapping(endpointId, threadId);
     const state = mapping ? this.runtime.getSession(endpointId, threadId, mapping.session.mapping_id) : undefined;
     let nickname = knownNickname ?? mapping?.nickname;
     const epoch = mapping ? this.runtime.currentEpoch(endpointId, threadId, mapping.session.mapping_id) : undefined;
-    if (!mapping || mapping.session.lifecycle_state !== "managed" || !nickname || state?.managementState !== "managed" || !epoch) return false;
+    if (!mapping || mapping.session.lifecycle_state !== "managed" || !nickname || !this.isDeliverableState(state?.managementState) || !epoch) return false;
     if (expected && (mapping.session.mapping_id !== expected.mappingId || epoch.id !== expected.epochId)) return false;
     if (expected) nickname = mapping.nickname;
     if (!authoritative) {
-      const history = await this.pool.request<{ thread: { turns: TerminalTurn[] } }>(endpointId, "thread/read", { threadId, includeTurns: true });
+      if (!await this.ownershipClassified(mapping.session, lease)) return false;
+      const history = await this.pool.request<{ thread: { turns: TerminalTurn[] } }>(
+        endpointId, "thread/read", { threadId, includeTurns: true }, undefined, lease,
+      );
+      if (!await this.ownershipClassified(mapping.session, lease)) return false;
       const turnIndex = history.thread.turns.findIndex((candidate) => candidate.id === turn.id);
       if (turnIndex < 0) return false;
       if (epoch.baselineTurnId) {
@@ -97,10 +132,11 @@ export class EventRelay {
       }
       turn = history.thread.turns[turnIndex]!;
       const directExpected = { mappingId: mapping.session.mapping_id, epochId: epoch.id };
-      if (!this.isCurrentGeneration(endpointId, threadId, directExpected)) return false;
+      if (!this.isDeliverableGeneration(endpointId, threadId, directExpected)) return false;
       const current = this.mapping(endpointId, threadId)!;
       nickname = current.nickname;
     }
+    if (this.ownership && !this.ownership.ownsTurn(mapping.session, turn.id)) return false;
     this.runtime.clearActiveTurn(endpointId, threadId, mapping.session.mapping_id, turn.id);
     this.pool.markTurnTerminal(endpointId, threadId, turn.id);
     const messages = this.finals.persistTerminalTurn(endpointId, threadId, turn, this.options.clock.now());
@@ -129,12 +165,19 @@ export class EventRelay {
     return true;
   }
 
-  private isCurrentGeneration(endpointId: string, threadId: string, expected: ExpectedGeneration): boolean {
+  private isDeliverableGeneration(endpointId: string, threadId: string, expected: ExpectedGeneration): boolean {
     const current = this.mapping(endpointId, threadId);
     const state = current ? this.runtime.getSession(endpointId, threadId, current.session.mapping_id) : undefined;
     const epoch = current ? this.runtime.currentEpoch(endpointId, threadId, current.session.mapping_id) : undefined;
     return current?.session.mapping_id === expected.mappingId && current.session.lifecycle_state === "managed"
-      && state?.managementState === "managed" && epoch?.id === expected.epochId;
+      && this.isDeliverableState(state?.managementState) && epoch?.id === expected.epochId;
+  }
+
+  private isDeliverableState(state: string | undefined): boolean { return state === "managed" || state === "unadopting"; }
+
+  private async ownershipClassified(identity: MappingIdentity, lease?: EndpointWorkLease): Promise<boolean> {
+    if (!this.ownership) return true;
+    return (await this.ownership.inspect(identity, lease)).state !== "unclassified";
   }
 
   private persistEvent(id: string, endpointId: string, threadId: string, turnId: string | undefined, kind: string, payload: unknown): void {

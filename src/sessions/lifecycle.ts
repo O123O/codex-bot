@@ -9,8 +9,9 @@ import type { ThreadGate } from "./thread-gate.ts";
 import { WorkspaceRouter } from "../endpoints/workspace-router.ts";
 import type { EndpointManager } from "../endpoints/manager.ts";
 import type { EndpointWorkLease } from "../endpoints/types.ts";
+import type { OwnershipInspection } from "./rollout-ownership.ts";
 
-interface ThreadView { id: string; cwd: string; threadSource?: string | null; status: { type: string }; turns: Array<{ id: string }> }
+interface ThreadView { id: string; cwd: string; path?: string | null; threadSource?: string | null; status: { type: string }; turns: Array<{ id: string }> }
 interface ThreadResponse { thread: ThreadView; cwd?: string; model?: string; reasoningEffort?: string | null }
 export interface CurrentSessionSettings { model?: string; effort?: string | null }
 export interface LifecycleCheckpoint extends MappingIdentity {
@@ -18,6 +19,14 @@ export interface LifecycleCheckpoint extends MappingIdentity {
   project_dir: string;
   lifecycle_state: MappingLifecycleState;
   step: "transition_intent" | "transitioned" | "native_unsubscribed" | "native_archived" | "removed";
+}
+
+interface SessionOwnershipLifecycle {
+  initialize(identity: MappingIdentity, path: string, lease?: EndpointWorkLease): Promise<void>;
+  inspectIfInitialized?(identity: MappingIdentity, lease?: EndpointWorkLease): Promise<
+    { state: "uninitialized" } | OwnershipInspection
+  >;
+  release(identity: MappingIdentity): void;
 }
 
 export function workerThreadStartParams(cwd: string, threadSource: string): { cwd: string; ephemeral: false; threadSource: string } {
@@ -33,6 +42,7 @@ export class SessionLifecycle {
     private readonly workspaces: Pick<ProjectWorkspacePolicy, "prepareExisting" | "assertDispatchable">,
     private readonly gate: ThreadGate,
     private readonly endpoints?: Pick<EndpointManager, "withWorkLease" | "runWithWorkLease">,
+    private readonly ownership?: SessionOwnershipLifecycle,
   ) {}
 
   async create(
@@ -54,17 +64,28 @@ export class SessionLifecycle {
     const settings = this.responseSettings(response);
     onThreadCreated?.(response.thread, settings);
     await this.gate.run(endpointId, response.thread.id, async () => {
+      const managedThread = this.ownership && !response.thread.path
+        ? (await this.read(endpointId, response.thread.id, lease)).thread
+        : response.thread;
+      if (managedThread.id !== response.thread.id) throw new AppError("OPERATION_UNCERTAIN", "new thread read returned an unexpected identity");
       await this.assertDispatchable(endpointId, project, lease);
-      await this.verifyCwd(endpointId, response.thread.cwd, project.path, lease);
-      if (response.thread.status.type !== "idle") throw new AppError("OPERATION_UNCERTAIN", `new thread ${response.thread.id} was created in ${response.thread.status.type} state`);
-      await this.registry.createManaged(nickname, {
+      await this.verifyCwd(endpointId, managedThread.cwd, project.path, lease);
+      if (managedThread.status.type !== "idle") throw new AppError("OPERATION_UNCERTAIN", `new thread ${managedThread.id} was created in ${managedThread.status.type} state`);
+      const identity = {
         endpoint: endpointId,
         thread_id: response.thread.id,
         project_dir: project.path,
         mapping_id: mappingId,
-      });
-      this.runtime.setSession(endpointId, response.thread.id, mappingId, "managed", response.thread.status.type);
-      this.runtime.beginEpoch(endpointId, response.thread.id, mappingId, this.baseline(response.thread), this.clock.now());
+      };
+      try {
+        if (this.ownership) await this.ownership.initialize(identity, this.requireRolloutPath(managedThread), lease);
+        await this.registry.createManaged(nickname, identity);
+      } catch (error) {
+        this.ownership?.release(identity);
+        throw error;
+      }
+      this.runtime.setSession(endpointId, managedThread.id, mappingId, "managed", managedThread.status.type);
+      this.runtime.beginEpoch(endpointId, managedThread.id, mappingId, this.baseline(managedThread), this.clock.now());
     });
     return settings;
     }, existingLease);
@@ -103,10 +124,12 @@ export class SessionLifecycle {
         this.requireIdle(after.thread);
         await this.assertDispatchable(endpointId, project, lease);
         await this.verifyCwd(endpointId, after.thread.cwd, project.path, lease);
+        if (this.ownership) await this.ownership.initialize(reserved, this.requireRolloutPath(after.thread), lease);
         await this.registry.promote(nickname, reserved);
         this.runtime.setSession(endpointId, threadId, reserved.mapping_id, "managed", after.thread.status.type);
         this.runtime.beginEpoch(endpointId, threadId, reserved.mapping_id, this.baseline(after.thread), this.clock.now());
       } catch (error) {
+        this.ownership?.release(reserved);
         if (resumed) {
           try {
             await this.pool.request(endpointId, "thread/unsubscribe", { threadId }, undefined, lease);
@@ -134,6 +157,7 @@ export class SessionLifecycle {
       checkpoint?.(this.checkpoint(nickname, session, "unadopting", "native_unsubscribed"));
       this.runtime.endEpoch(session.endpoint, session.thread_id, session.mapping_id, this.clock.now());
       if (!await this.registry.removeIfMatch(nickname, session)) throw new AppError("OPERATION_CONFLICT", "session mapping changed during unadoption");
+      this.ownership?.release(session);
       checkpoint?.(this.checkpoint(nickname, session, "unadopting", "removed"));
     }));
   }
@@ -152,6 +176,7 @@ export class SessionLifecycle {
       checkpoint?.(this.checkpoint(nickname, session, "archiving", "native_archived"));
       this.runtime.endEpoch(session.endpoint, session.thread_id, session.mapping_id, this.clock.now());
       if (!await this.registry.removeIfMatch(nickname, session)) throw new AppError("OPERATION_CONFLICT", "session mapping changed during archive");
+      this.ownership?.release(session);
       checkpoint?.(this.checkpoint(nickname, session, "archiving", "removed"));
     }));
   }
@@ -188,12 +213,14 @@ export class SessionLifecycle {
           await this.verifyCwd(session.endpoint, native.thread.cwd, project.path, lease);
           await this.assertDispatchable(session.endpoint, project, lease);
           const promotable = this.assertExact(nickname, expected, "adopting");
+          if (this.ownership) await this.ownership.initialize(promotable, this.requireRolloutPath(native.thread), lease);
           await this.registry.promote(nickname, promotable);
           this.runtime.setSession(promotable.endpoint, promotable.thread_id, promotable.mapping_id, "managed", native.thread.status.type);
           if (!this.runtime.currentEpoch(promotable.endpoint, promotable.thread_id, promotable.mapping_id)) {
             this.runtime.beginEpoch(promotable.endpoint, promotable.thread_id, promotable.mapping_id, this.baseline(native.thread), this.clock.now());
           }
         } catch (error) {
+          this.ownership?.release(session);
           const current = this.registry.get(nickname);
           if (resumed && current?.lifecycle_state === "adopting" && sameMapping(current, expected)) {
             try {
@@ -218,8 +245,12 @@ export class SessionLifecycle {
       const project = await this.prepareExisting(session.endpoint, session.project_dir, lease);
       await this.assertDispatchable(session.endpoint, project, lease);
       if (project.path !== session.project_dir) throw new AppError("CWD_MISMATCH", "managed project directory changed");
+      const guarded = await this.ownership?.inspectIfInitialized?.(session, lease);
+      if (guarded?.state === "external") throw new AppError("SESSION_BUSY", `thread ${session.thread_id} has an externally started turn`);
+      if (guarded?.state === "unclassified") throw new AppError("SESSION_BUSY", `thread ${session.thread_id} has a turn whose ownership is not yet classified`);
       const before = await this.read(session.endpoint, session.thread_id, lease);
       await this.verifyCwd(session.endpoint, before.thread.cwd, project.path, lease);
+      if (this.ownership) await this.ownership.initialize(session, this.requireRolloutPath(before.thread), lease);
       this.assertExact(nickname, expected, "managed");
       const resumed = await this.pool.request<ThreadResponse>(session.endpoint, "thread/resume", { threadId: session.thread_id }, undefined, lease);
       const afterResume = this.assertExact(nickname, expected, "managed");
@@ -258,6 +289,7 @@ export class SessionLifecycle {
       await this.pool.request(current.endpoint, method, { threadId: current.thread_id }, undefined, lease);
       this.runtime.endEpoch(current.endpoint, current.thread_id, current.mapping_id, this.clock.now());
       await this.registry.removeIfMatch(nickname, current);
+      this.ownership?.release(current);
     }));
   }
 
@@ -320,6 +352,10 @@ export class SessionLifecycle {
       ...(typeof response.model === "string" ? { model: response.model } : {}),
       ...(typeof response.reasoningEffort === "string" || response.reasoningEffort === null ? { effort: response.reasoningEffort } : {}),
     };
+  }
+  private requireRolloutPath(thread: ThreadView): string {
+    if (typeof thread.path !== "string" || thread.path.length === 0) throw new AppError("UNSUPPORTED_CAPABILITY", "Codex did not expose the managed thread rollout path");
+    return thread.path;
   }
   private checkpoint(nickname: string, session: RegistrySession, lifecycleState: "unadopting" | "archiving", step: LifecycleCheckpoint["step"]): LifecycleCheckpoint {
     return {

@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { createHash, randomBytes } from "node:crypto";
-import { mkdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Readable } from "node:stream";
 import test from "node:test";
 import {
@@ -111,4 +113,26 @@ test("published packages include both remote runtime assets", async () => {
   const manifest = JSON.parse(await readFile(new URL("../../package.json", import.meta.url), "utf8")) as { files: string[] };
   assert.ok(manifest.files.includes("assets/remote/qiyan-ssh-helper.mjs"));
   assert.ok(manifest.files.includes("assets/remote/qiyan-app-server-launcher.sh"));
+});
+
+test("the remote helper scans rollout ownership without returning message bodies", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "qiyan-remote-rollout-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const path = join(root, "rollout-thread-remote.jsonl");
+  const secret = "remote private message";
+  await writeFile(path, "\n");
+  const baselineArgument = encodeRemoteArgument(JSON.stringify({ requests: [{ path, threadId: "thread-remote" }] }));
+  const baseline = await runBoundedProcess(process.execPath, [helperPath.pathname, "rollout-scan", baselineArgument], { timeoutMs: 5_000, maxOutputBytes: 64 * 1024 });
+  const cursor = JSON.parse(baseline.stdout.toString("utf8")).results[0].cursor;
+  await appendFile(path, [
+    JSON.stringify({ timestamp: "now", type: "event_msg", payload: { type: "task_started", turn_id: "turn-remote" } }),
+    JSON.stringify({ timestamp: "now", type: "event_msg", payload: { type: "user_message", message: secret, client_id: "ctx:call" } }),
+    "",
+  ].join("\n"));
+  const argument = encodeRemoteArgument(JSON.stringify({ requests: [{ path, threadId: "thread-remote", cursor }] }));
+
+  const result = await runBoundedProcess(process.execPath, [helperPath.pathname, "rollout-scan", argument], { timeoutMs: 5_000, maxOutputBytes: 64 * 1024 });
+  const body = result.stdout.toString("utf8");
+  assert.equal(body.includes(secret), false);
+  assert.deepEqual(JSON.parse(body).results[0].starts, [{ turnId: "turn-remote", clientId: "ctx:call" }]);
 });

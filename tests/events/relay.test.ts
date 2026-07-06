@@ -13,6 +13,8 @@ import { DeliveryStore } from "../../src/storage/delivery-store.ts";
 import { RuntimeStore } from "../../src/storage/runtime-store.ts";
 import { ConversationStore } from "../../src/storage/conversation-store.ts";
 import { OwnerRouteStore } from "../../src/chat/owner-route-store.ts";
+import { SessionObservationProcessor } from "../../src/assistant/session-observer.ts";
+import { SessionDashboardStore } from "../../src/storage/session-dashboard-store.ts";
 
 const mappingId = "mapping-1";
 const binding = { adapterId: "telegram", conversationKey: "telegram:42", destination: { chatId: "42" } } as const;
@@ -23,7 +25,10 @@ class RelayEndpoint implements AppServerEndpoint {
   async request<T>(): Promise<T> { return { thread: { turns: this.turns } } as T; }
 }
 
-async function fixture(onTerminal?: (event: any) => void | Promise<void>) {
+async function fixture(
+  onTerminal?: (event: any) => void | Promise<void>,
+  ownershipOverride?: { inspect(): Promise<{ state: "owned" } | { state: "external"; turnId: string }>; ownsTurn(identity: unknown, turnId: string): boolean },
+) {
   const dir = await realpath(await mkdtemp(join(tmpdir(), "relay-")));
   const db = createTestDatabase();
   const registry = await SessionRegistry.open(join(dir, "sessions.json"), {
@@ -37,7 +42,11 @@ async function fixture(onTerminal?: (event: any) => void | Promise<void>) {
   const deliveries = new DeliveryStore(db);
   const routes = new OwnerRouteStore(db, binding);
   const conversations = new ConversationStore(db, deliveries);
-  const relay = new EventRelay(db, new AppServerPool([endpoint], { maxConcurrentTurns: 4 }), registry, runtime, new FinalMessageStore(db), deliveries, { binding: () => routes.current(), clock: { now: () => 100 }, ...(onTerminal ? { onTerminal } : {}) });
+  const ownership = ownershipOverride ?? {
+    inspect: async () => ({ state: "owned" as const }),
+    ownsTurn: (_identity: unknown, _turnId: string) => true,
+  };
+  const relay = new EventRelay(db, new AppServerPool([endpoint], { maxConcurrentTurns: 4 }), registry, runtime, new FinalMessageStore(db), deliveries, { binding: () => routes.current(), clock: { now: () => 100 }, ...(onTerminal ? { onTerminal } : {}) }, undefined, ownership);
   return { db, endpoint, registry, runtime, deliveries, relay, conversations, routes };
 }
 
@@ -100,6 +109,86 @@ test("failed no-final turns warn, transitional turns are excluded, and permissio
     "[payments] blocked by a permission request",
   ]);
   assert.equal((db.prepare("SELECT COUNT(*) AS n FROM events").get() as any).n, 2);
+});
+
+test("an ownership fence suppresses external replay but recovers an exact owned terminal", async () => {
+  const { endpoint, runtime, deliveries, relay } = await fixture(undefined, {
+    inspect: async () => ({ state: "external", turnId: "external" }),
+    ownsTurn: (_identity, turnId) => turnId === "owned-active",
+  });
+  runtime.setActiveTurn("local", "worker", mappingId, "owned-active");
+  runtime.setSession("local", "worker", mappingId, "unadopting", "active");
+  endpoint.turns = [terminal("baseline"), terminal("external", "interrupted", ""), terminal("owned-active", "completed", "owned final")];
+
+  await relay.reconcileEndpoint("local");
+  assert.deepEqual(deliveries.listReady().map((delivery) => delivery.body), ["[payments] owned final"]);
+  assert.equal(runtime.activeTurn("local", "worker", mappingId), undefined);
+  assert.equal(runtime.getSession("local", "worker", mappingId)?.deliveryCursor, "owned-active");
+});
+
+test("an external terminal notification is ownership-scanned and cannot use cached active state", async () => {
+  const { endpoint, runtime, deliveries, registry, routes, db } = await fixture();
+  const sequence: string[] = [];
+  endpoint.turns = [terminal("baseline"), terminal("external", "completed", "external body")];
+  endpoint.request = async <T>() => { sequence.push("read"); return { thread: { turns: endpoint.turns } } as T; };
+  const observer = new SessionObservationProcessor(new SessionDashboardStore(db), registry, runtime, {
+    now: () => 50,
+    readThread: async () => ({ turns: [] }),
+    readGoal: async () => ({ goal: null }),
+    onChanged: () => undefined,
+    onError: (error) => { throw error; },
+  });
+  assert.equal(observer.accept("local", "turn/started", { threadId: "worker", turn: { id: "external", startedAt: 5 } }), true);
+  await observer.idle();
+  assert.equal(runtime.activeTurn("local", "worker", mappingId), "external");
+  runtime.setSession("local", "worker", mappingId, "unadopting", "active");
+  const ownership = {
+    inspect: async () => { sequence.push("scan"); return { state: "external" as const, turnId: "external" }; },
+    ownsTurn: () => { sequence.push("prove"); return false; },
+  };
+  const relay = new EventRelay(db, new AppServerPool([endpoint], { maxConcurrentTurns: 4 }), registry, runtime, new FinalMessageStore(db), deliveries, { binding: () => routes.current(), clock: { now: () => 100 } }, undefined, ownership);
+
+  await relay.handleNotification("local", "turn/completed", { threadId: "worker", turn: terminal("external", "completed", "") });
+
+  assert.deepEqual(sequence, ["scan", "read", "scan", "prove"]);
+  assert.deepEqual(deliveries.listReady(), []);
+});
+
+test("a turn that becomes external during authoritative read is fenced before delivery", async () => {
+  const { endpoint, runtime, deliveries, registry, routes, db } = await fixture();
+  endpoint.turns = [terminal("baseline"), terminal("racing-external", "completed", "must not deliver")];
+  let scans = 0;
+  const ownership = {
+    inspect: async () => {
+      scans += 1;
+      if (scans === 1) return { state: "owned" as const };
+      runtime.setSession("local", "worker", mappingId, "unadopting", "idle");
+      return { state: "external" as const, turnId: "racing-external" };
+    },
+    ownsTurn: () => false,
+  };
+  const relay = new EventRelay(db, new AppServerPool([endpoint], { maxConcurrentTurns: 4 }), registry, runtime, new FinalMessageStore(db), deliveries, { binding: () => routes.current(), clock: { now: () => 100 } }, undefined, ownership);
+
+  await relay.handleNotification("local", "turn/completed", { threadId: "worker", turn: terminal("racing-external", "completed", "") });
+
+  assert.equal(scans, 2);
+  assert.deepEqual(deliveries.listReady(), []);
+});
+
+test("an unclassified task-start boundary blocks relay history reads", async () => {
+  const { endpoint, deliveries, registry, routes, db, runtime } = await fixture();
+  let reads = 0;
+  endpoint.request = async <T>() => { reads += 1; return { thread: { turns: endpoint.turns } } as T; };
+  const ownership = {
+    inspect: async () => ({ state: "unclassified" as const, turnId: "boundary-turn" }),
+    ownsTurn: () => false,
+  };
+  const relay = new EventRelay(db, new AppServerPool([endpoint], { maxConcurrentTurns: 4 }), registry, runtime, new FinalMessageStore(db), deliveries, { binding: () => routes.current(), clock: { now: () => 100 } }, undefined, ownership);
+
+  await relay.handleNotification("local", "turn/completed", { threadId: "worker", turn: terminal("boundary-turn") });
+
+  assert.equal(reads, 0);
+  assert.deepEqual(deliveries.listReady(), []);
 });
 
 test("ready reconciliation reads history after baseline and advances a durable cursor", async () => {

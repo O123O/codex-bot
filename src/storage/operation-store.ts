@@ -142,6 +142,15 @@ export class OperationStore {
     return row ? this.parseOperation(row) : undefined;
   }
 
+  ownsWorkerTurn(turn: { turnId: string; clientId?: string }): boolean {
+    const row = this.db.prepare(`SELECT 1 FROM operations
+      WHERE kind = 'send_to_session' AND (
+        (? IS NOT NULL AND context_id || ':' || call_id = ?)
+        OR json_extract(receipt_json, '$.turnId') = ?
+      ) LIMIT 1`).get(turn.clientId ?? null, turn.clientId ?? null, turn.turnId);
+    return row !== undefined;
+  }
+
   listRecoverable(): RecoverableOperation[] {
     return (this.db.prepare(`SELECT id, context_id, attempt_id, call_id, kind, args_json, effect_class, state, receipt_json, created_at, sequence
       FROM operations WHERE state IN ('dispatched', 'uncertain') ORDER BY created_at, id`).all() as Array<Record<string, unknown>>).map((row) => ({

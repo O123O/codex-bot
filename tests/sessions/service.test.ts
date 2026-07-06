@@ -11,6 +11,7 @@ import { SessionRegistry } from "../../src/registry/session-registry.ts";
 import { FinalMessageStore } from "../../src/sessions/final-messages.ts";
 import { SessionService } from "../../src/sessions/service.ts";
 import { SessionLifecycle } from "../../src/sessions/lifecycle.ts";
+import type { OwnershipInspection } from "../../src/sessions/rollout-ownership.ts";
 import { ThreadGate } from "../../src/sessions/thread-gate.ts";
 import { createTestDatabase } from "../../src/storage/database.ts";
 import { DeliveryStore } from "../../src/storage/delivery-store.ts";
@@ -67,7 +68,7 @@ class ServiceEndpoint implements AppServerEndpoint {
   }
 }
 
-async function fixture() {
+async function fixture(ownership?: { inspect(identity: { endpoint: string; thread_id: string; mapping_id: string }): Promise<OwnershipInspection> }) {
   const dir = await realpath(await mkdtemp(join(tmpdir(), "qiyan-bot-service-")));
   const registry = await SessionRegistry.open(join(dir, "sessions.json"), {
     version: 3, assistant: { endpoint: "local", thread_id: "coord", project_dir: dir },
@@ -89,7 +90,7 @@ async function fixture() {
     assertDispatchable: async () => { onWorkspaceCheck?.(); await workspaceBarrier; if (workspaceFailure) throw workspaceFailure; },
   };
   const gate = new ThreadGate();
-  const service = new SessionService(pool, registry, runtime, finals, deliveries, workspaces, gate);
+  const service = new SessionService(pool, registry, runtime, finals, deliveries, workspaces, gate, undefined, ownership);
   return {
     db, dir, endpoint, pool, registry, runtime, finals, deliveries, service, gate, workspaces,
     failWorkspace: () => { workspaceFailure = new AppError("CONFIGURATION_ERROR", "project workspace changed unexpectedly"); },
@@ -143,6 +144,63 @@ test("execution performs a fresh native cwd and project check before every mutat
   failWorkspace();
   await assert.rejects(service.send("payments", "blocked"), /changed unexpectedly/);
   assert.equal(endpoint.calls.some((call) => call.method === "turn/start" || call.method === "turn/steer"), false);
+});
+
+test("execution checks rollout ownership before reading or mutating the native thread", async () => {
+  const checked: string[] = [];
+  const value = await fixture({
+    inspect: async (identity) => {
+      checked.push(identity.mapping_id);
+      throw new AppError("SESSION_DETACHED", "external turn detected");
+    },
+  });
+
+  await assert.rejects(value.service.send("payments", "must not run"), (error: unknown) => error instanceof AppError && error.code === "SESSION_DETACHED");
+  assert.deepEqual(checked, [mappingId]);
+  assert.deepEqual(value.endpoint.calls, []);
+});
+
+test("execution rechecks rollout ownership after input preparation and immediately before dispatch", async () => {
+  let external = false;
+  let checks = 0;
+  const value = await fixture({
+    inspect: async () => {
+      checks += 1;
+      return external ? { state: "external", turnId: "outside" } : { state: "owned" };
+    },
+  });
+
+  await assert.rejects(value.service.send("payments", "must not run", {
+    prepareInput: async () => {
+      external = true;
+      return [{ type: "text", text: "prepared", text_elements: [] }];
+    },
+  }), (error: unknown) => error instanceof AppError && error.code === "SESSION_DETACHED");
+
+  assert.equal(checks, 2);
+  assert.equal(value.endpoint.calls.some((call) => call.method === "turn/start" || call.method === "turn/steer"), false);
+});
+
+test("interrupt ownership-fences the cached active turn before touching the App Server", async () => {
+  const value = await fixture({ inspect: async () => ({ state: "external", turnId: "outside" }) });
+  value.runtime.setActiveTurn("local", "thread", mappingId, "outside");
+
+  await assert.rejects(value.service.interrupt("payments", "outside"), (error: unknown) => {
+    assert.equal((error as { code?: string }).code, "SESSION_DETACHED");
+    return true;
+  });
+
+  assert.equal(value.endpoint.calls.some((call) => call.method === "turn/interrupt"), false);
+});
+
+test("an unclassified cached active turn cannot be steered or interrupted", async () => {
+  const value = await fixture({ inspect: async () => ({ state: "unclassified", turnId: "boundary-turn" }) });
+  value.runtime.setActiveTurn("local", "thread", mappingId, "boundary-turn");
+
+  await assert.rejects(value.service.send("payments", "do not steer"), (error: unknown) => error instanceof AppError && error.code === "SESSION_BUSY");
+  await assert.rejects(value.service.interrupt("payments", "boundary-turn"), (error: unknown) => error instanceof AppError && error.code === "SESSION_BUSY");
+
+  assert.equal(value.endpoint.calls.some((call) => call.method === "turn/steer" || call.method === "turn/interrupt"), false);
 });
 
 test("native cwd drift and mapping generation replacement block execution inside the gate", async () => {

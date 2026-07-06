@@ -550,4 +550,29 @@ export const migrations: readonly Migration[] = [
     updated_at INTEGER NOT NULL
   );
   `,
+  `
+  CREATE TABLE session_rollout_ownership (
+    endpoint_id TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
+    mapping_id TEXT NOT NULL,
+    rollout_path TEXT NOT NULL,
+    device TEXT NOT NULL,
+    inode TEXT NOT NULL,
+    byte_offset INTEGER NOT NULL CHECK(byte_offset >= 0),
+    external_turn_id TEXT,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY(endpoint_id, thread_id, mapping_id)
+  );
+  CREATE TABLE session_rollout_owned_turns (
+    endpoint_id TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
+    mapping_id TEXT NOT NULL,
+    turn_id TEXT NOT NULL,
+    recorded_at INTEGER NOT NULL,
+    PRIMARY KEY(endpoint_id, thread_id, mapping_id, turn_id),
+    FOREIGN KEY(endpoint_id, thread_id, mapping_id)
+      REFERENCES session_rollout_ownership(endpoint_id, thread_id, mapping_id)
+      ON DELETE CASCADE
+  );
+  `,
 ];

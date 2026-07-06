@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { constants, lstatSync, readdirSync, readFileSync, renameSync, unlinkSync } from "node:fs";
 import { chmod, lstat, mkdir, open, readFile, realpath, rm, stat, unlink } from "node:fs/promises";
 import { userInfo } from "node:os";
-import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { createConnection } from "node:net";
 
@@ -29,6 +29,7 @@ try {
     case "stop": result = await stop(decodeJson(encoded, 1)); break;
     case "read-file": result = await readFileDescriptor(decodeJson(encoded, 1)); break;
     case "write-file": result = await writeFileDescriptor(decodeJson(encoded, 1)); break;
+    case "rollout-scan": result = await scanRollouts(decodeJson(encoded, 1)); break;
     case "workspace": result = await workspace(decodeJson(encoded, 1)); break;
     default: throw new Error("unsupported helper operation");
     }
@@ -152,6 +153,109 @@ async function stop(value) {
   await rm(paths.socketPath, { force: true });
   await rm(paths.identityPath, { force: true });
   return { stopped: true };
+}
+
+async function scanRollouts(value) {
+  if (!Array.isArray(value?.requests) || value.requests.length < 1 || value.requests.length > 128) throw new Error("invalid rollout scan request");
+  return { results: await Promise.all(value.requests.map(scanRollout)) };
+}
+
+async function scanRollout(request) {
+  const path = request?.path;
+  const threadId = request?.threadId;
+  const cursor = request?.cursor;
+  const name = typeof path === "string" ? basename(path) : "";
+  if (typeof path !== "string" || !isAbsolute(path) || typeof threadId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u.test(threadId)
+    || !name.startsWith("rollout-") || !name.endsWith(`-${threadId}.jsonl`)) throw new Error("invalid rollout scan request");
+  if (cursor !== undefined && (cursor === null || typeof cursor !== "object" || !DECIMAL.test(cursor.device ?? "")
+    || !DECIMAL.test(cursor.inode ?? "") || !Number.isSafeInteger(cursor.offset) || cursor.offset < 0)) throw new Error("invalid rollout scan cursor");
+  const offset = cursor?.offset ?? 0;
+  const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const state = await file.stat({ bigint: true });
+    const uid = process.getuid?.();
+    if (!state.isFile() || (uid !== undefined && state.uid !== BigInt(uid)) || state.size > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error("invalid rollout file");
+    const device = state.dev.toString(10);
+    const inode = state.ino.toString(10);
+    if (cursor && (cursor.device !== device || cursor.inode !== inode)) throw new Error("rollout identity changed");
+    if (BigInt(offset) > state.size) throw new Error("rollout was truncated");
+    const parsed = await parseRolloutFile(file, offset, Number(state.size), cursor !== undefined);
+    const after = await file.stat({ bigint: true });
+    if (after.dev !== state.dev || after.ino !== state.ino || after.size !== state.size || after.mtimeNs !== state.mtimeNs) throw new Error("rollout changed while scanning");
+    return parsed.result({ device, inode, offset });
+  } finally { await file.close(); }
+}
+
+async function parseRolloutFile(file, offset, size, collectStarts) {
+  const parser = createRolloutParser(offset, collectStarts);
+  let position = offset;
+  let carry = Buffer.alloc(0);
+  let carryStart = offset;
+  while (position < size) {
+    const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, size - position));
+    const { bytesRead } = await file.read(chunk, 0, chunk.byteLength, position);
+    if (bytesRead === 0) throw new Error("rollout changed while scanning");
+    position += bytesRead;
+    const bytes = carry.byteLength === 0 ? chunk.subarray(0, bytesRead) : Buffer.concat([carry, chunk.subarray(0, bytesRead)]);
+    let lineStart = 0;
+    for (let index = 0; index < bytes.byteLength; index += 1) {
+      if (bytes[index] !== 0x0a) continue;
+      parser.consume(bytes.subarray(lineStart, index), carryStart + lineStart, carryStart + index + 1);
+      lineStart = index + 1;
+    }
+    carryStart += lineStart;
+    carry = Buffer.from(bytes.subarray(lineStart));
+    if (carry.byteLength > 64 * 1024 * 1024) throw new Error("rollout line exceeds bounded window");
+  }
+  return parser;
+}
+
+function createRolloutParser(baseOffset, collectStarts) {
+  const starts = [];
+  let current;
+  let parsedEnd = baseOffset;
+  function report(turn) {
+    if (!collectStarts) return;
+    if (starts.length >= 1024) throw new Error("rollout ownership scan contains too many turns");
+    starts.push(publicRolloutStart(turn));
+  }
+  function consume(raw, lineStart, lineEnd) {
+    parsedEnd = lineEnd;
+    if (raw.byteLength === 0) return;
+    const value = JSON.parse(raw.toString("utf8"));
+    if (value?.type !== "event_msg" || !value.payload) return;
+    const type = value.payload.type;
+    const turnId = typeof value.payload.turn_id === "string" ? value.payload.turn_id : undefined;
+    if ((type === "task_started" || type === "turn_started") && turnId) {
+      if (current) report(current);
+      current = { turnId, startOffset: lineStart, sawUserMessage: false };
+      return;
+    }
+    if (type === "user_message" && current) {
+      current.sawUserMessage = true;
+      if (typeof value.payload.client_id === "string" && value.payload.client_id.length > 0) current.clientId = value.payload.client_id;
+      return;
+    }
+    if ((type === "task_complete" || type === "turn_complete" || type === "turn_aborted")
+      && current && (!turnId || turnId === current.turnId)) {
+      report(current);
+      current = undefined;
+    }
+  }
+  function result(identity) {
+    if (current?.sawUserMessage) report(current);
+    const cursorOffset = current && !current.sawUserMessage ? current.startOffset : parsedEnd;
+    return {
+      cursor: { ...identity, offset: cursorOffset },
+      starts,
+      ...(current ? { openTurn: publicRolloutStart(current) } : {}),
+    };
+  }
+  return { consume, result };
+}
+
+function publicRolloutStart(turn) {
+  return { turnId: turn.turnId, ...(turn.clientId ? { clientId: turn.clientId } : {}) };
 }
 
 async function readFileDescriptor(value) {
