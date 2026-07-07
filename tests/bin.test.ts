@@ -22,6 +22,7 @@ test("packed qiyan-bot runs without source files or installed dependencies", asy
   const listing = (await execFileAsync("tar", ["-tzf", archive])).stdout.split("\n").filter(Boolean);
   const requiredFiles = new Set([
     "package/README.md",
+    "package/assets/brand/qiyan-logo.png",
     "package/assets/assistant/AGENTS.md",
     "package/assets/assistant/session-status.example.json",
     "package/assets/endpoints.example.jsonc",

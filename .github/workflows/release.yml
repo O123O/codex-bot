@@ -51,6 +51,7 @@ jobs:
           package/README.md
           package/assets/assistant/AGENTS.md
           package/assets/assistant/session-status.example.json
+          package/assets/brand/qiyan-logo.png
           package/assets/endpoints.example.jsonc
           package/assets/remote/qiyan-app-server-launcher.sh
           package/assets/remote/qiyan-ssh-helper.mjs
