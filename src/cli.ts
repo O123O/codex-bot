@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { AppError } from "./core/errors.ts";
+import { AppError, StartupPhaseError, type ErrorCode } from "./core/errors.ts";
 
 export type CliHelpTopic = "root" | "assistant-login" | "weixin-login" | "config-check";
 
@@ -42,7 +42,7 @@ export function formatCliHelp(topic: CliHelpTopic): string {
   if (topic !== "root") {
     return `QiYan ${topic}\n\nUsage:\n  qiyan-bot ${topic} [--home <path>]\n\nOptions:\n  -h, --help     Show help\n  --home <path>  QiYan home directory\n`;
   }
-  return `QiYan personal assistant bot\n\nUsage:\n  qiyan-bot [--home <path>] [--workdir <path>]\n  qiyan-bot assistant-login [--home <path>]\n  qiyan-bot weixin-login [--home <path>]\n  qiyan-bot config-check [--home <path>]\n  qiyan-bot --update\n  qiyan-bot --version\n\nOptions:\n  -h, --help       Show help\n  --home <path>    QiYan home directory\n  --workdir <path> Assistant working directory (run only)\n  --update         Install the latest GitHub Release\n  --version        Print version\n\nRequires Node.js 24 or newer.\n`;
+  return `QiYan personal assistant bot\n\nUsage:\n  qiyan-bot [--home <path>] [--workdir <path>]\n  qiyan-bot assistant-login [--home <path>]\n  qiyan-bot weixin-login [--home <path>]\n  qiyan-bot config-check [--home <path>]\n  qiyan-bot --update\n  qiyan-bot --version\n\nRunning without a command starts the long-lived bot in the foreground.\n\nOptions:\n  -h, --help       Show help\n  --home <path>    QiYan home directory\n  --workdir <path> Assistant working directory (run only)\n  --update         Install the latest GitHub Release\n  --version        Print version\n\nRequires Node.js 24 or newer.\n`;
 }
 
 function parsePathOptions(argv: readonly string[], allowWorkdir: boolean): { assistantWorkdir?: string; qiyanHome?: string } {
@@ -69,6 +69,13 @@ function parsePathOptions(argv: readonly string[], allowWorkdir: boolean): { ass
 }
 
 export function formatStartupError(error: unknown): string {
+  if (error instanceof StartupPhaseError) {
+    if (error.cause instanceof AppError && error.cause.code === "CONFIGURATION_ERROR") return formatStartupError(error.cause);
+    const reason = startupPhaseReasons.get(error.phase) ?? "application startup failed";
+    if (!(error.cause instanceof AppError)) return `STARTUP_ERROR: ${reason}`;
+    if (detailedStartupCodes.has(error.cause.code)) return `STARTUP_ERROR: ${reason} (${error.cause.code}: ${error.cause.message})`;
+    return `STARTUP_ERROR: ${reason} (${error.cause.code})`;
+  }
   if (error instanceof AppError && error.code === "CONFIGURATION_ERROR") return `${error.code}: ${error.message}`;
   if (error instanceof z.ZodError) {
     const issues = error.issues.map((issue) => `${issue.path.join(".") || "configuration"}: ${issue.message}`).join("; ");
@@ -76,3 +83,29 @@ export function formatStartupError(error: unknown): string {
   }
   return "startup failed";
 }
+
+const detailedStartupCodes = new Set<ErrorCode>([
+  "ENDPOINT_UNAVAILABLE",
+  "ENDPOINT_IDENTITY_CHANGED",
+  "UNSUPPORTED_CAPABILITY",
+  "PERMISSION_BLOCKED",
+]);
+
+const startupPhaseReasons: ReadonlyMap<string, string> = new Map([
+  ["assistant-workspace", "assistant workspace initialization failed"],
+  ["assistant-working-directory", "assistant working directory activation failed"],
+  ["storage", "state database initialization failed"],
+  ["registry", "session registry initialization failed"],
+  ["dashboard", "session dashboard initialization failed"],
+  ["attachments", "attachment store initialization failed"],
+  ["chat-adapters", "chat adapter initialization failed; verify configured credentials"],
+  ["mcp", "manager tool server startup failed"],
+  ["subscriptions", "runtime subscription initialization failed"],
+  ["endpoint", "Codex App Server startup failed; verify CODEX_BINARY, Codex version, and assistant authentication"],
+  ["reconciliation", "startup reconciliation failed"],
+  ["assistant", "assistant session initialization failed"],
+  ["scheduler", "assistant scheduler startup failed"],
+  ["delivery", "delivery recovery startup failed"],
+  ["maintenance", "maintenance scheduler startup failed"],
+  ["chat-ingress", "chat connection startup failed; verify credentials and network access"],
+]);

@@ -75,6 +75,8 @@ Before launching, remember that the assistant is non-interactive `danger-full-ac
 qiyan-bot
 ```
 
+QiYan deliberately runs as a long-lived foreground process; it does not daemonize itself. Successful startup prints a readiness line and keeps the terminal occupied until Ctrl+C, SIGINT, or SIGTERM. Use a process supervisor such as a user systemd service for unattended operation.
+
 QiYan home is selected by CLI `--home`, then process `QIYAN_HOME`, then `$HOME/.qiyan-bot`. Other settings use CLI, then process environment, then `<QIYAN_HOME>/.env`, then defaults. `QIYAN_HOME` itself is intentionally not allowed inside `.env`.
 
 The defaults are:

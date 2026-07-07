@@ -53,7 +53,9 @@ Store Telegram and Slack adapter variables in `<QIYAN_HOME>/.env` as their guide
 qiyan-bot
 ```
 
-Use `qiyan-bot --home /absolute/private/home` consistently for validation, login, and run when overriding the default. SIGINT and SIGTERM perform graceful shutdown. For a service, start directly in `qiyan-workdir`; do not use an external `EnvironmentFile`. QiYan reads its private mode-0600 `.env` itself.
+This starts a long-lived foreground process; the terminal remains occupied while QiYan serves chat traffic. Successful startup prints `QiYan is running in the foreground. Press Ctrl+C to stop.` Use Ctrl+C, SIGINT, or SIGTERM for graceful shutdown.
+
+Use `qiyan-bot --home /absolute/private/home` consistently for validation, login, and run when overriding the default. For unattended operation, run the same foreground command under a process supervisor such as a user systemd service. Start directly in `qiyan-workdir`; do not use an external `EnvironmentFile`. QiYan reads its private mode-0600 `.env` itself.
 
 QiYan's own replies have no prefix. Worker finals use `[nickname]`, and backend warnings use `[system]`.
 

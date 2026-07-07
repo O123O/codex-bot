@@ -1,5 +1,8 @@
 import type { BotConfig } from "./config.ts";
+import { StartupPhaseError } from "./core/errors.ts";
 import type { WeixinCredentialHandle } from "./weixin/credential-store.ts";
+
+export { StartupPhaseError } from "./core/errors.ts";
 
 export interface BotApp { start(): Promise<void>; stop(): Promise<void> }
 export interface AppPhase { name: string; start(): Promise<void>; stop(): Promise<void> }
@@ -48,20 +51,24 @@ export function composeApp(
       if (state === "stopping") await transition;
       state = "starting";
       transition = (async () => {
+        let startingPhase: string | undefined;
         try {
           for (const phase of phases) {
+            startingPhase = phase.name;
             await phase.start();
             started.push(phase);
           }
           if (options.maintenance) {
+            startingPhase = "maintenance";
             maintenanceTimer = timers.setInterval(() => void options.maintenance!.run().catch(() => undefined), options.maintenance.intervalMs);
             hasMaintenanceTimer = true;
           }
+          startingPhase = undefined;
           state = "running";
         } catch (error) {
           for (const phase of started.splice(0).reverse()) await phase.stop().catch(() => undefined);
           state = "stopped";
-          throw error;
+          throw error instanceof StartupPhaseError ? error : new StartupPhaseError(startingPhase ?? "unknown", error);
         }
       })();
       return transition;

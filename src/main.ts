@@ -1,4 +1,4 @@
-import { createApp } from "./app.ts";
+import { createApp, type BotApp } from "./app.ts";
 import { formatCliHelp, parseCliArgs } from "./cli.ts";
 import { loadConfig, loadAssistantLoginConfig } from "./config.ts";
 import { loadConfigSource } from "./config-source.ts";
@@ -71,13 +71,32 @@ export async function main(env = process.env, argv: readonly string[] = process.
     ...(command.assistantWorkdir === undefined ? {} : { assistantWorkdir: command.assistantWorkdir }),
   });
   const app = await createApp(config, weixin.configured ? { weixinCredential: weixin.credential } : {});
+  await runForegroundApp(app);
+}
+
+interface ForegroundSignals {
+  once(event: "SIGINT" | "SIGTERM", listener: () => void): unknown;
+}
+
+export const foregroundReadyMessage = "QiYan is running in the foreground. Press Ctrl+C to stop.\n";
+
+export async function runForegroundApp(
+  app: BotApp,
+  options: {
+    signals?: ForegroundSignals;
+    write?: (text: string) => void;
+    onStopError?: () => void;
+  } = {},
+): Promise<void> {
   await app.start();
+  (options.write ?? ((text) => { process.stdout.write(text); }))(foregroundReadyMessage);
   let stopping = false;
   const stop = () => {
     if (stopping) return;
     stopping = true;
-    void app.stop().catch(() => { process.exitCode = 1; });
+    void app.stop().catch(options.onStopError ?? (() => { process.exitCode = 1; }));
   };
-  process.once("SIGINT", stop);
-  process.once("SIGTERM", stop);
+  const signals = options.signals ?? process;
+  signals.once("SIGINT", stop);
+  signals.once("SIGTERM", stop);
 }

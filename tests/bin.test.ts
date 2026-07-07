@@ -171,7 +171,8 @@ test("packed qiyan-bot runs without source files or installed dependencies", asy
     },
   });
   assert.equal(startup.status, 1);
-  assert.equal(startup.stderr, "qiyan-bot: startup failed\n");
+  assert.equal(startup.stdout, "");
+  assert.equal(startup.stderr, "qiyan-bot: STARTUP_ERROR: Codex App Server startup failed; verify CODEX_BINARY, Codex version, and assistant authentication\n");
   assert.equal(await readFile(join(workdir, "AGENTS.md"), "utf8"), await readFile(join(packageRoot, "assets", "assistant", "AGENTS.md"), "utf8"));
   assert.deepEqual(JSON.parse(await readFile(join(workdir, "session-status.json"), "utf8")), { version: 2, sessions: {} });
   assert.deepEqual(JSON.parse(await readFile(join(workdir, "assistant-context.json"), "utf8")), {

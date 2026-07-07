@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { composeApp, createApp, TerminalInbox, type AppPhase } from "../src/app.ts";
+import { composeApp, createApp, StartupPhaseError, TerminalInbox, type AppPhase } from "../src/app.ts";
 import type { BotConfig } from "../src/config.ts";
 import type { WeixinCredentialHandle } from "../src/weixin/credential-store.ts";
 
@@ -23,7 +23,11 @@ test("startup failure cleans already started resources in reverse order", async 
     { name: "two", start: async () => { events.push("start:two"); throw new Error("boom"); }, stop: async () => { events.push("stop:two"); } },
     { name: "three", start: async () => { events.push("start:three"); }, stop: async () => undefined },
   ]);
-  await assert.rejects(app.start(), /boom/);
+  let failure: unknown;
+  try { await app.start(); } catch (error) { failure = error; }
+  assert.ok(failure instanceof StartupPhaseError);
+  assert.equal(failure.phase, "two");
+  assert.match(String(failure.cause), /boom/u);
   assert.deepEqual(events, ["start:one", "start:two", "stop:one"]);
   await app.stop();
 });
@@ -42,6 +46,17 @@ test("maintenance scheduling is deterministic and stops cleanly", async () => {
   await app.stop();
   assert.deepEqual(events, ["maintain"]);
   assert.equal(clears, 1);
+});
+
+test("maintenance timer setup failures retain a safe startup phase", async () => {
+  const app = composeApp([], {
+    maintenance: { intervalMs: 100, run: async () => undefined },
+    timers: { setInterval: () => { throw new Error("timer failed"); }, clearInterval: () => undefined },
+  });
+  let failure: unknown;
+  try { await app.start(); } catch (error) { failure = error; }
+  assert.ok(failure instanceof StartupPhaseError);
+  assert.equal(failure.phase, "maintenance");
 });
 
 test("terminal inbox preserves a completion that precedes attempt registration", () => {

@@ -30,3 +30,13 @@ export class AppError extends Error {
     this.name = "AppError";
   }
 }
+
+export class StartupPhaseError extends Error {
+  constructor(
+    readonly phase: string,
+    override readonly cause: unknown,
+  ) {
+    super("application startup failed", { cause });
+    this.name = "StartupPhaseError";
+  }
+}

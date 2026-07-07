@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { StartupPhaseError } from "../src/app.ts";
 import { formatCliHelp, formatStartupError, parseCliArgs } from "../src/cli.ts";
 import { AppError } from "../src/core/errors.ts";
 
@@ -33,6 +34,7 @@ test("formats useful top-level and command-specific help", () => {
   assert.match(root, /^QiYan personal assistant bot\n/u);
   assert.match(root, /Usage:\n  qiyan-bot \[--home <path>\] \[--workdir <path>\]/u);
   assert.match(root, /qiyan-bot assistant-login \[--home <path>\]/u);
+  assert.match(root, /starts the long-lived bot in the foreground/u);
   assert.match(root, /-h, --help/u);
   assert.match(root, /Requires Node\.js 24 or newer\./u);
   assert.equal(root.endsWith("\n"), true);
@@ -68,4 +70,31 @@ test("does not echo an unknown argument into a startup error", () => {
 test("formats only known user-facing startup failures", () => {
   assert.equal(formatStartupError(new AppError("CONFIGURATION_ERROR", "managed file changed")), "CONFIGURATION_ERROR: managed file changed");
   assert.equal(formatStartupError(new Error("request contained secret-token")), "startup failed");
+});
+
+test("formats startup phases and only sanitized typed causes", () => {
+  assert.equal(
+    formatStartupError(new StartupPhaseError("endpoint", new Error("spawn included secret-token"))),
+    "STARTUP_ERROR: Codex App Server startup failed; verify CODEX_BINARY, Codex version, and assistant authentication",
+  );
+  assert.equal(
+    formatStartupError(new StartupPhaseError("endpoint", new AppError("UNSUPPORTED_CAPABILITY", "requires Codex app-server 1.2.3 or newer"))),
+    "STARTUP_ERROR: Codex App Server startup failed; verify CODEX_BINARY, Codex version, and assistant authentication (UNSUPPORTED_CAPABILITY: requires Codex app-server 1.2.3 or newer)",
+  );
+  assert.equal(
+    formatStartupError(new StartupPhaseError("assistant", new AppError("OPERATION_UNCERTAIN", "response included secret-token"))),
+    "STARTUP_ERROR: assistant session initialization failed (OPERATION_UNCERTAIN)",
+  );
+  assert.equal(
+    formatStartupError(new StartupPhaseError("endpoint", new AppError("CONFIGURATION_ERROR", "assistant profile is not authenticated"))),
+    "CONFIGURATION_ERROR: assistant profile is not authenticated",
+  );
+  assert.equal(
+    formatStartupError(new StartupPhaseError("secret-phase-name", new Error("secret-token"))),
+    "STARTUP_ERROR: application startup failed",
+  );
+  assert.equal(
+    formatStartupError(new StartupPhaseError("constructor", new Error("secret-token"))),
+    "STARTUP_ERROR: application startup failed",
+  );
 });
