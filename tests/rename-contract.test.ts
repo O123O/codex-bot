@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { readFile, readdir } from "node:fs/promises";
 import { join, relative, resolve } from "node:path";
 import test from "node:test";
+import { APP_VERSION } from "../src/version.ts";
 
 const root = resolve(import.meta.dirname, "..");
 const historyRoot = resolve(root, "docs", "superpowers");
@@ -33,7 +34,7 @@ test("active source and documentation use only the QiYan identity", async () => 
 
   const manifest = JSON.parse(await readFile(join(root, "package.json"), "utf8")) as Record<string, unknown>;
   assert.equal(manifest.name, "qiyan-bot");
-  assert.equal(manifest.version, "0.5.1");
+  assert.equal(manifest.version, APP_VERSION);
   assert.deepEqual(manifest.bin, { "qiyan-bot": "dist/qiyan-bot" });
 });
 

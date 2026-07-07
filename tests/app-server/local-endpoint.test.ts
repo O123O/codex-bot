@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import test from "node:test";
 import { LocalEndpoint, resolveMcpClientIdentity } from "../../src/app-server/local-endpoint.ts";
+import { APP_VERSION } from "../../src/version.ts";
 
 class FakeChild extends EventEmitter {
   constructor(readonly pid?: number) { super(); }
@@ -37,7 +38,7 @@ test("initializes app-server before becoming ready", async () => {
   assert.equal(endpoint.state, "ready");
   assert.deepEqual(await endpoint.runtimeIdentity(), undefined);
   assert.equal(requests[0]?.method, "initialize");
-  assert.equal((requests[0]?.params as any).clientInfo.version, "0.5.1");
+  assert.equal((requests[0]?.params as any).clientInfo.version, APP_VERSION);
   assert.equal(requests[1]?.method, "initialized");
   await endpoint.stop();
   assert.equal(child.killed, true);
