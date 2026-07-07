@@ -1,5 +1,5 @@
 import { createApp } from "./app.ts";
-import { parseCliArgs } from "./cli.ts";
+import { formatCliHelp, parseCliArgs } from "./cli.ts";
 import { loadConfig, loadAssistantLoginConfig } from "./config.ts";
 import { loadConfigSource } from "./config-source.ts";
 import { runAssistantLogin } from "./assistant/login.ts";
@@ -13,6 +13,10 @@ import { bootstrapWeixin } from "./weixin/bootstrap.ts";
 
 export async function main(env = process.env, argv: readonly string[] = process.argv.slice(2)): Promise<void> {
   const command = parseCliArgs(argv);
+  if (command.command === "help") {
+    process.stdout.write(formatCliHelp(command.topic));
+    return;
+  }
   if (command.command === "version") {
     const packageInfo = await readPackageInfo();
     process.stdout.write(`${packageInfo.version}\n`);
