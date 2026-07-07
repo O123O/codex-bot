@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
-import { openDatabase } from "../../src/storage/database.ts";
+import { isDatabaseIntegrityFailure, openDatabase } from "../../src/storage/database.ts";
 import { migrations } from "../../src/storage/migrations.ts";
 import { AppError } from "../../src/core/errors.ts";
 import { preflightConversationCutover } from "../../src/storage/conversation-cutover.ts";
@@ -174,6 +174,7 @@ test("a corrupt legacy-WAL database is rejected without mutating pre-existing by
 
   assert.equal(failure instanceof AppError && failure.code === "CONFIGURATION_ERROR"
     && failure.message === "QiYan Bot state database failed integrity check; restore or recover it before starting", true);
+  assert.equal(isDatabaseIntegrityFailure(failure), true);
   assert.deepEqual(await readFile(path), beforeBytes);
   const afterStat = await stat(path);
   assert.equal(afterStat.size, beforeStat.size);
@@ -200,7 +201,8 @@ test("an inspector close failure cannot expose its raw error", async () => {
   finally { unexpectedlyOpened?.close(); }
 
   assert.equal(failure instanceof AppError && failure.code === "CONFIGURATION_ERROR"
-    && failure.message === "QiYan Bot state database failed integrity check; restore or recover it before starting", true);
+    && failure.message === "QiYan Bot state database inspection cleanup failed", true);
+  assert.equal(isDatabaseIntegrityFailure(failure), false);
   assert.doesNotMatch(failure instanceof Error ? failure.message : "", /secret close diagnostic/u);
   assert.throws(() => capturedInspector!.prepare("SELECT 1"));
 });
@@ -214,8 +216,10 @@ test("a pre-QiYan database is rejected without mutation or sidecars", async () =
   const beforeBytes = await readFile(path);
   const beforeStat = await stat(path);
 
-  assert.throws(() => openDatabase(path), (error: unknown) =>
-    error instanceof AppError && error.code === "CONFIGURATION_ERROR" && /not a QiYan Bot state database/.test(error.message));
+  assert.throws(() => openDatabase(path), (error: unknown) => {
+    assert.equal(isDatabaseIntegrityFailure(error), false);
+    return error instanceof AppError && error.code === "CONFIGURATION_ERROR" && /not a QiYan Bot state database/.test(error.message);
+  });
   assert.deepEqual(await readFile(path), beforeBytes);
   const afterStat = await stat(path);
   assert.equal(afterStat.size, beforeStat.size);

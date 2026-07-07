@@ -8,11 +8,9 @@ import { DatabaseSync } from "node:sqlite";
 import test, { type TestContext } from "node:test";
 import { AppError } from "../../src/core/errors.ts";
 import { openDatabase } from "../../src/storage/database.ts";
-import { acquireDatabaseLease } from "../../src/storage/database-lease.ts";
 import {
   installPreparedDashboardMetadataRecovery,
   prepareDashboardMetadataRecovery,
-  recoverDashboardMetadata,
   RECOVERY_TABLES,
   type RecoveryInstallStep,
 } from "../../src/storage/dashboard-metadata-recovery.ts";
@@ -436,49 +434,6 @@ test("rollback interference prevents a restored-state claim", async (t) => {
   }), (error: unknown) => error instanceof AppError
     && error.message === "QiYan Bot state database recovery installation failed; manual restore is required from retained quarantine");
   assert.equal(JSON.parse(await readFile(join(prepared.quarantinePath, "manifest.json"), "utf8")).state, "installing");
-});
-
-test("the complete recovery operation excludes concurrent database owners and releases its lease", async (t) => {
-  const value = await recoveryFixture(t);
-  const held = await acquireDatabaseLease(value.databasePath);
-  await assert.rejects(recoverDashboardMetadata(value.databasePath), (error: unknown) => error instanceof AppError
-    && error.message === "QiYan Bot state database is already in use");
-  await held.release();
-
-  const backups: string[] = [];
-  const recovered = await recoverDashboardMetadata(value.databasePath, {
-    onBackupComplete: (path) => { backups.push(path); },
-  });
-  assert.deepEqual(backups, [recovered.quarantinePath]);
-  const nextOwner = await acquireDatabaseLease(value.databasePath);
-  await nextOwner.release();
-});
-
-test("lease cleanup failures preserve primary recovery outcomes", async (t) => {
-  {
-    const value = await recoveryFixture(t);
-    await assert.rejects(recoverDashboardMetadata(value.databasePath, {
-      acquireLease: async () => ({ release: async () => { throw new Error("secret release failure"); } }),
-    }), (error: unknown) => error instanceof AppError
-      && error.message === "QiYan Bot state database recovery completed, but database lease cleanup failed; keep the service stopped");
-    const installed = new DatabaseSync(value.databasePath, { readOnly: true });
-    assert.equal(installed.prepare("PRAGMA integrity_check").get()!.integrity_check, "ok");
-    installed.close();
-  }
-
-  {
-    const value = await recoveryFixture(t);
-    await assert.rejects(recoverDashboardMetadata(value.databasePath, {
-      acquireLease: async () => ({ release: async () => { throw new Error("secret release failure"); } }),
-      installOptions: {
-        beforeStep: async (step) => {
-          if (step === "install-candidate") throw new Error("secret install failure");
-          if (step === "restore-original") throw new Error("secret rollback failure");
-        },
-      },
-    }), (error: unknown) => error instanceof AppError
-      && error.message === "QiYan Bot state database recovery installation failed; manual restore is required from retained quarantine");
-  }
 });
 
 async function recoveryFixture(

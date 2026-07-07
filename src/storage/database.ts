@@ -27,6 +27,7 @@ interface OpenDatabaseOptions {
 }
 
 const integrityFailure = "QiYan Bot state database failed integrity check; restore or recover it before starting";
+const inspectionCleanupFailure = "QiYan Bot state database inspection cleanup failed";
 const journalingFailure = "QiYan Bot state database could not enable safe journaling";
 const inspectionSuffixes = ["", "-wal", "-shm", "-journal"] as const;
 
@@ -40,6 +41,17 @@ interface InspectionArtifact {
   size: bigint;
   mtimeNs: bigint;
   ctimeNs: bigint;
+}
+
+class DatabaseIntegrityError extends AppError {
+  constructor() {
+    super("CONFIGURATION_ERROR", integrityFailure);
+    this.name = "DatabaseIntegrityError";
+  }
+}
+
+export function isDatabaseIntegrityFailure(error: unknown): boolean {
+  return error instanceof DatabaseIntegrityError;
 }
 
 export function openDatabase(path: string, options: OpenDatabaseOptions = {}): Database {
@@ -70,7 +82,7 @@ function existingFileState(path: string): "missing" | "empty" | "nonempty" {
 function assertQiYanDatabase(path: string, closeInspector: (inspector: DatabaseSync) => void): void {
   let inspector: DatabaseSync | undefined;
   let inspection: { path: string; cleanup(): void } | undefined;
-  let verdict: "foreign" | "integrity" | "valid" = "foreign";
+  let verdict: "foreign" | "integrity" | "valid" | "cleanup" = "foreign";
   try {
     inspection = createInspectionCopy(path);
     // Writable access is confined to the disposable copy so SQLite can recover
@@ -89,16 +101,20 @@ function assertQiYanDatabase(path: string, closeInspector: (inspector: DatabaseS
     if (inspector) {
       try { closeInspector(inspector); }
       catch {
-        if (verdict === "valid") verdict = "integrity";
+        if (verdict === "valid") verdict = "cleanup";
         try { inspector.close(); } catch { /* Preserve the sanitized verdict. */ }
       }
     }
     if (inspection) {
       try { inspection.cleanup(); }
-      catch { if (verdict === "valid") verdict = "integrity"; }
+      catch { if (verdict === "valid") verdict = "cleanup"; }
     }
   }
-  if (verdict !== "valid") throw new AppError("CONFIGURATION_ERROR", verdict === "foreign" ? "not a QiYan Bot state database" : integrityFailure);
+  if (verdict !== "valid") {
+    if (verdict === "foreign") throw new AppError("CONFIGURATION_ERROR", "not a QiYan Bot state database");
+    if (verdict === "cleanup") throw new AppError("CONFIGURATION_ERROR", inspectionCleanupFailure);
+    throw new DatabaseIntegrityError();
+  }
 }
 
 function createInspectionCopy(path: string): { path: string; cleanup(): void } {

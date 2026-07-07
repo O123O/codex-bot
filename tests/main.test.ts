@@ -2,7 +2,21 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import test from "node:test";
 import type { BotApp } from "../src/app.ts";
-import { main, runForegroundApp } from "../src/main.ts";
+import { requestServiceRestart, runForegroundApp } from "../src/main.ts";
+
+test("service restart requests a nonzero graceful SIGTERM", () => {
+  const signals: Array<{ pid: number; signal: string }> = [];
+  const control: { pid: number; exitCode: string | number | null | undefined; kill(pid: number, signal: string): void } = {
+    pid: 42,
+    exitCode: undefined,
+    kill: (pid, signal) => { signals.push({ pid, signal }); },
+  };
+
+  requestServiceRestart(control);
+
+  assert.equal(control.exitCode, 1);
+  assert.deepEqual(signals, [{ pid: 42, signal: "SIGTERM" }]);
+});
 
 test("foreground startup announces readiness and stops on a signal", async () => {
   const events: string[] = [];
@@ -38,23 +52,4 @@ test("foreground startup reports nothing before a failed start", async () => {
   assert.deepEqual(writes, []);
   assert.equal(signals.listenerCount("SIGINT"), 0);
   assert.equal(signals.listenerCount("SIGTERM"), 0);
-});
-
-test("recovery command reports the durable quarantine before static success without row data", async () => {
-  const writes: string[] = [];
-  const databasePath = "/srv/qiyan/data/bot.sqlite3";
-  await main({}, ["recover-dashboard-metadata", "--database", databasePath], {
-    write: (text) => { writes.push(text); },
-    recoverDashboardMetadata: async (path, options) => {
-      assert.equal(path, databasePath);
-      options.onBackupComplete?.("/srv/qiyan/data/.bot.sqlite3.recovery-safe");
-      return { quarantinePath: "/srv/qiyan/data/.bot.sqlite3.recovery-safe" };
-    },
-  });
-
-  assert.deepEqual(writes, [
-    "Recovery backup retained at /srv/qiyan/data/.bot.sqlite3.recovery-safe.\n",
-    "QiYan Bot state database recovery completed.\n",
-  ]);
-  assert.doesNotMatch(writes.join(""), /private row|secret token/u);
 });

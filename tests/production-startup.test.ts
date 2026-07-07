@@ -6,16 +6,32 @@ import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import test, { type TestContext } from "node:test";
 import type { BotConfig } from "../src/config.ts";
-import { assistantAccessWarning, buildProductionApp } from "../src/production-app.ts";
+import { assistantAccessWarning, buildProductionApp, createMaintenanceFailureHandler } from "../src/production-app.ts";
 import type { ChatAdapter } from "../src/chat/contracts.ts";
 import { StartupPhaseError } from "../src/app.ts";
-import { openDatabase, type Database } from "../src/storage/database.ts";
+import { createTestDatabase, openDatabase, type Database } from "../src/storage/database.ts";
 import { acquireDatabaseLease, type DatabaseLease } from "../src/storage/database-lease.ts";
+import { DashboardMetadataRecoveryRequiredError } from "../src/storage/session-dashboard-store.ts";
 
 test("only full-access assistant mode emits the structural startup warning", () => {
   assert.match(assistantAccessWarning("danger-full-access") ?? "", /non-interactively with full filesystem access/);
   assert.equal(assistantAccessWarning("workspace-write"), undefined);
   assert.equal(assistantAccessWarning("read-only"), undefined);
+});
+
+test("maintenance requests one restart only for exact recoverable metadata failure", () => {
+  const events: string[] = [];
+  const handle = createMaintenanceFailureHandler({
+    requestRestart: () => { events.push("restart"); },
+    reportRecoveryRequired: () => { events.push("recovery-required"); },
+    reportRetryableFailure: () => { events.push("retry"); },
+  });
+
+  handle(new DashboardMetadataRecoveryRequiredError());
+  handle(new DashboardMetadataRecoveryRequiredError());
+  handle(new Error("ordinary maintenance failure"));
+
+  assert.deepEqual(events, ["recovery-required", "restart", "retry"]);
 });
 
 test("production storage contention blocks adapters and the same app retries after release", async (t) => {
@@ -39,6 +55,87 @@ test("production storage contention blocks adapters and the same app retries aft
 
   const probe = await acquireDatabaseLease(join(root, "data", "bot.sqlite3"));
   await probe.release();
+});
+
+test("production repairs dashboard metadata inside one startup lease before adapters", async (t) => {
+  const { config } = await productionFixture(t);
+  const invalid = createTestDatabase();
+  invalid.prepare("DELETE FROM session_dashboard_meta").run();
+  const repaired = createTestDatabase();
+  const databases = [invalid, repaired];
+  const events: string[] = [];
+  let leaseAcquisitions = 0;
+  let recoveries = 0;
+  const app = await buildProductionApp(config, {
+    chdir: () => undefined,
+    chatAdapters: [fakeTelegramAdapter(() => { events.push("adapter-initialize"); })],
+    onOperationalEvent: (event) => { if (event.code === "database_metadata_recovered") events.push(event.code); },
+    storage: {
+      acquireDatabaseLease: async (path) => {
+        leaseAcquisitions += 1;
+        return acquireDatabaseLease(path);
+      },
+      openDatabase: () => {
+        events.push("database-open");
+        return databases.shift()!;
+      },
+      closeDatabase: (database) => {
+        database.close();
+        events.push("database-close");
+      },
+      recoverDatabase: async () => {
+        recoveries += 1;
+        assert.throws(() => invalid.prepare("SELECT 1"));
+        events.push("database-recover");
+      },
+    },
+  });
+
+  await assert.rejects(app.start(), (error: unknown) => error instanceof StartupPhaseError && error.phase === "endpoint");
+  assert.equal(leaseAcquisitions, 1);
+  assert.equal(recoveries, 1);
+  assert.deepEqual(events.slice(0, 6), [
+    "database-open",
+    "database-close",
+    "database-recover",
+    "database-open",
+    "database_metadata_recovered",
+    "adapter-initialize",
+  ]);
+  const probe = await acquireDatabaseLease(join(config.dataDir, "bot.sqlite3"));
+  await probe.release();
+});
+
+test("failed pre-recovery database close retains the lease and never starts recovery", async (t) => {
+  const { config } = await productionFixture(t);
+  const invalid = createTestDatabase();
+  invalid.prepare("DELETE FROM session_dashboard_meta").run();
+  let capturedLease: DatabaseLease | undefined;
+  let recoveries = 0;
+  const app = await buildProductionApp(config, {
+    chdir: () => undefined,
+    chatAdapters: [fakeTelegramAdapter()],
+    storage: {
+      acquireDatabaseLease: async (path) => {
+        capturedLease = await acquireDatabaseLease(path);
+        return capturedLease;
+      },
+      openDatabase: () => invalid,
+      closeDatabase: () => { throw new Error("private close failure"); },
+      recoverDatabase: async () => { recoveries += 1; },
+    },
+  });
+
+  await assert.rejects(app.start(), (error: unknown) => {
+    assert.equal(error instanceof StartupPhaseError && error.phase === "storage", true);
+    assert.doesNotMatch(error instanceof StartupPhaseError && error.cause instanceof Error ? error.cause.message : "", /private close failure/u);
+    return true;
+  });
+  assert.equal(recoveries, 0);
+  await assert.rejects(acquireDatabaseLease(join(config.dataDir, "bot.sqlite3")), /already in use/u);
+
+  invalid.close();
+  await capturedLease!.release();
 });
 
 test("storage failure closes its database before releasing its attempt-local lease", async (t) => {

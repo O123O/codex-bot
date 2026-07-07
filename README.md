@@ -166,19 +166,11 @@ These settings avoid SQLite WAL's shared-memory limitation on network filesystem
 
 For a filesystem backup, stop QiYan and confirm the service is inactive. Copy `bot.sqlite3` and every existing `bot.sqlite3-wal`, `bot.sqlite3-shm`, and `bot.sqlite3-journal` together with the rest of the data directory; never mix files from different snapshots. A live backup must instead use the SQLite online backup API. The assistant profile contains credentials, so protect the whole backup as private state.
 
-### Narrow dashboard-metadata recovery
+### Automatic dashboard-metadata recovery
 
-The offline command below exists only for a current-schema database whose corruption is confined to derived dashboard metadata while all authoritative tables remain readable:
+QiYan does not need periodic shutdowns or database maintenance. At startup, while holding the one-process lease, QiYan automatically retains a private backup, rebuilds only damaged derived dashboard metadata, verifies the replacement, and completes recovery before chat adapters start.
 
-```text
-qiyan-bot recover-dashboard-metadata --database <absolute-path>
-```
-
-Keep the service stopped for the entire operation. Recovery is never automatic and refuses to proceed when authoritative rows are unreadable, the schema is unexpected, a source artifact changes, or filesystem ownership and identity checks fail. When its preconditions hold, it preserves every readable authoritative row exactly, rebuilds only dashboard metadata and derived database structure in a fresh candidate, verifies integrity and foreign keys, and then installs that candidate without carrying forward old sidecars.
-
-Before candidate construction, the command retains a private, manifest-backed quarantine beside the database and reports its path. Its fsynced manifest progresses through `backup_complete`, `installing`, and `installed`; an ordinary installation failure restores and verifies the complete original artifact generation before recording `rolled_back`. Once reported, the quarantine remains after success or failure and contains private database bytes.
-
-If recovery is interrupted with a `backup_complete` or `installing` manifest, keep the service stopped. Verify the manifest names and SHA-256 hashes against the backup files, restore the complete artifact set as one generation without retaining candidate or stale sidecar files, and fsync the files and data directory before retrying. Do not start QiYan from a mixed or unverified generation. An `installed` manifest identifies a completed replacement; a `rolled_back` manifest identifies a byte- and identity-verified ordinary rollback.
+Recovery proceeds only when every authoritative row is readable and the current QiYan schema is exact. If authoritative data is unreadable, files change during inspection, or the schema is unexpected, startup stops safely instead of guessing. Backups that reached their durable manifest boundary remain private and retained for support.
 
 ## Attachments and recovery
 

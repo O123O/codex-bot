@@ -13,35 +13,15 @@ import { bootstrapWeixin } from "./weixin/bootstrap.ts";
 import { buildServiceEffectiveEnvironment, SystemdUserService } from "./service/systemd-user.ts";
 import { AppError } from "./core/errors.ts";
 import { createOperationalLogSink } from "./core/operational-log.ts";
-import { recoverDashboardMetadata } from "./storage/dashboard-metadata-recovery.ts";
 import { isAbsolute, resolve } from "node:path";
-
-interface MainOptions {
-  write?: (text: string) => void;
-  recoverDashboardMetadata?: (
-    databasePath: string,
-    options: { onBackupComplete?: (quarantinePath: string) => void },
-  ) => Promise<{ quarantinePath: string }>;
-}
 
 export async function main(
   env = process.env,
   argv: readonly string[] = process.argv.slice(2),
-  options: MainOptions = {},
 ): Promise<void> {
   const command = parseCliArgs(argv);
   if (command.command === "help") {
     process.stdout.write(formatCliHelp(command.topic));
-    return;
-  }
-  if (command.command === "recover-dashboard-metadata") {
-    const write = options.write ?? ((text: string) => { process.stdout.write(text); });
-    await (options.recoverDashboardMetadata ?? recoverDashboardMetadata)(command.databasePath, {
-      onBackupComplete: (quarantinePath) => {
-        write(`Recovery backup retained at ${quarantinePath}.\n`);
-      },
-    });
-    write("QiYan Bot state database recovery completed.\n");
     return;
   }
   if (command.command === "version") {
@@ -118,8 +98,20 @@ export async function main(
   const app = await createApp(config, {
     ...(weixin.configured ? { weixinCredential: weixin.credential } : {}),
     onOperationalEvent: createOperationalLogSink(),
+    requestRestart: () => { requestServiceRestart(); },
   });
   await runForegroundApp(app);
+}
+
+interface ServiceProcessControl {
+  pid: number;
+  exitCode: string | number | null | undefined;
+  kill(pid: number, signal: string): unknown;
+}
+
+export function requestServiceRestart(control: ServiceProcessControl = process): void {
+  control.exitCode = 1;
+  control.kill(control.pid, "SIGTERM");
 }
 
 function serviceUserHome(env: NodeJS.ProcessEnv): string {

@@ -6,7 +6,6 @@ import { pathToFileURL } from "node:url";
 import { AppError } from "../core/errors.ts";
 import { installConversationRoutingGuards } from "./conversation-cutover.ts";
 import { openDatabase, type Database } from "./database.ts";
-import { acquireDatabaseLease } from "./database-lease.ts";
 import { migrations } from "./migrations.ts";
 import { assertRecoverySchema, recoveryColumns, RECOVERY_TABLES, type RecoveryTable } from "./recovery-schema.ts";
 
@@ -19,7 +18,6 @@ const installValidationFailure = "QiYan Bot state database recovery installation
 const restoredInstallFailure = "QiYan Bot state database recovery installation failed; original state was restored";
 const manualRestoreFailure = "QiYan Bot state database recovery installation failed; manual restore is required from retained quarantine";
 const installedManifestFailure = "QiYan Bot state database recovery installed the candidate, but final manifest sync failed; keep the service stopped";
-const leaseCleanupFailure = "QiYan Bot state database recovery completed, but database lease cleanup failed; keep the service stopped";
 
 interface DirectoryPin {
   path: string;
@@ -87,10 +85,6 @@ export interface DashboardMetadataRecoveryOptions {
   expectedUid?: number;
   onBackupComplete?: (quarantinePath: string) => void;
   installOptions?: RecoveryInstallOptions;
-  acquireLease?: (
-    databasePath: string,
-    options: { expectedUid?: number },
-  ) => Promise<{ release(): Promise<void> }>;
 }
 
 const preparedInternals = new WeakMap<PreparedDashboardMetadataRecovery, RecoveryInternals>();
@@ -264,29 +258,17 @@ export async function installPreparedDashboardMetadataRecovery(
   }
 }
 
-export async function recoverDashboardMetadata(
+export async function recoverDashboardMetadataUnderLease(
   databasePath: string,
   options: DashboardMetadataRecoveryOptions = {},
 ): Promise<{ quarantinePath: string }> {
   const uidOption = options.expectedUid === undefined ? {} : { expectedUid: options.expectedUid };
-  const lease = await (options.acquireLease ?? acquireDatabaseLease)(databasePath, uidOption);
-  let primaryFailure = false;
-  try {
-    const prepared = await prepareDashboardMetadataRecovery(databasePath, {
-      ...uidOption,
-      ...(options.onBackupComplete === undefined ? {} : { onBackupComplete: options.onBackupComplete }),
-    });
-    await installPreparedDashboardMetadataRecovery(prepared, options.installOptions);
-    return { quarantinePath: prepared.quarantinePath };
-  } catch (error) {
-    primaryFailure = true;
-    throw error;
-  } finally {
-    try { await lease.release(); }
-    catch {
-      if (!primaryFailure) throw configuration(leaseCleanupFailure);
-    }
-  }
+  const prepared = await prepareDashboardMetadataRecovery(databasePath, {
+    ...uidOption,
+    ...(options.onBackupComplete === undefined ? {} : { onBackupComplete: options.onBackupComplete }),
+  });
+  await installPreparedDashboardMetadataRecovery(prepared, options.installOptions);
+  return { quarantinePath: prepared.quarantinePath };
 }
 
 async function validateRecoveryParent(databasePath: string, expectedUid: number): Promise<DirectoryPin> {
