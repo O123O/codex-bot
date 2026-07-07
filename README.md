@@ -158,6 +158,28 @@ The assistant also does not inherit home-scoped user skills. Put assistant-only 
 
 This is the v0.3 fresh QiYan state format. State created before v0.3.0 is rejected without migration or mutation. Do not use the generic updater for that first transition: follow the [required destructive fresh-cutover guide](docs/upgrading-to-v0.3.md). Stop the process and back up the data directory plus external assistant workdir together; the assistant profile contains secrets.
 
+### SQLite durability
+
+File-backed QiYan databases use a rollback journal with `journal_mode=DELETE`, `synchronous=EXTRA`, foreign keys, and a bounded busy timeout. They do not use WAL. QiYan also holds an adjacent lifetime lock, so only one QiYan process may own a data directory at a time. For every recognized QiYan database that is nonempty, startup runs a full `PRAGMA integrity_check` before chat adapters, Codex endpoints, or reconciliation can start; a corrupt authoritative store fails closed instead of accepting more work.
+
+These settings avoid SQLite WAL's shared-memory limitation on network filesystems, but they do not make every NFS deployment inherently safe. NFS lock and sync semantics remain correctness dependencies: the mount and server must provide what SQLite requires. Keep reliable backups and do not bypass the one-process lease.
+
+For a filesystem backup, stop QiYan and confirm the service is inactive. Copy `bot.sqlite3` and every existing `bot.sqlite3-wal`, `bot.sqlite3-shm`, and `bot.sqlite3-journal` together with the rest of the data directory; never mix files from different snapshots. A live backup must instead use the SQLite online backup API. The assistant profile contains credentials, so protect the whole backup as private state.
+
+### Narrow dashboard-metadata recovery
+
+The offline command below exists only for a current-schema database whose corruption is confined to derived dashboard metadata while all authoritative tables remain readable:
+
+```text
+qiyan-bot recover-dashboard-metadata --database <absolute-path>
+```
+
+Keep the service stopped for the entire operation. Recovery is never automatic and refuses to proceed when authoritative rows are unreadable, the schema is unexpected, a source artifact changes, or filesystem ownership and identity checks fail. When its preconditions hold, it preserves every readable authoritative row exactly, rebuilds only dashboard metadata and derived database structure in a fresh candidate, verifies integrity and foreign keys, and then installs that candidate without carrying forward old sidecars.
+
+Before candidate construction, the command retains a private, manifest-backed quarantine beside the database and reports its path. Its fsynced manifest progresses through `backup_complete`, `installing`, and `installed`; an ordinary installation failure restores and verifies the complete original artifact generation before recording `rolled_back`. Once reported, the quarantine remains after success or failure and contains private database bytes.
+
+If recovery is interrupted with a `backup_complete` or `installing` manifest, keep the service stopped. Verify the manifest names and SHA-256 hashes against the backup files, restore the complete artifact set as one generation without retaining candidate or stale sidecar files, and fsync the files and data directory before retrying. Do not start QiYan from a mixed or unverified generation. An `installed` manifest identifies a completed replacement; a `rolled_back` manifest identifies a byte- and identity-verified ordinary rollback.
+
 ## Attachments and recovery
 
 Inbound files are streamed into a private quota-limited store. Outbound project files are opened beneath a managed root with Linux no-follow checks and snapshotted before upload. Absolute outbound paths, traversal, symlinks, special files, and oversized content are rejected.

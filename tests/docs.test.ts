@@ -36,6 +36,26 @@ test("README links to all focused guides and every local guide target exists", a
   await Promise.all(links.map((link) => access(resolve(link))));
 });
 
+test("README documents the SQLite durability and offline recovery boundary", async () => {
+  const readme = await readFile(resolve("README.md"), "utf8");
+  assert.match(readme, /rollback journal.*`journal_mode=DELETE`/isu);
+  assert.match(readme, /`synchronous=EXTRA`/u);
+  assert.match(readme, /one QiYan process.*data directory/isu);
+  assert.match(readme, /recognized QiYan database.*full `PRAGMA integrity_check`.*before.*chat adapters/isu);
+  assert.match(readme, /stop QiYan.*bot\.sqlite3.*-wal.*-shm.*-journal.*together/isu);
+  assert.match(readme, /SQLite online backup API/iu);
+  assert.match(readme, /qiyan-bot recover-dashboard-metadata --database <absolute-path>/u);
+  assert.match(readme, /preserves every readable authoritative row.*rebuilds.*dashboard metadata.*derived database structure/isu);
+  assert.match(readme, /never automatic.*authoritative rows.*unreadable/isu);
+  for (const state of ["backup_complete", "installing", "installed", "rolled_back"]) {
+    assert.equal(readme.includes(`\`${state}\``), true, `README is missing recovery state ${state}`);
+  }
+  assert.match(readme, /once reported.*quarantine remains.*private database bytes/isu);
+  assert.match(readme, /interrupted.*keep.*service stopped.*verify.*manifest.*hashes.*restore.*complete artifact set.*fsync/isu);
+  assert.match(readme, /NFS.*lock.*sync.*depend/isu);
+  assert.doesNotMatch(readme, /NFS (?:is|filesystem is) (?:fully |completely )?safe/iu);
+});
+
 test("SSH worker guides document supported endpoints and the source-checkout fixture", async () => {
   const readme = await readFile(resolve("README.md"), "utf8");
   assert.equal(readme.includes("docs/development/ssh-worker-fixture.md"), true, "README does not link the SSH worker development guide");
