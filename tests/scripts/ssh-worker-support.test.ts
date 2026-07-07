@@ -341,7 +341,7 @@ test("checks the fixed remote environment and authenticated App Server without c
     id: 1,
     method: "initialize",
     params: {
-      clientInfo: { name: "qiyan_ssh_worker_check", title: "QiYan SSH Worker Check", version: "0.5.0" },
+      clientInfo: { name: "qiyan_ssh_worker_check", title: "QiYan SSH Worker Check", version: "0.5.1" },
       capabilities: { experimentalApi: true, requestAttestation: false },
     },
   });
