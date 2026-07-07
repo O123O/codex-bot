@@ -130,6 +130,7 @@ test("fresh pending identity records, materializes, commits, and clears in order
   const registry = await SessionRegistry.open(join(dir, "sessions.json"), {
     version: 3, assistant: { endpoint: "assistant-local", thread_id: "pending", project_dir: dir }, sessions: {},
   });
+  const config = { sentinel: { branch: "fresh-start" } };
   const order: string[] = [];
   const endpoint = {
     id: "assistant-local",
@@ -137,6 +138,7 @@ test("fresh pending identity records, materializes, commits, and clears in order
       order.push(method);
       if (method === "thread/start") {
         assert.equal(params.threadSource, "bot-nonce");
+        assert.deepEqual(params.config, config);
         return { thread: { id: "created", cwd: dir, threadSource: "bot-nonce", name: null, status: { type: "idle" } } } as T;
       }
       if (method === "thread/name/set") {
@@ -149,7 +151,7 @@ test("fresh pending identity records, materializes, commits, and clears in order
     },
   };
   const result = await resumeAssistantIdentity({
-    registry, endpoint, assistantDir: dir, sandboxMode: "workspace-write", config: {},
+    registry, endpoint, assistantDir: dir, sandboxMode: "workspace-write", config,
     creationNonce: "bot-nonce", pendingThreadId: null,
     recordPendingThread: async (id) => { order.push(`record:${id}`); assert.equal(registry.snapshot().assistant.thread_id, "pending"); },
     clearPendingThread: async (id) => { order.push(`clear:${id}`); assert.equal(registry.snapshot().assistant.thread_id, id); },
@@ -223,12 +225,14 @@ test("registered identity clears a matching stale creation receipt after verifie
   const registry = await SessionRegistry.open(join(dir, "sessions.json"), {
     version: 3, assistant: { endpoint: "assistant-local", thread_id: "registered-thread", project_dir: dir }, sessions: {},
   });
+  const config = { sentinel: { branch: "registered-resume" } };
   const calls: string[] = [];
   const endpoint = {
     id: "assistant-local",
     request: async <T>(method: string, params: any) => {
       calls.push(method);
       assert.equal(params.threadId, "registered-thread");
+      assert.deepEqual(params.config, config);
       return {
         thread: {
           id: "registered-thread",
@@ -242,7 +246,7 @@ test("registered identity clears a matching stale creation receipt after verifie
   };
   let cleared: string | undefined;
   const result = await resumeAssistantIdentity({
-    registry, endpoint, assistantDir: dir, sandboxMode: "workspace-write", config: {},
+    registry, endpoint, assistantDir: dir, sandboxMode: "workspace-write", config,
     creationNonce: "bot-nonce", pendingThreadId: "registered-thread",
     recordPendingThread: async () => { throw new Error("must not record"); },
     clearPendingThread: async (id) => { cleared = id; },

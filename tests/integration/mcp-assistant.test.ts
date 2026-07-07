@@ -8,7 +8,7 @@ import { JsonRpcResponseError } from "../../src/app-server/json-rpc-client.ts";
 import { AppServerPool } from "../../src/app-server/pool.ts";
 import { createAssistantTools } from "../../src/assistant/tools.ts";
 import { buildAssistantChildEnvironment } from "../../src/assistant/profile.ts";
-import { buildWorkerChildEnvironment, assistantTurnConfig, LoopbackMcpServer } from "../../src/mcp/server.ts";
+import { buildWorkerChildEnvironment, assistantTurnConfig, LoopbackMcpServer, secureShellConfig } from "../../src/mcp/server.ts";
 import { createTestDatabase } from "../../src/storage/database.ts";
 import { OperationStore } from "../../src/storage/operation-store.ts";
 
@@ -18,6 +18,28 @@ async function writeSkill(root: string, name: string): Promise<void> {
   const path = join(root, name);
   await mkdir(path, { recursive: true });
   await writeFile(join(path, "SKILL.md"), `---\nname: ${name}\ndescription: Integration fixture ${name}\n---\n\n# ${name}\n`);
+}
+
+async function assertShellEnvironment(
+  endpoint: LocalEndpoint,
+  threadId: string,
+  expected: { userHome: string; codexHome: string },
+): Promise<void> {
+  let unsubscribe: () => void = () => undefined;
+  const completed = new Promise<any>((resolve, reject) => {
+    const timeout = setTimeout(() => { unsubscribe(); reject(new Error("shell environment probe timed out")); }, 10_000);
+    unsubscribe = endpoint.onNotification((method, params: any) => {
+      if (method !== "item/completed" || params.threadId !== threadId || params.item?.type !== "commandExecution") return;
+      clearTimeout(timeout);
+      unsubscribe();
+      resolve(params.item);
+    });
+  });
+  await endpoint.request("thread/shellCommand", {
+    threadId,
+    command: `node -e 'const ok = process.env.HOME === ${JSON.stringify(expected.userHome)} && process.env.CODEX_HOME === ${JSON.stringify(expected.codexHome)} && process.env.QIYAN_BOT_MCP_TOKEN === undefined; process.stdout.write(ok ? "QIYAN_ENV_OK" : "QIYAN_ENV_BAD")'`,
+  });
+  assert.equal((await completed).aggregatedOutput, "QIYAN_ENV_OK");
 }
 
 test("isolated app-server persists thread provenance and excludes normal-home skills", { skip: !enabled, timeout: 60_000 }, async (t) => {
@@ -40,7 +62,11 @@ test("isolated app-server persists thread provenance and excludes normal-home sk
   const endpoint = new LocalEndpoint({
     id: "assistant-local",
     codexBinary: "codex",
-    env: buildAssistantChildEnvironment({ ...process.env, HOME: normalHome }, { home: assistantHome, codexHome: assistantCodexHome }),
+    env: buildAssistantChildEnvironment(
+      { ...process.env, HOME: normalHome },
+      { home: assistantHome, codexHome: assistantCodexHome },
+      "must-not-reach-shell",
+    ),
     expectedCodexHome: assistantCodexHome,
     requestTimeoutMs: 30_000,
   });
@@ -54,6 +80,16 @@ test("isolated app-server persists thread provenance and excludes normal-home sk
   assert.equal(names.get(workdir)?.includes("normal-user-only"), false);
   assert.equal(names.get(nestedWorkdir)?.includes("repository-parent"), true);
   assert.equal(names.get(nestedWorkdir)?.includes("normal-user-only"), false);
+
+  const shellThread = await endpoint.request<any>("thread/start", {
+    cwd: workdir,
+    approvalPolicy: "never",
+    sandbox: "workspace-write",
+    config: secureShellConfig({ userHome: normalHome, codexHome: assistantCodexHome }),
+    ephemeral: true,
+    threadSource: crypto.randomUUID(),
+  });
+  await assertShellEnvironment(endpoint, shellThread.thread.id, { userHome: normalHome, codexHome: assistantCodexHome });
 
   const volatile = await endpoint.request<any>("thread/start", {
     cwd: workdir,
@@ -85,7 +121,7 @@ test("isolated app-server persists thread provenance and excludes normal-home sk
     cwd: workdir,
     approvalPolicy: "never",
     sandbox: "workspace-write",
-    config: {},
+    config: secureShellConfig({ userHome: normalHome, codexHome: assistantCodexHome }),
   });
   assert.deepEqual({
     start: started.thread.threadSource ?? null,
@@ -110,6 +146,7 @@ test("isolated app-server persists thread provenance and excludes normal-home sk
     cwd: workdir,
     resumeCwd: workdir,
   });
+  await assertShellEnvironment(endpoint, resumed.thread.id, { userHome: normalHome, codexHome: assistantCodexHome });
 });
 
 test("real assistant can call its approved manager MCP while a project worker cannot enumerate it", { skip: !enabled, timeout: 180_000 }, async (t) => {
@@ -149,7 +186,10 @@ test("real assistant can call its approved manager MCP while a project worker ca
   const cwd = await mkdtemp(join(tmpdir(), "qiyan-bot-real-mcp-"));
   const thread = await endpoint.request<any>("thread/start", {
     cwd, approvalPolicy: "never", sandbox: "workspace-write", ephemeral: false,
-    config: assistantTurnConfig(mcp.url, token),
+    config: assistantTurnConfig(mcp.url, token, {
+      userHome,
+      codexHome: process.env.CODEX_HOME ?? join(userHome, ".codex"),
+    }),
   });
   const terminal = new Promise<any>((resolve, reject) => {
     const timeout = setTimeout(() => reject(new Error("MCP integration timed out")), 120_000);

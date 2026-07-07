@@ -32,7 +32,9 @@ test("packaged assistant policy is concise and reserves examples for exact direc
   assert.match(policy, /prefer direct work for small, personal, one-off, or cross-project tasks/iu);
   assert.match(policy, /delegate deliberately.*resumable transcript/isu);
   assert.match(policy, /read `assistant-context\.json` and `session-status\.json`.*after context compaction/isu);
-  assert.match(policy, /never use bare shell `~`.*isolated HOME/isu);
+  assert.match(policy, /App Server `HOME` is isolated.*Codex state and skills/isu);
+  assert.match(policy, /shell commands.*real user `HOME`.*shell `~`/isu);
+  assert.match(policy, /`CODEX_HOME`.*isolated/isu);
   assert.match(policy, /absolute paths derived from `assistant-context\.json\.user_home`/iu);
   assert.match(policy, /never create or root a project worker in the assistant workdir.*QiYan state/isu);
   assert.match(policy, /existing relevant project.*user-specified location.*semantic user location/isu);

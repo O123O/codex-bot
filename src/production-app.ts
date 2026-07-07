@@ -1294,7 +1294,10 @@ export async function buildProductionApp(
       endpoint: assistantEndpoint,
       assistantDir,
       sandboxMode: config.assistantSandboxMode,
-      config: assistantTurnConfig(mcp.url, token),
+      config: assistantTurnConfig(mcp.url, token, {
+        userHome: config.userHome,
+        codexHome: assistantProfile.codexHome,
+      }),
       creationNonce: assistantProfile.creationNonce,
       pendingThreadId: assistantProfile.pendingThreadId,
       recordPendingThread: (threadId) => assistantProfile.recordPendingThread(threadId),

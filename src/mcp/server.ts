@@ -242,17 +242,25 @@ export function buildAssistantBaseEnvironment(host: NodeJS.ProcessEnv, mcpToken?
   return result;
 }
 
-export function assistantTurnConfig(mcpUrl: string, _mcpToken: string): Record<string, unknown> {
+export function assistantTurnConfig(
+  mcpUrl: string,
+  _mcpToken: string,
+  shellEnvironment: { userHome: string; codexHome: string },
+): Record<string, unknown> {
   return {
     mcp_servers: { qiyan_bot_manager: { url: mcpUrl, bearer_token_env_var: "QIYAN_BOT_MCP_TOKEN", default_tools_approval_mode: "approve" } },
-    ...secureShellConfig(),
+    ...secureShellConfig(shellEnvironment),
   };
 }
 
-export function secureShellConfig(): Record<string, unknown> {
+export function secureShellConfig(shellEnvironment: { userHome: string; codexHome: string }): Record<string, unknown> {
   return {
     allow_login_shell: false,
     "shell_environment_policy.inherit": "core",
     "shell_environment_policy.exclude": [...BOT_SECRET_ENV_NAMES],
+    "shell_environment_policy.set": {
+      HOME: shellEnvironment.userHome,
+      CODEX_HOME: shellEnvironment.codexHome,
+    },
   };
 }

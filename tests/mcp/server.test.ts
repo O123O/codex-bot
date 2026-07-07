@@ -185,10 +185,17 @@ test("worker environment preserves user configuration while removing only exact 
   ]) {
     assert.equal(env[key], undefined);
   }
-  const config = assistantTurnConfig("http://127.0.0.1:1/mcp", "mcp-secret");
+  const config = assistantTurnConfig("http://127.0.0.1:1/mcp", "mcp-secret", {
+    userHome: "/home/user",
+    codexHome: "/private/manager-codex",
+  });
   const manager = (config.mcp_servers as { qiyan_bot_manager: Record<string, unknown> }).qiyan_bot_manager;
   assert.equal(manager.default_tools_approval_mode, "approve");
   assert.deepEqual((config["shell_environment_policy.exclude"] as any).includes("QIYAN_BOT_MCP_TOKEN"), true);
+  assert.deepEqual(config["shell_environment_policy.set"], {
+    HOME: "/home/user",
+    CODEX_HOME: "/private/manager-codex",
+  });
   assert.equal(config.allow_login_shell, false);
   assert.equal(JSON.stringify(config).includes("mcp-secret"), false);
 });
