@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile, spawnSync } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -96,6 +96,81 @@ test("packed qiyan-bot runs without source files or installed dependencies", asy
   assert.match(help.stdout, /^QiYan personal assistant bot\n/u);
   assert.match(help.stdout, /qiyan-bot assistant-login/u);
   assert.equal(help.stderr, "");
+
+  const serviceHome = join(temp, "service-home");
+  const serviceQiyanHome = join(serviceHome, ".qiyan-bot");
+  const serviceBin = join(temp, "service-bin");
+  await mkdir(serviceQiyanHome, { recursive: true, mode: 0o700 });
+  await mkdir(serviceBin, { mode: 0o700 });
+  await writeFile(join(serviceQiyanHome, ".env"), [
+    "TELEGRAM_BOT_TOKEN=private-file-token",
+    "TELEGRAM_OWNER_ID=7",
+    "TELEGRAM_DESTINATION_CHAT_ID=7",
+    "",
+  ].join("\n"), { mode: 0o600 });
+  const fakeSystemctl = join(serviceBin, "systemctl");
+  await writeFile(fakeSystemctl, `#!/usr/bin/env node
+const { appendFileSync } = require("node:fs");
+const { join } = require("node:path");
+const argv = process.argv.slice(2);
+appendFileSync(join(process.env.HOME, "systemctl-calls.jsonl"), JSON.stringify({ argv, leaked: Boolean(process.env.TELEGRAM_BOT_TOKEN || process.env.OTHER_SECRET) }) + "\\n");
+if (argv[1] === "is-active") process.stdout.write("active\\n");
+if (argv[1] === "is-enabled") process.stdout.write("enabled\\n");
+`);
+  await chmod(fakeSystemctl, 0o755);
+  const serviceEnv = {
+    PATH: `${serviceBin}:${process.env.PATH ?? ""}`,
+    HOME: serviceHome,
+    TELEGRAM_BOT_TOKEN: "process-secret",
+    OTHER_SECRET: "other-secret",
+  };
+  const shellOnlyHome = join(temp, "shell-only-service-home");
+  const shellOnlyQiyanHome = join(shellOnlyHome, ".qiyan-bot");
+  await mkdir(shellOnlyQiyanHome, { recursive: true, mode: 0o700 });
+  await writeFile(join(shellOnlyQiyanHome, ".env"), [
+    "TELEGRAM_OWNER_ID=7",
+    "TELEGRAM_DESTINATION_CHAT_ID=7",
+    "",
+  ].join("\n"), { mode: 0o600 });
+  const shellOnlyInstall = spawnSync(executable, ["service", "install"], {
+    cwd: temp,
+    encoding: "utf8",
+    env: { ...serviceEnv, HOME: shellOnlyHome },
+  });
+  assert.equal(shellOnlyInstall.status, 1);
+  assert.equal(shellOnlyInstall.stdout, "");
+  assert.match(shellOnlyInstall.stderr, /CONFIGURATION_ERROR/u);
+  assert.doesNotMatch(shellOnlyInstall.stderr, /process-secret|other-secret/u);
+  await assert.rejects(lstat(join(shellOnlyHome, ".config", "systemd", "user", "qiyan-bot.service")),
+    (error: unknown) => (error as NodeJS.ErrnoException).code === "ENOENT");
+  const serviceInstall = spawnSync(executable, ["service", "install"], { cwd: temp, encoding: "utf8", env: serviceEnv });
+  assert.equal(serviceInstall.status, 0);
+  assert.equal(serviceInstall.stdout, "Installed and started qiyan-bot.service.\n");
+  assert.equal(serviceInstall.stderr, "");
+  const installedUnitPath = join(serviceHome, ".config", "systemd", "user", "qiyan-bot.service");
+  const installedUnit = await readFile(installedUnitPath, "utf8");
+  assert.match(installedUnit, /ExecStart=.*qiyan-bot.* --home .*\.qiyan-bot/u);
+  assert.doesNotMatch(installedUnit, /process-secret|private-file-token|other-secret/u);
+  const serviceStatus = spawnSync(executable, ["service", "status"], { cwd: temp, encoding: "utf8", env: serviceEnv });
+  assert.equal(serviceStatus.status, 0);
+  assert.equal(serviceStatus.stdout, "qiyan-bot.service is active and enabled.\n");
+  assert.equal(serviceStatus.stderr, "");
+  const serviceUninstall = spawnSync(executable, ["service", "uninstall"], { cwd: temp, encoding: "utf8", env: serviceEnv });
+  assert.equal(serviceUninstall.status, 0);
+  assert.equal(serviceUninstall.stdout, "Stopped and removed qiyan-bot.service.\n");
+  assert.equal(serviceUninstall.stderr, "");
+  await assert.rejects(lstat(installedUnitPath), (error: unknown) => (error as NodeJS.ErrnoException).code === "ENOENT");
+  const serviceCalls = (await readFile(join(serviceHome, "systemctl-calls.jsonl"), "utf8")).trim().split("\n").map((line) => JSON.parse(line) as { argv: string[]; leaked: boolean });
+  assert.deepEqual(serviceCalls.map(({ argv }) => argv), [
+    ["--user", "daemon-reload"],
+    ["--user", "enable", "qiyan-bot.service"],
+    ["--user", "restart", "qiyan-bot.service"],
+    ["--user", "is-active", "qiyan-bot.service"],
+    ["--user", "is-enabled", "qiyan-bot.service"],
+    ["--user", "disable", "--now", "qiyan-bot.service"],
+    ["--user", "daemon-reload"],
+  ]);
+  assert.equal(serviceCalls.some(({ leaked }) => leaked), false);
 
   const checkedHome = join(temp, "checked-qiyan-home");
   await mkdir(checkedHome, { mode: 0o700 });

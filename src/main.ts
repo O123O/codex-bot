@@ -10,6 +10,9 @@ import { WeixinAuthClient } from "./weixin/auth-client.ts";
 import { WeixinCredentialStore } from "./weixin/credential-store.ts";
 import { createNodeWeixinLoginTerminal, runWeixinLogin } from "./weixin/login.ts";
 import { bootstrapWeixin } from "./weixin/bootstrap.ts";
+import { buildServiceEffectiveEnvironment, SystemdUserService } from "./service/systemd-user.ts";
+import { AppError } from "./core/errors.ts";
+import { isAbsolute, resolve } from "node:path";
 
 export async function main(env = process.env, argv: readonly string[] = process.argv.slice(2)): Promise<void> {
   const command = parseCliArgs(argv);
@@ -26,6 +29,23 @@ export async function main(env = process.env, argv: readonly string[] = process.
     const result = await updateFromLatestRelease({ env });
     process.stdout.write(`Updated qiyan-bot to ${result.version} in ${result.prefix}.\n`);
     process.stdout.write("Restart any running qiyan-bot process to use this version.\n");
+    return;
+  }
+  if (command.command === "service") {
+    const userHome = serviceUserHome(env);
+    const executable = process.argv[1];
+    if (!executable || !isAbsolute(executable)) throw new AppError("CONFIGURATION_ERROR", "service management requires an absolute qiyan-bot executable path");
+    const service = new SystemdUserService({ userHome, executable, env });
+    if (command.action === "install") {
+      const selected = await loadConfigSource(env, command.qiyanHome === undefined ? {} : { cliHome: command.qiyanHome });
+      const loaded = await loadConfigSource(buildServiceEffectiveEnvironment(env), { cliHome: selected.qiyanHome });
+      const weixin = await bootstrapWeixin(loaded.qiyanHome);
+      const config = loadConfig(loaded.values, { qiyanHome: loaded.qiyanHome, weixinConfigured: weixin.configured });
+      await validateAssistantWorkspacePaths({ workdir: config.assistantWorkdir, dataDir: config.dataDir, registryPath: config.sessionRegistryPath });
+      process.stdout.write(await service.execute("install", { qiyanHome: loaded.qiyanHome }));
+    } else {
+      process.stdout.write(await service.execute(command.action));
+    }
     return;
   }
   if (command.command === "assistant-login") {
@@ -72,6 +92,12 @@ export async function main(env = process.env, argv: readonly string[] = process.
   });
   const app = await createApp(config, weixin.configured ? { weixinCredential: weixin.credential } : {});
   await runForegroundApp(app);
+}
+
+function serviceUserHome(env: NodeJS.ProcessEnv): string {
+  const home = env.HOME;
+  if (!home || !isAbsolute(home) || resolve(home) !== home) throw new AppError("CONFIGURATION_ERROR", "HOME must be an absolute normalized path for service management");
+  return home;
 }
 
 interface ForegroundSignals {

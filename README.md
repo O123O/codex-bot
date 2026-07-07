@@ -77,6 +77,15 @@ qiyan-bot
 
 QiYan deliberately runs as a long-lived foreground process; it does not daemonize itself. Successful startup prints a readiness line and keeps the terminal occupied until Ctrl+C, SIGINT, or SIGTERM. Use a process supervisor such as a user systemd service for unattended operation.
 
+On a systemd-based Linux desktop or server, install and start QiYan as an enabled user service after configuration and assistant login:
+
+```bash
+qiyan-bot service install
+qiyan-bot service status
+```
+
+The service supervises the same foreground process, so tmux is unnecessary. Other lifecycle actions are `start`, `stop`, `restart`, and `uninstall`. The generated unit contains only absolute paths and environment-variable names; QiYan continues to read credentials from its private `.env`, which is never copied into the unit. Installation validates this service-effective configuration rather than temporary shell-only bot variables. An existing unit not marked as QiYan-managed is never overwritten or removed. See the [shared setup guide](docs/setup.md) for user-service path, lingering, and recovery details.
+
 QiYan home is selected by CLI `--home`, then process `QIYAN_HOME`, then `$HOME/.qiyan-bot`. Other settings use CLI, then process environment, then `<QIYAN_HOME>/.env`, then defaults. `QIYAN_HOME` itself is intentionally not allowed inside `.env`.
 
 The defaults are:

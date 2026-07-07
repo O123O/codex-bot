@@ -17,6 +17,13 @@ test("parses an explicit assistant workdir", () => {
   assert.deepEqual(parseCliArgs(["config-check", "--home", "/srv/qiyan"]), { command: "config-check", qiyanHome: "/srv/qiyan" });
   assert.deepEqual(parseCliArgs(["--version"]), { command: "version" });
   assert.deepEqual(parseCliArgs(["--update"]), { command: "update" });
+  assert.deepEqual(parseCliArgs(["service", "install"]), { command: "service", action: "install" });
+  assert.deepEqual(parseCliArgs(["service", "install", "--home", "/srv/qiyan"]), { command: "service", action: "install", qiyanHome: "/srv/qiyan" });
+  assert.deepEqual(parseCliArgs(["service", "start"]), { command: "service", action: "start" });
+  assert.deepEqual(parseCliArgs(["service", "stop"]), { command: "service", action: "stop" });
+  assert.deepEqual(parseCliArgs(["service", "restart"]), { command: "service", action: "restart" });
+  assert.deepEqual(parseCliArgs(["service", "status"]), { command: "service", action: "status" });
+  assert.deepEqual(parseCliArgs(["service", "uninstall"]), { command: "service", action: "uninstall" });
 });
 
 test("parses top-level and command-specific help without accepting extra arguments", () => {
@@ -25,6 +32,8 @@ test("parses top-level and command-specific help without accepting extra argumen
   assert.deepEqual(parseCliArgs(["assistant-login", "--help"]), { command: "help", topic: "assistant-login" });
   assert.deepEqual(parseCliArgs(["weixin-login", "-h"]), { command: "help", topic: "weixin-login" });
   assert.deepEqual(parseCliArgs(["config-check", "--help"]), { command: "help", topic: "config-check" });
+  assert.deepEqual(parseCliArgs(["service", "--help"]), { command: "help", topic: "service" });
+  assert.deepEqual(parseCliArgs(["service", "install", "--help"]), { command: "help", topic: "service" });
   assert.throws(() => parseCliArgs(["--help", "--home", "/srv/qiyan"]), /unknown argument/);
   assert.throws(() => parseCliArgs(["assistant-login", "--help", "--home", "/srv/qiyan"]), /unknown argument/);
 });
@@ -34,6 +43,7 @@ test("formats useful top-level and command-specific help", () => {
   assert.match(root, /^QiYan personal assistant bot\n/u);
   assert.match(root, /Usage:\n  qiyan-bot \[--home <path>\] \[--workdir <path>\]/u);
   assert.match(root, /qiyan-bot assistant-login \[--home <path>\]/u);
+  assert.match(root, /qiyan-bot service <action>/u);
   assert.match(root, /starts the long-lived bot in the foreground/u);
   assert.match(root, /-h, --help/u);
   assert.match(root, /Requires Node\.js 24 or newer\./u);
@@ -45,6 +55,7 @@ test("formats useful top-level and command-specific help", () => {
 
   assert.match(formatCliHelp("weixin-login"), /qiyan-bot weixin-login \[--home <path>\]/u);
   assert.match(formatCliHelp("config-check"), /qiyan-bot config-check \[--home <path>\]/u);
+  assert.match(formatCliHelp("service"), /install\|start\|stop\|restart\|status\|uninstall/u);
 });
 
 test("rejects missing, repeated, and unknown CLI arguments", () => {
@@ -58,6 +69,10 @@ test("rejects missing, repeated, and unknown CLI arguments", () => {
   assert.throws(() => parseCliArgs(["config-check", "--workdir", "one"]), /unknown argument/);
   assert.throws(() => parseCliArgs(["--version", "--workdir", "one"]), /unknown argument/);
   assert.throws(() => parseCliArgs(["--update", "--version"]), /unknown argument/);
+  assert.throws(() => parseCliArgs(["service"]), /service action is required/);
+  assert.throws(() => parseCliArgs(["service", "unknown-secret"]), /unknown service action/);
+  assert.throws(() => parseCliArgs(["service", "start", "--home", "/srv/qiyan"]), /unknown argument/);
+  assert.throws(() => parseCliArgs(["service", "install", "--workdir", "/srv/qiyan"]), /unknown argument/);
 });
 
 test("does not echo an unknown argument into a startup error", () => {
