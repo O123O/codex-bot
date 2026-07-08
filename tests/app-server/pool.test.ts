@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { AppServerPool, type AppServerEndpoint } from "../../src/app-server/pool.ts";
 import { AppError } from "../../src/core/errors.ts";
-import type { ManagedAppServerEndpoint } from "../../src/endpoints/types.ts";
+import type { EndpointWorkLease, ManagedAppServerEndpoint } from "../../src/endpoints/types.ts";
 
 class FakeEndpoint implements AppServerEndpoint {
   readonly id: string = "local";
@@ -373,6 +373,52 @@ test("connection loss retains and coalesces cold active and provisional claims",
   assert.equal(pool.activeTurnCount, 0);
   await pool.reconcileEndpointClaims("devbox");
   assert.equal(pool.activeTurnCount, 0);
+});
+
+test("claim reconciliation stops after endpoint loss and reuses its exact lease without activation", async () => {
+  const lease: EndpointWorkLease = {
+    endpointId: "devbox", lifecycleGeneration: 1, endpointGeneration: 1, leaseId: "claim-recovery",
+  };
+  let firstReadStarted!: () => void;
+  let releaseFirstRead!: () => void;
+  const started = new Promise<void>((resolve) => { firstReadStarted = resolve; });
+  const blocked = new Promise<void>((resolve) => { releaseFirstRead = resolve; });
+  const reads: string[] = [];
+  let activations = 0;
+  const endpoint: AppServerEndpoint = {
+    id: "devbox",
+    state: "ready",
+    request: async <T>(_method: string, params: any) => {
+      reads.push(params.threadId);
+      if (reads.length === 1) {
+        firstReadStarted();
+        await blocked;
+      }
+      return { thread: { status: "active", turns: [{
+        id: `turn-${params.threadId}`, status: "inProgress", itemsView: "full", items: [],
+      }] } } as T;
+    },
+  };
+  const pool = new AppServerPool([endpoint], {
+    maxConcurrentTurns: 2,
+    workLeaseProvider: async (_endpointId, existingLease, run) => {
+      if (!existingLease) activations += 1;
+      return run(existingLease);
+    },
+  });
+  pool.restoreObservedActiveTurn("devbox", "thread-a", "turn-thread-a");
+  pool.restoreObservedActiveTurn("devbox", "thread-b", "turn-thread-b");
+  let current = true;
+
+  const reconciling = pool.reconcileEndpointClaims("devbox", lease, () => current);
+  await started;
+  current = false;
+  releaseFirstRead();
+  await reconciling;
+
+  assert.deepEqual(reads, ["thread-a"]);
+  assert.equal(activations, 0);
+  assert.equal(pool.activeTurnCount, 2);
 });
 
 test("a provisional claim bound during recovery stays resolved after its turn terminates", async () => {

@@ -196,6 +196,92 @@ test("ownership detection and release propagate one existing endpoint lease", as
   assert.deepEqual(removals, [existingLease]);
 });
 
+test("ownership release stops after endpoint loss during the first of two incidents", async () => {
+  const registry = await registryFixture();
+  const projectDir = registry.snapshot().assistant.project_dir;
+  await registry.createManaged("worker-2", {
+    endpoint: "local", thread_id: "thread-2", project_dir: projectDir, mapping_id: "mapping-2",
+  });
+  const incidents = [
+    { nickname: "worker", endpoint: "local", thread_id: "thread-1", mapping_id: "mapping-1", turnId: "external-1" },
+    { nickname: "worker-2", endpoint: "local", thread_id: "thread-2", mapping_id: "mapping-2", turnId: "external-2" },
+  ];
+  let firstStarted!: () => void;
+  let releaseFirst!: () => void;
+  const started = new Promise<void>((resolve) => { firstStarted = resolve; });
+  const blocked = new Promise<void>((resolve) => { releaseFirst = resolve; });
+  const removals: string[] = [];
+  const callbacks: string[] = [];
+  const watcher = new SessionOwnershipWatcher(
+    registry,
+    { inspect: async () => ({ state: "owned" }) },
+    { unadopt: async (nickname) => {
+      removals.push(nickname);
+      if (removals.length === 1) {
+        firstStarted();
+        await blocked;
+      }
+    } },
+    { onExternal: async () => undefined, onReleased: async (incident) => { callbacks.push(incident.nickname); } },
+  );
+  let current = true;
+
+  const releasing = watcher.release(incidents, lease("local"), () => current);
+  await started;
+  current = false;
+  releaseFirst();
+  await releasing;
+
+  assert.deepEqual(removals, ["worker"]);
+  assert.deepEqual(callbacks, []);
+});
+
+test("ownership detection stops after endpoint loss during the first external callback", async () => {
+  const registry = await registryFixture();
+  const projectDir = registry.snapshot().assistant.project_dir;
+  await registry.createManaged("worker-2", {
+    endpoint: "local", thread_id: "thread-2", project_dir: projectDir, mapping_id: "mapping-2",
+  });
+  let callbackStarted!: () => void;
+  let releaseCallback!: () => void;
+  const started = new Promise<void>((resolve) => { callbackStarted = resolve; });
+  const blocked = new Promise<void>((resolve) => { releaseCallback = resolve; });
+  const inspections: string[] = [];
+  const callbacks: string[] = [];
+  const existingLease = lease("local");
+  const watcher = new SessionOwnershipWatcher(
+    registry,
+    { inspect: async (identity, actualLease) => {
+      assert.equal(actualLease, existingLease);
+      inspections.push(identity.thread_id);
+      return { state: "external", turnId: `external-${identity.thread_id}` };
+    } },
+    { unadopt: async () => undefined },
+    {
+      onExternal: async (incident) => {
+        callbacks.push(incident.thread_id);
+        if (callbacks.length === 1) {
+          callbackStarted();
+          await blocked;
+        }
+      },
+      onReleased: async () => undefined,
+    },
+  );
+  let current = true;
+
+  const detecting = watcher.detectEndpoint("local", existingLease, () => current);
+  await started;
+  current = false;
+  releaseCallback();
+  assert.deepEqual(await detecting, [{
+    nickname: "worker", endpoint: "local", thread_id: "thread-1", mapping_id: "mapping-1", turnId: "external-thread-1",
+  }]);
+
+  assert.deepEqual(inspections, ["thread-1"]);
+  assert.deepEqual(callbacks, ["thread-1"]);
+});
+
 test("the external monitor reuses one lease for pending and newly detected release", async () => {
   const timers = new FakeOwnershipTimers();
   const existingLease = lease("devbox");

@@ -214,7 +214,11 @@ export class AppServerPool {
     return [...this.claims.values()].some((state) => state.endpointId === endpointId);
   }
 
-  async reconcileEndpointClaims(endpointId: string): Promise<void> {
+  async reconcileEndpointClaims(
+    endpointId: string,
+    lease?: EndpointWorkLease,
+    isCurrent: () => boolean = () => true,
+  ): Promise<void> {
     const byThread = new Map<string, ClaimState[]>();
     for (const state of this.claims.values()) {
       if (state.endpointId !== endpointId) continue;
@@ -223,28 +227,35 @@ export class AppServerPool {
       byThread.set(state.threadId, values);
     }
     for (const [threadId, states] of byThread) {
+      if (!isCurrent()) return;
       let history: ThreadHistory;
-      try { history = await this.readFullThread(endpointId, threadId); } catch { continue; }
+      try { history = await this.readFullThread(endpointId, threadId, lease); }
+      catch { if (!isCurrent()) return; continue; }
+      if (!isCurrent()) return;
       const threadStatus = typeof history.status === "string" ? history.status : history.status?.type;
       const fullyIdle = threadStatus === "idle" && history.turns.every((turn) => turn.itemsView === "full");
       for (const state of states) {
+        if (!isCurrent()) return;
         if (!this.claims.has(state.id)) continue;
         if (state.phase === "active" && state.turnId) {
           const turn = history.turns.find((candidate) => candidate.id === state.turnId);
           if (turn && isTerminal(turn.status)) this.markTurnTerminal(endpointId, threadId, state.turnId);
           else if (!turn && fullyIdle) this.releaseClaimState(state);
+          if (!isCurrent()) return;
           continue;
         }
         const turn = state.clientUserMessageId === undefined ? undefined : history.turns.find((candidate) =>
           candidate.items.some((item) => item.type === "userMessage" && item.clientId === state.clientUserMessageId));
         if (!turn) {
           if (fullyIdle) { this.resolved(state.id); this.releaseClaimState(state); }
+          if (!isCurrent()) return;
           continue;
         }
         if (isTerminal(turn.status)) {
           this.resolved(state.id);
           this.recordTerminalClaim(state, turn.id);
           this.releaseClaimState(state);
+          if (!isCurrent()) return;
           continue;
         }
         const duplicate = [...this.claims.values()].find((candidate) => candidate.id !== state.id
@@ -257,6 +268,7 @@ export class AppServerPool {
           this.resolved(state.id);
           this.bindTurnCapacityClaim(state, turn.id);
         }
+        if (!isCurrent()) return;
       }
     }
   }

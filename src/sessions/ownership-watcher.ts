@@ -63,38 +63,51 @@ export class SessionOwnershipWatcher {
     await this.release(await this.detectEndpoint(endpointId, lease), lease);
   }
 
-  async detectEndpoint(endpointId: string, lease?: EndpointWorkLease): Promise<ExternalTurnIncident[]> {
+  async detectEndpoint(
+    endpointId: string,
+    lease?: EndpointWorkLease,
+    isCurrent: () => boolean = () => true,
+  ): Promise<ExternalTurnIncident[]> {
     const incidents: ExternalTurnIncident[] = [];
     const sessions = Object.entries(this.registry.snapshot().sessions)
       .filter(([, session]) => session.endpoint === endpointId && session.lifecycle_state === "managed");
     for (const [nickname, session] of sessions) {
+      if (!isCurrent()) return incidents;
       if (this.options.isInspectable && !this.options.isInspectable(session)) continue;
-      const inspect = () => this.ownership.inspect(session, lease);
+      const inspect = async (): Promise<OwnershipInspection> => {
+        if (!isCurrent()) throw new AppError("ENDPOINT_UNAVAILABLE", "ownership inspection generation changed");
+        const result = await this.ownership.inspect(session, lease);
+        if (!isCurrent()) throw new AppError("ENDPOINT_UNAVAILABLE", "ownership inspection generation changed");
+        return result;
+      };
       const result = this.gate
         ? await this.gate.run(session.endpoint, session.thread_id, inspect)
         : await inspect();
+      if (!isCurrent()) return incidents;
       if (result.state !== "external") continue;
-      await this.options.onExternal({
+      const incident = {
         nickname,
         endpoint: session.endpoint,
         thread_id: session.thread_id,
         mapping_id: session.mapping_id,
         turnId: result.turnId,
-      });
-      incidents.push({
-        nickname,
-        endpoint: session.endpoint,
-        thread_id: session.thread_id,
-        mapping_id: session.mapping_id,
-        turnId: result.turnId,
-      });
+      };
+      incidents.push(incident);
+      if (!isCurrent()) return incidents;
+      await this.options.onExternal(incident);
+      if (!isCurrent()) return incidents;
     }
     return incidents;
   }
 
-  async release(incidents: readonly ExternalTurnIncident[], lease?: EndpointWorkLease): Promise<void> {
+  async release(
+    incidents: readonly ExternalTurnIncident[],
+    lease?: EndpointWorkLease,
+    isCurrent: () => boolean = () => true,
+  ): Promise<void> {
     const seen = new Set<string>();
     for (const incident of incidents) {
+      if (!isCurrent()) return;
       const key = `${incident.endpoint}\0${incident.thread_id}\0${incident.mapping_id}`;
       if (seen.has(key)) continue;
       seen.add(key);
@@ -102,8 +115,11 @@ export class SessionOwnershipWatcher {
       if (!current || current.endpoint !== incident.endpoint || current.thread_id !== incident.thread_id
         || current.mapping_id !== incident.mapping_id || current.lifecycle_state !== "managed") continue;
       try {
+        if (!isCurrent()) return;
         await this.lifecycle.unadopt(incident.nickname, undefined, lease);
+        if (!isCurrent()) return;
         await this.options.onReleased(incident);
+        if (!isCurrent()) return;
       } catch (error) {
         if (error instanceof AppError && error.code === "SESSION_BUSY") continue;
         throw error;
