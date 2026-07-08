@@ -35,6 +35,14 @@ test("assistant terminal failure reports always request one coalesced recovery w
   assert.equal(recoveries, 1);
 });
 
+test("assistant notification failure before dispatcher construction still reports safely", () => {
+  const reports: string[] = [];
+  assert.doesNotThrow(() => reportAssistantTerminalFailure(undefined, () => {
+    reports.push("assistant notification");
+  }));
+  assert.deepEqual(reports, ["assistant notification"]);
+});
+
 test("endpoint lifecycle recovery checkpoints require an exact phase and runtime identity", () => {
   const checkpoint = { endpoint: "devbox", phase: "runtime_started", identity: { kind: "ssh", token: "a".repeat(32), pid: 10, linuxStartTime: "20", processGroupId: 10 } };
   assert.deepEqual(parseEndpointLifecycleCheckpoint(checkpoint), checkpoint);

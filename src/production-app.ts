@@ -100,11 +100,11 @@ export function assistantAccessWarning(mode: BotConfig["assistantSandboxMode"]):
 }
 
 export function reportAssistantTerminalFailure(
-  dispatcher: Pick<ConversationDispatcher, "requestRecovery">,
+  dispatcher: Pick<ConversationDispatcher, "requestRecovery"> | undefined,
   report: () => void,
 ): void {
   try { report(); }
-  finally { dispatcher.requestRecovery(); }
+  finally { dispatcher?.requestRecovery(); }
 }
 
 export type RemovalRecoveryDecision = "pending" | "no_effect" | "reconcile" | "succeeded";
@@ -317,6 +317,7 @@ export async function buildProductionApp(
   let weixinIncidents: WeixinIncidentRouter | undefined;
   let attemptScope!: AttemptScope;
   let dispatcher!: ConversationDispatcher;
+  let dispatcherAvailable = false;
   let scheduler!: AssistantScheduler;
   let mcp!: LoopbackMcpServer;
   let chats: ChatAdapter[] = [];
@@ -801,7 +802,8 @@ export async function buildProductionApp(
         unsubscribers.push(endpointManager.onEndpoint((target, generation) => bindProjectEndpoint(target, generation)));
         unsubscribers.push(assistantEndpoint.onNotification((method, params) => runBackground(
           () => onNotification(assistantEndpoint.id, method, params),
-          () => reportAssistantTerminalFailure(dispatcher, () => recordBackgroundFailure("assistant notification")),
+          // Before construction, the assistant phase's initial dispatcher.recover() is the recovery boundary.
+          () => reportAssistantTerminalFailure(dispatcherAvailable ? dispatcher : undefined, () => recordBackgroundFailure("assistant notification")),
         )));
         unsubscribers.push(assistantEndpoint.onUnavailable((kind) => {
           assistantToolReadiness.block();
@@ -888,6 +890,7 @@ export async function buildProductionApp(
             () => reportAssistantTerminalFailure(dispatcher, () => recordBackgroundFailure("deferred assistant terminal")),
           ),
         });
+        dispatcherAvailable = true;
         await dispatcher.recover();
         await dispatcher.idle();
         assistant.hydrateActive();
@@ -919,9 +922,9 @@ export async function buildProductionApp(
         stopping = true;
         assistantToolReadiness.stop();
         schedulerAccepting = false;
+        assistant.fenceToolAdmission();
         const active = assistant.current();
         if (active && !active.turnId.startsWith("pending:")) {
-          assistant.beginTerminalizing(active.turnId);
           await assistant.fenceTools(active.attemptId, 1_000);
           let interruptTimer: ReturnType<typeof setTimeout> | undefined;
           await Promise.race([

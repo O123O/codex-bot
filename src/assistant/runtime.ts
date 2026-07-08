@@ -97,16 +97,24 @@ export class AssistantRuntime {
   }
 
   beginTerminalizing(turnId: string): ActiveAssistantContext | undefined {
+    const row = this.attemptRow(turnId);
+    if (!row) return undefined;
+    return this.terminalizeAttempt(String(row.id), turnId);
+  }
+
+  fenceToolAdmission(): void {
+    for (const attempt of this.activeAttempts()) this.terminalizeAttempt(attempt.attemptId, attempt.turnId);
+  }
+
+  private terminalizeAttempt(attemptId: string, turnId: string): ActiveAssistantContext {
     return inTransaction(this.db, () => {
-      const row = this.attemptRow(turnId);
-      if (!row) return undefined;
-      const attemptId = String(row.id);
       this.db.prepare(`UPDATE assistant_attempts
         SET tool_fence = tool_fence + CASE WHEN accepting_tools = 1 THEN 1 ELSE 0 END, accepting_tools = 0
         WHERE id = ? AND state = 'active'`).run(attemptId);
       this.db.prepare(`UPDATE assistant_turn_lease SET phase = 'terminalizing', steer_paused = 1, pause_reason = 'terminalizing'
         WHERE attempt_id = ? AND turn_id = ?`).run(attemptId, turnId);
-      const refreshed = this.attemptRow(turnId)!;
+      const refreshed = this.db.prepare(`SELECT a.*, l.trigger_kind AS lease_trigger_kind FROM assistant_attempts a
+        LEFT JOIN assistant_turn_lease l ON l.attempt_id = a.id WHERE a.id = ?`).get(attemptId) as Record<string, unknown>;
       const active = this.parseActive(refreshed);
       if (this.active?.attemptId === attemptId) this.active = active;
       return active;

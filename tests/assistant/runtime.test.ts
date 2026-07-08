@@ -254,6 +254,10 @@ test("tool settlement is observable and the global drain waits for every attempt
   assert.equal(await settled, "settled");
   await draining;
   assert.equal(drained, true);
+
+  runtime.fenceToolAdmission();
+  assert.throws(() => runtime.registerTool("attempt-one"), /terminal/u);
+  assert.throws(() => runtime.registerTool("attempt-two"), /terminal/u);
 });
 
 test("causal finals retain the attempt binding while destinationless internal recovery stays unbound", () => {
