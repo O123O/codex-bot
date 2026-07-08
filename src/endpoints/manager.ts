@@ -113,9 +113,29 @@ export class EndpointManager {
     return this.withWorkLease(endpointId, "rpc", (_endpoint, lease) => run(lease));
   }
 
+  async runWithReadyWorkLease<T>(
+    endpointId: string,
+    existing: EndpointWorkLease | undefined,
+    run: (lease: EndpointWorkLease | undefined) => Promise<T>,
+  ): Promise<T> {
+    if (existing) {
+      if (!this.validateReadyWorkLease(existing, endpointId)) {
+        throw new AppError("ENDPOINT_UNAVAILABLE", `endpoint is unavailable for existing work lease: ${endpointId}`);
+      }
+      return run(existing);
+    }
+    return this.withWorkLease(endpointId, "rpc", (_endpoint, lease) => run(lease));
+  }
+
   validateWorkLease(lease: EndpointWorkLease, endpointId: string): boolean {
     const record = this.records.get(endpointId);
     return record !== undefined && record.generation === lease.endpointGeneration && record.gate.validate(lease, record.generation);
+  }
+
+  validateReadyWorkLease(lease: EndpointWorkLease, endpointId: string): boolean {
+    const record = this.records.get(endpointId);
+    return record?.endpoint?.state === "ready" && record.generation === lease.endpointGeneration
+      && record.gate.validate(lease, record.generation);
   }
 
   endpointGeneration(id: string): { endpoint: ManagedAppServerEndpoint; generation: number } {

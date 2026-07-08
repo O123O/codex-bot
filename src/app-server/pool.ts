@@ -115,12 +115,23 @@ export class AppServerPool {
   }
 
   request<T>(endpointId: string, method: string, params: unknown, signal?: AbortSignal, lease?: EndpointWorkLease): Promise<T> {
-    return this.withWorkLease(endpointId, lease, () => this.requestAdmitted<T>(endpointId, method, params, signal));
+    return this.withWorkLease(endpointId, lease, () => this.requestAdmitted<T>(
+      endpointId, method, params, signal, lease === undefined,
+    ));
   }
 
-  private requestAdmitted<T>(endpointId: string, method: string, params: unknown, signal?: AbortSignal): Promise<T> {
+  private requestAdmitted<T>(
+    endpointId: string,
+    method: string,
+    params: unknown,
+    signal: AbortSignal | undefined,
+    allowActivation: boolean,
+  ): Promise<T> {
     const existing = this.endpoints.get(endpointId);
     if (existing?.state === "ready") return existing.request<T>(method, params, signal);
+    if (!allowActivation) {
+      return Promise.reject(new AppError("ENDPOINT_UNAVAILABLE", `leased app-server endpoint is unavailable: ${endpointId}`));
+    }
     return this.ensureEndpoint(endpointId).then((endpoint) => endpoint.request<T>(method, params, signal));
   }
 

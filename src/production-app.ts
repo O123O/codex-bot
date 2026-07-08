@@ -1618,7 +1618,7 @@ export async function buildProductionApp(
         pool = new AppServerPool([endpoint, assistantEndpoint], {
           maxConcurrentTurns: config.maxConcurrentTurns,
           resolveEndpoint: (id) => endpointManager.ensureReady(id),
-          workLeaseProvider: (id, lease, run) => id === assistantEndpoint.id ? run(lease) : endpointManager.runWithWorkLease(id, lease, run),
+          workLeaseProvider: (id, lease, run) => id === assistantEndpoint.id ? run(lease) : endpointManager.runWithReadyWorkLease(id, lease, run),
         });
         recoveredEndpointIds = new EndpointCapacityRecovery({
           runtime,
@@ -1867,7 +1867,7 @@ export async function buildProductionApp(
             || lifecycleOwnedEndpointIds().has(endpointId) || endpointManager.desiredState(endpointId) !== "automatic") continue;
           await reconcileOwnershipBeforeRelayWithLease(endpointManager, ownershipWatcher, relay, endpointId, async (lease) => {
             await pool.reconcileEndpointClaims(
-              endpointId, lease, () => endpointManager.validateWorkLease(lease, endpointId),
+              endpointId, lease, () => endpointManager.validateReadyWorkLease(lease, endpointId),
             );
           });
           endpointReadyBuffer?.acknowledge(endpointId);
@@ -2886,8 +2886,7 @@ export async function buildProductionApp(
   function isManagedRecoveryLeaseCurrent(endpointId: string, lease: EndpointWorkLease): boolean {
     try {
       const current = endpointManager.endpointGeneration(endpointId);
-      return current.endpoint.state === "ready" && current.generation === lease.endpointGeneration
-        && endpointManager.validateWorkLease(lease, endpointId);
+      return current.generation === lease.endpointGeneration && endpointManager.validateReadyWorkLease(lease, endpointId);
     } catch { return false; }
   }
 
