@@ -128,7 +128,7 @@ export interface EndpointReadyBuffer {
   acknowledge(endpointId: string): void;
   pause(): void;
   acceptAndDrain(): Promise<void>;
-  stop(): void;
+  stop(): Promise<void>;
 }
 
 export function createEndpointReadyBuffer(options: {
@@ -140,13 +140,40 @@ export function createEndpointReadyBuffer(options: {
     throw new RangeError("maxPendingEndpoints must be a positive safe integer");
   }
   const pending = new Set<string>();
+  const recoveries = new Map<string, { dirty: boolean; running: Promise<void> }>();
   let accepting = false;
   let stopped = false;
+
+  const requestRecovery = (endpointId: string): Promise<void> => {
+    const existing = recoveries.get(endpointId);
+    if (existing) {
+      existing.dirty = true;
+      return existing.running;
+    }
+    const state = { dirty: false, running: undefined as unknown as Promise<void> };
+    recoveries.set(endpointId, state);
+    state.running = Promise.resolve().then(async () => {
+      if (stopped) {
+        recoveries.delete(endpointId);
+        return;
+      }
+      let firstError: unknown;
+      do {
+        state.dirty = false;
+        try { await options.recover(endpointId); }
+        catch (error) { firstError ??= error; }
+      } while (state.dirty && accepting && !stopped);
+      if (state.dirty && !accepting && !stopped) pending.add(endpointId);
+      if (recoveries.get(endpointId) === state) recoveries.delete(endpointId);
+      if (firstError) throw firstError;
+    });
+    return state.running;
+  };
 
   return {
     ready: (endpointId) => {
       if (stopped) return undefined;
-      if (accepting) return options.recover(endpointId);
+      if (accepting) return requestRecovery(endpointId);
       if (pending.has(endpointId)) return undefined;
       if (pending.size >= maxPendingEndpoints) {
         return Promise.reject(new AppError("CAPACITY_EXCEEDED", "too many endpoint-ready events are pending"));
@@ -160,19 +187,20 @@ export function createEndpointReadyBuffer(options: {
       if (stopped) return;
       accepting = true;
       for (const endpointId of [...pending].sort()) {
-        if (stopped) break;
+        if (stopped || !accepting) break;
         pending.delete(endpointId);
-        try { await options.recover(endpointId); }
+        try { await requestRecovery(endpointId); }
         catch (error) {
           if (!stopped) pending.add(endpointId);
           throw error;
         }
       }
     },
-    stop: () => {
+    stop: async () => {
       stopped = true;
       accepting = false;
       pending.clear();
+      await Promise.allSettled([...recoveries.values()].map((state) => state.running));
     },
   };
 }
@@ -669,6 +697,7 @@ export async function stopRelayRecovery(
 }
 
 export async function stopRecoveryOwnerSet(dependencies: {
+  ready?: Pick<EndpointReadyBuffer, "stop">;
   operations?: Pick<OperationReconciliationLoop, "stop">;
   dispatcher?: Pick<ConversationDispatcher, "stop">;
   relay?: Pick<EventRelay, "stop">;
@@ -677,6 +706,7 @@ export async function stopRecoveryOwnerSet(dependencies: {
 }): Promise<void> {
   let firstError: unknown;
   for (const stop of [
+    () => dependencies.ready?.stop(),
     () => dependencies.operations?.stop(),
     () => dependencies.dispatcher?.stop(),
     () => dependencies.relay?.stop(),
@@ -1424,8 +1454,8 @@ export async function buildProductionApp(
 
   function stopRecoveryOwners(): Promise<void> {
     if (recoveryOwnersStop) return recoveryOwnersStop;
-    endpointReadyBuffer?.stop();
     recoveryOwnersStop = stopRecoveryOwnerSet({
+      ...(endpointReadyBuffer ? { ready: endpointReadyBuffer } : {}),
       ...(operationReconciler ? { operations: operationReconciler } : {}),
       ...(dispatcherAvailable ? { dispatcher } : {}),
       ...(relay ? { relay } : {}),

@@ -202,6 +202,100 @@ test("a ready event deferred during startup drains the complete endpoint pipelin
   assert.equal(attempts, 2, "a failed drain remains pending for the next recovery boundary");
 });
 
+test("ready recovery is single-flight per endpoint and coalesces one dirty follow-up", async () => {
+  let signalStarted!: () => void;
+  let releaseFirst!: () => void;
+  const started = new Promise<void>((resolve) => { signalStarted = resolve; });
+  const blocked = new Promise<void>((resolve) => { releaseFirst = resolve; });
+  let attempts = 0;
+  let active = 0;
+  let maxActive = 0;
+  const readyBuffer = createEndpointReadyBuffer({
+    recover: async () => {
+      attempts += 1;
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      if (attempts === 1) {
+        signalStarted();
+        await blocked;
+      }
+      active -= 1;
+    },
+  });
+  await readyBuffer.acceptAndDrain();
+  const first = readyBuffer.ready("devbox");
+  assert.ok(first);
+  await started;
+  const second = readyBuffer.ready("devbox");
+  const third = readyBuffer.ready("devbox");
+  assert.equal(second, first);
+  assert.equal(third, first);
+  releaseFirst();
+  await first;
+  assert.deepEqual({ attempts, maxActive }, { attempts: 2, maxActive: 1 });
+
+  let signalPausedStarted!: () => void;
+  let releasePaused!: () => void;
+  const pausedStarted = new Promise<void>((resolve) => { signalPausedStarted = resolve; });
+  const pausedBlock = new Promise<void>((resolve) => { releasePaused = resolve; });
+  let pausedAttempts = 0;
+  const pausedBuffer = createEndpointReadyBuffer({
+    recover: async () => {
+      pausedAttempts += 1;
+      if (pausedAttempts === 1) {
+        signalPausedStarted();
+        await pausedBlock;
+      }
+    },
+  });
+  await pausedBuffer.acceptAndDrain();
+  const pausedFirst = pausedBuffer.ready("devbox");
+  assert.ok(pausedFirst);
+  await pausedStarted;
+  pausedBuffer.ready("devbox");
+  pausedBuffer.pause();
+  releasePaused();
+  await pausedFirst;
+  assert.equal(pausedAttempts, 1, "pause defers a dirty follow-up");
+  await pausedBuffer.acceptAndDrain();
+  assert.equal(pausedAttempts, 2);
+});
+
+test("production-style endpoint recovery starts a dirty pass after the current generation is removed", async () => {
+  const owners = ["lifecycle", "managed", "claims", "relay", "observations", "operations"] as const;
+  const seen: string[] = [];
+  const active = new Map<string, Promise<void>>();
+  let generation = 0;
+  let readyBuffer!: ReturnType<typeof createEndpointReadyBuffer>;
+  const recoverProjectEndpoint = (endpointId: string): Promise<void> => {
+    const existing = active.get(endpointId);
+    if (existing) return existing;
+    const currentGeneration = ++generation;
+    let recovery!: Promise<void>;
+    recovery = (async () => {
+      await Promise.resolve();
+      for (const owner of owners) {
+        seen.push(`${owner}:${currentGeneration}`);
+        if (currentGeneration === 1 && owner === "managed") {
+          readyBuffer.ready(endpointId);
+          readyBuffer.ready(endpointId);
+        }
+      }
+    })().finally(() => {
+      if (active.get(endpointId) === recovery) active.delete(endpointId);
+    });
+    active.set(endpointId, recovery);
+    return recovery;
+  };
+  readyBuffer = createEndpointReadyBuffer({ recover: recoverProjectEndpoint });
+  readyBuffer.ready("devbox");
+  await readyBuffer.acceptAndDrain();
+
+  assert.equal(generation, 2);
+  assert.deepEqual(seen, [...owners.map((owner) => `${owner}:1`), ...owners.map((owner) => `${owner}:2`)]);
+  assert.equal(active.size, 0);
+});
+
 test("per-endpoint recovery chains preserve durable lifecycle order and unrelated progress", async () => {
   const entry = (id: string, sequence: number, policy: "endpoint_lifecycle" | "ready_endpoint" | "local", endpointId?: string) => ({
     operation: { id, sequence, createdAt: 1_000 },
@@ -639,6 +733,49 @@ test("production shutdown drains blocked relay work before endpoint teardown", a
   release();
   await stopping;
   assert.deepEqual(seen, ["relay:start", "relay:end", "observations", "dashboard", "endpoint"]);
+});
+
+test("production shutdown drains live ready recovery before every owner and endpoint", async () => {
+  let signalStarted!: () => void;
+  let release!: () => void;
+  const started = new Promise<void>((resolve) => { signalStarted = resolve; });
+  const blocked = new Promise<void>((resolve) => { release = resolve; });
+  const seen: string[] = [];
+  const readyBuffer = createEndpointReadyBuffer({
+    recover: async () => {
+      seen.push("ready:start");
+      signalStarted();
+      await blocked;
+      seen.push("ready:end");
+    },
+  });
+  await readyBuffer.acceptAndDrain();
+  const app = composeApp([
+    { name: "endpoint", start: async () => undefined, stop: async () => { seen.push("endpoint"); } },
+    {
+      name: "recovery-owners",
+      start: async () => undefined,
+      stop: () => stopRecoveryOwnerSet({
+        ready: readyBuffer,
+        operations: { stop: async () => { seen.push("operations"); } },
+        dispatcher: { stop: async () => { seen.push("dispatcher"); } },
+        relay: { stop: async () => { seen.push("relay"); } },
+        observations: { idle: async () => { seen.push("observations"); } },
+      }),
+    },
+  ]);
+  await app.start();
+  const live = readyBuffer.ready("devbox");
+  assert.ok(live);
+  await started;
+  const stopping = app.stop();
+  await new Promise<void>((resolve) => { setImmediate(resolve); });
+  assert.deepEqual(seen, ["ready:start"]);
+  assert.equal(readyBuffer.ready("other"), undefined, "shutdown rejects new ready work");
+  release();
+  await live;
+  await stopping;
+  assert.deepEqual(seen, ["ready:start", "ready:end", "operations", "dispatcher", "relay", "observations", "endpoint"]);
 });
 
 test("assistant startup failure drains every recovery owner before endpoint teardown", async () => {
