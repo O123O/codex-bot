@@ -75,6 +75,31 @@ export class EndpointManager {
     }
   }
 
+  async withReadyWorkLease<T>(
+    id: string | undefined,
+    run: (lease: EndpointWorkLease) => Promise<T>,
+  ): Promise<T> {
+    const endpointId = this.normalize(id);
+    if (this.closing) throw new AppError("ENDPOINT_UNAVAILABLE", "endpoint manager is shutting down");
+    const record = this.records.get(endpointId);
+    const endpoint = record?.endpoint;
+    if (!record || !endpoint || record.generation === 0 || endpoint.state !== "ready") {
+      throw new AppError("ENDPOINT_UNAVAILABLE", `endpoint is unavailable: ${endpointId}`);
+    }
+    const generation = record.generation;
+    const lease = record.gate.acquire(generation);
+    try {
+      if (this.records.get(endpointId) !== record || record.endpoint !== endpoint
+        || record.generation !== generation || endpoint.state !== "ready"
+        || !record.gate.validate(lease, generation)) {
+        throw new AppError("ENDPOINT_UNAVAILABLE", `endpoint generation changed before work began: ${endpointId}`);
+      }
+      return await run(lease);
+    } finally {
+      record.gate.release(lease);
+    }
+  }
+
   async runWithWorkLease<T>(
     endpointId: string,
     existing: EndpointWorkLease | undefined,

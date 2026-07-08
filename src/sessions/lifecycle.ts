@@ -143,7 +143,11 @@ export class SessionLifecycle {
     }), existingLease);
   }
 
-  async unadopt(nickname: string, checkpoint?: (value: LifecycleCheckpoint) => void): Promise<void> {
+  async unadopt(
+    nickname: string,
+    checkpoint?: (value: LifecycleCheckpoint) => void,
+    existingLease?: EndpointWorkLease,
+  ): Promise<void> {
     const expected = this.requireManaged(nickname);
     await this.withMutationLease(expected.endpoint, (lease) => this.gate.run(expected.endpoint, expected.thread_id, async () => {
       const session = this.assertExact(nickname, expected, "managed");
@@ -159,7 +163,7 @@ export class SessionLifecycle {
       if (!await this.registry.removeIfMatch(nickname, session)) throw new AppError("OPERATION_CONFLICT", "session mapping changed during unadoption");
       this.ownership?.release(session);
       checkpoint?.(this.checkpoint(nickname, session, "unadopting", "removed"));
-    }));
+    }), existingLease);
   }
 
   async archive(nickname: string, checkpoint?: (value: LifecycleCheckpoint) => void): Promise<void> {
@@ -280,7 +284,7 @@ export class SessionLifecycle {
     }
   }
 
-  async reconcileRemoval(nickname: string, expected: RegistrySession): Promise<void> {
+  async reconcileRemoval(nickname: string, expected: RegistrySession, existingLease?: EndpointWorkLease): Promise<void> {
     await this.withMutationLease(expected.endpoint, (lease) => this.gate.run(expected.endpoint, expected.thread_id, async () => {
       const current = this.registry.get(nickname);
       if (!current || !sameMapping(current, expected)) return;
@@ -290,7 +294,7 @@ export class SessionLifecycle {
       this.runtime.endEpoch(current.endpoint, current.thread_id, current.mapping_id, this.clock.now());
       await this.registry.removeIfMatch(nickname, current);
       this.ownership?.release(current);
-    }));
+    }), existingLease);
   }
 
   private requireAvailable(nickname: string, endpointId: string, threadId: string): void {

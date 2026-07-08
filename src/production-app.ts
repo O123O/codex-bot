@@ -202,7 +202,7 @@ export async function reconcileOwnershipBeforeRelay(
   await beforeRelay?.(lease);
   await relay.reconcileEndpoint(endpointId, lease);
   const after = await ownership.detectEndpoint(endpointId, lease);
-  await ownership.release([...before, ...after]);
+  await ownership.release([...before, ...after], lease);
 }
 
 export function reconcileOwnershipBeforeRelayWithLease(
@@ -1341,7 +1341,7 @@ export async function buildProductionApp(
         const before = await ownershipWatcher.detectEndpoint(endpointId, lease);
         await relay.handleNotification(endpointId, method, params, lease);
         const after = await ownershipWatcher.detectEndpoint(endpointId, lease);
-        await ownershipWatcher.release([...before, ...after]);
+        await ownershipWatcher.release([...before, ...after], lease);
       });
     } else {
       await relay.handleNotification(endpointId, method, params);

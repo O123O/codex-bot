@@ -1,6 +1,7 @@
 import { AppError } from "../core/errors.ts";
 import type { EndpointWorkLease } from "../endpoints/types.ts";
 import type { MappingIdentity, SessionRegistry } from "../registry/session-registry.ts";
+import type { LifecycleCheckpoint } from "./lifecycle.ts";
 import type { OwnershipInspection } from "./rollout-ownership.ts";
 
 interface OwnershipInspector {
@@ -8,7 +9,11 @@ interface OwnershipInspector {
 }
 
 interface SessionUnadopter {
-  unadopt(nickname: string): Promise<void>;
+  unadopt(
+    nickname: string,
+    checkpoint?: (value: LifecycleCheckpoint) => void,
+    existingLease?: EndpointWorkLease,
+  ): Promise<void>;
 }
 
 interface OwnershipGate {
@@ -55,7 +60,7 @@ export class SessionOwnershipWatcher {
   ) {}
 
   async reconcileEndpoint(endpointId: string, lease?: EndpointWorkLease): Promise<void> {
-    await this.release(await this.detectEndpoint(endpointId, lease));
+    await this.release(await this.detectEndpoint(endpointId, lease), lease);
   }
 
   async detectEndpoint(endpointId: string, lease?: EndpointWorkLease): Promise<ExternalTurnIncident[]> {
@@ -87,7 +92,7 @@ export class SessionOwnershipWatcher {
     return incidents;
   }
 
-  async release(incidents: readonly ExternalTurnIncident[]): Promise<void> {
+  async release(incidents: readonly ExternalTurnIncident[], lease?: EndpointWorkLease): Promise<void> {
     const seen = new Set<string>();
     for (const incident of incidents) {
       const key = `${incident.endpoint}\0${incident.thread_id}\0${incident.mapping_id}`;
@@ -97,12 +102,130 @@ export class SessionOwnershipWatcher {
       if (!current || current.endpoint !== incident.endpoint || current.thread_id !== incident.thread_id
         || current.mapping_id !== incident.mapping_id || current.lifecycle_state !== "managed") continue;
       try {
-        await this.lifecycle.unadopt(incident.nickname);
+        await this.lifecycle.unadopt(incident.nickname, undefined, lease);
         await this.options.onReleased(incident);
       } catch (error) {
         if (error instanceof AppError && error.code === "SESSION_BUSY") continue;
         throw error;
       }
+    }
+  }
+}
+
+export type ExternalOwnershipOutcome = "succeeded" | "failed" | "inconclusive";
+
+export interface ExternalOwnershipCycleResult {
+  endpointId: string;
+  outcome: ExternalOwnershipOutcome;
+}
+
+export interface ExternalOwnershipMonitorOptions {
+  endpointIds(): readonly string[];
+  pending(endpointId: string): readonly ExternalTurnIncident[];
+  withReadyEndpointWorkLease<T>(
+    endpointId: string,
+    run: (lease: EndpointWorkLease) => Promise<T>,
+  ): Promise<T>;
+  resumeRemoval(incident: ExternalTurnIncident, lease: EndpointWorkLease): Promise<void>;
+  inspectAndRelease(endpointId: string, lease: EndpointWorkLease): Promise<void>;
+  onCycle(results: readonly ExternalOwnershipCycleResult[]): void;
+}
+
+export interface OwnershipMonitorTimers {
+  setTimeout(callback: () => void, ms: number): ReturnType<typeof setTimeout>;
+  clearTimeout(handle: ReturnType<typeof setTimeout>): void;
+}
+
+const nodeOwnershipMonitorTimers: OwnershipMonitorTimers = {
+  setTimeout: (callback, ms) => setTimeout(callback, ms),
+  clearTimeout: (handle) => clearTimeout(handle),
+};
+
+export class ExternalOwnershipMonitor {
+  private stopped = true;
+  private generation = 0;
+  private timer: ReturnType<typeof setTimeout> | undefined;
+  private running: Promise<void> | undefined;
+  private starting: Promise<void> | undefined;
+
+  constructor(
+    private readonly options: ExternalOwnershipMonitorOptions,
+    private readonly timers: OwnershipMonitorTimers = nodeOwnershipMonitorTimers,
+    private readonly intervalMs = 60_000,
+  ) {}
+
+  async start(): Promise<void> {
+    if (!this.stopped) {
+      await this.starting;
+      return;
+    }
+    this.stopped = false;
+    this.generation += 1;
+    const generation = this.generation;
+    const draining = this.running;
+    let starting: Promise<void>;
+    starting = (async () => {
+      await draining;
+      if (this.stopped || generation !== this.generation) return;
+      this.schedule(generation);
+    })().finally(() => {
+      if (this.starting === starting) this.starting = undefined;
+    });
+    this.starting = starting;
+    await starting;
+  }
+
+  async stop(): Promise<void> {
+    this.stopped = true;
+    if (this.timer !== undefined) this.timers.clearTimeout(this.timer);
+    this.timer = undefined;
+    await this.starting;
+    await this.running;
+  }
+
+  private schedule(generation: number): void {
+    if (this.stopped || generation !== this.generation || this.timer !== undefined) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    timer = this.timers.setTimeout(() => {
+      if (this.stopped || generation !== this.generation || timer === undefined || this.timer !== timer) return;
+      this.timer = undefined;
+      this.run(generation);
+    }, this.intervalMs);
+    timer.unref?.();
+    this.timer = timer;
+  }
+
+  private run(generation: number): void {
+    if (this.stopped || generation !== this.generation || this.running) return;
+    let running: Promise<void>;
+    running = this.runCycle().catch(() => undefined).finally(() => {
+      if (this.running === running) this.running = undefined;
+      if (!this.stopped && generation === this.generation) this.schedule(generation);
+    });
+    this.running = running;
+  }
+
+  private async runCycle(): Promise<void> {
+    const endpointIds = [...new Set(this.options.endpointIds())];
+    const results = await Promise.all(endpointIds.map((endpointId) => this.runEndpoint(endpointId)));
+    try { this.options.onCycle(results); }
+    catch { /* Operational reporting must not stop the ownership clock. */ }
+  }
+
+  private async runEndpoint(endpointId: string): Promise<ExternalOwnershipCycleResult> {
+    try {
+      await this.options.withReadyEndpointWorkLease(endpointId, async (lease) => {
+        for (const incident of this.options.pending(endpointId)) {
+          await this.options.resumeRemoval(incident, lease);
+        }
+        await this.options.inspectAndRelease(endpointId, lease);
+      });
+      return { endpointId, outcome: "succeeded" };
+    } catch (error) {
+      return {
+        endpointId,
+        outcome: error instanceof AppError && error.code === "ENDPOINT_UNAVAILABLE" ? "inconclusive" : "failed",
+      };
     }
   }
 }

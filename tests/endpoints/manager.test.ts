@@ -280,3 +280,47 @@ test("leases reject foreign generations and old endpoint callbacks cannot replac
   first.fail("runtime-lost");
   assert.equal(value.manager.endpointGeneration("devbox").endpoint, second);
 });
+
+test("a ready-only work lease uses the published generation and drains before disconnect", async () => {
+  const value = fixture();
+  const endpoint = await value.manager.ensureReady("devbox");
+  let captured: import("../../src/endpoints/types.ts").EndpointWorkLease | undefined;
+  let release: (() => void) | undefined;
+  const blocked = new Promise<void>((resolve) => { release = resolve; });
+  let entered: (() => void) | undefined;
+  const started = new Promise<void>((resolve) => { entered = resolve; });
+
+  const work = value.manager.withReadyWorkLease("devbox", async (lease) => {
+    captured = lease;
+    assert.equal(value.manager.validateWorkLease(lease, "devbox"), true);
+    assert.equal(value.manager.endpointGeneration("devbox").endpoint, endpoint);
+    entered?.();
+    await blocked;
+    return "done";
+  });
+  await started;
+  const disconnecting = value.manager.disconnect("devbox");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(value.remotes.get("devbox")?.runtimeStops, 0);
+
+  release?.();
+  assert.equal(await work, "done");
+  await disconnecting;
+  assert.ok(captured);
+  assert.equal(value.manager.validateWorkLease(captured, "devbox"), false);
+  assert.equal(value.remotes.get("devbox")?.runtimeStops, 1);
+});
+
+test("a ready-only work lease never activates or reloads an unavailable endpoint", async () => {
+  const value = fixture();
+  let ran = false;
+
+  await assert.rejects(
+    value.manager.withReadyWorkLease("offline", async () => { ran = true; }),
+    (error: unknown) => error instanceof Error && (error as { code?: string }).code === "ENDPOINT_UNAVAILABLE",
+  );
+
+  assert.equal(ran, false);
+  assert.equal(value.reloads(), 0);
+  assert.equal(value.remotes.size, 0);
+});

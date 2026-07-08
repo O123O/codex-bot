@@ -11,6 +11,8 @@ import { SessionLifecycle } from "../../src/sessions/lifecycle.ts";
 import { ThreadGate } from "../../src/sessions/thread-gate.ts";
 import { createTestDatabase } from "../../src/storage/database.ts";
 import { RuntimeStore } from "../../src/storage/runtime-store.ts";
+import type { EndpointWorkLease } from "../../src/endpoints/types.ts";
+import type { EndpointManager } from "../../src/endpoints/manager.ts";
 
 class LifecycleEndpoint implements AppServerEndpoint {
   readonly id = "local";
@@ -48,7 +50,7 @@ async function fixture(ownership?: {
   initialize(identity: { endpoint: string; thread_id: string; mapping_id: string }, path: string): Promise<void>;
   inspectIfInitialized?(identity: { endpoint: string; thread_id: string; mapping_id: string }): Promise<{ state: "uninitialized" | "owned" } | { state: "external"; turnId: string }>;
   release(identity: { endpoint: string; thread_id: string; mapping_id: string }): void;
-}) {
+}, endpoints?: Pick<EndpointManager, "withWorkLease" | "runWithWorkLease">) {
   const dir = await realpath(await mkdtemp(join(tmpdir(), "qiyan-bot-life-")));
   const registry = await SessionRegistry.open(join(dir, "sessions.json"), {
     version: 3,
@@ -71,7 +73,7 @@ async function fixture(ownership?: {
       assertDispatchable: async (prepared) => { checked.push(prepared.path); },
     },
     gate,
-    undefined,
+    endpoints,
     ownership,
   );
   return { dir, registry, endpoint, runtime, lifecycle, project, checked, gate };
@@ -335,6 +337,45 @@ test("startup completes exact unadopting and archiving mappings before managed r
   assert.equal(registry.get("billing"), undefined);
   assert.equal(endpoint.calls.some((call) => call.method === "thread/unsubscribe"), true);
   assert.equal(endpoint.calls.some((call) => call.method === "thread/archive"), true);
+});
+
+test("external removal reuses one existing endpoint lease through unadopt and resumption", async () => {
+  const lease: EndpointWorkLease = {
+    endpointId: "local",
+    lifecycleGeneration: 1,
+    endpointGeneration: 2,
+    leaseId: "external-monitor",
+  };
+  const seen: Array<EndpointWorkLease | undefined> = [];
+  const endpoints = {
+    withWorkLease: async () => { assert.fail("an existing lease must not acquire a replacement"); },
+    runWithWorkLease: async <T>(endpointId: string, existing: EndpointWorkLease | undefined, run: (value: EndpointWorkLease | undefined) => Promise<T>) => {
+      assert.equal(endpointId, "local");
+      seen.push(existing);
+      return run(existing);
+    },
+  } as Pick<EndpointManager, "withWorkLease" | "runWithWorkLease">;
+  const { dir, registry, endpoint, lifecycle } = await fixture(undefined, endpoints);
+  await registry.createManaged("payments", {
+    endpoint: "local", thread_id: "thread-1", project_dir: dir, mapping_id: "mapping-1",
+  });
+
+  await lifecycle.unadopt("payments", undefined, lease);
+  assert.equal(registry.get("payments"), undefined);
+
+  endpoint.threadId = "thread-2";
+  const removing = {
+    endpoint: "local", thread_id: "thread-2", project_dir: dir, mapping_id: "mapping-2", lifecycle_state: "unadopting" as const,
+  };
+  const adopting: RegistrySession = { ...removing, lifecycle_state: "adopting" };
+  const managed: RegistrySession = { ...removing, lifecycle_state: "managed" };
+  await registry.reserve("billing", adopting);
+  await registry.promote("billing", adopting);
+  await registry.transition("billing", managed, "unadopting");
+
+  await lifecycle.reconcileRemoval("billing", removing, lease);
+  assert.equal(registry.get("billing"), undefined);
+  assert.deepEqual(seen, [lease, lease]);
 });
 
 test("a rename waiting on the gate cannot rename a reused nickname generation", async () => {

@@ -127,7 +127,7 @@ test("startup and reconnect reconciliation hold one endpoint generation lease ac
     } },
     {
       detectEndpoint: async (_endpointId, actualLease) => { seen.push(actualLease); return []; },
-      release: async () => { seen.push("release"); },
+      release: async (_incidents, actualLease) => { seen.push(actualLease); },
     },
     { reconcileEndpoint: async (_endpointId, actualLease) => { seen.push(actualLease); } },
     "devbox",
@@ -137,7 +137,7 @@ test("startup and reconnect reconciliation hold one endpoint generation lease ac
     lease,
     lease,
     lease,
-    "release",
+    lease,
   ]);
 });
 
