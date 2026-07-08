@@ -15,6 +15,7 @@ import {
   reconcileOwnershipBeforeRelay,
   reconcileOwnershipBeforeRelayWithLease,
   recoverRemovalOperation,
+  recoverableLifecycleEndpointReferences,
   recoverableOperationActivationReferences,
   recoverableOperationEndpointReferences,
   recoverableOperationTarget,
@@ -98,6 +99,10 @@ test("recoverable operation targets are exhaustive and fail closed", () => {
   assert.deepEqual(recoverableOperationEndpointReferences([
     { kind: "restart_endpoint", args: { endpoint: "endpoint-a" }, receipt: undefined },
   ], resolve), ["endpoint-a"], "lifecycle targets pin identity without eager activation");
+  assert.deepEqual(recoverableLifecycleEndpointReferences([
+    { kind: "disconnect_endpoint", args: {}, receipt: undefined },
+    { kind: "restart_endpoint", args: { endpoint: "endpoint-a" }, receipt: undefined },
+  ], resolve), ["endpoint-a", "local"]);
 });
 
 test("durable operation endpoints survive restart as startup identity references", async () => {
@@ -227,9 +232,12 @@ test("ordinary operation recovery waits without endpoint activation while lifecy
 });
 
 test("operation recovery retries only source-classified transient proof failures", () => {
+  const lifecycleTarget = { policy: "endpoint_lifecycle", endpointId: "endpoint-a" } as const;
+  const ordinaryTarget = { policy: "ready_endpoint", endpointId: "endpoint-a" } as const;
   assert.equal(operationRecoveryFailureDisposition(new RpcRequestTimeoutError("thread/read")), "retry");
   assert.equal(operationRecoveryFailureDisposition(new AppError("OPERATION_UNCERTAIN", "temporary", { recovery: "ownership_unclassified" })), "retry");
-  assert.equal(operationRecoveryFailureDisposition(new AppError("ENDPOINT_UNAVAILABLE", "offline")), "wait_for_endpoint");
+  assert.equal(operationRecoveryFailureDisposition(new AppError("ENDPOINT_UNAVAILABLE", "offline"), lifecycleTarget), "retry");
+  assert.equal(operationRecoveryFailureDisposition(new AppError("ENDPOINT_UNAVAILABLE", "offline"), ordinaryTarget), "wait_for_endpoint");
   assert.equal(operationRecoveryFailureDisposition(new AppError("OPERATION_UNCERTAIN", "permanent")), "sleep");
   assert.equal(operationRecoveryFailureDisposition(new Error("unknown")), "sleep");
 });

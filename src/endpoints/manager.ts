@@ -1,4 +1,5 @@
 import { AppError } from "../core/errors.ts";
+import { RpcRequestTimeoutError } from "../app-server/rpc-client.ts";
 import type { SshEndpointDefinition } from "./catalog.ts";
 import { EndpointAdmissionGate, type EndpointDesiredState } from "./admission-gate.ts";
 import type { PendingDestinationBinding } from "./ssh-config.ts";
@@ -343,7 +344,10 @@ export class EndpointManager {
     for (const threadId of await this.options.managedThreadIds(endpointId)) {
       let response: { thread?: { status?: string | { type?: string } } };
       try { response = await endpoint.request("thread/read", { threadId, includeTurns: true }); }
-      catch (error) { throw new AppError("OPERATION_UNCERTAIN", `could not prove managed thread idle on endpoint ${endpointId}`, { cause: error }); }
+      catch (error) {
+        if (error instanceof RpcRequestTimeoutError) throw error;
+        throw new AppError("OPERATION_UNCERTAIN", `could not prove managed thread idle on endpoint ${endpointId}`, { cause: error });
+      }
       const status = typeof response.thread?.status === "string" ? response.thread.status : response.thread?.status?.type;
       if (status !== "idle") throw new AppError("OPERATION_CONFLICT", `managed thread is not idle on endpoint ${endpointId}`);
     }

@@ -217,6 +217,18 @@ export function recoverableOperationActivationReferences(
   return [...references].sort();
 }
 
+export function recoverableLifecycleEndpointReferences(
+  operations: readonly Pick<RecoverableOperation, "kind" | "args" | "receipt">[],
+  resolver: OperationRecoveryTargetResolver,
+): string[] {
+  const references = new Set<string>();
+  for (const operation of operations) {
+    const target = recoverableOperationTarget(operation, resolver);
+    if (target.policy === "endpoint_lifecycle") references.add(target.endpointId);
+  }
+  return [...references].sort();
+}
+
 export type OperationRecoveryPreflight = "attempt" | "wait_for_endpoint" | "sleep";
 
 export function operationRecoveryPreflight(
@@ -238,10 +250,15 @@ export function runOperationRecoveryTarget<T>(
 
 export type OperationRecoveryFailureDisposition = "retry" | "wait_for_endpoint" | "sleep";
 
-export function operationRecoveryFailureDisposition(error: unknown): OperationRecoveryFailureDisposition {
+export function operationRecoveryFailureDisposition(
+  error: unknown,
+  target?: OperationRecoveryTarget,
+): OperationRecoveryFailureDisposition {
   if (error instanceof RpcRequestTimeoutError
     || (error instanceof AppError && error.details?.recovery === "ownership_unclassified")) return "retry";
-  if (error instanceof AppError && error.code === "ENDPOINT_UNAVAILABLE") return "wait_for_endpoint";
+  if (error instanceof AppError && error.code === "ENDPOINT_UNAVAILABLE") {
+    return target?.policy === "endpoint_lifecycle" ? "retry" : "wait_for_endpoint";
+  }
   return "sleep";
 }
 
@@ -1179,9 +1196,12 @@ export async function buildProductionApp(
         stopping = false;
         endpointsCommitted = false;
         try {
-          await endpointManager.ensureReady("local");
+          const lifecycleOwned = lifecycleOwnedEndpointIds();
+          if (!lifecycleOwned.has("local")) await endpointManager.ensureReady("local");
           await startAuthenticatedAssistantEndpoint(assistantEndpoint, assistantProfile);
-          if (endpoint.state !== "ready" || assistantEndpoint.state !== "ready") throw new AppError("ENDPOINT_UNAVAILABLE", "an app-server became unavailable during initial startup");
+          if ((!lifecycleOwned.has("local") && endpoint.state !== "ready") || assistantEndpoint.state !== "ready") {
+            throw new AppError("ENDPOINT_UNAVAILABLE", "an app-server became unavailable during initial startup");
+          }
           endpointsCommitted = true;
         } catch (error) {
           stopping = true;
@@ -1250,18 +1270,20 @@ export async function buildProductionApp(
         await dispatcher.recover();
         await dispatcher.idle();
         assistant.hydrateActive();
+        const lifecycleOwned = lifecycleOwnedEndpointIds();
         const referencedEndpoints = [...new Set([
           ...Object.values(registry.snapshot().sessions).map((session) => session.endpoint),
           ...recoveredEndpointIds,
           ...recoverableActivationReferences(),
-        ])].filter((id) => id !== "local" && id !== assistantEndpoint.id);
+        ])].filter((id) => id !== "local" && id !== assistantEndpoint.id && !lifecycleOwned.has(id));
         const activation = await endpointManager.activateReferenced(referencedEndpoints);
         await reconcileOperations();
         conversations.repairQueueNotices();
-        await reconcileLifecycleState();
-        await resumeManagedSessions();
+        await reconcileStartupLifecycleState();
+        await resumeStartupManagedSessions();
         for (const endpointId of [...new Set(recoveredEndpointIds)]) {
-          if (endpointId === assistantEndpoint.id || activation.unavailable.includes(endpointId)) continue;
+          if (endpointId === assistantEndpoint.id || activation.unavailable.includes(endpointId)
+            || lifecycleOwnedEndpointIds().has(endpointId) || endpointManager.desiredState(endpointId) !== "automatic") continue;
           await reconcileOwnershipBeforeRelayWithLease(endpointManager, ownershipWatcher, relay, endpointId, async () => {
             await pool.reconcileEndpointClaims(endpointId);
           });
@@ -1733,6 +1755,13 @@ export async function buildProductionApp(
     }).filter((endpointId) => endpointId !== assistantEndpoint.id);
   }
 
+  function lifecycleOwnedEndpointIds(): Set<string> {
+    return new Set(recoverableLifecycleEndpointReferences(operations.listRecoverable(), {
+      defaultProjectEndpointId: "local",
+      session: (nickname) => registry.get(nickname),
+    }));
+  }
+
   function bindProjectEndpoint(target: ManagedAppServerEndpoint, generation: number): void {
     for (const unsubscribe of projectEndpointSubscriptions.get(target.id) ?? []) unsubscribe();
     const current = () => {
@@ -1890,7 +1919,12 @@ export async function buildProductionApp(
     let attempted = false;
     let waitingForEndpoint = false;
     const transientTargets = new Map<string, OperationRecoveryTarget>();
-    for (const operation of operations.listRecoverable()) {
+    const recoverable = operations.listRecoverable();
+    const ordered = [
+      ...recoverable.filter((operation) => operation.kind === "disconnect_endpoint" || operation.kind === "restart_endpoint"),
+      ...recoverable.filter((operation) => operation.kind !== "disconnect_endpoint" && operation.kind !== "restart_endpoint"),
+    ];
+    for (const operation of ordered) {
       if (operationRecoveryAction({ state: operation.state, activeHandler: assistant.hasActiveTools(operation.attemptId) }) === "wait_for_tool") continue;
       const target = recoverableOperationTarget(operation, {
         defaultProjectEndpointId: endpoint.id,
@@ -2112,7 +2146,7 @@ export async function buildProductionApp(
         };
         await runOperationRecoveryTarget(target, endpointManager, recover);
       } catch (error) {
-        const disposition = operationRecoveryFailureDisposition(error);
+        const disposition = operationRecoveryFailureDisposition(error, target);
         const current = operations.get(operation.id);
         if (disposition === "retry" && current && (current.state === "dispatched" || current.state === "uncertain")) {
           transientTargets.set(operation.id, target);
@@ -2154,6 +2188,24 @@ export async function buildProductionApp(
       projectDirDevice: project.identity.device,
       projectDirInode: project.identity.inode,
     };
+  }
+
+  async function reconcileStartupLifecycleState(): Promise<void> {
+    const excluded = lifecycleOwnedEndpointIds();
+    const endpointIds = [...new Set(Object.values(registry.snapshot().sessions).map((session) => session.endpoint))]
+      .filter((endpointId) => !excluded.has(endpointId) && endpointManager.desiredState(endpointId) === "automatic");
+    if (endpointIds.length === 0) {
+      reconcileExternalOwnershipReleases();
+      return;
+    }
+    for (const endpointId of endpointIds) await reconcileLifecycleState({ endpointId });
+  }
+
+  async function resumeStartupManagedSessions(): Promise<void> {
+    const excluded = lifecycleOwnedEndpointIds();
+    const endpointIds = [...new Set(Object.values(registry.managedSnapshot().sessions).map((session) => session.endpoint))]
+      .filter((endpointId) => !excluded.has(endpointId) && endpointManager.desiredState(endpointId) === "automatic");
+    for (const endpointId of endpointIds) await resumeManagedSessions(endpointId);
   }
 
   async function resumeManagedSessions(endpointFilter?: string, unavailableOnly = false): Promise<void> {
