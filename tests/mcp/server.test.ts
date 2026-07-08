@@ -4,7 +4,7 @@ import { once } from "node:events";
 import test from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { TOOL_NAMES, createAssistantTools } from "../../src/assistant/tools.ts";
+import { TOOL_NAMES, createAssistantTools, type AssistantToolName, type ToolHandler } from "../../src/assistant/tools.ts";
 import { buildAssistantChildEnvironment } from "../../src/assistant/profile.ts";
 import { readLinuxProcessIdentity } from "../../src/core/process-identity.ts";
 import { buildWorkerChildEnvironment, assistantTurnConfig, LoopbackMcpServer, tcpConnectionInodes, ToolReadinessGate } from "../../src/mcp/server.ts";
@@ -78,6 +78,45 @@ test("assistant tools wait at the MCP boundary until startup reconciliation is r
   release();
   assert.equal((await pending).isError, undefined);
   assert.equal(called, true);
+  await client.close();
+  await server.stop();
+});
+
+test("post-tool callback follows finish for successful and rejected handlers", async (t) => {
+  const events: string[] = [];
+  let rejectHandler = false;
+  const tools = {} as Record<AssistantToolName, ToolHandler>;
+  for (const name of TOOL_NAMES) {
+    tools[name] = async () => {
+      if (name === "list_managed_sessions") {
+        events.push("handler");
+        if (rejectHandler) throw new Error("handler rejected");
+      }
+      return [];
+    };
+  }
+  const server = new LoopbackMcpServer(tools, {
+    current: () => ({ contextId: "ctx", attemptId: "attempt", turnId: "turn" }),
+    registerTool: () => { events.push("register"); return 0; },
+    finishTool: () => { events.push("finish"); },
+  }, {
+    host: "127.0.0.1",
+    port: 0,
+    token: "secret",
+    afterToolCall: () => { events.push("after"); throw new Error("contained callback failure"); },
+  });
+  await server.start();
+  t.after(() => server.stop());
+  const client = new Client({ name: "test", version: "1" });
+  await client.connect(new StreamableHTTPClientTransport(new URL(server.url), { requestInit: { headers: { authorization: "Bearer secret" } } }) as any);
+
+  assert.equal((await client.callTool({ name: "list_managed_sessions", arguments: {} })).isError, undefined);
+  assert.deepEqual(events, ["register", "handler", "finish", "after"]);
+  events.length = 0;
+  rejectHandler = true;
+  assert.equal((await client.callTool({ name: "list_managed_sessions", arguments: {} })).isError, true);
+  assert.deepEqual(events, ["register", "handler", "finish", "after"]);
+
   await client.close();
   await server.stop();
 });

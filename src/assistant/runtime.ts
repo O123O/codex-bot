@@ -24,6 +24,7 @@ export class AssistantRuntime {
   private active: ActiveAssistantContext | undefined;
   private readonly activeTools = new Map<string, number>();
   private readonly toolWaiters = new Map<string, Set<() => void>>();
+  private readonly allToolsWaiters = new Set<() => void>();
 
   constructor(
     private readonly db: Database,
@@ -119,6 +120,10 @@ export class AssistantRuntime {
     return Number(row.tool_fence);
   }
 
+  hasActiveTools(attemptId: string): boolean {
+    return (this.activeTools.get(attemptId) ?? 0) > 0;
+  }
+
   finishTool(attemptId: string): void {
     const next = Math.max(0, (this.activeTools.get(attemptId) ?? 0) - 1);
     if (next > 0) this.activeTools.set(attemptId, next);
@@ -126,27 +131,43 @@ export class AssistantRuntime {
       this.activeTools.delete(attemptId);
       for (const resolve of this.toolWaiters.get(attemptId) ?? []) resolve();
       this.toolWaiters.delete(attemptId);
+      if (this.activeTools.size === 0) {
+        for (const resolve of this.allToolsWaiters) resolve();
+        this.allToolsWaiters.clear();
+      }
     }
   }
 
-  async fenceTools(attemptId: string, timeoutMs: number): Promise<void> {
-    if ((this.activeTools.get(attemptId) ?? 0) === 0) return;
+  async fenceTools(attemptId: string, timeoutMs: number): Promise<"settled" | "timed_out"> {
+    if (!this.hasActiveTools(attemptId)) return "settled";
     let timer: ReturnType<typeof setTimeout> | undefined;
-    await Promise.race([
-      new Promise<void>((resolve) => {
+    let settleWaiter: (() => void) | undefined;
+    const result = await Promise.race([
+      new Promise<"settled">((resolve) => {
+        settleWaiter = () => resolve("settled");
         const waiters = this.toolWaiters.get(attemptId) ?? new Set<() => void>();
-        waiters.add(resolve);
+        waiters.add(settleWaiter);
         this.toolWaiters.set(attemptId, waiters);
       }),
-      new Promise<void>((resolve) => { timer = setTimeout(resolve, Math.max(0, timeoutMs)); }),
+      new Promise<"timed_out">((resolve) => { timer = setTimeout(() => resolve("timed_out"), Math.max(0, timeoutMs)); }),
     ]);
     if (timer) clearTimeout(timer);
-    if ((this.activeTools.get(attemptId) ?? 0) > 0) {
+    if (settleWaiter) {
+      this.toolWaiters.get(attemptId)?.delete(settleWaiter);
+      if (this.toolWaiters.get(attemptId)?.size === 0) this.toolWaiters.delete(attemptId);
+    }
+    if (result === "timed_out" && this.hasActiveTools(attemptId)) {
       inTransaction(this.db, () => {
         this.operations.markAttemptOperationsUncertain(attemptId);
         this.db.prepare("UPDATE assistant_attempts SET accepting_tools = 0 WHERE id = ?").run(attemptId);
       });
     }
+    return result;
+  }
+
+  async waitForTools(): Promise<void> {
+    if (this.activeTools.size === 0) return;
+    await new Promise<void>((resolve) => this.allToolsWaiters.add(resolve));
   }
 
   handleTerminal(turnId: string, status: "completed" | "failed" | "interrupted", finalText?: string, error?: unknown): { recoveryContextId?: string };

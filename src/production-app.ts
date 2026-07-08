@@ -99,6 +99,14 @@ export function assistantAccessWarning(mode: BotConfig["assistantSandboxMode"]):
   return mode === "danger-full-access" ? fullAccessWarning : undefined;
 }
 
+export function reportAssistantTerminalFailure(
+  dispatcher: Pick<ConversationDispatcher, "requestRecovery">,
+  report: () => void,
+): void {
+  try { report(); }
+  finally { dispatcher.requestRecovery(); }
+}
+
 export type RemovalRecoveryDecision = "pending" | "no_effect" | "reconcile" | "succeeded";
 
 export function removalRecoveryDecision(
@@ -791,7 +799,10 @@ export async function buildProductionApp(
         }, threadGate);
         scheduler = new AssistantScheduler();
         unsubscribers.push(endpointManager.onEndpoint((target, generation) => bindProjectEndpoint(target, generation)));
-        unsubscribers.push(assistantEndpoint.onNotification((method, params) => runBackground(() => onNotification(assistantEndpoint.id, method, params), () => recordBackgroundFailure("assistant notification"))));
+        unsubscribers.push(assistantEndpoint.onNotification((method, params) => runBackground(
+          () => onNotification(assistantEndpoint.id, method, params),
+          () => reportAssistantTerminalFailure(dispatcher, () => recordBackgroundFailure("assistant notification")),
+        )));
         unsubscribers.push(assistantEndpoint.onUnavailable((kind) => {
           assistantToolReadiness.block();
           runBackground(() => handleEndpointUnavailable(assistantEndpoint, kind), () => recordBackgroundFailure("assistant unavailable handling"));
@@ -874,7 +885,7 @@ export async function buildProductionApp(
           onOperationalEvent: (code) => { report({ level: code === "assistant_submission_uncertain" ? "warn" : "info", code }); },
           onDeferredTerminal: (turn) => runBackground(
             () => processAssistantTerminal({ threadId: identity.thread_id, turn }),
-            () => recordBackgroundFailure("deferred assistant terminal"),
+            () => reportAssistantTerminalFailure(dispatcher, () => recordBackgroundFailure("deferred assistant terminal")),
           ),
         });
         await dispatcher.recover();
@@ -919,6 +930,7 @@ export async function buildProductionApp(
           ]);
           if (interruptTimer) clearTimeout(interruptTimer);
         }
+        await assistant.waitForTools();
         await dispatcher.stop();
       },
     },

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createChatHistoryAction, isUncertainAssistantTransportFailure, managedSessionNeedsRecovery, parseEndpointLifecycleCheckpoint, reconcileLifecycleAndOwnership, reconcileLifecycleTransitions, reconcileOwnershipBeforeRelay, reconcileOwnershipBeforeRelayWithLease, registryReloadPreservesWorkerMappings, removalRecoveryDecision, stopRelayRecovery, withRecoveredSessionLease, withRelayEndpointWorkLease } from "../src/production-app.ts";
+import { createChatHistoryAction, isUncertainAssistantTransportFailure, managedSessionNeedsRecovery, parseEndpointLifecycleCheckpoint, reconcileLifecycleAndOwnership, reconcileLifecycleTransitions, reconcileOwnershipBeforeRelay, reconcileOwnershipBeforeRelayWithLease, registryReloadPreservesWorkerMappings, removalRecoveryDecision, reportAssistantTerminalFailure, stopRelayRecovery, withRecoveredSessionLease, withRelayEndpointWorkLease } from "../src/production-app.ts";
 import { AppError } from "../src/core/errors.ts";
 import { ChatAdapterRegistry } from "../src/chat/adapter-registry.ts";
 import type { EndpointWorkLease } from "../src/endpoints/types.ts";
@@ -10,6 +10,29 @@ test("assistant uncertainty is preserved even while the endpoint still reports r
   assert.equal(isUncertainAssistantTransportFailure(new AppError("OPERATION_UNCERTAIN", "shutdown"), "ready"), true);
   assert.equal(isUncertainAssistantTransportFailure(new Error("ordinary failure"), "ready"), false);
   assert.equal(isUncertainAssistantTransportFailure(new Error("transport failed"), "unavailable"), true);
+});
+
+test("assistant terminal failure reports always request one coalesced recovery wake", async () => {
+  let wakeScheduled = false;
+  let recoveries = 0;
+  const dispatcher = {
+    requestRecovery: () => {
+      if (wakeScheduled) return;
+      wakeScheduled = true;
+      queueMicrotask(() => { recoveries += 1; });
+    },
+  };
+  const reports: string[] = [];
+
+  reportAssistantTerminalFailure(dispatcher, () => { reports.push("assistant notification"); });
+  assert.throws(() => reportAssistantTerminalFailure(dispatcher, () => {
+    reports.push("deferred assistant terminal");
+    throw new Error("reporter failed");
+  }), /reporter failed/u);
+  await Promise.resolve();
+
+  assert.deepEqual(reports, ["assistant notification", "deferred assistant terminal"]);
+  assert.equal(recoveries, 1);
 });
 
 test("endpoint lifecycle recovery checkpoints require an exact phase and runtime identity", () => {
