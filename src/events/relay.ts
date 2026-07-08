@@ -455,11 +455,13 @@ export class EventRelay {
   }
 
   private scheduleRetry(endpointId: string): void {
-    if (this.stopped || this.unavailableEndpoints.has(endpointId) || this.retryTimers.has(endpointId)) return;
+    if (this.stopped) return;
     if (!this.hasPendingWork(endpointId)) {
+      this.clearRetryTimer(endpointId);
       this.retryAttempts.delete(endpointId);
       return;
     }
+    if (this.unavailableEndpoints.has(endpointId) || this.retryTimers.has(endpointId)) return;
     const attempt = this.retryAttempts.get(endpointId) ?? 0;
     const delay = Math.min(1_000 * 2 ** attempt, 30_000);
     const generation = this.endpointGeneration(endpointId);

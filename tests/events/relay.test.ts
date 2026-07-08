@@ -719,6 +719,35 @@ test("final resolution cancels its timer immediately and reconnect resets retry 
   assert.equal(timers.scheduled[0]?.ms, 1_000);
 });
 
+test("ready scan clears a timer armed by stale notification work ahead of it", async () => {
+  const timers = new FakeRelayTimers();
+  const { endpoint, relay } = await fixture(undefined, undefined, { timers });
+  endpoint.turns = [terminal("baseline"), terminal("ready-wins", "completed", "resolved by ready")];
+  let entered!: () => void;
+  let release!: () => void;
+  const reading = new Promise<void>((resolve) => { entered = resolve; });
+  const barrier = new Promise<void>((resolve) => { release = resolve; });
+  let reads = 0;
+  endpoint.request = async <T>() => {
+    reads += 1;
+    if (reads === 1) { entered(); await barrier; }
+    return { thread: { turns: endpoint.turns } } as T;
+  };
+
+  const notification = relay.handleNotification(
+    "local", "turn/completed", { threadId: "worker", turn: terminal("ready-wins") }, workLease,
+  );
+  await reading;
+  const ready = relay.endpointReady("local", workLease);
+  release();
+  assert.equal(await notification, "retry");
+  await ready;
+
+  assert.equal(timers.scheduled.length, 0);
+  assert.equal((relay as unknown as { retryAttempts: Map<string, number> }).retryAttempts.size, 0);
+  assert.deepEqual(retainedTargets(relay), []);
+});
+
 test("terminal ordinal hydration reuses the relay's exact active endpoint lease", async () => {
   const seen: Array<EndpointWorkLease | undefined> = [];
   let processor!: SessionObservationProcessor;
