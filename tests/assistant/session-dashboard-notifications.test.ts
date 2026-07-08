@@ -215,6 +215,82 @@ test("observation retries only classified RPC timeouts and clears the durable ro
   assert.equal(value.store.pendingNotifications().length, 0);
 });
 
+test("endpoint loss or stop before queued observation work fences native reads and projection", async () => {
+  for (const action of ["loss", "stop"] as const) {
+    let reads = 0;
+    const value = fixture({ readGoal: async () => { reads += 1; return { goal: null }; } });
+    value.processor.accept("local", "thread/goal/cleared", { threadId: "thread-1" });
+    if (action === "loss") value.processor.endpointUnavailable("local");
+    else await value.processor.stop();
+    await value.processor.idle();
+    assert.equal(reads, 0, action);
+    assert.equal(value.store.pendingNotifications().length, 1, action);
+    assert.equal(value.changes(), 0, action);
+  }
+});
+
+test("endpoint loss during an observation RPC cannot project or complete the stale row", async () => {
+  let signalStarted!: () => void;
+  let release!: () => void;
+  const started = new Promise<void>((resolve) => { signalStarted = resolve; });
+  const blocked = new Promise<void>((resolve) => { release = resolve; });
+  let reads = 0;
+  const value = fixture({
+    readGoal: async () => {
+      reads += 1;
+      if (reads === 1) {
+        signalStarted();
+        await blocked;
+        return { goal: { objective: "stale", status: "active", tokenBudget: null, updatedAt: 2 } };
+      }
+      return { goal: null };
+    },
+  });
+  value.processor.accept("local", "thread/goal/cleared", { threadId: "thread-1" });
+  value.processor.accept("local", "thread/settings/updated", {
+    threadId: "thread-1", threadSettings: { model: "new-model", effort: "high" },
+  });
+  await started;
+  value.processor.endpointUnavailable("local");
+  release();
+  await value.processor.idle();
+
+  assert.equal(value.store.pendingNotifications().length, 2);
+  assert.equal(value.store.facts({ endpointId: "local", threadId: "thread-1" }).goal, null);
+  assert.equal(value.store.facts({ endpointId: "local", threadId: "thread-1" }).currentSettings.model, null);
+  assert.equal(value.changes(), 0);
+  await value.processor.endpointReady("local");
+  assert.equal(reads, 2);
+  assert.equal(value.store.pendingNotifications().length, 0);
+  assert.equal(value.store.facts({ endpointId: "local", threadId: "thread-1" }).currentSettings.model, "new-model");
+});
+
+test("ordinary observation success clears only its still-current retry timer", async () => {
+  const clock = fakeTimers();
+  let reads = 0;
+  const value = fixture({
+    readGoal: async () => {
+      reads += 1;
+      if (reads === 1) throw new RpcRequestTimeoutError("thread/goal/get");
+      return { goal: null };
+    },
+    classifyFailure: (error) => error instanceof RpcRequestTimeoutError ? "retry" : "sleep",
+    timers: clock.api,
+  });
+  value.processor.accept("local", "thread/goal/cleared", { threadId: "thread-1" });
+  await value.processor.idle();
+  const stale = clock.timers[0]!;
+  value.processor.accept("local", "thread/settings/updated", {
+    threadId: "thread-1", threadSettings: { model: "gpt-5", effort: "high" },
+  });
+  await value.processor.idle();
+  assert.equal(stale.cleared, true);
+  assert.equal(value.store.pendingNotifications().length, 0);
+  stale.callback();
+  await new Promise<void>((resolve) => { setImmediate(resolve); });
+  assert.equal(reads, 2);
+});
+
 test("throwing operational reporting cannot suppress repeated observation retries or create user-visible rows", async () => {
   const clock = fakeTimers();
   let reads = 0;
@@ -341,7 +417,7 @@ test("observation stop cancels timers, awaits tails, and fences stale callbacks"
   assert.equal(stopped, false);
   release();
   await Promise.all([live, stopping]);
-  assert.equal(value.store.pendingNotifications().length, 0);
+  assert.equal(value.store.pendingNotifications().length, 1);
   stale.callback();
   await new Promise<void>((resolve) => { setImmediate(resolve); });
   assert.equal(reads, 2);

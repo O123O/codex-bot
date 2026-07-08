@@ -41,8 +41,9 @@ const supportedMethods = new Set([
 
 export class SessionObservationProcessor {
   private tails = new Map<string, Promise<void>>();
-  private retryTimers = new Map<string, { handle: unknown; generation: number }>();
+  private retryTimers = new Map<string, { handle: unknown; generation: number; epoch: number }>();
   private retryGenerations = new Map<string, number>();
+  private endpointEpochs = new Map<string, number>();
   private unavailableEndpoints = new Set<string>();
   private stopped = false;
 
@@ -77,15 +78,17 @@ export class SessionObservationProcessor {
 
   endpointUnavailable(endpointId: string): void {
     if (this.stopped) return;
+    this.advanceEndpointEpoch(endpointId);
     this.unavailableEndpoints.add(endpointId);
     this.clearRetry(endpointId);
   }
 
   async endpointReady(endpointId: string): Promise<void> {
     if (this.stopped) return;
+    this.advanceEndpointEpoch(endpointId);
     this.unavailableEndpoints.delete(endpointId);
     this.clearRetry(endpointId);
-    await this.enqueue(endpointId);
+    await this.enqueue(endpointId, this.endpointEpoch(endpointId));
   }
 
   async stop(): Promise<void> {
@@ -159,61 +162,74 @@ export class SessionObservationProcessor {
     if (workerChanged || lifecycleChanged) this.options.onChanged();
   }
 
-  private enqueue(endpointId: string): Promise<void> {
+  private enqueue(endpointId: string, epoch = this.endpointEpoch(endpointId)): Promise<void> {
     if (this.stopped) return Promise.resolve();
     const previous = this.tails.get(endpointId) ?? Promise.resolve();
-    const run = previous.then(() => this.processPending(endpointId), () => this.processPending(endpointId));
-    const contained = run.catch((error) => {
+    const run = previous.then(() => this.processPending(endpointId, epoch), () => this.processPending(endpointId, epoch));
+    const contained = run.then((current) => {
+      if (current) this.clearRetry(endpointId, epoch);
+    }, (error) => {
+      if (!this.runIsCurrent(endpointId, epoch)) return;
       try { this.options.onError(error); }
       catch { /* operational reporting must not change retry ownership */ }
-      if ((this.options.classifyFailure?.(error) ?? "sleep") === "retry") this.scheduleRetry(endpointId);
+      let disposition: "retry" | "endpoint" | "sleep" = "sleep";
+      try { disposition = this.options.classifyFailure?.(error) ?? "sleep"; }
+      catch { /* a classifier failure must leave durable work asleep */ }
+      if (disposition === "retry") this.scheduleRetry(endpointId, epoch);
     });
     this.tails.set(endpointId, contained);
     void contained.finally(() => { if (this.tails.get(endpointId) === contained) this.tails.delete(endpointId); });
     return contained;
   }
 
-  private scheduleRetry(endpointId: string): void {
-    if (this.stopped || this.unavailableEndpoints.has(endpointId) || this.retryTimers.has(endpointId)) return;
+  private scheduleRetry(endpointId: string, epoch: number): void {
+    if (!this.runIsCurrent(endpointId, epoch) || this.retryTimers.has(endpointId)) return;
     const generation = (this.retryGenerations.get(endpointId) ?? 0) + 1;
     this.retryGenerations.set(endpointId, generation);
     const timers = this.options.timers ?? nodeObservationTimers;
     const handle = timers.setTimeout(() => {
       const current = this.retryTimers.get(endpointId);
-      if (this.stopped || this.unavailableEndpoints.has(endpointId) || current?.generation !== generation) return;
+      if (!this.runIsCurrent(endpointId, epoch) || current?.generation !== generation || current.epoch !== epoch) return;
       this.retryTimers.delete(endpointId);
-      void this.enqueue(endpointId);
+      void this.enqueue(endpointId, epoch);
     }, this.options.retryMs ?? 1_000);
-    this.retryTimers.set(endpointId, { handle, generation });
+    this.retryTimers.set(endpointId, { handle, generation, epoch });
     (handle as { unref?: () => void } | undefined)?.unref?.();
   }
 
-  private clearRetry(endpointId: string): void {
-    this.retryGenerations.set(endpointId, (this.retryGenerations.get(endpointId) ?? 0) + 1);
+  private clearRetry(endpointId: string, expectedEpoch?: number): void {
     const timer = this.retryTimers.get(endpointId);
+    if (expectedEpoch !== undefined && timer?.epoch !== expectedEpoch) return;
+    this.retryGenerations.set(endpointId, (this.retryGenerations.get(endpointId) ?? 0) + 1);
     if (timer) (this.options.timers ?? nodeObservationTimers).clearTimeout(timer.handle);
     this.retryTimers.delete(endpointId);
   }
 
-  private async processPending(endpointId: string): Promise<void> {
+  private async processPending(endpointId: string, epoch: number): Promise<boolean> {
+    if (!this.runIsCurrent(endpointId, epoch)) return false;
     for (const notification of this.store.pendingNotifications(endpointId)) {
-      let result: boolean | "deferred";
+      if (!this.runIsCurrent(endpointId, epoch)) return false;
+      let result: boolean | "deferred" | "stale";
       try {
-        result = await this.process(notification);
+        result = await this.process(notification, epoch);
       } catch (error) {
         if (!(error instanceof ZodError)) throw error;
+        if (!this.runIsCurrent(endpointId, epoch)) return false;
         const safeError = { message: `invalid ${notification.method} notification` };
         this.store.failNotification(notification.sequence, safeError);
         this.options.onError(new Error(safeError.message));
         continue;
       }
+      if (result === "stale" || !this.runIsCurrent(endpointId, epoch)) return false;
       if (result === "deferred") continue;
       this.store.completeNotification(notification.sequence);
-      if (result) this.options.onChanged();
+      if (result && this.runIsCurrent(endpointId, epoch)) this.options.onChanged();
     }
+    return this.runIsCurrent(endpointId, epoch);
   }
 
-  private async process(notification: DashboardNotification): Promise<boolean | "deferred"> {
+  private async process(notification: DashboardNotification, epoch: number): Promise<boolean | "deferred" | "stale"> {
+    if (!this.runIsCurrent(notification.endpointId, epoch)) return "stale";
     const params = notification.params as any;
     const target = this.observationTarget(notification.endpointId, String(params.threadId));
     if (target.kind === "deferred") return "deferred";
@@ -250,6 +266,7 @@ export class SessionObservationProcessor {
       let ordinal = this.store.turnOrdinal(identity, params.turnId);
       if (ordinal === undefined) {
         const history = await this.options.readThread(notification.endpointId, identity.threadId);
+        if (!this.runIsCurrent(notification.endpointId, epoch)) return "stale";
         this.store.hydrateTurnOrder(identity, history.turns.map((turn) => ({ id: turn.id, startedAt: turn.startedAt })));
         ordinal = this.store.turnOrdinal(identity, params.turnId);
       }
@@ -263,6 +280,7 @@ export class SessionObservationProcessor {
     }
     if (notification.method === "thread/goal/cleared") {
       const current = await this.options.readGoal(notification.endpointId, identity.threadId) as any;
+      if (!this.runIsCurrent(notification.endpointId, epoch)) return "stale";
       const goal = current?.goal;
       if (goal) {
         const sourceTime = normalizeProtocolTime(goal.updatedAt, notification.receivedAt);
@@ -271,6 +289,12 @@ export class SessionObservationProcessor {
       return this.store.observeGoal(identity, null, notification.receivedAt, notification.sequence, notification.receivedAt);
     }
     return false;
+  }
+
+  private endpointEpoch(endpointId: string): number { return this.endpointEpochs.get(endpointId) ?? 0; }
+  private advanceEndpointEpoch(endpointId: string): void { this.endpointEpochs.set(endpointId, this.endpointEpoch(endpointId) + 1); }
+  private runIsCurrent(endpointId: string, epoch: number): boolean {
+    return !this.stopped && !this.unavailableEndpoints.has(endpointId) && this.endpointEpoch(endpointId) === epoch;
   }
 
   private managedTarget(endpointId: string, threadId: string): { identity: DashboardIdentity; mappingId: string } | undefined {

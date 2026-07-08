@@ -644,9 +644,14 @@ const nodeManagedRecoveryTimers: ManagedRecoveryTimers = {
 
 export interface ManagedSessionRecoveryResult { restored: boolean }
 
+export interface ManagedSessionRecoveryBatchResult extends ManagedSessionRecoveryResult {
+  restoredKeys: readonly ManagedRetryKey[];
+  settledKeys: readonly ManagedRetryKey[];
+  failures: readonly { key: ManagedRetryKey; disposition: ManagedRecoveryDisposition }[];
+}
+
 export interface ManagedSessionRecoveryOwner {
   recordFailure(key: ManagedRetryKey, disposition: ManagedRecoveryDisposition): void;
-  recordSuccess(key: ManagedRetryKey): void;
   endpointReady(endpointId: string, lease: EndpointWorkLease): Promise<ManagedSessionRecoveryResult>;
   endpointUnavailable(endpointId: string): void;
   stop(): Promise<void>;
@@ -654,16 +659,19 @@ export interface ManagedSessionRecoveryOwner {
 
 export function createManagedSessionRecoveryOwner(options: {
   endpoints: Pick<EndpointManager, "withReadyWorkLease">;
-  recover(endpointId: string, keys: readonly ManagedRetryKey[], lease: EndpointWorkLease): Promise<ManagedSessionRecoveryResult>;
+  isLeaseCurrent(endpointId: string, lease: EndpointWorkLease): boolean;
+  recover(endpointId: string, keys: readonly ManagedRetryKey[], lease: EndpointWorkLease): Promise<ManagedSessionRecoveryBatchResult>;
   onRestored(endpointId: string, lease: EndpointWorkLease): Promise<void>;
   onError(error: unknown): void;
   timers?: ManagedRecoveryTimers;
   retryMs?: number;
 }): ManagedSessionRecoveryOwner {
-  const pending = new Map<ManagedRetryKey, "retry" | "endpoint">();
+  type PendingTarget = { disposition: "retry" | "endpoint"; stage: "managed" | "downstream" };
+  const pending = new Map<ManagedRetryKey, PendingTarget>();
   const unavailableEndpoints = new Set<string>();
-  const timers = new Map<string, { handle: unknown; generation: number }>();
-  const generations = new Map<string, number>();
+  const timers = new Map<string, { handle: unknown; generation: number; epoch: number }>();
+  const timerGenerations = new Map<string, number>();
+  const endpointEpochs = new Map<string, number>();
   const tails = new Map<string, Promise<void>>();
   let stopped = false;
 
@@ -671,106 +679,159 @@ export function createManagedSessionRecoveryOwner(options: {
     try { options.onError(error); }
     catch { /* operational reporting must not change recovery ownership */ }
   };
+  const endpointEpoch = (endpointId: string): number => endpointEpochs.get(endpointId) ?? 0;
+  const advanceEndpointEpoch = (endpointId: string): number => {
+    const next = endpointEpoch(endpointId) + 1;
+    endpointEpochs.set(endpointId, next);
+    return next;
+  };
   const clearTimer = (endpointId: string): void => {
-    generations.set(endpointId, (generations.get(endpointId) ?? 0) + 1);
+    timerGenerations.set(endpointId, (timerGenerations.get(endpointId) ?? 0) + 1);
     const timer = timers.get(endpointId);
     if (timer) (options.timers ?? nodeManagedRecoveryTimers).clearTimeout(timer.handle);
     timers.delete(endpointId);
   };
-  const keysFor = (endpointId: string, selection: "retry" | "all"): ManagedRetryKey[] => [...pending]
-    .filter(([key, disposition]) => managedRetryEndpoint(key) === endpointId && (selection === "all" || disposition === "retry"))
-    .map(([key]) => key);
-  const applyOwnerFailure = (keys: readonly ManagedRetryKey[], error: unknown): void => {
+  const targetsFor = (endpointId: string, selection: "retry" | "all"): Array<[ManagedRetryKey, PendingTarget]> => [...pending]
+    .filter(([key, target]) => managedRetryEndpoint(key) === endpointId && (selection === "all" || target.disposition === "retry"));
+  const markEndpointWaiting = (endpointId: string): void => {
+    unavailableEndpoints.add(endpointId);
+    for (const [key, target] of pending) {
+      if (managedRetryEndpoint(key) === endpointId) pending.set(key, { ...target, disposition: "endpoint" });
+    }
+    clearTimer(endpointId);
+  };
+  const applyFailure = (keys: readonly ManagedRetryKey[], error: unknown, stage: PendingTarget["stage"]): void => {
     const disposition = managedRecoveryDisposition(error);
     for (const key of keys) {
-      if (disposition === "retry" || disposition === "endpoint") pending.set(key, disposition);
-      else pending.delete(key);
+      if (disposition === "retry" || disposition === "endpoint") pending.set(key, { disposition, stage });
+      else if (stage === "managed") pending.delete(key);
+      else {
+        const current = pending.get(key);
+        pending.set(key, { disposition: current?.disposition ?? "endpoint", stage: "downstream" });
+      }
     }
-    if (disposition === "endpoint") unavailableEndpoints.add(keys.length > 0 ? managedRetryEndpoint(keys[0]!) : "");
+    if (disposition === "endpoint" && keys.length > 0) markEndpointWaiting(managedRetryEndpoint(keys[0]!));
     report(error);
   };
+  const runIsCurrent = (endpointId: string, epoch: number, lease: EndpointWorkLease): boolean => !stopped
+    && !unavailableEndpoints.has(endpointId)
+    && endpointEpoch(endpointId) === epoch
+    && options.isLeaseCurrent(endpointId, lease);
 
   let schedule!: (endpointId: string) => void;
-  const run = async (endpointId: string, selection: "retry" | "all", existingLease?: EndpointWorkLease): Promise<ManagedSessionRecoveryResult> => {
+  const run = async (endpointId: string, selection: "retry" | "all", epoch: number, existingLease?: EndpointWorkLease): Promise<ManagedSessionRecoveryResult> => {
     if (stopped) return { restored: false };
-    const keys = keysFor(endpointId, selection);
-    if (keys.length === 0) return { restored: false };
+    const targets = targetsFor(endpointId, selection);
+    if (targets.length === 0) return { restored: false };
     const recover = async (lease: EndpointWorkLease): Promise<ManagedSessionRecoveryResult> => {
+      if (!runIsCurrent(endpointId, epoch, lease)) return { restored: false };
+      const managedKeys = targets.filter(([, target]) => target.stage === "managed").map(([key]) => key);
+      const downstreamKeys = targets.filter(([, target]) => target.stage === "downstream").map(([key]) => key);
+      let batch: ManagedSessionRecoveryBatchResult = { restored: false, restoredKeys: [], settledKeys: [], failures: [] };
       try {
-        const result = await options.recover(endpointId, keys, lease);
-        if (result.restored && !stopped) {
-          try { await options.onRestored(endpointId, lease); }
-          catch (error) { report(error); }
-        }
-        return stopped ? { restored: false } : result;
+        if (managedKeys.length > 0) batch = await options.recover(endpointId, managedKeys, lease);
       } catch (error) {
-        applyOwnerFailure(keys, error);
+        if (runIsCurrent(endpointId, epoch, lease)) applyFailure(managedKeys, error, "managed");
         return { restored: false };
       }
+      if (!runIsCurrent(endpointId, epoch, lease)) return { restored: false };
+      const managedSet = new Set(managedKeys);
+      const returnedKeys = [...batch.restoredKeys, ...batch.settledKeys, ...batch.failures.map(({ key }) => key)];
+      if (returnedKeys.some((key) => !managedSet.has(key))) {
+        applyFailure(managedKeys, new Error("managed recovery returned an unexpected mapping"), "managed");
+        return { restored: false };
+      }
+      for (const key of batch.restoredKeys) {
+        const current = pending.get(key);
+        if (current) pending.set(key, { ...current, stage: "downstream" });
+      }
+      for (const key of batch.settledKeys) pending.delete(key);
+      for (const failure of batch.failures) {
+        if (failure.disposition === "retry" || failure.disposition === "endpoint") {
+          pending.set(failure.key, { disposition: failure.disposition, stage: "managed" });
+        } else pending.delete(failure.key);
+      }
+      if (batch.failures.some(({ disposition }) => disposition === "endpoint")) markEndpointWaiting(endpointId);
+      if (!runIsCurrent(endpointId, epoch, lease)) return { restored: false };
+      const wakeKeys = [...new Set([...downstreamKeys, ...batch.restoredKeys])];
+      if (wakeKeys.length === 0) return { restored: false };
+      for (const key of wakeKeys) {
+        const current = pending.get(key);
+        if (current) pending.set(key, { ...current, stage: "downstream" });
+      }
+      try { await options.onRestored(endpointId, lease); }
+      catch (error) {
+        if (runIsCurrent(endpointId, epoch, lease)) applyFailure(wakeKeys, error, "downstream");
+        return { restored: false };
+      }
+      if (!runIsCurrent(endpointId, epoch, lease)) return { restored: false };
+      for (const key of wakeKeys) pending.delete(key);
+      return { restored: true };
     };
     let result: ManagedSessionRecoveryResult;
     if (existingLease) result = await recover(existingLease);
     else {
       try { result = await options.endpoints.withReadyWorkLease(endpointId, recover); }
       catch (error) {
-        applyOwnerFailure(keys, error);
+        if (!stopped && endpointEpoch(endpointId) === epoch) {
+          for (const stage of ["managed", "downstream"] as const) {
+            const keys = targets.filter(([, target]) => target.stage === stage).map(([key]) => key);
+            if (keys.length > 0) applyFailure(keys, error, stage);
+          }
+        }
         result = { restored: false };
       }
     }
-    if (!stopped && !unavailableEndpoints.has(endpointId) && keysFor(endpointId, "retry").length > 0) schedule(endpointId);
+    if (!stopped && !unavailableEndpoints.has(endpointId) && targetsFor(endpointId, "retry").length > 0) schedule(endpointId);
     return result;
   };
-  const enqueue = (endpointId: string, selection: "retry" | "all", lease?: EndpointWorkLease): Promise<ManagedSessionRecoveryResult> => {
+  const enqueue = (endpointId: string, selection: "retry" | "all", epoch: number, lease?: EndpointWorkLease): Promise<ManagedSessionRecoveryResult> => {
     if (stopped) return Promise.resolve({ restored: false });
     const previous = tails.get(endpointId) ?? Promise.resolve();
     let result: ManagedSessionRecoveryResult = { restored: false };
-    const scheduled = previous.then(async () => { result = await run(endpointId, selection, lease); }, async () => { result = await run(endpointId, selection, lease); });
+    const scheduled = previous.then(async () => { result = await run(endpointId, selection, epoch, lease); }, async () => { result = await run(endpointId, selection, epoch, lease); });
     const contained = scheduled.catch(report);
     tails.set(endpointId, contained);
     void contained.finally(() => { if (tails.get(endpointId) === contained) tails.delete(endpointId); });
     return contained.then(() => result);
   };
   schedule = (endpointId: string): void => {
-    if (stopped || unavailableEndpoints.has(endpointId) || timers.has(endpointId) || keysFor(endpointId, "retry").length === 0) return;
-    const generation = (generations.get(endpointId) ?? 0) + 1;
-    generations.set(endpointId, generation);
+    if (stopped || unavailableEndpoints.has(endpointId) || timers.has(endpointId) || targetsFor(endpointId, "retry").length === 0) return;
+    const generation = (timerGenerations.get(endpointId) ?? 0) + 1;
+    const epoch = endpointEpoch(endpointId);
+    timerGenerations.set(endpointId, generation);
     const timerApi = options.timers ?? nodeManagedRecoveryTimers;
     const handle = timerApi.setTimeout(() => {
       const timer = timers.get(endpointId);
-      if (stopped || unavailableEndpoints.has(endpointId) || timer?.generation !== generation) return;
+      if (stopped || unavailableEndpoints.has(endpointId) || timer?.generation !== generation || timer.epoch !== epoch
+        || endpointEpoch(endpointId) !== epoch) return;
       timers.delete(endpointId);
-      void enqueue(endpointId, "retry");
+      void enqueue(endpointId, "retry", epoch);
     }, options.retryMs ?? 1_000);
-    timers.set(endpointId, { handle, generation });
+    timers.set(endpointId, { handle, generation, epoch });
     (handle as { unref?: () => void } | undefined)?.unref?.();
   };
 
   return {
     recordFailure: (key, disposition) => {
       if (stopped) return;
-      if (disposition === "retry" || disposition === "endpoint") pending.set(key, disposition);
+      if (disposition === "retry" || disposition === "endpoint") pending.set(key, { disposition, stage: "managed" });
       else pending.delete(key);
       const endpointId = managedRetryEndpoint(key);
-      if (disposition === "endpoint") {
-        unavailableEndpoints.add(endpointId);
-        clearTimer(endpointId);
-      } else if (disposition === "retry") schedule(endpointId);
-      else if (keysFor(endpointId, "retry").length === 0) clearTimer(endpointId);
-    },
-    recordSuccess: (key) => {
-      pending.delete(key);
-      const endpointId = managedRetryEndpoint(key);
-      if (keysFor(endpointId, "retry").length === 0) clearTimer(endpointId);
+      if (disposition === "endpoint") markEndpointWaiting(endpointId);
+      else if (disposition === "retry") schedule(endpointId);
+      else if (targetsFor(endpointId, "retry").length === 0) clearTimer(endpointId);
     },
     endpointReady: (endpointId, lease) => {
+      const epoch = advanceEndpointEpoch(endpointId);
       unavailableEndpoints.delete(endpointId);
       clearTimer(endpointId);
-      return enqueue(endpointId, "all", lease);
+      return enqueue(endpointId, "all", epoch, lease);
     },
     endpointUnavailable: (endpointId) => {
       if (stopped) return;
-      unavailableEndpoints.add(endpointId);
-      clearTimer(endpointId);
+      advanceEndpointEpoch(endpointId);
+      markEndpointWaiting(endpointId);
     },
     stop: async () => {
       if (!stopped) {
@@ -1486,6 +1547,7 @@ export async function buildProductionApp(
         }, threadGate);
         managedRecoveryOwner = createManagedSessionRecoveryOwner({
           endpoints: endpointManager,
+          isLeaseCurrent: isManagedRecoveryLeaseCurrent,
           recover: (endpointId, keys, lease) => resumeManagedSessions(endpointId, { unavailableOnly: true, keys, lease }),
           onRestored: (endpointId, lease) => reconcileRestoredEndpoint(endpointId, lease),
           onError: () => reportOperationalSafely(report, {
@@ -2550,7 +2612,7 @@ export async function buildProductionApp(
     unavailableOnly?: boolean;
     keys?: readonly ManagedRetryKey[];
     lease?: EndpointWorkLease;
-  } = {}): Promise<ManagedSessionRecoveryResult> {
+  } = {}): Promise<ManagedSessionRecoveryBatchResult> {
     const exactKeys = options.keys ? new Set(options.keys) : undefined;
     if (!options.unavailableOnly && !exactKeys) {
       for (const session of Object.values(registry.managedSnapshot().sessions)) {
@@ -2561,7 +2623,9 @@ export async function buildProductionApp(
         }
       }
     }
-    let restored = false;
+    const restoredKeys: ManagedRetryKey[] = [];
+    const settledKeys: ManagedRetryKey[] = [];
+    const failures: Array<{ key: ManagedRetryKey; disposition: ManagedRecoveryDisposition }> = [];
     const seenKeys = new Set<ManagedRetryKey>();
     for (const [nickname, session] of Object.entries(registry.managedSnapshot().sessions)) {
       if (endpointFilter && session.endpoint !== endpointFilter) continue;
@@ -2570,11 +2634,14 @@ export async function buildProductionApp(
       seenKeys.add(key);
       const stateBefore = runtime.getSession(session.endpoint, session.thread_id, session.mapping_id);
       if (options.unavailableOnly && stateBefore?.managementState !== "unavailable") {
-        managedRecoveryOwner?.recordSuccess(key);
+        settledKeys.push(key);
         continue;
       }
       try {
         const response = await lifecycle.reconcileManaged(nickname, session, options.lease);
+        if (options.lease && !isManagedRecoveryLeaseCurrent(session.endpoint, options.lease)) {
+          throw new AppError("ENDPOINT_UNAVAILABLE", "managed recovery endpoint generation changed");
+        }
         const activeTurn = [...(response.thread.turns ?? [])].reverse().find((turn: any) => !isTerminalStatus(turn.status));
         if (activeTurn) pool.restoreObservedActiveTurn(session.endpoint, session.thread_id, activeTurn.id);
         const resumeObservationSequence = dashboardStore.allocateObservationSequence();
@@ -2585,11 +2652,11 @@ export async function buildProductionApp(
           native: nativeObservationSequence,
         });
         dashboardStore.observeLifecycle({ endpointId: session.endpoint, threadId: session.thread_id }, Date.now());
-        managedRecoveryOwner?.recordSuccess(key);
-        restored = true;
+        restoredKeys.push(key);
       } catch (error) {
         const disposition = managedRecoveryDisposition(error);
-        managedRecoveryOwner?.recordFailure(key, disposition);
+        failures.push({ key, disposition });
+        if (!exactKeys) managedRecoveryOwner?.recordFailure(key, disposition);
         const current = registry.get(nickname);
         if (current?.mapping_id === session.mapping_id && current.endpoint === session.endpoint
           && current.thread_id === session.thread_id && current.lifecycle_state === "managed") {
@@ -2609,8 +2676,16 @@ export async function buildProductionApp(
         }
       }
     }
-    if (exactKeys) for (const key of exactKeys) if (!seenKeys.has(key)) managedRecoveryOwner?.recordSuccess(key);
-    return { restored };
+    if (exactKeys) for (const key of exactKeys) if (!seenKeys.has(key)) settledKeys.push(key);
+    return { restored: restoredKeys.length > 0, restoredKeys, settledKeys, failures };
+  }
+
+  function isManagedRecoveryLeaseCurrent(endpointId: string, lease: EndpointWorkLease): boolean {
+    try {
+      const current = endpointManager.endpointGeneration(endpointId);
+      return current.endpoint.state === "ready" && current.generation === lease.endpointGeneration
+        && endpointManager.validateWorkLease(lease, endpointId);
+    } catch { return false; }
   }
 
   async function reconcileRestoredEndpoint(endpointId: string, existingLease?: EndpointWorkLease): Promise<void> {
