@@ -46,7 +46,7 @@ import { SessionDiscovery } from "./sessions/discovery.ts";
 import { FinalMessageStore } from "./sessions/final-messages.ts";
 import { SessionLifecycle } from "./sessions/lifecycle.ts";
 import { OwnershipEventStore } from "./sessions/ownership-event-store.ts";
-import { SessionOwnershipWatcher } from "./sessions/ownership-watcher.ts";
+import { SessionOwnershipWatcher, type ExternalTurnIncident } from "./sessions/ownership-watcher.ts";
 import { SessionOwnershipGuard } from "./sessions/rollout-ownership.ts";
 import { preparedProjectWorkspaceFromCheckpoint, ProjectWorkspacePolicy, type PreparedProjectWorkspace } from "./sessions/project-workspace.ts";
 import { SessionService } from "./sessions/service.ts";
@@ -649,10 +649,12 @@ export interface ManagedSessionRecoveryBatchResult {
   failures: readonly { key: ManagedRetryKey; disposition: ManagedRecoveryDisposition }[];
 }
 
-export type ManagedEndpointReadyOutcome =
-  | { outcome: "needs_shared_wake" }
-  | { outcome: "pending" }
-  | { outcome: "completed" };
+export interface ManagedEndpointReadyOutcome {
+  recovery: "none" | "pending" | "completed";
+  sharedWake: "needed" | "completed" | "stale";
+}
+
+export type ManagedOwnershipIncidentReceipt = ExternalTurnIncident;
 
 export interface ManagedSessionRecoveryOwner {
   recordFailure(key: ManagedRetryKey, disposition: ManagedRecoveryDisposition): void;
@@ -668,8 +670,9 @@ export async function recoverManagedEndpointReady(
   wakeShared: () => Promise<void>,
 ): Promise<ManagedEndpointReadyOutcome> {
   const result = await owner.endpointReady(endpointId, lease);
-  if (result.outcome === "needs_shared_wake") await wakeShared();
-  return result;
+  if (result.sharedWake !== "needed") return result;
+  await wakeShared();
+  return { ...result, sharedWake: "completed" };
 }
 
 export function createManagedSessionRecoveryOwner(options: {
@@ -681,9 +684,18 @@ export function createManagedSessionRecoveryOwner(options: {
     lease: EndpointWorkLease,
     isCurrent: () => boolean,
   ): Promise<ManagedSessionRecoveryBatchResult>;
-  beforeShared(endpointId: string, lease: EndpointWorkLease): Promise<void>;
-  wakeShared(endpointId: string, lease: EndpointWorkLease): Promise<void>;
-  afterShared(endpointId: string, lease: EndpointWorkLease): Promise<void>;
+  beforeShared(
+    endpointId: string,
+    lease: EndpointWorkLease,
+    isCurrent: () => boolean,
+  ): Promise<readonly ManagedOwnershipIncidentReceipt[]>;
+  wakeShared(endpointId: string, lease: EndpointWorkLease, isCurrent: () => boolean): Promise<void>;
+  afterShared(
+    endpointId: string,
+    lease: EndpointWorkLease,
+    beforeIncidents: readonly ManagedOwnershipIncidentReceipt[],
+    isCurrent: () => boolean,
+  ): Promise<void>;
   onSafetyFailure(error: unknown): void;
   onError(error: unknown): void;
   timers?: ManagedRecoveryTimers;
@@ -692,6 +704,7 @@ export function createManagedSessionRecoveryOwner(options: {
   type PendingTarget = {
     disposition: "retry" | "endpoint" | "safety";
     stage: "managed" | "before_shared" | "after_shared";
+    incidents: readonly ManagedOwnershipIncidentReceipt[] | undefined;
   };
   const pending = new Map<ManagedRetryKey, PendingTarget>();
   const unavailableEndpoints = new Set<string>();
@@ -730,9 +743,11 @@ export function createManagedSessionRecoveryOwner(options: {
   const applyFailure = (keys: readonly ManagedRetryKey[], error: unknown, stage: PendingTarget["stage"]): void => {
     const disposition = managedRecoveryDisposition(error);
     for (const key of keys) {
-      if (disposition === "retry" || disposition === "endpoint") pending.set(key, { disposition, stage });
+      const current = pending.get(key);
+      const incidents = current?.stage === stage ? current.incidents : undefined;
+      if (disposition === "retry" || disposition === "endpoint") pending.set(key, { disposition, stage, incidents });
       else if (stage === "managed") pending.delete(key);
-      else pending.set(key, { disposition: "safety", stage });
+      else pending.set(key, { disposition: "safety", stage, incidents });
     }
     if (disposition === "endpoint" && keys.length > 0) markEndpointWaiting(managedRetryEndpoint(keys[0]!));
     if (disposition !== "retry" && disposition !== "endpoint" && stage !== "managed" && keys.length > 0) {
@@ -745,86 +760,121 @@ export function createManagedSessionRecoveryOwner(options: {
     }
     report(error);
   };
-  const runIsCurrent = (endpointId: string, epoch: number, lease: EndpointWorkLease): boolean => !stopped
-    && !unavailableEndpoints.has(endpointId)
+  const generationIsCurrent = (endpointId: string, epoch: number, lease: EndpointWorkLease): boolean => !stopped
     && endpointEpoch(endpointId) === epoch
     && options.isLeaseCurrent(endpointId, lease);
+  const runIsCurrent = (endpointId: string, epoch: number, lease: EndpointWorkLease): boolean => generationIsCurrent(endpointId, epoch, lease)
+    && !unavailableEndpoints.has(endpointId);
+  const dedupeIncidents = (incidents: readonly ManagedOwnershipIncidentReceipt[]): ManagedOwnershipIncidentReceipt[] => {
+    const seen = new Set<string>();
+    return incidents.filter((incident) => {
+      const key = `${incident.endpoint}\0${incident.thread_id}\0${incident.mapping_id}\0${incident.turnId}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  };
 
   let schedule!: (endpointId: string) => void;
   const run = async (endpointId: string, selection: "retry" | "all", epoch: number, existingLease?: EndpointWorkLease): Promise<ManagedEndpointReadyOutcome> => {
-    if (stopped) return { outcome: "pending" };
+    if (stopped) return { recovery: "pending", sharedWake: "stale" };
     const targets = targetsFor(endpointId, selection);
     if (targets.length === 0) {
       safetyReported.delete(endpointId);
-      return { outcome: "needs_shared_wake" };
+      return { recovery: "none", sharedWake: "needed" };
     }
     const targetKeys = targets.map(([key]) => key);
     const recover = async (lease: EndpointWorkLease): Promise<ManagedEndpointReadyOutcome> => {
       const isCurrent = (): boolean => runIsCurrent(endpointId, epoch, lease);
-      const retainedOutcome = (): ManagedEndpointReadyOutcome => targetsFor(endpointId, "all").length > 0
-        ? { outcome: "pending" }
-        : { outcome: "needs_shared_wake" };
-      if (!isCurrent()) return { outcome: "pending" };
+      const isGenerationCurrent = (): boolean => generationIsCurrent(endpointId, epoch, lease);
+      const recovery = (completed = false): ManagedEndpointReadyOutcome["recovery"] => targetsFor(endpointId, "all").length > 0
+        ? "pending"
+        : completed ? "completed" : "none";
+      const pendingWake = (): ManagedEndpointReadyOutcome => ({
+        recovery: recovery(),
+        sharedWake: isGenerationCurrent() ? "needed" : "stale",
+      });
+      if (!isCurrent()) return { recovery: "pending", sharedWake: "stale" };
       const managedKeys = targets.filter(([, target]) => target.stage === "managed").map(([key]) => key);
       let batch: ManagedSessionRecoveryBatchResult = { restored: false, restoredKeys: [], settledKeys: [], failures: [] };
       try {
         if (managedKeys.length > 0) batch = await options.recover(endpointId, managedKeys, lease, isCurrent);
       } catch (error) {
         if (isCurrent()) applyFailure(managedKeys, error, "managed");
-        return isCurrent() ? retainedOutcome() : { outcome: "pending" };
+        return pendingWake();
       }
-      if (!isCurrent()) return { outcome: "pending" };
+      if (!isCurrent()) return pendingWake();
       const managedSet = new Set(managedKeys);
       const returnedKeys = [...batch.restoredKeys, ...batch.settledKeys, ...batch.failures.map(({ key }) => key)];
       if (returnedKeys.some((key) => !managedSet.has(key))) {
         applyFailure(managedKeys, new Error("managed recovery returned an unexpected mapping"), "managed");
-        return retainedOutcome();
+        return pendingWake();
       }
       for (const key of batch.restoredKeys) {
         const current = pending.get(key);
-        if (current) pending.set(key, { ...current, stage: "before_shared" });
+        if (current) pending.set(key, { ...current, stage: "before_shared", incidents: undefined });
       }
       for (const key of batch.settledKeys) pending.delete(key);
       for (const failure of batch.failures) {
         if (failure.disposition === "retry" || failure.disposition === "endpoint") {
-          pending.set(failure.key, { disposition: failure.disposition, stage: "managed" });
+          pending.set(failure.key, { disposition: failure.disposition, stage: "managed", incidents: undefined });
         } else pending.delete(failure.key);
       }
       if (batch.failures.some(({ disposition }) => disposition === "endpoint")) markEndpointWaiting(endpointId);
-      if (!isCurrent()) return { outcome: "pending" };
+      if (!isCurrent()) return pendingWake();
 
       const beforeKeys = targetKeys.filter((key) => pending.get(key)?.stage === "before_shared");
       if (beforeKeys.length > 0) {
+        const needsBefore = beforeKeys.filter((key) => pending.get(key)?.incidents === undefined);
         try {
-          await options.beforeShared(endpointId, lease);
-          if (!isCurrent()) return { outcome: "pending" };
-          await options.wakeShared(endpointId, lease);
+          if (needsBefore.length > 0) {
+            const discovered = dedupeIncidents(await options.beforeShared(endpointId, lease, isCurrent));
+            if (!isCurrent()) return pendingWake();
+            const accumulated = dedupeIncidents([
+              ...beforeKeys.flatMap((key) => pending.get(key)?.incidents ?? []),
+              ...discovered,
+            ]);
+            for (const key of beforeKeys) {
+              const current = pending.get(key);
+              if (current?.stage === "before_shared") pending.set(key, { ...current, incidents: accumulated });
+            }
+          }
+          if (!isCurrent()) return pendingWake();
+          await options.wakeShared(endpointId, lease, isCurrent);
         } catch (error) {
           if (isCurrent()) applyFailure(beforeKeys, error, "before_shared");
-          return { outcome: "pending" };
+          return pendingWake();
         }
-        if (!isCurrent()) return { outcome: "pending" };
+        if (!isCurrent()) return { recovery: "pending", sharedWake: "stale" };
+        const beforeIncidents = dedupeIncidents(beforeKeys.flatMap((key) => pending.get(key)?.incidents ?? []));
         for (const key of beforeKeys) {
           const current = pending.get(key);
-          if (current?.stage === "before_shared") pending.set(key, { ...current, stage: "after_shared" });
+          if (current?.stage === "before_shared") pending.set(key, {
+            ...current, stage: "after_shared", incidents: beforeIncidents,
+          });
         }
       }
 
       const afterKeys = targetKeys.filter((key) => pending.get(key)?.stage === "after_shared");
       if (afterKeys.length > 0) {
-        try { await options.afterShared(endpointId, lease); }
+        const beforeIncidents = dedupeIncidents(afterKeys.flatMap((key) => pending.get(key)?.incidents ?? []));
+        try { await options.afterShared(endpointId, lease, beforeIncidents, isCurrent); }
         catch (error) {
           if (isCurrent()) applyFailure(afterKeys, error, "after_shared");
-          return { outcome: "pending" };
+          return {
+            recovery: recovery(),
+            sharedWake: isGenerationCurrent() ? "completed" : "stale",
+          };
         }
-        if (!isCurrent()) return { outcome: "pending" };
+        if (!isCurrent()) return { recovery: "pending", sharedWake: "stale" };
         for (const key of afterKeys) pending.delete(key);
       }
       if (beforeKeys.length > 0 || afterKeys.length > 0) {
         safetyReported.delete(endpointId);
-        return { outcome: "completed" };
+        return { recovery: recovery(true), sharedWake: "completed" };
       }
-      return retainedOutcome();
+      const hasCompletedWake = targets.some(([, target]) => target.stage === "after_shared");
+      return { recovery: recovery(), sharedWake: hasCompletedWake ? "completed" : "needed" };
     };
     let result: ManagedEndpointReadyOutcome;
     if (existingLease) result = await recover(existingLease);
@@ -837,18 +887,19 @@ export function createManagedSessionRecoveryOwner(options: {
             if (keys.length > 0) applyFailure(keys, error, stage);
           }
         }
-        result = !stopped && endpointEpoch(endpointId) === epoch && targetsFor(endpointId, "all").length === 0
-          ? { outcome: "needs_shared_wake" }
-          : { outcome: "pending" };
+        result = {
+          recovery: targetsFor(endpointId, "all").length > 0 ? "pending" : "none",
+          sharedWake: !stopped && endpointEpoch(endpointId) === epoch ? "needed" : "stale",
+        };
       }
     }
     if (!stopped && !unavailableEndpoints.has(endpointId) && targetsFor(endpointId, "retry").length > 0) schedule(endpointId);
     return result;
   };
   const enqueue = (endpointId: string, selection: "retry" | "all", epoch: number, lease?: EndpointWorkLease): Promise<ManagedEndpointReadyOutcome> => {
-    if (stopped) return Promise.resolve({ outcome: "pending" });
+    if (stopped) return Promise.resolve({ recovery: "pending", sharedWake: "stale" });
     const previous = tails.get(endpointId) ?? Promise.resolve();
-    let result: ManagedEndpointReadyOutcome = { outcome: "pending" };
+    let result: ManagedEndpointReadyOutcome = { recovery: "pending", sharedWake: "stale" };
     const scheduled = previous.then(async () => { result = await run(endpointId, selection, epoch, lease); }, async () => { result = await run(endpointId, selection, epoch, lease); });
     const contained = scheduled.catch(report);
     tails.set(endpointId, contained);
@@ -875,7 +926,9 @@ export function createManagedSessionRecoveryOwner(options: {
   return {
     recordFailure: (key, disposition) => {
       if (stopped) return;
-      if (disposition === "retry" || disposition === "endpoint") pending.set(key, { disposition, stage: "managed" });
+      if (disposition === "retry" || disposition === "endpoint") pending.set(key, {
+        disposition, stage: "managed", incidents: undefined,
+      });
       else pending.delete(key);
       const endpointId = managedRetryEndpoint(key);
       if (disposition === "endpoint") markEndpointWaiting(endpointId);
@@ -908,11 +961,35 @@ export async function wakeRestoredSessionOwners(dependencies: {
   relay: Pick<EventRelay, "endpointReady">;
   observations: Pick<SessionObservationProcessor, "endpointReady">;
   onError(owner: "relay" | "observations", error: unknown): void;
-}, endpointId: string, lease?: EndpointWorkLease): Promise<void> {
+}, endpointId: string, lease?: EndpointWorkLease, isCurrent: () => boolean = () => true): Promise<void> {
+  if (!isCurrent()) return;
   try { await dependencies.relay.endpointReady(endpointId, lease); }
-  catch (error) { dependencies.onError("relay", error); }
+  catch (error) { if (isCurrent()) dependencies.onError("relay", error); }
+  if (!isCurrent()) return;
   try { await dependencies.observations.endpointReady(endpointId); }
-  catch (error) { dependencies.onError("observations", error); }
+  catch (error) { if (isCurrent()) dependencies.onError("observations", error); }
+  if (!isCurrent()) return;
+}
+
+export async function releaseRestoredOwnershipIncidents(dependencies: {
+  ownership: Pick<SessionOwnershipWatcher, "detectEndpoint" | "release">;
+}, endpointId: string, lease: EndpointWorkLease, beforeIncidents: readonly ManagedOwnershipIncidentReceipt[], isCurrent: () => boolean): Promise<void> {
+  const assertCurrent = (): void => {
+    if (!isCurrent()) throw new AppError("ENDPOINT_UNAVAILABLE", "managed recovery generation changed during ownership release");
+  };
+  assertCurrent();
+  const afterIncidents = await dependencies.ownership.detectEndpoint(endpointId, lease);
+  assertCurrent();
+  const seen = new Set<string>();
+  const incidents = [...beforeIncidents, ...afterIncidents].filter((incident) => {
+    const key = `${incident.endpoint}\0${incident.thread_id}\0${incident.mapping_id}\0${incident.turnId}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  assertCurrent();
+  await dependencies.ownership.release(incidents, lease);
+  assertCurrent();
 }
 
 export function reportOperationalSafely(sink: OperationalEventSink, event: OperationalEvent): void {
@@ -2765,9 +2842,10 @@ export async function buildProductionApp(
 
   async function reconcileRestoredEndpoint(endpointId: string, existingLease?: EndpointWorkLease): Promise<void> {
     const reconcile = async (lease: EndpointWorkLease): Promise<void> => {
-      await beforeRestoredEndpoint(endpointId, lease);
-      await wakeRestoredEndpoint(endpointId, lease);
-      await afterRestoredEndpoint(endpointId, lease);
+      const isCurrent = (): boolean => isManagedRecoveryLeaseCurrent(endpointId, lease);
+      const beforeIncidents = await beforeRestoredEndpoint(endpointId, lease, isCurrent);
+      await wakeRestoredEndpoint(endpointId, lease, isCurrent);
+      await afterRestoredEndpoint(endpointId, lease, beforeIncidents, isCurrent);
     };
     if (existingLease) {
       await endpointManager.runWithWorkLease(endpointId, existingLease, async (lease) => {
@@ -2779,24 +2857,46 @@ export async function buildProductionApp(
     await endpointManager.withReadyWorkLease(endpointId, reconcile);
   }
 
-  async function beforeRestoredEndpoint(endpointId: string, lease: EndpointWorkLease): Promise<void> {
-    await ownershipWatcher.detectEndpoint(endpointId, lease);
-    await pool.reconcileEndpointClaims(endpointId);
+  function assertManagedRecoveryCurrent(isCurrent: () => boolean): void {
+    if (!isCurrent()) throw new AppError("ENDPOINT_UNAVAILABLE", "managed recovery generation changed during downstream work");
   }
 
-  async function wakeRestoredEndpoint(endpointId: string, lease: EndpointWorkLease): Promise<void> {
+  async function beforeRestoredEndpoint(
+    endpointId: string,
+    lease: EndpointWorkLease,
+    isCurrent: () => boolean,
+  ): Promise<readonly ManagedOwnershipIncidentReceipt[]> {
+    assertManagedRecoveryCurrent(isCurrent);
+    const incidents = await ownershipWatcher.detectEndpoint(endpointId, lease);
+    assertManagedRecoveryCurrent(isCurrent);
+    await pool.reconcileEndpointClaims(endpointId);
+    assertManagedRecoveryCurrent(isCurrent);
+    return incidents;
+  }
+
+  async function wakeRestoredEndpoint(
+    endpointId: string,
+    lease: EndpointWorkLease,
+    isCurrent: () => boolean,
+  ): Promise<void> {
+    assertManagedRecoveryCurrent(isCurrent);
     await wakeRestoredSessionOwners({
       relay,
       observations,
       onError: (owner) => reportOperationalSafely(report, {
         level: "warn", code: "background_task_failed", component: `managed_${owner}_recovery`,
       }),
-    }, endpointId, lease);
+    }, endpointId, lease, isCurrent);
+    assertManagedRecoveryCurrent(isCurrent);
   }
 
-  async function afterRestoredEndpoint(endpointId: string, lease: EndpointWorkLease): Promise<void> {
-    const incidents = await ownershipWatcher.detectEndpoint(endpointId, lease);
-    await ownershipWatcher.release(incidents, lease);
+  async function afterRestoredEndpoint(
+    endpointId: string,
+    lease: EndpointWorkLease,
+    beforeIncidents: readonly ManagedOwnershipIncidentReceipt[],
+    isCurrent: () => boolean,
+  ): Promise<void> {
+    await releaseRestoredOwnershipIncidents({ ownership: ownershipWatcher }, endpointId, lease, beforeIncidents, isCurrent);
   }
 
   function recoverProjectEndpoint(endpointId: string): Promise<void> {
@@ -2807,7 +2907,7 @@ export async function buildProductionApp(
       await endpointManager.withReadyWorkLease(endpointId, async (lease) => {
         await recoverManagedEndpointReady(
           managedRecoveryOwner!, endpointId, lease,
-          () => reconcileRestoredEndpoint(endpointId, lease),
+          () => wakeRestoredEndpoint(endpointId, lease, () => isManagedRecoveryLeaseCurrent(endpointId, lease)),
         );
       });
       await operationReconciler?.endpointReady(endpointId);
@@ -2879,7 +2979,7 @@ export async function buildProductionApp(
       await endpointManager.withReadyWorkLease(endpoint.id, async (lease) => {
         await recoverManagedEndpointReady(
           managedRecoveryOwner!, endpoint.id, lease,
-          () => reconcileRestoredEndpoint(endpoint.id, lease),
+          () => wakeRestoredEndpoint(endpoint.id, lease, () => isManagedRecoveryLeaseCurrent(endpoint.id, lease)),
         );
       });
       await operationReconciler?.endpointReady(target.id);

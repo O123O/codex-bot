@@ -286,7 +286,7 @@ test("stopping managed recovery while native resume is blocked fences every succ
       observationPublications += 1;
       return { restored: true, restoredKeys: keys, settledKeys: [], failures: [] };
     },
-    beforeShared: async () => undefined,
+    beforeShared: async () => [],
     wakeShared: async () => undefined,
     afterShared: async () => undefined,
     onSafetyFailure: () => assert.fail("stale recovery must not reach safety handling"),
@@ -298,7 +298,7 @@ test("stopping managed recovery while native resume is blocked fences every succ
   await resumeStarted;
   const stopping = owner.stop();
   releaseResume();
-  assert.deepEqual(await recovering, { outcome: "pending" });
+  assert.deepEqual(await recovering, { recovery: "none", sharedWake: "stale" });
   await stopping;
 
   assert.equal(runtime.getSession("local", "thread-1", session.mapping_id)?.managementState, "unavailable");
