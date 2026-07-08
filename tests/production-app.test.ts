@@ -1,10 +1,259 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createChatHistoryAction, isUncertainAssistantTransportFailure, managedSessionNeedsRecovery, parseEndpointLifecycleCheckpoint, reconcileLifecycleAndOwnership, reconcileLifecycleTransitions, reconcileOwnershipBeforeRelay, reconcileOwnershipBeforeRelayWithLease, registryReloadPreservesWorkerMappings, removalRecoveryDecision, reportAssistantTerminalFailure, stopRelayRecovery, withRecoveredSessionLease, withRelayEndpointWorkLease } from "../src/production-app.ts";
+import {
+  createOperationReconciliationLoop,
+  createChatHistoryAction,
+  isUncertainAssistantTransportFailure,
+  managedSessionNeedsRecovery,
+  operationRecoveryAction,
+  operationRecoveryFailureDisposition,
+  operationRecoveryPreflight,
+  parseEndpointLifecycleCheckpoint,
+  processWorkerTerminalNotification,
+  reconcileLifecycleAndOwnership,
+  reconcileLifecycleTransitions,
+  reconcileOwnershipBeforeRelay,
+  reconcileOwnershipBeforeRelayWithLease,
+  recoverableOperationTarget,
+  registryReloadPreservesWorkerMappings,
+  removalRecoveryDecision,
+  reportAssistantTerminalFailure,
+  requestOperationRecoveryForAttempt,
+  runAssistantTerminalRecovery,
+  stopRelayRecovery,
+  stopRecoveryOwnerSet,
+  withRecoveredSessionLease,
+  withRelayEndpointWorkLease,
+  type OperationReconciliationPass,
+  type OperationRecoveryTarget,
+} from "../src/production-app.ts";
 import { AppError } from "../src/core/errors.ts";
 import { ChatAdapterRegistry } from "../src/chat/adapter-registry.ts";
 import type { EndpointWorkLease } from "../src/endpoints/types.ts";
 import { composeApp } from "../src/app.ts";
+import { RpcRequestTimeoutError } from "../src/app-server/rpc-client.ts";
+
+test("operation recovery waits only for the exact in-process tool handler", () => {
+  assert.equal(operationRecoveryAction({ state: "dispatched", activeHandler: true }), "wait_for_tool");
+  assert.equal(operationRecoveryAction({ state: "uncertain", activeHandler: true }), "wait_for_tool");
+  assert.equal(operationRecoveryAction({ state: "uncertain", activeHandler: false }), "attempt");
+  assert.equal(operationRecoveryAction({ state: "dispatched", activeHandler: false }), "attempt");
+});
+
+test("recoverable operation targets are exhaustive and fail closed", () => {
+  const sessionEndpoints = new Map([
+    ["worker-a", "endpoint-a"],
+    ["worker-b", "endpoint-b"],
+  ]);
+  const resolve = { defaultProjectEndpointId: "local", sessionEndpoint: (nickname: string) => sessionEndpoints.get(nickname) };
+  const target = (kind: string, args: Record<string, unknown> = {}, receipt?: unknown) => recoverableOperationTarget({ kind, args, ...(receipt === undefined ? {} : { receipt }) }, resolve);
+  const localKinds = [
+    "update_session_notes", "send_chat_message", "send_chat_attachment", "collect_messages",
+    "set_session_model", "set_reasoning_effort", "rename_session",
+  ];
+  for (const kind of localKinds) assert.deepEqual(target(kind), { policy: "local" }, kind);
+  assert.deepEqual(target("prepare_chat_attachment", { owner: "assistant" }), { policy: "local" });
+  assert.deepEqual(target("prepare_chat_attachment", { owner: "worker-a" }), { policy: "ready_endpoint", endpointId: "endpoint-a" });
+  for (const kind of ["create_session", "adopt_session"]) {
+    assert.deepEqual(target(kind, { endpoint: "endpoint-a" }), { policy: "ready_endpoint", endpointId: "endpoint-a" }, kind);
+    assert.deepEqual(target(kind, { endpoint: "endpoint-a" }, { endpoint: "endpoint-b" }), { policy: "ready_endpoint", endpointId: "endpoint-b" }, `${kind} checkpoint`);
+  }
+  assert.deepEqual(target("send_to_session", { nickname: "worker-a" }), { policy: "ready_endpoint", endpointId: "endpoint-a" });
+  for (const kind of ["set_goal", "pause_goal", "resume_goal", "cancel_goal", "interrupt_session"]) {
+    assert.deepEqual(target(kind, { nickname: "worker-b" }), { policy: "ready_endpoint", endpointId: "endpoint-b" }, kind);
+  }
+  for (const kind of ["unadopt_session", "archive_session"]) {
+    assert.deepEqual(target(kind, { nickname: "worker-a" }, { endpoint: "endpoint-b" }), { policy: "ready_endpoint", endpointId: "endpoint-b" }, kind);
+  }
+  for (const kind of ["disconnect_endpoint", "restart_endpoint"]) {
+    assert.deepEqual(target(kind, { endpoint: "endpoint-a" }), { policy: "endpoint_lifecycle", endpointId: "endpoint-a" }, kind);
+    assert.deepEqual(target(kind, { endpoint: "endpoint-a" }, { endpoint: "endpoint-b" }), { policy: "endpoint_lifecycle", endpointId: "endpoint-b" }, `${kind} checkpoint`);
+  }
+  assert.deepEqual(target("future_operation", { endpoint: "endpoint-a" }), { policy: "unknown" });
+  assert.deepEqual(target("send_to_session", { nickname: "missing" }), { policy: "unknown" });
+});
+
+test("ordinary operation recovery waits without endpoint activation while lifecycle work remains actionable", () => {
+  let readinessChecks = 0;
+  const ready = (endpointId: string) => { readinessChecks += 1; return endpointId === "endpoint-a"; };
+  assert.equal(operationRecoveryPreflight({ policy: "ready_endpoint", endpointId: "endpoint-b" }, ready), "wait_for_endpoint");
+  assert.equal(operationRecoveryPreflight({ policy: "ready_endpoint", endpointId: "endpoint-a" }, ready), "attempt");
+  assert.equal(operationRecoveryPreflight({ policy: "endpoint_lifecycle", endpointId: "endpoint-b" }, ready), "attempt");
+  assert.equal(operationRecoveryPreflight({ policy: "local" }, ready), "attempt");
+  assert.equal(operationRecoveryPreflight({ policy: "unknown" }, ready), "sleep");
+  assert.equal(readinessChecks, 2);
+});
+
+test("operation recovery retries only source-classified transient proof failures", () => {
+  assert.equal(operationRecoveryFailureDisposition(new RpcRequestTimeoutError("thread/read")), "retry");
+  assert.equal(operationRecoveryFailureDisposition(new AppError("OPERATION_UNCERTAIN", "temporary", { recovery: "ownership_unclassified" })), "retry");
+  assert.equal(operationRecoveryFailureDisposition(new AppError("ENDPOINT_UNAVAILABLE", "offline")), "wait_for_endpoint");
+  assert.equal(operationRecoveryFailureDisposition(new AppError("OPERATION_UNCERTAIN", "permanent")), "sleep");
+  assert.equal(operationRecoveryFailureDisposition(new Error("unknown")), "sleep");
+});
+
+test("classified operation retry is single-flight, capped, endpoint-scoped, and stopped safely", async () => {
+  type Timer = { callback: () => void; delay: number; cleared: boolean };
+  const timers: Timer[] = [];
+  const timerApi = {
+    setTimeout: (callback: () => void, delay: number) => {
+      const timer = { callback, delay, cleared: false };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimeout: (timer: Timer) => { timer.cleared = true; },
+  };
+  const ready = new Set(["endpoint-a"]);
+  let passes = 0;
+  let releaseFirst!: () => void;
+  const firstBlocked = new Promise<void>((resolve) => { releaseFirst = resolve; });
+  const outcomes: OperationReconciliationPass[] = [
+    {
+      outcome: { attempted: true, transientRetry: true, waitingForEndpoint: false },
+      transientTargets: new Map<string, OperationRecoveryTarget>([
+        ["local-op", { policy: "local" }],
+        ["a-op", { policy: "ready_endpoint", endpointId: "endpoint-a" }],
+        ["b-op", { policy: "ready_endpoint", endpointId: "endpoint-b" }],
+      ]),
+    },
+    { outcome: { attempted: true, transientRetry: false, waitingForEndpoint: true }, transientTargets: new Map() },
+  ];
+  const loop = createOperationReconciliationLoop({
+    reconcileOnce: async () => {
+      passes += 1;
+      if (passes === 1) await firstBlocked;
+      return outcomes.shift()!;
+    },
+    isEndpointReady: (endpointId) => ready.has(endpointId),
+    timers: timerApi,
+  });
+
+  const running = loop.request();
+  const joined = [loop.request(), loop.request(), loop.request()];
+  releaseFirst();
+  await Promise.all([running, ...joined]);
+  assert.equal(passes, 2, "many concurrent wakes coalesce into one follow-up pass");
+  assert.equal(timers.length, 0, "the final conclusive follow-up cancels an older retry intent");
+
+  outcomes.push({
+    outcome: { attempted: true, transientRetry: true, waitingForEndpoint: false },
+    transientTargets: new Map([["a-op", { policy: "ready_endpoint", endpointId: "endpoint-a" }]]),
+  });
+  await loop.request();
+  assert.equal(timers.length, 1);
+  assert.equal(timers[0]!.delay, 1_000);
+  ready.delete("endpoint-a");
+  loop.endpointUnavailable("endpoint-a");
+  assert.equal(timers[0]!.cleared, true);
+
+  outcomes.push({ outcome: { attempted: true, transientRetry: false, waitingForEndpoint: false }, transientTargets: new Map() });
+  ready.add("endpoint-a");
+  await loop.endpointReady("endpoint-a");
+  assert.equal(passes, 4);
+
+  const stale = timers[0]!.callback;
+  await loop.stop();
+  stale();
+  await Promise.resolve();
+  assert.equal(passes, 4, "a stale timer callback cannot publish work after stop");
+});
+
+test("operation retry backoff is capped at thirty seconds", async () => {
+  const scheduled: Array<{ callback: () => void; delay: number }> = [];
+  const loop = createOperationReconciliationLoop({
+    reconcileOnce: async () => ({
+      outcome: { attempted: true, transientRetry: true, waitingForEndpoint: false },
+      transientTargets: new Map([["local", { policy: "local" }]]),
+    }),
+    isEndpointReady: () => false,
+    timers: {
+      setTimeout: (callback, delay) => { const timer = { callback, delay }; scheduled.push(timer); return timer; },
+      clearTimeout: () => undefined,
+    },
+  });
+  await loop.request();
+  const expected = [1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000];
+  for (let index = 0; index < expected.length; index += 1) {
+    assert.equal(scheduled[index]!.delay, expected[index]);
+    if (index + 1 < expected.length) {
+      scheduled[index]!.callback();
+      await new Promise<void>((resolve) => { setImmediate(resolve); });
+    }
+  }
+  await loop.stop();
+});
+
+test("worker terminal reconciliation runs outside its endpoint lease and preserves enqueue ordering", async () => {
+  const lease: EndpointWorkLease = { endpointId: "endpoint-a", lifecycleGeneration: 1, endpointGeneration: 1, leaseId: "terminal" };
+  const seen: string[] = [];
+  let leaseHeld = false;
+  await processWorkerTerminalNotification({
+    endpoints: { withReadyWorkLease: async (_endpointId, run) => {
+      seen.push("lease:acquired");
+      leaseHeld = true;
+      try { return await run(lease); }
+      finally { leaseHeld = false; seen.push("lease:released"); }
+    } },
+    ownership: {
+      detectEndpoint: async () => { seen.push("ownership"); return []; },
+      release: async () => { seen.push("ownership:released"); },
+    },
+    relay: { handleNotification: async () => { seen.push("relay"); return "retry" as const; } },
+    reconcileOperations: async () => { assert.equal(leaseHeld, false); seen.push("operations"); },
+    enqueuePendingEvents: async () => { seen.push("events"); },
+  }, "endpoint-a", "turn/completed", { threadId: "thread-a", turn: { id: "turn-a" } });
+  assert.deepEqual(seen, ["lease:acquired", "ownership", "relay", "ownership", "ownership:released", "lease:released", "operations", "events"]);
+
+  seen.length = 0;
+  await assert.rejects(processWorkerTerminalNotification({
+    endpoints: { withReadyWorkLease: async (_endpointId, run) => {
+      seen.push("lease:acquired");
+      leaseHeld = true;
+      try { return await run(lease); }
+      finally { leaseHeld = false; seen.push("lease:released"); }
+    } },
+    ownership: {
+      detectEndpoint: async () => { seen.push("ownership"); return []; },
+      release: async () => undefined,
+    },
+    relay: { handleNotification: async () => { seen.push("relay"); throw new Error("retry"); } },
+    reconcileOperations: async () => { assert.equal(leaseHeld, false); seen.push("operations"); },
+    enqueuePendingEvents: async () => { seen.push("events"); },
+  }, "endpoint-a", "turn/completed", { threadId: "thread-a", turn: { id: "turn-a" } }), /retry/u);
+  assert.deepEqual(seen, ["lease:acquired", "ownership", "relay", "lease:released", "operations"]);
+});
+
+test("tool settlement and assistant terminalization request explicit operation recovery", async () => {
+  let requests = 0;
+  const requested = requestOperationRecoveryForAttempt({
+    listRecoverable: () => [{ attemptId: "attempt-a" }] as never,
+  }, "attempt-a", async () => { requests += 1; });
+  const skipped = requestOperationRecoveryForAttempt({
+    listRecoverable: () => [{ attemptId: "attempt-a" }] as never,
+  }, "attempt-b", async () => { requests += 1; });
+  await Promise.resolve();
+  assert.equal(requested, true);
+  assert.equal(skipped, false);
+  assert.equal(requests, 1);
+
+  const seen: string[] = [];
+  await runAssistantTerminalRecovery({
+    fenceTools: async () => { seen.push("fence"); },
+    reconcileOperations: async () => { seen.push("operations"); },
+    finalize: async () => { seen.push("finalize"); },
+    hasRecoverableOperations: () => true,
+  });
+  assert.deepEqual(seen, ["fence", "operations", "finalize", "operations"]);
+
+  seen.length = 0;
+  await runAssistantTerminalRecovery({
+    fenceTools: async () => { seen.push("fence"); },
+    reconcileOperations: async () => { seen.push("operations"); },
+    finalize: async () => { seen.push("finalize"); },
+    hasRecoverableOperations: () => false,
+  });
+  assert.deepEqual(seen, ["fence", "operations", "finalize"]);
+});
 
 test("assistant uncertainty is preserved even while the endpoint still reports ready", () => {
   assert.equal(isUncertainAssistantTransportFailure(new AppError("OPERATION_UNCERTAIN", "shutdown"), "ready"), true);
@@ -101,7 +350,7 @@ test("session operation recovery holds one endpoint lease for its complete callb
   const lease: EndpointWorkLease = { endpointId: "devbox", lifecycleGeneration: 1, endpointGeneration: 2, leaseId: "lease-1" };
   let acquisitions = 0;
   const result = await withRecoveredSessionLease({
-    withWorkLease: async (_id, _kind, run) => { acquisitions += 1; return run({} as never, lease); },
+    withReadyWorkLease: async (_id, run) => { acquisitions += 1; return run(lease); },
   }, "devbox", async (actual) => {
     assert.equal(actual, lease);
     return "recovered";
@@ -159,6 +408,45 @@ test("production shutdown drains blocked relay work before endpoint teardown", a
   release();
   await stopping;
   assert.deepEqual(seen, ["relay:start", "relay:end", "observations", "dashboard", "endpoint"]);
+});
+
+test("assistant startup failure drains every recovery owner before endpoint teardown", async () => {
+  let release!: () => void;
+  const blocked = new Promise<void>((resolve) => { release = resolve; });
+  const seen: string[] = [];
+  const app = composeApp([
+    { name: "endpoint", start: async () => undefined, stop: async () => { seen.push("endpoint"); } },
+    {
+      name: "recovery-owners",
+      start: async () => undefined,
+      stop: () => stopRecoveryOwnerSet({
+        operations: { stop: async () => { seen.push("operations:start"); await blocked; seen.push("operations:end"); } },
+        dispatcher: { stop: async () => { seen.push("dispatcher"); } },
+        relay: { stop: async () => { seen.push("relay"); } },
+        observations: { idle: async () => { seen.push("observations"); } },
+        finishDashboard: async () => { seen.push("dashboard"); },
+      }),
+    },
+    { name: "assistant", start: async () => { throw new Error("startup failed"); }, stop: async () => undefined },
+  ]);
+  const starting = app.start();
+  await new Promise<void>((resolve) => { setImmediate(resolve); });
+  assert.deepEqual(seen, ["operations:start"]);
+  release();
+  await assert.rejects(starting);
+  assert.deepEqual(seen, ["operations:start", "operations:end", "dispatcher", "relay", "observations", "dashboard", "endpoint"]);
+});
+
+test("recovery-owner cleanup settles later owners after an earlier cleanup fails", async () => {
+  const seen: string[] = [];
+  await assert.rejects(stopRecoveryOwnerSet({
+    operations: { stop: async () => { seen.push("operations"); throw new Error("operation cleanup failed"); } },
+    dispatcher: { stop: async () => { seen.push("dispatcher"); } },
+    relay: { stop: async () => { seen.push("relay"); throw new Error("relay cleanup failed"); } },
+    observations: { idle: async () => { seen.push("observations"); } },
+    finishDashboard: async () => { seen.push("dashboard"); },
+  }), /operation cleanup failed/u);
+  assert.deepEqual(seen, ["operations", "dispatcher", "relay", "observations", "dashboard"]);
 });
 
 test("periodic lifecycle reconciliation supplies per-session failure isolation to both phases", async () => {
