@@ -26,6 +26,7 @@ import {
   projectReadyRecoveryDisposition,
   parseEndpointLifecycleCheckpoint,
   processWorkerTerminalNotification,
+  stopOperationRecoveryBeforeTools,
   reconcileLifecycleAndOwnership,
   reconcileLifecycleTransitions,
   reconcileOwnershipBeforeRelay,
@@ -210,8 +211,32 @@ test("successful durable event wake settles only after enqueueInternal settles",
 test("operation recovery waits only for the exact in-process tool handler", () => {
   assert.equal(operationRecoveryAction({ state: "dispatched", activeHandler: true }), "wait_for_tool");
   assert.equal(operationRecoveryAction({ state: "uncertain", activeHandler: true }), "wait_for_tool");
+  assert.equal(operationRecoveryAction({ state: "dispatched", activeHandler: true, recoveryOwned: true }), "wait_for_tool");
+  assert.equal(operationRecoveryAction({ state: "uncertain", activeHandler: true, recoveryOwned: true }), "attempt");
   assert.equal(operationRecoveryAction({ state: "uncertain", activeHandler: false }), "attempt");
   assert.equal(operationRecoveryAction({ state: "dispatched", activeHandler: false }), "attempt");
+});
+
+test("shutdown stops operation waits before waiting for MCP handlers", async () => {
+  const events: string[] = [];
+  let releaseRecovery!: () => void;
+  const recoveryStopped = new Promise<void>((resolve) => { releaseRecovery = resolve; });
+  const stopping = stopOperationRecoveryBeforeTools({
+    stopOperationRecovery: () => { events.push("operation:stop"); return recoveryStopped; },
+    waitForTools: async () => { events.push("tools:wait"); releaseRecovery(); },
+  });
+  await stopping;
+  assert.deepEqual(events, ["operation:stop", "tools:wait"]);
+
+  let releaseTools!: () => void;
+  const toolsFinished = new Promise<void>((resolve) => { releaseTools = resolve; });
+  const rejected = stopOperationRecoveryBeforeTools({
+    stopOperationRecovery: async () => { throw new Error("recovery stop failed"); },
+    waitForTools: () => toolsFinished,
+  });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  releaseTools();
+  await assert.rejects(rejected, /recovery stop failed/u);
 });
 
 test("create recovery terminalizes only exact no-dispatch and lost-empty-thread proofs", () => {
@@ -1901,6 +1926,93 @@ test("classified operation retry is single-flight, capped, endpoint-scoped, and 
   stale();
   await Promise.resolve();
   assert.equal(passes, 4, "a stale timer callback cannot publish work after stop");
+});
+
+test("operation terminal waiters settle after reconciliation and reject on shutdown", async () => {
+  const states = new Map<string, "uncertain" | "succeeded" | "failed">([
+    ["success", "uncertain"],
+    ["shutdown", "uncertain"],
+  ]);
+  let passes = 0;
+  const loop = createOperationReconciliationLoop({
+    reconcileOnce: async () => {
+      passes += 1;
+      states.set("success", "succeeded");
+      return { outcome: { attempted: true, transientRetry: false, waitingForEndpoint: false }, transientTargets: new Map() };
+    },
+    isEndpointReady: () => true,
+    operationState: (operationId) => states.get(operationId),
+  });
+
+  await Promise.all([loop.waitForTerminal("success"), loop.waitForTerminal("success")]);
+  assert.equal(passes, 1);
+
+  states.set("already-failed", "failed");
+  await loop.waitForTerminal("already-failed");
+  assert.equal(passes, 1, "an already terminal operation does not start another pass");
+
+  const shutdown = loop.waitForTerminal("shutdown");
+  await loop.stop();
+  await assert.rejects(shutdown, /operation reconciliation stopped/u);
+});
+
+test("a canceled terminal waiter detaches without canceling exact durable recovery", async () => {
+  const states = new Map<string, "uncertain" | "succeeded">([["create", "uncertain"]]);
+  let passes = 0;
+  const loop = createOperationReconciliationLoop({
+    reconcileOnce: async () => {
+      passes += 1;
+      return {
+        outcome: { attempted: false, transientRetry: false, waitingForEndpoint: true },
+        transientTargets: new Map<string, OperationRecoveryTarget>([["create", { policy: "ready_endpoint", endpointId: "remote" }]]),
+      };
+    },
+    isEndpointReady: () => false,
+    operationState: (operationId) => states.get(operationId),
+  });
+  const abort = new AbortController();
+  const waiting = loop.waitForTerminal("create", abort.signal);
+  abort.abort(new Error("HTTP request closed"));
+  await assert.rejects(waiting, /HTTP request closed/u);
+  assert.equal(loop.recoveryOwns("create"), true, "request cancellation does not return durable ownership to an active handler");
+
+  states.set("create", "succeeded");
+  await loop.endpointReady("remote");
+  assert.equal(passes >= 1, true);
+  assert.equal(loop.recoveryOwns("create"), false);
+  await loop.stop();
+});
+
+test("a thrown reconciliation pass retains its terminal waiter and retries", async () => {
+  const scheduled: Array<{ callback: () => void; delay: number; cleared: boolean }> = [];
+  let state: "uncertain" | "succeeded" = "uncertain";
+  let passes = 0;
+  const loop = createOperationReconciliationLoop({
+    reconcileOnce: async () => {
+      passes += 1;
+      if (passes === 1) throw new Error("temporary reconciliation failure");
+      state = "succeeded";
+      return { outcome: { attempted: true, transientRetry: false, waitingForEndpoint: false }, transientTargets: new Map() };
+    },
+    isEndpointReady: () => true,
+    operationState: () => state,
+    timers: {
+      setTimeout: (callback, delay) => { const timer = { callback, delay, cleared: false }; scheduled.push(timer); return timer; },
+      clearTimeout: (timer: { cleared: boolean }) => { timer.cleared = true; },
+    },
+  });
+
+  const waiting = loop.waitForTerminal("create");
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(loop.recoveryOwns("create"), true);
+  assert.equal(scheduled[0]?.delay, 1_000);
+  loop.endpointUnavailable("remote");
+  assert.equal(scheduled[0]?.cleared, false, "endpoint pruning cannot cancel the only retry after a thrown pass");
+  scheduled[0]!.callback();
+  await waiting;
+  assert.equal(passes, 2);
+  assert.equal(loop.recoveryOwns("create"), false);
+  await loop.stop();
 });
 
 test("operation retry backoff is capped at thirty seconds", async () => {

@@ -31,7 +31,7 @@ import {
   type BackgroundFailureNotice,
 } from "./core/background-failure-reporter.ts";
 import type { OperationalEvent, OperationalEventSink } from "./core/operational-log.ts";
-import type { CanonicalChatSource, ManagementState } from "./core/types.ts";
+import type { CanonicalChatSource, ManagementState, OperationState } from "./core/types.ts";
 import { SessionDashboard } from "./assistant/session-dashboard.ts";
 import { activateAssistantProfileIdentity, resumeAssistantIdentity } from "./assistant/identity.ts";
 import { recordAssistantAuthenticationFailure } from "./assistant/auth-recovery.ts";
@@ -171,8 +171,24 @@ export type OperationRecoveryAction = "wait_for_tool" | "attempt";
 export function operationRecoveryAction(input: {
   state: RecoverableOperation["state"];
   activeHandler: boolean;
+  recoveryOwned?: boolean;
 }): OperationRecoveryAction {
-  return input.activeHandler ? "wait_for_tool" : "attempt";
+  return input.activeHandler && !(input.state === "uncertain" && input.recoveryOwned) ? "wait_for_tool" : "attempt";
+}
+
+export async function stopOperationRecoveryBeforeTools(dependencies: {
+  stopOperationRecovery(): Promise<void>;
+  waitForTools(): Promise<void>;
+}): Promise<void> {
+  let stopping: Promise<void>;
+  try { stopping = dependencies.stopOperationRecovery(); }
+  catch (error) { stopping = Promise.reject(error); }
+  let waiting: Promise<void>;
+  try { waiting = dependencies.waitForTools(); }
+  catch (error) { waiting = Promise.reject(error); }
+  const [stopped, tools] = await Promise.allSettled([stopping, waiting]);
+  if (stopped.status === "rejected") throw stopped.reason;
+  if (tools.status === "rejected") throw tools.reason;
 }
 
 export type OperationRecoveryTarget =
@@ -556,6 +572,8 @@ interface OperationTimerApi {
 
 export interface OperationReconciliationLoop {
   request(): Promise<void>;
+  waitForTerminal(operationId: string, signal?: AbortSignal): Promise<void>;
+  recoveryOwns(operationId: string): boolean;
   endpointReady(endpointId: string): Promise<void>;
   endpointUnavailable(endpointId: string): void;
   stop(): Promise<void>;
@@ -564,6 +582,7 @@ export interface OperationReconciliationLoop {
 export function createOperationReconciliationLoop(options: {
   reconcileOnce(): Promise<OperationReconciliationPass>;
   isEndpointReady(endpointId: string): boolean;
+  operationState?(operationId: string): OperationState | undefined;
   timers?: OperationTimerApi;
 }): OperationReconciliationLoop {
   let operationReconciliationTail: Promise<void> = Promise.resolve();
@@ -574,7 +593,33 @@ export function createOperationReconciliationLoop(options: {
   let retryAttempt = 0;
   let timerGeneration = 0;
   let stopped = false;
+  let ownedPassFailureRetryActive = false;
   let transientTargets = new Map<string, OperationRecoveryTarget>();
+  const recoveryOwnedOperations = new Set<string>();
+  type TerminalWaiter = { resolve(): void; reject(error: Error): void; detach(): void };
+  const terminalWaiters = new Map<string, Set<TerminalWaiter>>();
+
+  const removeTerminalWaiter = (operationId: string, waiter: TerminalWaiter): void => {
+    waiter.detach();
+    const waiters = terminalWaiters.get(operationId);
+    waiters?.delete(waiter);
+    if (waiters?.size === 0) terminalWaiters.delete(operationId);
+  };
+
+  const settleTerminalWaiters = (): void => {
+    if (!options.operationState) return;
+    for (const operationId of recoveryOwnedOperations) {
+      const state = options.operationState(operationId);
+      if (state !== "succeeded" && state !== "failed") continue;
+      recoveryOwnedOperations.delete(operationId);
+      const waiters = terminalWaiters.get(operationId) ?? new Set<TerminalWaiter>();
+      terminalWaiters.delete(operationId);
+      for (const waiter of waiters) {
+        waiter.detach();
+        waiter.resolve();
+      }
+    }
+  };
 
   const isActionable = (target: OperationRecoveryTarget): boolean => target.policy === "local" || target.policy === "endpoint_lifecycle"
     || (target.policy === "ready_endpoint" && options.isEndpointReady(target.endpointId));
@@ -609,7 +654,17 @@ export function createOperationReconciliationLoop(options: {
     let queuedBeforeFirstPass = followupRequested;
     do {
       followupRequested = false;
-      finalPass = await options.reconcileOnce();
+      try {
+        finalPass = await options.reconcileOnce();
+      } catch (error) {
+        if (!stopped && recoveryOwnedOperations.size > 0) {
+          ownedPassFailureRetryActive = true;
+          armRetryTimer();
+        }
+        throw error;
+      }
+      ownedPassFailureRetryActive = false;
+      settleTerminalWaiters();
       if (queuedBeforeFirstPass) {
         queuedBeforeFirstPass = false;
         followupRequested = true;
@@ -625,7 +680,10 @@ export function createOperationReconciliationLoop(options: {
     if (stopped) return Promise.resolve();
     if (running) {
       followupRequested = true;
-      return running;
+      const current = running;
+      return current.then(() => {
+        if (!stopped && followupRequested) return request();
+      });
     }
     clearRetryTimer(false);
     followupRequested = false;
@@ -638,13 +696,51 @@ export function createOperationReconciliationLoop(options: {
 
   return {
     request,
+    waitForTerminal: (operationId, signal) => {
+      if (!options.operationState) return Promise.reject(new Error("operation terminal state reader is unavailable"));
+      if (stopped) return Promise.reject(new Error("operation reconciliation stopped"));
+      const state = options.operationState(operationId);
+      if (state === "succeeded" || state === "failed") return Promise.resolve();
+      if (state !== "uncertain") return Promise.reject(new Error("only an uncertain operation can be handed to reconciliation"));
+      const newlyOwned = !recoveryOwnedOperations.has(operationId);
+      recoveryOwnedOperations.add(operationId);
+      const pending = new Promise<void>((resolve, reject) => {
+        let abort: (() => void) | undefined;
+        const waiter: TerminalWaiter = {
+          resolve,
+          reject,
+          detach: () => { if (abort) signal?.removeEventListener("abort", abort); },
+        };
+        abort = () => {
+          removeTerminalWaiter(operationId, waiter);
+          reject(signal?.reason instanceof Error ? signal.reason : new Error("operation terminal wait was canceled"));
+        };
+        const waiters = terminalWaiters.get(operationId) ?? new Set<TerminalWaiter>();
+        waiters.add(waiter);
+        terminalWaiters.set(operationId, waiters);
+        if (signal?.aborted) abort();
+        else signal?.addEventListener("abort", abort, { once: true });
+      });
+      settleTerminalWaiters();
+      if (newlyOwned && recoveryOwnedOperations.has(operationId)) void request().catch(() => undefined);
+      return pending;
+    },
+    recoveryOwns: (operationId) => recoveryOwnedOperations.has(operationId),
     endpointReady: () => request(),
     endpointUnavailable: () => {
-      if (![...transientTargets.values()].some(isActionable)) clearRetryTimer(false);
+      if (!ownedPassFailureRetryActive && ![...transientTargets.values()].some(isActionable)) clearRetryTimer(false);
     },
     stop: async () => {
       if (!stopped) {
         stopped = true;
+        const error = new Error("operation reconciliation stopped");
+        for (const waiters of terminalWaiters.values()) for (const waiter of waiters) {
+          waiter.detach();
+          waiter.reject(error);
+        }
+        terminalWaiters.clear();
+        recoveryOwnedOperations.clear();
+        ownedPassFailureRetryActive = false;
         followupRequested = false;
         transientTargets.clear();
         clearRetryTimer(true);
@@ -1930,7 +2026,14 @@ export async function buildProductionApp(
         attemptScope = new AttemptScope(db, operations, { maxCollectCount: config.maxCollectCount, attachments });
         assistant = new AssistantRuntime(db, operations, deliveries, { binding: currentOwnerBinding });
         const actions = buildActions();
-        const tools = createAssistantTools(operations, actions, { maxCollectCount: config.maxCollectCount, attemptScope });
+        const tools = createAssistantTools(operations, actions, {
+          maxCollectCount: config.maxCollectCount,
+          attemptScope,
+          waitForTerminal: (operationId, signal) => {
+            if (!operationReconciler) throw new AppError("ENDPOINT_UNAVAILABLE", "operation reconciliation is not ready");
+            return operationReconciler.waitForTerminal(operationId, signal);
+          },
+        });
         mcp = new LoopbackMcpServer(tools, assistant, {
           host: config.mcpHost,
           port: config.mcpPort,
@@ -2144,6 +2247,7 @@ export async function buildProductionApp(
         operationReconciler = createOperationReconciliationLoop({
           reconcileOnce: reconcileOperationsOnce,
           isEndpointReady: isRecoveryEndpointReady,
+          operationState: (operationId) => operations.get(operationId)?.state,
         });
         endpointReadyBuffer = createEndpointReadyBuffer({ recover: recoverProjectEndpoint });
         scheduler = new AssistantScheduler();
@@ -2286,7 +2390,10 @@ export async function buildProductionApp(
         schedulerAccepting = false;
         const active = assistant.current();
         assistant.fenceToolAdmission();
-        await assistant.waitForTools();
+        await stopOperationRecoveryBeforeTools({
+          stopOperationRecovery: () => operationReconciler?.stop() ?? Promise.resolve(),
+          waitForTools: () => assistant.waitForTools(),
+        });
         if (active?.turnId) {
           let interruptTimer: ReturnType<typeof setTimeout> | undefined;
           await Promise.race([
@@ -2983,7 +3090,11 @@ export async function buildProductionApp(
         session: (nickname) => registry.get(nickname),
       });
     await runOperationRecoveryChains(entries, resolveTarget, async ({ operation }, target) => {
-      if (operationRecoveryAction({ state: operation.state, activeHandler: assistant.hasActiveTools(operation.attemptId) }) === "wait_for_tool") return true;
+      if (operationRecoveryAction({
+        state: operation.state,
+        activeHandler: assistant.hasActiveTools(operation.attemptId),
+        recoveryOwned: operationReconciler?.recoveryOwns(operation.id) ?? false,
+      }) === "wait_for_tool") return true;
       const preflight = operationRecoveryPreflight(target, isRecoveryEndpointReady);
       if (preflight === "sleep") return true;
       if (preflight === "wait_for_endpoint") {

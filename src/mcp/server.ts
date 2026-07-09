@@ -139,6 +139,7 @@ export class LoopbackMcpServer {
           callId: `mcp:${String(extra.requestId)}`,
           ...(active.turnId ? { turnId: active.turnId } : {}),
           ...(toolFence === undefined ? {} : { toolFence }),
+          ...(extra.signal ? { signal: extra.signal as AbortSignal } : {}),
         };
         try {
           const result = await this.tools[name](context, args);

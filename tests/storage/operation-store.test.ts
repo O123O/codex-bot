@@ -76,6 +76,24 @@ test("recoverable operations retain their canonical arguments and stable call id
   assert.equal(store.listRecoverable()[0]?.recoveryProtocol, 1);
 });
 
+test("durable operation errors are projected consistently and cleared by recovered success", () => {
+  const store = new OperationStore(createTestDatabase());
+  const operation = store.prepare({ contextId: "ctx", attemptId: "attempt", callId: "call", kind: "create_session", args: { nickname: "docs" } });
+  store.markDispatched(operation.id);
+  store.fail(operation.id, { message: "SSH process failed (exit 1)" }, true);
+
+  for (const projected of [
+    store.get(operation.id),
+    store.findForCall("attempt", "call", "create_session"),
+    store.listForAttempt("attempt")[0],
+    store.listRecoverable()[0],
+  ]) assert.deepEqual(projected?.error, { message: "SSH process failed (exit 1)" });
+
+  store.succeed(operation.id, { nickname: "docs", mapping_id: "mapping-1" });
+  assert.equal(store.get(operation.id)?.error, undefined);
+  assert.equal(store.findForCall("attempt", "call", "create_session")?.error, undefined);
+});
+
 test("a durable current attempt is actionable after process-local tool handlers are lost", () => {
   const db = createTestDatabase();
   const store = new OperationStore(db);
