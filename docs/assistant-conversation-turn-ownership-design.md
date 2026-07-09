@@ -41,7 +41,8 @@ The two identities answer different questions and must not be conflated.
 | Assistant attempt and admitted MCP tools | QiYan SQLite plus in-process tool fence | Side-effect scope and safe terminal settlement |
 | Live native turn ID and lifecycle | Codex App Server | Start, steer, interrupt, and completion |
 | Client user message ID | QiYan-generated correlation token | Reconcile only a submission whose response was genuinely lost |
-| `turn/started` and `turn/completed` notifications | App Server | Authoritative native identity and live lifecycle events |
+| Correlated `turn/started` notification | App Server | Native identity authority when the start response is unavailable |
+| `turn/completed` notification | App Server | Terminal authority for an already-bound exact ID; otherwise uncertainty evidence |
 | Reconstructed thread history | Recovery evidence | Exact-ID terminal proof, submission-presence/absence evidence, and final content; never mint a live ID |
 
 A native turn ID is an opaque exact token. QiYan stores it because `turn/steer`, `turn/interrupt`, and `turn/completed` correlation require it. It does not determine which chat conversation owns the turn; the durable conversation binding does.
@@ -54,7 +55,7 @@ A native turn ID is an opaque exact token. QiYan stores it because `turn/steer`,
 4. Only one native start or steer submission may be unresolved at a time.
 5. A successful `turn/start` response binds the capacity claim, lease, and attempt source to exactly the returned turn ID.
 6. No `thread/read`, rollout-derived record, client-ID match, or unrelated notification may replace that successful turn ID.
-7. A live completion normally terminalizes only the exact stored native turn ID. The sole unknown-ID exception is `starting(turnId=NULL, unresolved clientId=C)` plus an authoritative completion notification whose own turn payload contains `C`; that transition atomically binds the notification ID and enters `terminalizing` without passing through an active/steerable state.
+7. A live completion terminalizes only the exact stored native turn ID. An unknown-ID completion never establishes identity; while the exact local start request is in flight it may be buffered only for later comparison with an authoritative start response or correlated `turn/started` notification.
 8. MCP admission requires the singleton lease, its matching active attempt, phase `starting` or `active`, and an open attempt tool fence. An active lease additionally requires a non-null exact native turn ID consistent with the attempt mirror.
 9. Beginning terminalization closes new MCP tool admission before admitted tools settle and durable operations reconcile; MCP admission derives from lease phase so a crash between the lease CAS and the attempt fence is closed safely.
 10. Repeated start/steer/completion/recovery events are idempotent and cannot release another attempt's lease.
@@ -97,7 +98,7 @@ On success, the returned ID must equal the stored expected turn ID. A different 
 During a healthy App Server connection, `turn/completed` is the live terminal authority.
 
 1. Known-ID path: `active(turnId=A) + completed(A)` compare-and-sets the singleton lease to `terminalizing(A)`. Every other ID is ignored.
-2. Unknown-ID recovery path: `starting(turnId=NULL, unresolved clientId=C)` plus a `turn/completed(A)` notification whose own turn items contain `C` atomically confirms the start as submitted, binds `A`, and enters `terminalizing(A)`. It never opens an active/steerable interval. An uncorrelated completion may remain only in the bounded in-flight-start buffer; history cannot manufacture its correlation.
+2. Unknown-ID path: `starting(turnId=NULL)` plus `turn/completed(A)` records durable `unknown_terminal_observed` uncertainty but does not bind `A`. During the exact local start request it may remain in the bounded buffer; only a later authoritative start response or correlated `turn/started(A)` may consume it and enter `terminalizing(A)`.
 3. After dispatcher settlement, production rereads the singleton lease and continues only when it is `terminalizing` with the notification's exact turn ID. It then resolves the active attempt by that lease's exact attempt ID plus turn ID. An unmatched, orphan, or historical attempt cannot enter fencing or finalization merely because its turn ID appears in a notification.
 4. MCP admission reads the lease phase, so either successful lease transition closes new admission immediately. The attempt fence is then incremented for durable audit and in-process tool settlement.
 5. Release native turn capacity as soon as the exact App Server completion is observed.
@@ -113,13 +114,13 @@ The assistant dispatcher is the sole durable recovery owner when QiYan did not r
 
 - When the assistant supplies a caller-owned capacity claim, `AppServerPool.startTurn` sends `turn/start` once. Success is returned unchanged. A possibly-dispatched failure is surfaced as uncertain without a history read and without releasing the caller's provisional claim. The dispatcher persists and reconciles that uncertainty. The pool may retain self-reconciliation for implicit non-assistant callers.
 - If `turn/start` becomes uncertain, do not retransmit it. Full history may prove that the client-correlated input is present or absent, but a history turn ID is not sufficient provenance to become the live steer/completion token.
-- An App Server `turn/started` or `turn/completed` notification whose turn items contain the unresolved start's exact client user message ID may supply the native ID because the notification is a native lifecycle surface with direct correlation. Without that evidence or the original successful response, retain the uncertain lease. Do not infer provenance from uniqueness, recency, UUID shape, or a `rollout-` prefix.
+- An App Server `turn/started` notification whose turn items contain the unresolved start's exact client user message ID may supply the native ID because it is a native start surface with direct correlation. A `turn/completed` notification cannot supply an unknown ID. Without a successful response or correlated start notification, retain the uncertain lease. Do not infer provenance from uniqueness, recency, UUID shape, or a `rollout-` prefix.
 - If `turn/steer` becomes uncertain, use its unique client ID only inside the already known exact expected turn. History may prove admission to that same turn, but may not rebind the lease to another turn.
 - If history conclusively proves no effect, restore the source according to the existing policy.
 - If history is incomplete, ambiguous, or contains only reconstructed identity, retain the durable uncertain state. Do not guess, release the lease, steer, interrupt, or admit another conversation.
 - On startup or endpoint reconnect, reconcile a lease that already has an exact turn ID by exact ID only. History may prove that exact turn terminal; it may not replace it.
 
-A start with no received turn ID remains non-steerable but continues to admit MCP calls for its exact singleton starting lease because the native turn may really be running. Those calls are scoped by QiYan attempt/source identity and do not resolve native identity. A correlated terminal notification may bind and immediately terminalize. Once an authoritative ID is bound, every native lifecycle operation is exact-ID-only.
+A start with no received turn ID remains non-steerable but continues to admit MCP calls for its exact singleton starting lease because the native turn may really be running. Those calls are scoped by QiYan attempt/source identity and do not resolve native identity. An unknown completion records durable uncertainty, suppressing absence proof, polling, and retransmission until an authoritative start identity arrives. Once an authoritative ID is bound, every native lifecycle operation is exact-ID-only.
 
 ### Notification/response race
 
@@ -127,7 +128,7 @@ An authoritative lifecycle notification can arrive while the original `turn/star
 
 - `turn/started(A,C)` followed by successful response `A` is one idempotent active binding.
 - `turn/started(A,C)` followed by a transport rejection remains bound to `A`; the rejection cannot regress the source to uncertain.
-- Correlated `turn/completed(A,C)` followed by response/rejection `A` remains terminalizing and finalizes once; it cannot reopen active state.
+- `turn/completed(A,C)` before response is buffered without binding; response `A` consumes it and terminalizes once, while response rejection retains durable uncertainty.
 - If notification binds `A` and the later response reports `B`, retain `A`, keep the lease closed to conflicting progress, and report an identity conflict. Never overwrite the lease or pump another conversation.
 
 Failure handling first reads the durable submission/lease disposition. It marks uncertainty only while that submission is still unresolved. Notification correlation always uses the notification turn's own user item and exact client ID, never a separate history candidate.
@@ -142,7 +143,7 @@ The one-time legacy conversation cutover follows the same rule. An existing exac
 
 1. Add a pool regression where `turn/start` successfully returns active turn `A`, while a possible `thread/read` would contain terminal client-correlated turn `B`. Assert that the response and capacity claim remain bound to `A` and that no history read occurs. Update the existing test that currently expects replacement.
 2. For a caller-supplied claim, make `AppServerPool.startTurn` surface a possibly-dispatched failure without reading history or releasing the claim. Keep implicit non-assistant recovery isolated in the pool. The dispatcher remains the one durable assistant uncertainty owner.
-3. Change dispatcher reconciliation so history cannot bind an unknown start ID. Bind an uncertain start only from a correlated App Server lifecycle notification; synthetic/history-only evidence remains uncertain. A steer reconciliation must match its existing expected turn exactly.
+3. Change dispatcher reconciliation so history and completion notifications cannot bind an unknown start ID. Bind an uncertain start only from a successful response or correlated App Server `turn/started`; synthetic/history-only evidence remains uncertain. A steer reconciliation must match its existing expected turn exactly.
 4. Split or CAS-check store confirmation semantics: start returns `bound | already_same | already_terminal_same | conflict`; steer only confirms membership in the existing exact turn and cannot rewrite lease or attempt identity. Start success/failure and lifecycle-notification handlers must be idempotent across their race.
 5. Gate production fencing/finalization by rereading the exact singleton `terminalizing` lease after dispatcher settlement, then resolving only that lease's attempt ID and turn ID. Never find an old/orphan attempt by notification turn ID alone.
 6. Make runtime hydration/current context and `registerTool` require the same singleton `starting` or `active` lease, matching active attempt, and open tool fence. Active leases additionally require a non-null exact ID consistent with the attempt mirror. Terminalizing and orphan attempts reject new MCP calls. Make the native turn ID optional in provisional tool context instead of manufacturing a `pending:*` ID.
@@ -162,10 +163,10 @@ No schema migration is required. The existing lease binding, native turn ID, att
 - Completion for `A`: fence tools, finalize once, release lease, then start the oldest queued conversation.
 - Lost start response with one synthetic/full-history client-ID match: remain uncertain, keep the exact starting attempt's MCP admission open, and do not steer or bind that history ID.
 - Lost start response followed by a correlated authoritative `turn/started`: bind that notification ID without retransmission.
-- Lost start response followed by a correlated authoritative `turn/completed`: bind and terminalize without a transient active/steerable state; starting tools may already exist, but new admission closes immediately.
+- Lost start response followed by `turn/completed`: retain durable `unknown_terminal_observed`, keep the starting attempt tool-admissible, and do not prove absence or retransmit.
 - `turn/started(A,C)` before response, then response `A`: one active binding and no history read.
 - `turn/started(A,C)` before response, then rejection: remain bound to `A`, not uncertain.
-- Correlated `turn/completed(A,C)` before response/rejection `A`: remain terminalizing and finalize once.
+- `turn/completed(A,C)` before response `A`: buffer then terminalize exactly A once; before response rejection, retain uncertainty without binding.
 - Notification binds `A`, later response reports `B`: retain `A`, do not pump another conversation, and surface a safe identity conflict.
 - Lost steer response correlated inside exact expected turn: mark admitted; correlation in another turn must not rebind.
 - Restart with exact active turn ID: use exact-ID history only; terminal history for another ID has no effect.

@@ -259,6 +259,23 @@ export class ConversationStore {
     if (!this.markUncertainIfUnresolved(attemptId, contextId)) this.conflict("submission cannot become uncertain");
   }
 
+  observeUnknownStartTerminal(attemptId: string, contextId: string): boolean {
+    return inTransaction(this.db, () => {
+      const lease = this.lease();
+      const member = this.membersForAttempt(attemptId).find((candidate) => candidate.contextId === contextId);
+      if (!lease || lease.attemptId !== attemptId || lease.primaryContextId !== contextId
+        || lease.phase !== "starting" || lease.turnId || !member || member.submissionKind !== "start"
+        || !new Set(["start_submitting", "uncertain"]).has(member.state)) return false;
+      const changed = this.db.prepare(`UPDATE assistant_attempt_sources SET state = 'uncertain', updated_at = ?
+        WHERE attempt_id = ? AND context_id = ? AND submission_kind = 'start' AND state = 'start_submitting'`)
+        .run(Date.now(), attemptId, contextId).changes;
+      if (this.db.prepare(`UPDATE assistant_turn_lease SET steer_paused = 1, pause_reason = 'unknown_terminal_observed'
+        WHERE singleton = 1 AND attempt_id = ? AND phase = 'starting' AND turn_id IS NULL`)
+        .run(attemptId).changes !== 1) this.conflict("unknown terminal observation changed with the start lease");
+      return changed === 1;
+    });
+  }
+
   markUncertainIfUnresolved(attemptId: string, contextId: string): boolean {
     return inTransaction(this.db, () => {
       const lease = this.lease();

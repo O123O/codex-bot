@@ -173,17 +173,60 @@ test("turn/started remains authoritative when the pending start response rejects
   await dispatcher.stop();
 });
 
-test("a correlated completion binds an unresolved start directly to terminalizing", async () => {
-  const { store, runner, dispatcher } = fixture();
+test("a correlated completion waits for the authoritative start response before terminalizing", async () => {
+  const deferred: string[] = [];
+  const { store, pool, runner, dispatcher } = fixture(1, { onDeferredTerminal: (turn) => { deferred.push(turn.id); } });
+  const markedTerminal: string[] = [];
+  const markTurnTerminal = pool.markTurnTerminal.bind(pool);
+  pool.markTurnTerminal = (endpointId, threadId, turnId) => {
+    markedTerminal.push(turnId);
+    markTurnTerminal(endpointId, threadId, turnId);
+  };
   await dispatcher.accept(chat("first"));
   const clientId = runner.starts[0]!.params.clientUserMessageId;
   await dispatcher.terminal({ id: "turn-a", status: "completed", itemsView: "full", items: [{ type: "userMessage", clientId }] });
-  assert.deepEqual({ phase: store.lease()?.phase, turnId: store.lease()?.turnId }, { phase: "terminalizing", turnId: "turn-a" });
+  assert.deepEqual({ phase: store.lease()?.phase, turnId: store.lease()?.turnId }, { phase: "starting", turnId: undefined });
+  assert.deepEqual(deferred, []);
+  assert.deepEqual(markedTerminal, []);
 
-  runner.starts[0]!.result.reject(new Error("response lost"));
+  runner.starts[0]!.result.resolve({ turn: { id: "turn-a", status: "inProgress", itemsView: "full", items: [] } });
   await dispatcher.idle();
   assert.deepEqual({ phase: store.lease()?.phase, turnId: store.lease()?.turnId }, { phase: "terminalizing", turnId: "turn-a" });
   assert.equal(store.membersForAttempt(store.lease()!.attemptId)[0]?.state, "submitted");
+  assert.deepEqual(deferred, ["turn-a"]);
+  assert.deepEqual(markedTerminal, ["turn-a"]);
+  await dispatcher.stop();
+});
+
+test("a client-correlated reconstructed completion cannot replace the live start response", async () => {
+  const db = createTestDatabase();
+  const deliveries = new DeliveryStore(db);
+  const store = new ConversationStore(db, deliveries);
+  const endpoint: AppServerEndpoint = { id: "assistant-local", state: "ready", request: async () => { throw new Error("unused"); } };
+  const pool = new AppServerPool([endpoint], { maxConcurrentTurns: 1 });
+  const runner = new FakeRunner();
+  const runtime = new AssistantRuntime(db, new OperationStore(db), deliveries, { binding: route("chat-1") });
+  const dispatcher = new ConversationDispatcher(store, pool, runner, {
+    endpointId: "assistant-local", threadId: "assistant", runtimeObserver: runtime, retryMs: 10,
+  });
+  await dispatcher.accept(chat("first"));
+  await dispatcher.accept(chat("outsider", "chat-2"));
+  const clientId = runner.starts[0]!.params.clientUserMessageId;
+
+  await dispatcher.terminal({
+    id: "rollout-2061", status: "completed", itemsView: "full", items: [{ type: "userMessage", clientId }],
+  });
+  assert.deepEqual({ phase: store.lease()?.phase, turnId: store.lease()?.turnId }, { phase: "starting", turnId: undefined });
+  assert.equal(store.membersForAttempt(store.lease()!.attemptId)[0]?.state, "uncertain");
+  assert.equal(store.lease()?.pauseReason, "unknown_terminal_observed");
+  assert.equal(runtime.current()?.contextId, "first");
+
+  runner.starts[0]!.result.resolve({ turn: { id: "turn-live", status: "inProgress", itemsView: "full", items: [] } });
+  await dispatcher.idle();
+  assert.deepEqual({ phase: store.lease()?.phase, turnId: store.lease()?.turnId }, { phase: "active", turnId: "turn-live" });
+  assert.equal(runtime.current()?.turnId, "turn-live");
+  assert.equal(runner.steers.length, 0);
+  assert.equal(db.prepare("SELECT state FROM source_contexts WHERE id = 'outsider'").get()!.state, "pending");
   await dispatcher.stop();
 });
 
@@ -693,20 +736,99 @@ test("unrelated early completion is cleared after successful start settlement", 
   await dispatcher.stop();
 });
 
-test("unrelated early completion is cleared after failed start settlement", async () => {
-  const { store, runner, dispatcher } = fixture();
+test("an early unknown completion survives failed start settlement without retransmission", async () => {
+  const { db, store, pool, runner, dispatcher } = fixture();
   runner.history = { status: "idle", turns: [] };
   await dispatcher.accept(chat("first"));
   await dispatcher.terminal({ id: "turn-b", status: "completed", itemsView: "full", items: [] });
   runner.starts[0]!.result.reject(new Error("response lost"));
   await dispatcher.idle();
   await dispatcher.enqueueInternal("retry");
-  await waitFor(() => runner.starts.length === 2);
-  runner.starts[1]!.result.resolve({ turn: { id: "turn-b", status: "inProgress", itemsView: "full", items: [] } });
   await dispatcher.idle();
 
-  assert.deepEqual({ phase: store.lease()?.phase, turnId: store.lease()?.turnId }, { phase: "active", turnId: "turn-b" });
+  assert.equal(runner.starts.length, 1);
+  assert.equal(pool.activeTurnCount, 1);
+  assert.deepEqual({ phase: store.lease()?.phase, turnId: store.lease()?.turnId, reason: store.lease()?.pauseReason }, {
+    phase: "starting", turnId: undefined, reason: "unknown_terminal_observed",
+  });
+  assert.equal(db.prepare("SELECT state FROM assistant_attempt_sources").get()!.state, "uncertain");
   await dispatcher.stop();
+});
+
+test("a late correlated completion cannot mint an identity after the start response is lost", async () => {
+  const { db, store, runner, dispatcher } = fixture();
+  runner.history = { status: "active", turns: [] };
+  await dispatcher.accept(chat("first"));
+  const clientId = runner.starts[0]!.params.clientUserMessageId;
+  runner.starts[0]!.result.reject(new Error("response lost"));
+  await dispatcher.idle();
+
+  await dispatcher.terminal({
+    id: "rollout-late", status: "completed", itemsView: "full", items: [{ type: "userMessage", clientId }],
+  });
+  assert.deepEqual({ phase: store.lease()?.phase, turnId: store.lease()?.turnId, reason: store.lease()?.pauseReason }, {
+    phase: "starting", turnId: undefined, reason: "unknown_terminal_observed",
+  });
+  assert.equal(db.prepare("SELECT state FROM assistant_attempt_sources").get()!.state, "uncertain");
+  await dispatcher.stop();
+});
+
+test("a late completion wins over an in-flight idle-history absence proof", async () => {
+  const { db, store, runner, dispatcher } = fixture();
+  let readStarted!: () => void;
+  let releaseRead!: (value: ThreadSnapshot) => void;
+  const started = new Promise<void>((resolve) => { readStarted = resolve; });
+  const blockedRead = new Promise<ThreadSnapshot>((resolve) => { releaseRead = resolve; });
+  runner.readThread = async () => {
+    runner.historyReads += 1;
+    readStarted();
+    return blockedRead;
+  };
+  await dispatcher.accept(chat("first"));
+  const clientId = runner.starts[0]!.params.clientUserMessageId;
+  runner.starts[0]!.result.reject(new Error("response lost"));
+  await started;
+
+  await dispatcher.terminal({
+    id: "rollout-late", status: "completed", itemsView: "full", items: [{ type: "userMessage", clientId }],
+  });
+  releaseRead({ status: "idle", turns: [] });
+  await dispatcher.idle();
+
+  assert.equal(runner.starts.length, 1);
+  assert.equal(runner.historyReads, 1);
+  assert.deepEqual({ phase: store.lease()?.phase, turnId: store.lease()?.turnId, reason: store.lease()?.pauseReason }, {
+    phase: "starting", turnId: undefined, reason: "unknown_terminal_observed",
+  });
+  assert.equal(db.prepare("SELECT state FROM assistant_attempt_sources").get()!.state, "uncertain");
+  await dispatcher.stop();
+});
+
+test("unknown terminal evidence survives dispatcher reconstruction without recovery polling", async () => {
+  const first = fixture();
+  first.runner.history = { status: "idle", turns: [] };
+  await first.dispatcher.accept(chat("first"));
+  await first.dispatcher.terminal({ id: "turn-unknown", status: "completed", itemsView: "full", items: [] });
+  first.runner.starts[0]!.result.reject(new Error("response lost"));
+  await first.dispatcher.idle();
+  await first.dispatcher.stop();
+
+  const endpoint: AppServerEndpoint = { id: "assistant-local", state: "ready", request: async () => { throw new Error("unused"); } };
+  const recoveredPool = new AppServerPool([endpoint], { maxConcurrentTurns: 1 });
+  const recoveredRunner = new FakeRunner();
+  recoveredRunner.history = { status: "idle", turns: [] };
+  const recovered = new ConversationDispatcher(first.store, recoveredPool, recoveredRunner, {
+    endpointId: "assistant-local", threadId: "assistant", retryMs: 10,
+  });
+  await recovered.recover();
+  await recovered.idle();
+
+  assert.equal(recoveredRunner.starts.length, 0);
+  assert.equal(recoveredRunner.historyReads, 0);
+  assert.deepEqual({ phase: first.store.lease()?.phase, reason: first.store.lease()?.pauseReason }, {
+    phase: "starting", reason: "unknown_terminal_observed",
+  });
+  await recovered.stop();
 });
 
 test("direct terminal start paths account for one completed conversation period", async () => {
@@ -719,9 +841,10 @@ test("direct terminal start paths account for one completed conversation period"
   await correlated.dispatcher.terminal({
     id: "turn-a", status: "completed", itemsView: "full", items: [{ type: "userMessage", clientId }],
   });
-  assert.equal(correlatedPeriods, 1);
-  correlated.runner.starts[0]!.result.reject(new Error("response lost"));
+  assert.equal(correlatedPeriods, 0);
+  correlated.runner.starts[0]!.result.resolve({ turn: { id: "turn-a", status: "inProgress", itemsView: "full", items: [] } });
   await correlated.dispatcher.idle();
+  assert.equal(correlatedPeriods, 1);
   await correlated.dispatcher.stop();
 
   const responseScheduler = new AssistantScheduler();
