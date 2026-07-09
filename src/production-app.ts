@@ -1,5 +1,5 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { chmod, mkdir, readFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { dirname, join, posix, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
@@ -95,6 +95,7 @@ import { EndpointManager } from "./endpoints/manager.ts";
 import { SshGenerationPlanner } from "./endpoints/ssh-config.ts";
 import { SshRemoteClient, SshRuntime } from "./endpoints/ssh-runtime.ts";
 import { openSshUnixTunnel, SshEndpoint } from "./endpoints/ssh-endpoint.ts";
+import { prepareLocalSshEndpointSocket, prepareLocalSshRuntimeRoot } from "./endpoints/local-runtime.ts";
 import { WebSocketWire } from "./app-server/websocket-wire.ts";
 import { SshHost } from "./endpoints/ssh-host.ts";
 import { WorkspaceRouter } from "./endpoints/workspace-router.ts";
@@ -1941,9 +1942,7 @@ export async function buildProductionApp(
           validateEnvironment: () => assistantProfile.assertIntact(),
           minimumVersion: MINIMUM_SUPPORTED_CODEX_VERSION,
         });
-        const sshRuntimeRoot = join(dataDir, "ssh-runtime");
-        await mkdir(sshRuntimeRoot, { recursive: true, mode: 0o700 });
-        await chmod(sshRuntimeRoot, 0o700);
+        const sshRuntimeRoot = await prepareLocalSshRuntimeRoot(dataDir);
         const helperSource = await readFile(join(remoteAssetRoot, "qiyan-ssh-helper.mjs"));
         const planner = new SshGenerationPlanner({
           sshBinary: "ssh",
@@ -1958,10 +1957,7 @@ export async function buildProductionApp(
             const generation = await planner.createGeneration(definition.id);
             const remote = new SshRemoteClient({ plan: generation.plan, helperSource });
             const remoteRuntime = new SshRuntime({ endpointId: definition.id, remote, assetRoot: remoteAssetRoot });
-            const socketRoot = join(sshRuntimeRoot, "sockets", createHash("sha256").update(definition.id).digest("hex").slice(0, 24));
-            await mkdir(socketRoot, { recursive: true, mode: 0o700 });
-            await chmod(socketRoot, 0o700);
-            const localSocket = join(socketRoot, "app-server.sock");
+            const { socketRoot, socketPath: localSocket } = await prepareLocalSshEndpointSocket(sshRuntimeRoot, definition.id);
             const remoteEndpoint = new SshEndpoint({
               id: definition.id,
               runtime: remoteRuntime,
