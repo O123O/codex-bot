@@ -138,6 +138,35 @@ test("reports terminal metadata after final persistence without copying the body
   assert.equal(JSON.stringify(observed).includes("done"), false);
 });
 
+test("an idle status recovers a missing completion notification through worker delivery", async () => {
+  let observer!: SessionObservationProcessor;
+  const value = await fixture((event, lease) => observer.observeTerminal(event, lease));
+  const dashboard = new SessionDashboardStore(value.db);
+  observer = new SessionObservationProcessor(dashboard, value.registry, value.runtime, {
+    now: () => 100,
+    readThread: async (endpointId, threadId, lease) => (await value.pool.request<any>(
+      endpointId, "thread/read", { threadId, includeTurns: true }, undefined, lease,
+    )).thread,
+    readGoal: async () => ({ goal: null }),
+    onIdleTurn: async ({ endpointId, threadId, turnId }) => {
+      await value.relay.handleNotification(endpointId, "turn/completed", { threadId, turn: { id: turnId } }, workLease);
+    },
+    onChanged: () => undefined,
+    onError: (error) => { throw error; },
+  });
+  value.endpoint.turns = [terminal("baseline"), terminal("missed")];
+  value.runtime.setActiveTurn("local", "worker", mappingId, "missed");
+
+  observer.accept("local", "thread/status/changed", { threadId: "worker", status: { type: "idle" } });
+  await observer.idle();
+
+  assert.deepEqual(value.deliveries.listReady().map((delivery) => delivery.body), ["[payments] done"]);
+  assert.equal((value.db.prepare("SELECT COUNT(*) AS n FROM events WHERE turn_id = 'missed'").get() as { n: number }).n, 1);
+  assert.equal(dashboard.facts({ endpointId: "local", threadId: "worker" }).lastWorkerEvent?.turn_id, "missed");
+  assert.equal(value.runtime.activeTurn("local", "worker", mappingId), undefined);
+  assert.equal(dashboard.pendingNotifications().length, 0);
+});
+
 test("a final terminal projection wakes once only after the inserted event is ready", async () => {
   let releaseTerminal!: () => void;
   const terminalBarrier = new Promise<void>((resolve) => { releaseTerminal = resolve; });

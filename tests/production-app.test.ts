@@ -2295,7 +2295,7 @@ test("production shutdown drains blocked relay work before endpoint teardown", a
       start: async () => undefined,
       stop: () => stopRelayRecovery(
         { stop: async () => { seen.push("relay:start"); await blocked; seen.push("relay:end"); } },
-        { idle: async () => { seen.push("observations"); } },
+        { stop: async () => { seen.push("observations"); } },
         async () => { seen.push("dashboard"); },
       ),
     },
@@ -2303,10 +2303,26 @@ test("production shutdown drains blocked relay work before endpoint teardown", a
   await app.start();
   const stopping = app.stop();
   await new Promise<void>((resolve) => { setImmediate(resolve); });
-  assert.deepEqual(seen, ["relay:start"]);
+  assert.deepEqual(seen, ["observations", "relay:start"]);
   release();
   await stopping;
-  assert.deepEqual(seen, ["relay:start", "relay:end", "observations", "dashboard", "endpoint"]);
+  assert.deepEqual(seen, ["observations", "relay:start", "relay:end", "dashboard", "endpoint"]);
+});
+
+test("shutdown drains idle completion recovery while the relay is still live", async () => {
+  let relayStopped = false;
+  const seen: string[] = [];
+
+  await stopRecoveryOwnerSet({
+    observations: { stop: async () => {
+      seen.push("observations");
+      assert.equal(relayStopped, false);
+      seen.push("idle-terminal-recovery");
+    } },
+    relay: { stop: async () => { relayStopped = true; seen.push("relay"); } },
+  });
+
+  assert.deepEqual(seen, ["observations", "idle-terminal-recovery", "relay"]);
 });
 
 test("production shutdown drains live ready recovery before every owner and endpoint", async () => {
@@ -2350,7 +2366,7 @@ test("production shutdown drains live ready recovery before every owner and endp
   release();
   await live;
   await stopping;
-  assert.deepEqual(seen, ["ready:start", "ready:end", "managed", "relay", "observations", "operations", "dispatcher", "endpoint"]);
+  assert.deepEqual(seen, ["ready:start", "ready:end", "managed", "observations", "relay", "operations", "dispatcher", "endpoint"]);
 });
 
 test("assistant startup failure drains every recovery owner before endpoint teardown", async () => {
@@ -2375,10 +2391,10 @@ test("assistant startup failure drains every recovery owner before endpoint tear
   ]);
   const starting = app.start();
   await new Promise<void>((resolve) => { setImmediate(resolve); });
-  assert.deepEqual(seen, ["managed", "relay", "observations", "operations:start"]);
+  assert.deepEqual(seen, ["managed", "observations", "relay", "operations:start"]);
   release();
   await assert.rejects(starting);
-  assert.deepEqual(seen, ["managed", "relay", "observations", "operations:start", "operations:end", "dispatcher", "dashboard", "endpoint"]);
+  assert.deepEqual(seen, ["managed", "observations", "relay", "operations:start", "operations:end", "dispatcher", "dashboard", "endpoint"]);
 });
 
 test("recovery-owner cleanup settles later owners after an earlier cleanup fails", async () => {
@@ -2390,7 +2406,7 @@ test("recovery-owner cleanup settles later owners after an earlier cleanup fails
     observations: { stop: async () => { seen.push("observations"); } },
     finishDashboard: async () => { seen.push("dashboard"); },
   }), /relay cleanup failed/u);
-  assert.deepEqual(seen, ["relay", "observations", "operations", "dispatcher", "dashboard"]);
+  assert.deepEqual(seen, ["observations", "relay", "operations", "dispatcher", "dashboard"]);
 });
 
 test("lifecycle reconciliation supplies per-session failure isolation to both phases", async () => {

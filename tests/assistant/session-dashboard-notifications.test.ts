@@ -21,6 +21,7 @@ function fixture(options: {
     clearTimeout(handle: any): void;
   };
   onError?: (error: unknown) => void;
+  onIdleTurn?: (event: { endpointId: string; threadId: string; turnId: string }) => Promise<void>;
 } = {}) {
   const db = createTestDatabase();
   const store = new SessionDashboardStore(db);
@@ -42,12 +43,50 @@ function fixture(options: {
       errors.push(error);
       options.onError?.(error);
     },
+    ...(options.onIdleTurn ? { onIdleTurn: options.onIdleTurn } : {}),
     ...(options.classifyFailure ? { classifyFailure: options.classifyFailure } : {}),
     ...(options.retryMs === undefined ? {} : { retryMs: options.retryMs }),
     ...(options.timers ? { timers: options.timers } : {}),
   });
   return { db, store, runtime, processor, changes: () => changes, errors };
 }
+
+test("an idle status durably recovers a missing terminal notification before clearing its turn", async () => {
+  const clock = fakeTimers();
+  const attempts: Array<{ endpointId: string; threadId: string; turnId: string }> = [];
+  let fail = true;
+  let value: ReturnType<typeof fixture>;
+  value = fixture({
+    onIdleTurn: async (event) => {
+      attempts.push(event);
+      assert.equal(value.runtime.activeTurn("local", "thread-1", mappingId), "turn-1");
+      if (fail) throw new RpcRequestTimeoutError("thread/read");
+    },
+    classifyFailure: (error) => error instanceof RpcRequestTimeoutError ? "retry" : "sleep",
+    retryMs: 25,
+    timers: clock.api,
+  });
+  value.runtime.setActiveTurn("local", "thread-1", mappingId, "turn-1");
+
+  value.processor.accept("local", "thread/status/changed", { threadId: "thread-1", status: { type: "idle" } });
+  await value.processor.idle();
+
+  assert.deepEqual(attempts, [{ endpointId: "local", threadId: "thread-1", turnId: "turn-1" }]);
+  assert.equal(value.store.pendingNotifications().length, 1);
+  assert.equal(value.runtime.activeTurn("local", "thread-1", mappingId), "turn-1");
+  assert.equal(clock.timers.length, 1);
+
+  fail = false;
+  await settleTimer(clock.timers[0]!);
+  await value.processor.idle();
+
+  assert.deepEqual(attempts, [
+    { endpointId: "local", threadId: "thread-1", turnId: "turn-1" },
+    { endpointId: "local", threadId: "thread-1", turnId: "turn-1" },
+  ]);
+  assert.equal(value.store.pendingNotifications().length, 0);
+  assert.equal(value.runtime.activeTurn("local", "thread-1", mappingId), undefined);
+});
 
 interface FakeTimer {
   callback: () => void;

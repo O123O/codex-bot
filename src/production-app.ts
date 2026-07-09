@@ -1581,11 +1581,11 @@ export function withRelayEndpointWorkLease<T>(
 
 export async function stopRelayRecovery(
   relay: Pick<EventRelay, "stop">,
-  observations: Pick<SessionObservationProcessor, "idle">,
+  observations: Pick<SessionObservationProcessor, "stop">,
   finishDashboard: () => Promise<void>,
 ): Promise<void> {
+  await observations.stop();
   await relay.stop();
-  await observations.idle();
   await finishDashboard();
 }
 
@@ -1602,8 +1602,8 @@ export async function stopRecoveryOwnerSet(dependencies: {
   for (const stop of [
     () => dependencies.ready?.stop(),
     () => dependencies.managed?.stop(),
-    () => dependencies.relay?.stop(),
     () => dependencies.observations?.stop(),
+    () => dependencies.relay?.stop(),
     () => dependencies.operations?.stop(),
     () => dependencies.dispatcher?.stop(),
     () => dependencies.finishDashboard?.(),
@@ -2190,6 +2190,12 @@ export async function buildProductionApp(
             lease,
           )).thread,
           readGoal: (endpointId, threadId) => pool.request(endpointId, "thread/goal/get", { threadId }),
+          onIdleTurn: ({ endpointId, threadId, turnId }) => processWorkerTerminalNotification({
+            endpoints: endpointManager,
+            ownership: ownershipWatcher,
+            relay,
+            reconcileOperations,
+          }, endpointId, "turn/completed", { threadId, turn: { id: turnId } }),
           onChanged: () => runBackground(() => renderDashboardSafely(), () => recordBackgroundFailure("dashboard rendering")),
           classifyFailure: (error) => error instanceof RpcRequestTimeoutError
             ? "retry"

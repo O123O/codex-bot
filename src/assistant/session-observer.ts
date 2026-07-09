@@ -15,6 +15,7 @@ interface ObserverOptions {
   readGoal(endpointId: string, threadId: string): Promise<unknown>;
   onChanged(): void;
   onError(error: unknown): void;
+  onIdleTurn?(event: { endpointId: string; threadId: string; turnId: string }): Promise<void>;
   classifyFailure?(error: unknown): "retry" | "endpoint" | "sleep";
   retryMs?: number;
   timers?: ObservationTimers;
@@ -247,6 +248,17 @@ export class SessionObservationProcessor {
     }
     if (notification.method === "thread/status/changed") {
       const nativeStatus = String(params.status.type);
+      const completedTurnId = nativeStatus === "idle"
+        ? this.runtime.activeTurn(notification.endpointId, identity.threadId, mappingId)
+        : undefined;
+      if (completedTurnId) {
+        await this.options.onIdleTurn?.({
+          endpointId: notification.endpointId,
+          threadId: identity.threadId,
+          turnId: completedTurnId,
+        });
+        if (!this.runIsCurrent(notification.endpointId, epoch)) return "stale";
+      }
       const activeTurn = nativeStatus === "active" ? this.runtime.activeTurn(notification.endpointId, identity.threadId, mappingId) : undefined;
       const before = this.visibleRuntime(identity, mappingId);
       this.runtime.reconcileNativeState(notification.endpointId, identity.threadId, mappingId, nativeStatus, activeTurn, notification.sequence);
