@@ -210,6 +210,49 @@ test("adopt resumes a disk-backed notLoaded thread before enforcing idle", async
   assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/read", "thread/resume", "thread/read"]);
 });
 
+test("adopt manages a loaded empty thread without requiring a nonexistent rollout resume", async () => {
+  const initialized: Array<{ allowUnmaterialized?: boolean }> = [];
+  const { registry, endpoint, lifecycle } = await fixture({
+    initialize: async (_identity, _path, _lease, options) => { initialized.push(options ?? {}); },
+    release: () => undefined,
+  });
+  endpoint.turns = [];
+  endpoint.unmaterialized = true;
+  endpoint.failResume = true;
+
+  await lifecycle.adopt("payments", "local", "thread-1");
+
+  assert.equal(required(registry).lifecycle_state, "managed");
+  assert.deepEqual(endpoint.calls.map((call) => [call.method, call.params?.includeTurns]), [
+    ["thread/read", true],
+    ["thread/read", false],
+  ]);
+  assert.deepEqual(initialized, [{ allowUnmaterialized: true }]);
+});
+
+test("loaded-empty adoption failure removes only its reservation and preserves ownership evidence", async () => {
+  const released: string[] = [];
+  const { registry, endpoint, lifecycle } = await fixture({
+    initialize: async () => { throw new AppError("SESSION_BUSY", "external first turn was classified"); },
+    release: (identity) => { released.push(identity.mapping_id); },
+  });
+  endpoint.turns = [];
+  endpoint.unmaterialized = true;
+  endpoint.failResume = true;
+
+  await assert.rejects(
+    lifecycle.adopt("payments", "local", "thread-1", undefined, "mapping-empty-failure"),
+    (error: unknown) => error instanceof AppError && error.code === "SESSION_BUSY",
+  );
+
+  assert.equal(registry.get("payments"), undefined);
+  assert.deepEqual(endpoint.calls.map((call) => [call.method, call.params?.includeTurns]), [
+    ["thread/read", true],
+    ["thread/read", false],
+  ]);
+  assert.deepEqual(released, []);
+});
+
 test("adopt resumes an exact read-not-loaded thread and validates it before promotion", async () => {
   const { registry, endpoint, runtime, lifecycle } = await fixture();
   endpoint.readErrors.push(new JsonRpcResponseError(-32600, "thread not loaded: thread-1"));
@@ -455,6 +498,47 @@ test("adopting reconciliation resumes an exact read-not-loaded durable mapping",
   assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/read", "thread/resume", "thread/read"]);
 });
 
+test("adopting reconciliation promotes a loaded empty thread without rollout resume", async () => {
+  const { dir, registry, endpoint, lifecycle } = await fixture();
+  await registry.reserve("payments", {
+    endpoint: "local", thread_id: "thread-1", project_dir: dir, mapping_id: "mapping-empty", lifecycle_state: "adopting",
+  });
+  endpoint.turns = [];
+  endpoint.unmaterialized = true;
+  endpoint.failResume = true;
+
+  await lifecycle.reconcileAdopting();
+
+  assert.equal(required(registry).lifecycle_state, "managed");
+  assert.deepEqual(endpoint.calls.map((call) => [call.method, call.params?.includeTurns]), [
+    ["thread/read", true],
+    ["thread/read", false],
+  ]);
+});
+
+test("loaded-empty adopting reconciliation failure retains its mapping without unsubscribe", async () => {
+  const released: string[] = [];
+  const { dir, registry, endpoint, lifecycle } = await fixture({
+    initialize: async () => { throw new AppError("OPERATION_UNCERTAIN", "ownership scan is temporarily unavailable"); },
+    release: (identity) => { released.push(identity.mapping_id); },
+  });
+  await registry.reserve("payments", {
+    endpoint: "local", thread_id: "thread-1", project_dir: dir, mapping_id: "mapping-empty-retry", lifecycle_state: "adopting",
+  });
+  endpoint.turns = [];
+  endpoint.unmaterialized = true;
+  endpoint.failResume = true;
+
+  await assert.rejects(lifecycle.reconcileAdopting(), /temporarily unavailable/u);
+
+  assert.equal(required(registry).lifecycle_state, "adopting");
+  assert.deepEqual(endpoint.calls.map((call) => [call.method, call.params?.includeTurns]), [
+    ["thread/read", true],
+    ["thread/read", false],
+  ]);
+  assert.deepEqual(released, []);
+});
+
 test("startup reconciliation can isolate one unavailable transitional mapping", async () => {
   const { dir, registry, endpoint, runtime, lifecycle } = await fixture();
   const adopting = { endpoint: "local", thread_id: "thread-1", project_dir: dir, mapping_id: "mapping-offline", lifecycle_state: "adopting" as const };
@@ -479,6 +563,25 @@ test("startup reconstructs a missing runtime row for an exact managed generation
   assert.equal(resumed.thread.id, "thread-1");
   assert.equal(runtime.getSession("local", "thread-1", "mapping-durable")?.managementState, "managed");
   assert.equal(runtime.currentEpoch("local", "thread-1", "mapping-durable")?.baselineTurnId, "historical");
+});
+
+test("managed recovery restores a loaded empty thread without rollout resume", async () => {
+  const { dir, registry, endpoint, runtime, lifecycle } = await fixture();
+  await registry.createManaged("payments", {
+    endpoint: "local", thread_id: "thread-1", project_dir: dir, mapping_id: "mapping-empty",
+  });
+  endpoint.turns = [];
+  endpoint.unmaterialized = true;
+  endpoint.failResume = true;
+
+  const recovered = await lifecycle.reconcileManaged("payments", required(registry));
+
+  assert.equal(recovered.thread.id, "thread-1");
+  assert.equal(runtime.getSession("local", "thread-1", "mapping-empty")?.managementState, "managed");
+  assert.deepEqual(endpoint.calls.map((call) => [call.method, call.params?.includeTurns]), [
+    ["thread/read", true],
+    ["thread/read", false],
+  ]);
 });
 
 test("managed recovery checks ownership before resuming an exact read-not-loaded mapping", async () => {

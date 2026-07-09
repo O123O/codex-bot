@@ -105,6 +105,7 @@ export class SessionLifecycle {
     await this.withMutationLease(endpointId, (lease) => this.gate.run(endpointId, threadId, async () => {
       this.requireAvailable(nickname, endpointId, threadId);
       let resumed = false;
+      let resumeAttempted = false;
       let reserved: RegistrySession | undefined;
       try {
         let before: ThreadResponse;
@@ -132,7 +133,8 @@ export class SessionLifecycle {
         await this.registry.reserve(nickname, reserved);
         this.runtime.setSession(endpointId, threadId, reserved.mapping_id, "adopting", before.thread.status.type);
         let after = before;
-        if (!resumed) {
+        if (!resumed && this.requiresResume(before.thread)) {
+          resumeAttempted = true;
           const response = await this.pool.request<ThreadResponse>(endpointId, "thread/resume", { threadId }, undefined, lease);
           resumed = true;
           this.requireThreadIdentity(response.thread, threadId);
@@ -157,6 +159,10 @@ export class SessionLifecycle {
             }
           } catch {
             throw new AppError("OPERATION_UNCERTAIN", "adoption failed and its subscription rollback could not be confirmed");
+          }
+        } else if (reserved && !resumeAttempted) {
+          if (!await this.registry.removeIfMatch(nickname, reserved)) {
+            throw new AppError("OPERATION_UNCERTAIN", "adoption failed and its reservation rollback could not be confirmed");
           }
         }
         throw error;
@@ -252,7 +258,7 @@ export class SessionLifecycle {
           await this.verifyCwd(session.endpoint, before.thread.cwd, project.path, lease);
           this.assertExact(nickname, expected, "adopting");
           let native = before;
-          if (!resumed) {
+          if (!resumed && this.requiresResume(before.thread)) {
             const response = await this.pool.request<ThreadResponse>(session.endpoint, "thread/resume", { threadId: session.thread_id }, undefined, lease);
             resumed = true;
             this.requireThreadIdentity(response.thread, session.thread_id);
@@ -340,7 +346,7 @@ export class SessionLifecycle {
       }
       this.assertExact(nickname, expected, "managed");
       let authoritative = before;
-      if (!resumed) {
+      if (!resumed && this.requiresResume(before.thread)) {
         resumed = await this.pool.request<ThreadResponse>(session.endpoint, "thread/resume", { threadId: session.thread_id }, undefined, lease);
         assertCurrent();
         this.requireThreadIdentity(resumed.thread, session.thread_id);
@@ -443,6 +449,10 @@ export class SessionLifecycle {
     if (thread.status.type !== "idle" && thread.status.type !== "notLoaded") {
       throw new AppError("SESSION_BUSY", `thread ${thread.id} is ${thread.status.type}`);
     }
+  }
+
+  private requiresResume(thread: ThreadView): boolean {
+    return thread.status.type === "notLoaded" || thread.turns.length > 0;
   }
 
   private requireThreadIdentity(thread: ThreadView, threadId: string): void {
