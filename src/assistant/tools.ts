@@ -148,10 +148,13 @@ export function createAssistantTools(
             ? error
             : new AppError("OPERATION_UNCERTAIN", `${name} terminalized before its result could be committed`);
         }
-        const uncertain = sideEffecting && !isProvenNoEffect(error);
+        const uncertain = sideEffecting && !isProvenNoEffect(error, operations.get(operation.id));
         const failure = { message: error instanceof Error ? error.message : String(error) };
-        if (uncertain) operations.fail(operation.id, failure, true, context.toolFence);
-        else operations.failAndUnbind(operation.id, failure, context.toolFence);
+        if (uncertain) {
+          operations.fail(operation.id, failure, true, context.toolFence);
+          throw new AppError("OPERATION_UNCERTAIN", `${name} may already have taken effect; wait for durable reconciliation before retrying`);
+        }
+        operations.failAndUnbind(operation.id, failure, context.toolFence);
         throw error;
       }
     };
@@ -167,4 +170,7 @@ const provenNoEffectCodes = new Set([
   "UNSUPPORTED_CAPABILITY", "ATTACHMENT_INVALID", "OPERATION_CONFLICT", "CAPACITY_EXCEEDED", "PERMISSION_BLOCKED",
   "CONFIGURATION_ERROR",
 ]);
-function isProvenNoEffect(error: unknown): boolean { return error instanceof AppError && provenNoEffectCodes.has(error.code); }
+function isProvenNoEffect(error: unknown, operation?: OperationRecord): boolean {
+  if (operation?.kind === "create_session" && isRecord(operation.receipt) && operation.receipt.dispatchStarted === true) return false;
+  return error instanceof AppError && provenNoEffectCodes.has(error.code);
+}

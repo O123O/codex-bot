@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { AppError } from "../../src/core/errors.ts";
+import { LocalWorkspaceHost, type WorkspaceHost } from "../../src/endpoints/ssh-host.ts";
 import { preparedProjectWorkspaceFromCheckpoint, ProjectWorkspacePolicy } from "../../src/sessions/project-workspace.ts";
 
 async function fixture() {
@@ -22,6 +23,37 @@ async function fixture() {
     dataDir: await realpath(dataDir),
     registryPath,
     policy: new ProjectWorkspacePolicy({ userHome, qiyanHome, assistantWorkdir, dataDir, registryPath }),
+  };
+}
+
+function policyFor(value: Awaited<ReturnType<typeof fixture>>, host: WorkspaceHost): ProjectWorkspacePolicy {
+  return new ProjectWorkspacePolicy({
+    userHome: value.userHome,
+    qiyanHome: value.qiyanHome,
+    assistantWorkdir: value.assistantWorkdir,
+    dataDir: value.dataDir,
+    registryPath: value.registryPath,
+    host,
+  });
+}
+
+function failingHost(userHome: string, fail: (method: "lstat" | "realpath", path: string) => Error | undefined): WorkspaceHost {
+  const local = new LocalWorkspaceHost(userHome);
+  return {
+    endpointId: "devbox",
+    home: () => local.home(),
+    lstat: async (path) => {
+      const error = fail("lstat", path);
+      if (error) throw error;
+      return local.lstat(path);
+    },
+    realpath: async (path) => {
+      const error = fail("realpath", path);
+      if (error) throw error;
+      return local.realpath(path);
+    },
+    mkdir: (path, options) => local.mkdir(path, options),
+    chmod: (path, mode) => local.chmod(path, mode),
   };
 }
 
@@ -108,6 +140,24 @@ test("dispatch revalidation detects replacement after its canonical safety check
   };
 
   await assert.rejects(value.policy.assertDispatchable(prepared), /changed unexpectedly/);
+});
+
+test("workspace policy preserves typed endpoint failures from finalize and dispatch revalidation", async () => {
+  const value = await fixture();
+  const prepared = await value.policy.prepareCreate("remote", "~/Documents/remote");
+
+  const finalizeFailure = new AppError("ENDPOINT_UNAVAILABLE", "SSH process failed (exit 1)");
+  let targetStats = 0;
+  const finalizePolicy = policyFor(value, failingHost(value.userHome, (method, path) => {
+    if (method === "lstat" && path === prepared.path && ++targetStats === 2) return finalizeFailure;
+    return undefined;
+  }));
+  await assert.rejects(finalizePolicy.prepareExisting(prepared.path), (error: unknown) => error === finalizeFailure);
+
+  const dispatchFailure = new AppError("ENDPOINT_UNAVAILABLE", "SSH process failed (exit 1)");
+  const dispatchPolicy = policyFor(value, failingHost(value.userHome, (method, path) =>
+    method === "lstat" && path === prepared.path ? dispatchFailure : undefined));
+  await assert.rejects(dispatchPolicy.assertDispatchable(prepared), (error: unknown) => error === dispatchFailure);
 });
 
 test("prepared directories are retained when later work fails", async () => {

@@ -182,6 +182,57 @@ test("configuration rejection is recorded as proven no effect", async () => {
   assert.deepEqual(await tools.create_session({ ...base, callId: "second" }, { nickname: "docs", project_dir: "/tmp/docs" }), { nickname: "docs" });
 });
 
+test("a side-effecting failure returns fixed uncertainty while retaining its original durable cause", async () => {
+  const db = createTestDatabase();
+  const operations = new OperationStore(db);
+  operations.createSourceContext({ id: "ctx", kind: "telegram", sourceId: "uncertain", rawText: "create it", attachmentIds: [] });
+  let calls = 0;
+  const tools = createAssistantTools(operations, {
+    create_session: async () => {
+      calls += 1;
+      throw new AppError("ENDPOINT_UNAVAILABLE", "SSH process failed (exit 1)");
+    },
+  }, { maxCollectCount: 20 });
+  const context = { sourceContextId: "ctx", attemptId: "a", turnId: "t", callId: "create" };
+
+  await assert.rejects(tools.create_session(context, { nickname: "docs" }), (error: unknown) => {
+    assert.equal(error instanceof AppError && error.code === "OPERATION_UNCERTAIN", true);
+    assert.equal((error as Error).message, "create_session may already have taken effect; wait for durable reconciliation before retrying");
+    assert.doesNotMatch(String(error), /SSH process/u);
+    return true;
+  });
+  const row = db.prepare("SELECT state, error_json FROM operations WHERE call_id = 'create'").get() as { state: string; error_json: string };
+  assert.equal(row.state, "uncertain");
+  assert.deepEqual(JSON.parse(row.error_json), { message: "SSH process failed (exit 1)" });
+  await assert.rejects(tools.create_session(context, { nickname: "docs" }), (error: unknown) => error instanceof AppError && error.code === "OPERATION_UNCERTAIN");
+  assert.equal(calls, 1, "uncertain creation is never redispatched");
+});
+
+test("a create failure after native dispatch is uncertain even for a normally no-effect error code", async () => {
+  const db = createTestDatabase();
+  const operations = new OperationStore(db);
+  operations.createSourceContext({ id: "ctx", kind: "telegram", sourceId: "post-dispatch", rawText: "create it", attachmentIds: [] });
+  const tools = createAssistantTools(operations, {
+    create_session: async (_args, context) => {
+      context.checkpoint({ endpoint: "devbox", dispatchStarted: true });
+      throw new AppError("CONFIGURATION_ERROR", "project workspace changed unexpectedly");
+    },
+  }, { maxCollectCount: 20 });
+  const context = { sourceContextId: "ctx", attemptId: "a", turnId: "t", callId: "create-after-dispatch" };
+
+  await assert.rejects(tools.create_session(context, { nickname: "docs", endpoint: "devbox" }), (error: unknown) => {
+    assert.equal(error instanceof AppError && error.code === "OPERATION_UNCERTAIN", true);
+    assert.equal((error as Error).message, "create_session may already have taken effect; wait for durable reconciliation before retrying");
+    return true;
+  });
+  const row = db.prepare("SELECT state, receipt_json, error_json FROM operations WHERE call_id = 'create-after-dispatch'").get() as {
+    state: string; receipt_json: string; error_json: string;
+  };
+  assert.equal(row.state, "uncertain");
+  assert.deepEqual(JSON.parse(row.receipt_json), { endpoint: "devbox", dispatchStarted: true });
+  assert.deepEqual(JSON.parse(row.error_json), { message: "project workspace changed unexpectedly" });
+});
+
 test("manager note updates require a bounded partial patch and expose stable operation order", async () => {
   const db = createTestDatabase();
   const operations = new OperationStore(db);

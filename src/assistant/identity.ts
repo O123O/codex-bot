@@ -1,5 +1,5 @@
 import { realpath } from "node:fs/promises";
-import { JsonRpcResponseError } from "../app-server/json-rpc-client.ts";
+import { isExactThreadNotLoaded } from "../app-server/thread-errors.ts";
 import { AppError } from "../core/errors.ts";
 import type { SessionRegistry } from "../registry/session-registry.ts";
 
@@ -125,10 +125,6 @@ async function verifyThread(thread: ThreadResponse["thread"], expected: { id?: s
   if (!await sameDirectory(thread.cwd, expected.cwd)) throw new AppError("CONFIGURATION_ERROR", `assistant app-server did not use configured working directory ${expected.cwd}`);
   if (expected.nonce !== undefined && thread.threadSource !== expected.nonce) throw new AppError("CONFIGURATION_ERROR", "assistant app-server returned a thread with the wrong creation nonce");
   if (expected.name !== undefined && thread.name !== expected.name) throw new AppError("CONFIGURATION_ERROR", "assistant app-server returned a thread with the wrong creation name");
-}
-
-function isExactThreadNotLoaded(error: unknown, threadId: string): boolean {
-  return error instanceof JsonRpcResponseError && error.code === -32600 && error.rpcMessage === `thread not loaded: ${threadId}`;
 }
 
 async function validateRegistration(registry: SessionRegistry, endpointId: string, assistantDir: string) {

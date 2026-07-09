@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
-import { mkdtemp, realpath } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import type { AppServerEndpoint } from "../../src/app-server/pool.ts";
 import { AppServerPool } from "../../src/app-server/pool.ts";
+import { JsonRpcResponseError } from "../../src/app-server/json-rpc-client.ts";
+import { isExactThreadNotLoaded } from "../../src/app-server/thread-errors.ts";
 import { AppError } from "../../src/core/errors.ts";
 import { SessionRegistry, type RegistrySession } from "../../src/registry/session-registry.ts";
 import { SessionLifecycle } from "../../src/sessions/lifecycle.ts";
@@ -13,19 +15,26 @@ import { createTestDatabase } from "../../src/storage/database.ts";
 import { RuntimeStore } from "../../src/storage/runtime-store.ts";
 import type { EndpointWorkLease } from "../../src/endpoints/types.ts";
 import type { EndpointManager } from "../../src/endpoints/manager.ts";
+import { WorkspaceRouter } from "../../src/endpoints/workspace-router.ts";
+import { LocalWorkspaceHost, type WorkspaceHost } from "../../src/endpoints/ssh-host.ts";
+import { ProjectWorkspacePolicy } from "../../src/sessions/project-workspace.ts";
 import { createManagedSessionRecoveryOwner, managedRetryKey } from "../../src/production-app.ts";
 
 class LifecycleEndpoint implements AppServerEndpoint {
-  readonly id = "local";
+  constructor(readonly id = "local") {}
   state: AppServerEndpoint["state"] = "ready";
   readonly calls: Array<{ method: string; params: any }> = [];
   cwd = "";
   status = "idle";
   threadId = "thread-1";
+  resumeThreadId: string | undefined;
   turns = [{ id: "historical" }];
   path = "/tmp/rollout-thread-1.jsonl";
   pathOnStart: string | null | undefined;
   failResume = false;
+  readonly readErrors: Error[] = [];
+  unsubscribeError: Error | undefined;
+  archiveError: Error | undefined;
   onResume: (() => void) | undefined;
   resumeBarrier: Promise<void> | undefined;
 
@@ -38,13 +47,19 @@ class LifecycleEndpoint implements AppServerEndpoint {
       model: "gpt-5",
       reasoningEffort: "high",
     } as T;
-    if (method === "thread/read") return { thread } as T;
+    if (method === "thread/read") {
+      const error = this.readErrors.shift();
+      if (error) throw error;
+      return { thread } as T;
+    }
     if (method === "thread/resume") {
       this.onResume?.();
       await this.resumeBarrier;
       if (this.failResume) throw new Error("resume response lost");
-      return { thread, cwd: this.cwd, model: "gpt-5", reasoningEffort: "high" } as T;
+      return { thread: { ...thread, id: this.resumeThreadId ?? thread.id }, cwd: this.cwd, model: "gpt-5", reasoningEffort: "high" } as T;
     }
+    if (method === "thread/unsubscribe" && this.unsubscribeError) throw this.unsubscribeError;
+    if (method === "thread/archive" && this.archiveError) throw this.archiveError;
     return {} as T;
   }
 }
@@ -67,6 +82,7 @@ async function fixture(ownership?: {
   const runtime = new RuntimeStore(createTestDatabase());
   const project = { path: dir, created: false, fallback: false, identity: { device: "1", inode: "1" } };
   const checked: string[] = [];
+  const workspaceFailure: { error?: unknown } = {};
   const gate = new ThreadGate();
   const lifecycle = new SessionLifecycle(
     new AppServerPool([endpoint], { maxConcurrentTurns: 2 }),
@@ -74,14 +90,18 @@ async function fixture(ownership?: {
     runtime,
     { now: () => 10_000 },
     {
-      prepareExisting: async (path) => { assert.equal(path, dir); return project; },
+      prepareExisting: async (path) => {
+        if (workspaceFailure.error) throw workspaceFailure.error;
+        if (path !== dir) throw new AppError("CONFIGURATION_ERROR", "project workspace path is unavailable");
+        return project;
+      },
       assertDispatchable: async (prepared) => { checked.push(prepared.path); },
     },
     gate,
     endpoints,
     ownership,
   );
-  return { dir, registry, endpoint, runtime, lifecycle, project, checked, gate };
+  return { dir, registry, endpoint, runtime, lifecycle, project, checked, gate, workspaceFailure };
 }
 
 function required(registry: SessionRegistry, nickname = "payments"): RegistrySession {
@@ -89,6 +109,14 @@ function required(registry: SessionRegistry, nickname = "payments"): RegistrySes
   assert.ok(session);
   return session;
 }
+
+test("thread-not-loaded evidence requires the exact RPC code, message, and thread identity", () => {
+  assert.equal(isExactThreadNotLoaded(new JsonRpcResponseError(-32600, "thread not loaded: thread-1"), "thread-1"), true);
+  assert.equal(isExactThreadNotLoaded(new JsonRpcResponseError(-32000, "thread not loaded: thread-1"), "thread-1"), false);
+  assert.equal(isExactThreadNotLoaded(new JsonRpcResponseError(-32600, "thread not loaded: thread-2"), "thread-1"), false);
+  assert.equal(isExactThreadNotLoaded(new JsonRpcResponseError(-32600, "thread missing: thread-1"), "thread-1"), false);
+  assert.equal(isExactThreadNotLoaded(new Error("thread not loaded: thread-1"), "thread-1"), false);
+});
 
 test("create establishes one generation-safe managed epoch", async () => {
   const { registry, endpoint, runtime, lifecycle, project } = await fixture();
@@ -142,6 +170,138 @@ test("adopt resumes a disk-backed notLoaded thread before enforcing idle", async
   assert.equal(session.lifecycle_state, "managed");
   assert.equal(runtime.getSession("local", "thread-1", session.mapping_id)?.nativeStatus, "idle");
   assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/read", "thread/resume", "thread/read"]);
+});
+
+test("adopt resumes an exact read-not-loaded thread and validates it before promotion", async () => {
+  const { registry, endpoint, runtime, lifecycle } = await fixture();
+  endpoint.readErrors.push(new JsonRpcResponseError(-32600, "thread not loaded: thread-1"));
+
+  await lifecycle.adopt("payments", "local", "thread-1");
+
+  const session = required(registry);
+  assert.equal(session.lifecycle_state, "managed");
+  assert.equal(runtime.getSession("local", "thread-1", session.mapping_id)?.managementState, "managed");
+  assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/read", "thread/resume", "thread/read"]);
+});
+
+test("adopt validates the immediate resume response identity before trusting a later read", async () => {
+  const { registry, endpoint, lifecycle } = await fixture();
+  endpoint.readErrors.push(new JsonRpcResponseError(-32600, "thread not loaded: thread-1"));
+  endpoint.resumeThreadId = "wrong-thread";
+
+  await assert.rejects(lifecycle.adopt("payments", "local", "thread-1"), (error: unknown) => {
+    assert.equal(error instanceof AppError && error.code === "OPERATION_UNCERTAIN", true);
+    return true;
+  });
+
+  assert.equal(registry.get("payments"), undefined);
+  assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/read", "thread/resume", "thread/unsubscribe"]);
+});
+
+test("an early adoption resume rolls back wrong identity and surfaces rollback uncertainty", async () => {
+  const first = await fixture();
+  first.endpoint.readErrors.push(new JsonRpcResponseError(-32600, "thread not loaded: thread-1"));
+  first.endpoint.onResume = () => { first.endpoint.threadId = "wrong-thread"; };
+
+  await assert.rejects(first.lifecycle.adopt("payments", "local", "thread-1"), (error: unknown) => {
+    assert.equal(error instanceof AppError && error.code === "OPERATION_UNCERTAIN", true);
+    return true;
+  });
+  assert.equal(first.registry.get("payments"), undefined);
+  assert.deepEqual(first.endpoint.calls.map((call) => call.method), ["thread/read", "thread/resume", "thread/read", "thread/unsubscribe"]);
+
+  const second = await fixture();
+  second.endpoint.readErrors.push(new JsonRpcResponseError(-32600, "thread not loaded: thread-1"));
+  second.endpoint.onResume = () => { second.endpoint.cwd = join(second.dir, "wrong"); };
+  second.endpoint.unsubscribeError = new Error("rollback response lost");
+  await assert.rejects(second.lifecycle.adopt("payments", "local", "thread-1"), (error: unknown) => {
+    assert.equal(error instanceof AppError && error.code === "OPERATION_UNCERTAIN", true);
+    assert.match(String(error), /rollback could not be confirmed/u);
+    return true;
+  });
+});
+
+test("an early adoption resume rolls back source and status validation failures", async () => {
+  const source = await fixture();
+  source.endpoint.readErrors.push(new JsonRpcResponseError(-32600, "thread not loaded: thread-1"));
+  await assert.rejects(source.lifecycle.adopt("payments", "local", "thread-1", () => {
+    throw new AppError("OPERATION_UNCERTAIN", "recovered worker thread has the wrong creation source");
+  }), /creation source/u);
+  assert.equal(source.registry.get("payments"), undefined);
+  assert.deepEqual(source.endpoint.calls.map((call) => call.method), ["thread/read", "thread/resume", "thread/read", "thread/unsubscribe"]);
+
+  const active = await fixture();
+  active.endpoint.readErrors.push(new JsonRpcResponseError(-32600, "thread not loaded: thread-1"));
+  active.endpoint.onResume = () => { active.endpoint.status = "active"; };
+  await assert.rejects(active.lifecycle.adopt("payments", "local", "thread-1"), (error: unknown) => {
+    assert.equal(error instanceof AppError && error.code === "SESSION_BUSY", true);
+    return true;
+  });
+  assert.equal(active.registry.get("payments"), undefined);
+  assert.deepEqual(active.endpoint.calls.map((call) => call.method), ["thread/read", "thread/resume", "thread/read", "thread/unsubscribe"]);
+});
+
+test("adoption rollback accepts exact unsubscribe absence but requires exact reservation removal", async () => {
+  const absent = await fixture();
+  absent.endpoint.readErrors.push(new JsonRpcResponseError(-32600, "thread not loaded: thread-1"));
+  absent.endpoint.unsubscribeError = new JsonRpcResponseError(-32600, "thread not loaded: thread-1");
+  await assert.rejects(absent.lifecycle.adopt("payments", "local", "thread-1", () => {
+    throw new AppError("OPERATION_UNCERTAIN", "source validation failed");
+  }), /source validation failed/u);
+  assert.equal(absent.registry.get("payments"), undefined);
+
+  const fenced = await fixture();
+  fenced.endpoint.onResume = () => { fenced.endpoint.status = "active"; };
+  const registryWithFailedRemoval = fenced.registry as SessionRegistry & {
+    removeIfMatch(nickname: string, expected: RegistrySession): Promise<boolean>;
+  };
+  registryWithFailedRemoval.removeIfMatch = async () => false;
+  await assert.rejects(fenced.lifecycle.adopt("payments", "local", "thread-1"), (error: unknown) => {
+    assert.equal(error instanceof AppError && error.code === "OPERATION_UNCERTAIN", true);
+    assert.match(String(error), /rollback could not be confirmed/u);
+    return true;
+  });
+  assert.equal(required(fenced.registry).lifecycle_state, "adopting");
+});
+
+test("direct adoption retains ownership until rollback and exact reservation removal both succeed", async () => {
+  for (const failure of ["unsubscribe", "remove"] as const) {
+    const initialized: string[] = [];
+    const released: string[] = [];
+    const value = await fixture({
+      initialize: async (identity) => { initialized.push(identity.mapping_id); },
+      release: (identity) => { released.push(identity.mapping_id); },
+    });
+    const registryWithFailure = value.registry as SessionRegistry & {
+      promote(nickname: string, expected: RegistrySession): Promise<void>;
+      removeIfMatch(nickname: string, expected: RegistrySession): Promise<boolean>;
+    };
+    registryWithFailure.promote = async () => { throw new Error("promotion failed after ownership initialization"); };
+    if (failure === "unsubscribe") value.endpoint.unsubscribeError = new Error("unsubscribe response lost");
+    else registryWithFailure.removeIfMatch = async () => false;
+
+    await assert.rejects(value.lifecycle.adopt("payments", "local", "thread-1"), (error: unknown) => {
+      assert.equal(error instanceof AppError && error.code === "OPERATION_UNCERTAIN", true);
+      return true;
+    });
+
+    assert.equal(initialized.length, 1);
+    assert.deepEqual(released, [], `ownership must survive ${failure} rollback failure`);
+    assert.equal(required(value.registry).lifecycle_state, "adopting");
+  }
+});
+
+test("adopt never treats a near-match read error as thread absence", async () => {
+  for (const error of [
+    new JsonRpcResponseError(-32000, "thread not loaded: thread-1"),
+    new JsonRpcResponseError(-32600, "thread not loaded: another-thread"),
+  ]) {
+    const { registry, endpoint, lifecycle } = await fixture();
+    endpoint.readErrors.push(error);
+    await assert.rejects(lifecycle.adopt("payments", "local", "thread-1"), (actual: unknown) => actual === error);
+    assert.equal(registry.get("payments"), undefined);
+    assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/read"]);
+  }
 });
 
 test("adopt rejects active and systemError threads before reservation or resume", async (context) => {
@@ -218,6 +378,20 @@ test("an uncertain resume remains adopting and startup reconciliation promotes o
   assert.deepEqual(endpoint.calls[1]?.params, { threadId: "thread-1" });
 });
 
+test("adopting reconciliation resumes an exact read-not-loaded durable mapping", async () => {
+  const { dir, registry, endpoint, lifecycle } = await fixture();
+  const adopting = {
+    endpoint: "local", thread_id: "thread-1", project_dir: dir, mapping_id: "mapping-durable", lifecycle_state: "adopting" as const,
+  };
+  await registry.reserve("payments", adopting);
+  endpoint.readErrors.push(new JsonRpcResponseError(-32600, "thread not loaded: thread-1"));
+
+  await lifecycle.reconcileAdopting();
+
+  assert.equal(required(registry).lifecycle_state, "managed");
+  assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/read", "thread/resume", "thread/read"]);
+});
+
 test("startup reconciliation can isolate one unavailable transitional mapping", async () => {
   const { dir, registry, endpoint, runtime, lifecycle } = await fixture();
   const adopting = { endpoint: "local", thread_id: "thread-1", project_dir: dir, mapping_id: "mapping-offline", lifecycle_state: "adopting" as const };
@@ -242,6 +416,40 @@ test("startup reconstructs a missing runtime row for an exact managed generation
   assert.equal(resumed.thread.id, "thread-1");
   assert.equal(runtime.getSession("local", "thread-1", "mapping-durable")?.managementState, "managed");
   assert.equal(runtime.currentEpoch("local", "thread-1", "mapping-durable")?.baselineTurnId, "historical");
+});
+
+test("managed recovery checks ownership before resuming an exact read-not-loaded mapping", async () => {
+  const seen: string[] = [];
+  const { dir, registry, endpoint, lifecycle } = await fixture({
+    initialize: async () => { seen.push("initialize"); },
+    inspectIfInitialized: async () => { seen.push("ownership"); return { state: "owned" }; },
+    release: () => undefined,
+  });
+  await registry.createManaged("payments", {
+    endpoint: "local", thread_id: "thread-1", project_dir: dir, mapping_id: "mapping-durable",
+  });
+  endpoint.readErrors.push(new JsonRpcResponseError(-32600, "thread not loaded: thread-1"));
+
+  await lifecycle.reconcileManaged("payments", required(registry));
+
+  assert.deepEqual(seen, ["ownership", "initialize"]);
+  assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/read", "thread/resume", "thread/read"]);
+});
+
+test("managed recovery rejects a wrong immediate resume identity before projecting settings", async () => {
+  const { dir, registry, endpoint, runtime, lifecycle } = await fixture();
+  await registry.createManaged("payments", {
+    endpoint: "local", thread_id: "thread-1", project_dir: dir, mapping_id: "mapping-durable",
+  });
+  endpoint.resumeThreadId = "wrong-thread";
+
+  await assert.rejects(lifecycle.reconcileManaged("payments", required(registry)), (error: unknown) => {
+    assert.equal(error instanceof AppError && error.code === "OPERATION_UNCERTAIN", true);
+    return true;
+  });
+
+  assert.equal(runtime.getSession("local", "thread-1", "mapping-durable"), undefined);
+  assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/read", "thread/resume"]);
 });
 
 test("stopping managed recovery while native resume is blocked fences every success publication", async () => {
@@ -368,6 +576,138 @@ test("adopting reconciliation rolls back a proven subscription when post-resume 
   assert.equal(registry.get("payments"), undefined);
 });
 
+test("adopting reconciliation retains ownership until its exact rollback commits", async () => {
+  const preResumeReleased: string[] = [];
+  const preResume = await fixture({
+    initialize: async () => undefined,
+    release: (identity) => { preResumeReleased.push(identity.mapping_id); },
+  });
+  await preResume.registry.reserve("payments", {
+    endpoint: "local", thread_id: "thread-1", project_dir: preResume.dir, mapping_id: "mapping-pre", lifecycle_state: "adopting",
+  });
+  preResume.endpoint.cwd = join(preResume.dir, "drifted");
+  await assert.rejects(preResume.lifecycle.reconcileAdopting(), /cwd|directory/iu);
+  assert.deepEqual(preResumeReleased, [], "pre-resume validation cannot release a pre-existing ownership row");
+  assert.equal(required(preResume.registry).lifecycle_state, "adopting");
+
+  for (const failure of ["unsubscribe", "remove"] as const) {
+    const released: string[] = [];
+    const value = await fixture({
+      initialize: async () => undefined,
+      release: (identity) => { released.push(identity.mapping_id); },
+    });
+    await value.registry.reserve("payments", {
+      endpoint: "local", thread_id: "thread-1", project_dir: value.dir, mapping_id: `mapping-${failure}`, lifecycle_state: "adopting",
+    });
+    const registryWithFailure = value.registry as SessionRegistry & {
+      promote(nickname: string, expected: RegistrySession): Promise<void>;
+      removeIfMatch(nickname: string, expected: RegistrySession): Promise<boolean>;
+    };
+    registryWithFailure.promote = async () => { throw new Error("promotion failed after ownership initialization"); };
+    if (failure === "unsubscribe") value.endpoint.unsubscribeError = new Error("unsubscribe response lost");
+    else registryWithFailure.removeIfMatch = async () => false;
+
+    await assert.rejects(value.lifecycle.reconcileAdopting(), (error: unknown) => {
+      assert.equal(error instanceof AppError && error.code === "OPERATION_UNCERTAIN", true);
+      return true;
+    });
+    assert.deepEqual(released, [], `ownership must survive ${failure} reconciliation rollback failure`);
+    assert.equal(required(value.registry).lifecycle_state, "adopting");
+  }
+});
+
+test("cwd verification preserves endpoint loss and redacts genuine path failures", async () => {
+  const unavailable = await fixture();
+  unavailable.workspaceFailure.error = new AppError("ENDPOINT_UNAVAILABLE", "SSH process failed (exit 1)");
+  await assert.rejects(unavailable.lifecycle.create("payments", "local", unavailable.project, "operation-1"), (error: unknown) => {
+    assert.equal(error instanceof AppError && error.code === "ENDPOINT_UNAVAILABLE", true);
+    assert.match(String(error), /SSH process failed/u);
+    return true;
+  });
+
+  const invalid = await fixture();
+  invalid.workspaceFailure.error = new AppError("CONFIGURATION_ERROR", `private path ${invalid.dir}`);
+  await assert.rejects(invalid.lifecycle.create("payments", "local", invalid.project, "operation-2"), (error: unknown) => {
+    assert.equal(error instanceof AppError && error.code === "CWD_MISMATCH", true);
+    assert.equal((error as Error).message, "thread cwd could not be verified");
+    assert.doesNotMatch(String(error), new RegExp(invalid.dir.replaceAll("/", "\\/"), "u"));
+    return true;
+  });
+
+  const unknown = await fixture();
+  const transportFailure = new Error("raw transport timeout");
+  unknown.workspaceFailure.error = transportFailure;
+  await assert.rejects(
+    unknown.lifecycle.create("payments", "local", unknown.project, "operation-3"),
+    (error: unknown) => error === transportFailure,
+  );
+});
+
+test("real workspace policy and router preserve a post-start SSH failure", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "qiyan-bot-remote-policy-")));
+  const userHome = join(root, "home");
+  const qiyanHome = join(userHome, ".qiyan-bot");
+  const assistantWorkdir = join(qiyanHome, "assistant");
+  const dataDir = join(qiyanHome, "data");
+  const projectDir = join(userHome, "projects", "worker");
+  await Promise.all([
+    mkdir(assistantWorkdir, { recursive: true }),
+    mkdir(dataDir, { recursive: true }),
+    mkdir(projectDir, { recursive: true }),
+  ]);
+  const localHost = new LocalWorkspaceHost(userHome);
+  let projectStats = 0;
+  let failAt = Number.POSITIVE_INFINITY;
+  const failure = new AppError("ENDPOINT_UNAVAILABLE", "SSH process failed (exit 1)");
+  const host: WorkspaceHost = {
+    endpointId: "devbox",
+    home: () => localHost.home(),
+    lstat: async (path) => {
+      if (path === projectDir && ++projectStats === failAt) throw failure;
+      return localHost.lstat(path);
+    },
+    realpath: (path) => localHost.realpath(path),
+    mkdir: (path, options) => localHost.mkdir(path, options),
+    chmod: (path, mode) => localHost.chmod(path, mode),
+  };
+  const policy = new ProjectWorkspacePolicy({
+    userHome,
+    qiyanHome,
+    assistantWorkdir,
+    dataDir,
+    registryPath: join(dataDir, "sessions.json"),
+    host,
+  });
+  const project = await policy.prepareExisting(projectDir);
+  projectStats = 0;
+  failAt = 3;
+  const registry = await SessionRegistry.open(join(dataDir, "sessions.json"), {
+    version: 3,
+    assistant: { endpoint: "local", thread_id: "assistant", project_dir: assistantWorkdir },
+    sessions: {},
+  });
+  const endpoint = new LifecycleEndpoint("devbox");
+  endpoint.cwd = projectDir;
+  const lifecycle = new SessionLifecycle(
+    new AppServerPool([endpoint], { maxConcurrentTurns: 2 }),
+    registry,
+    new RuntimeStore(createTestDatabase()),
+    { now: () => 10_000 },
+    new WorkspaceRouter(() => policy) as never,
+    new ThreadGate(),
+  );
+  let dispatchStarted = false;
+
+  await assert.rejects(
+    lifecycle.create("payments", "devbox", project, "operation-remote", undefined, () => { dispatchStarted = true; }),
+    (error: unknown) => error === failure,
+  );
+
+  assert.equal(dispatchStarted, true);
+  assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/start"]);
+  assert.equal(registry.get("payments"), undefined);
+});
+
 test("unadopt is idle-only, unsubscribes without archive, and removes exactly one mapping", async () => {
   const { registry, endpoint, runtime, lifecycle } = await fixture();
   await lifecycle.adopt("payments", "local", "thread-1");
@@ -389,6 +729,95 @@ test("unadopt is idle-only, unsubscribes without archive, and removes exactly on
   assert.equal(endpoint.calls.some((call) => call.method === "thread/archive" || call.method === "thread/delete"), false);
 });
 
+test("unadopt treats native notLoaded status and exact read absence as already unsubscribed", async () => {
+  for (const absence of ["status", "error"] as const) {
+    const released: string[] = [];
+    const { dir, registry, endpoint, runtime, lifecycle } = await fixture({
+      initialize: async () => undefined,
+      release: (identity) => { released.push(identity.mapping_id); },
+    });
+    await registry.createManaged("payments", {
+      endpoint: "local", thread_id: "thread-1", project_dir: dir, mapping_id: `mapping-${absence}`,
+    });
+    runtime.setSession("local", "thread-1", `mapping-${absence}`, "managed", absence === "status" ? "notLoaded" : "idle");
+    if (absence === "status") endpoint.status = "notLoaded";
+    else endpoint.readErrors.push(new JsonRpcResponseError(-32600, "thread not loaded: thread-1"));
+    const checkpoints: string[] = [];
+
+    await lifecycle.unadopt("payments", (checkpoint) => { checkpoints.push(checkpoint.step); });
+
+    assert.equal(registry.get("payments"), undefined);
+    assert.equal(endpoint.calls.some((call) => call.method === "thread/unsubscribe"), false);
+    assert.deepEqual(checkpoints, ["transition_intent", "transitioned", "native_unsubscribed", "removed"]);
+    assert.deepEqual(released, [`mapping-${absence}`]);
+  }
+});
+
+test("unadopt accepts exact absence returned by unsubscribe but not broader failures", async () => {
+  const exact = await fixture();
+  await exact.registry.createManaged("payments", {
+    endpoint: "local", thread_id: "thread-1", project_dir: exact.dir, mapping_id: "mapping-exact",
+  });
+  exact.endpoint.unsubscribeError = new JsonRpcResponseError(-32600, "thread not loaded: thread-1");
+  await exact.lifecycle.unadopt("payments");
+  assert.equal(exact.registry.get("payments"), undefined);
+
+  const broad = await fixture();
+  await broad.registry.createManaged("payments", {
+    endpoint: "local", thread_id: "thread-1", project_dir: broad.dir, mapping_id: "mapping-broad",
+  });
+  const failure = new JsonRpcResponseError(-32000, "thread not loaded: thread-1");
+  broad.endpoint.unsubscribeError = failure;
+  await assert.rejects(broad.lifecycle.unadopt("payments"), (error: unknown) => error === failure);
+  assert.equal(required(broad.registry).lifecycle_state, "unadopting");
+});
+
+test("direct unadoption reports uncertainty when exact registry removal loses its fence", async () => {
+  const released: string[] = [];
+  const value = await fixture({
+    initialize: async () => undefined,
+    release: (identity) => { released.push(identity.mapping_id); },
+  });
+  await value.registry.createManaged("payments", {
+    endpoint: "local", thread_id: "thread-1", project_dir: value.dir, mapping_id: "mapping-direct-fence",
+  });
+  const registryWithFailedRemoval = value.registry as SessionRegistry & {
+    removeIfMatch(nickname: string, expected: RegistrySession): Promise<boolean>;
+  };
+  registryWithFailedRemoval.removeIfMatch = async () => false;
+
+  await assert.rejects(value.lifecycle.unadopt("payments"), (error: unknown) => {
+    assert.equal(error instanceof AppError && error.code === "OPERATION_UNCERTAIN", true);
+    return true;
+  });
+
+  assert.equal(required(value.registry).lifecycle_state, "unadopting");
+  assert.deepEqual(released, []);
+});
+
+test("direct archive reports uncertainty without releasing ownership when exact removal loses its fence", async () => {
+  const released: string[] = [];
+  const value = await fixture({
+    initialize: async () => undefined,
+    release: (identity) => { released.push(identity.mapping_id); },
+  });
+  await value.registry.createManaged("payments", {
+    endpoint: "local", thread_id: "thread-1", project_dir: value.dir, mapping_id: "mapping-archive-fence",
+  });
+  const registryWithFailedRemoval = value.registry as SessionRegistry & {
+    removeIfMatch(nickname: string, expected: RegistrySession): Promise<boolean>;
+  };
+  registryWithFailedRemoval.removeIfMatch = async () => false;
+
+  await assert.rejects(value.lifecycle.archive("payments"), (error: unknown) => {
+    assert.equal(error instanceof AppError && error.code === "OPERATION_UNCERTAIN", true);
+    return true;
+  });
+
+  assert.equal(required(value.registry).lifecycle_state, "archiving");
+  assert.deepEqual(released, []);
+});
+
 test("archive is idle-only, invokes native archive, removes the mapping, and never deletes", async () => {
   const { registry, endpoint, lifecycle } = await fixture();
   await lifecycle.adopt("payments", "local", "thread-1");
@@ -405,6 +834,56 @@ test("archive is idle-only, invokes native archive, removes the mapping, and nev
   assert.deepEqual(checkpoints, ["transition_intent", "transitioned", "native_archived", "removed"]);
   assert.equal(endpoint.calls.some((call) => call.method === "thread/archive"), true);
   assert.equal(endpoint.calls.some((call) => call.method === "thread/delete"), false);
+});
+
+test("removal reconciliation accepts exact absence only for unadoption", async () => {
+  const unadopting = await fixture();
+  await unadopting.registry.createManaged("payments", {
+    endpoint: "local", thread_id: "thread-1", project_dir: unadopting.dir, mapping_id: "mapping-unadopt",
+  });
+  const managed = required(unadopting.registry);
+  await unadopting.registry.transition("payments", managed, "unadopting");
+  const removing = required(unadopting.registry);
+  unadopting.endpoint.readErrors.push(new JsonRpcResponseError(-32600, "thread not loaded: thread-1"));
+  await unadopting.lifecycle.reconcileRemoval("payments", removing);
+  assert.equal(unadopting.registry.get("payments"), undefined);
+  assert.deepEqual(unadopting.endpoint.calls.map((call) => call.method), ["thread/read"]);
+
+  const archiving = await fixture();
+  await archiving.registry.createManaged("payments", {
+    endpoint: "local", thread_id: "thread-1", project_dir: archiving.dir, mapping_id: "mapping-archive",
+  });
+  const archiveManaged = required(archiving.registry);
+  await archiving.registry.transition("payments", archiveManaged, "archiving");
+  archiving.endpoint.archiveError = new JsonRpcResponseError(-32600, "thread not loaded: thread-1");
+  const archiveError = archiving.endpoint.archiveError;
+  await assert.rejects(archiving.lifecycle.reconcileRemoval("payments", required(archiving.registry)), (error: unknown) => error === archiveError);
+  assert.equal(required(archiving.registry).lifecycle_state, "archiving");
+});
+
+test("removal reconciliation never releases ownership when exact registry removal loses its fence", async () => {
+  const released: string[] = [];
+  const value = await fixture({
+    initialize: async () => undefined,
+    release: (identity) => { released.push(identity.mapping_id); },
+  });
+  await value.registry.createManaged("payments", {
+    endpoint: "local", thread_id: "thread-1", project_dir: value.dir, mapping_id: "mapping-fenced",
+  });
+  const managed = required(value.registry);
+  await value.registry.transition("payments", managed, "unadopting");
+  const registryWithFailedRemoval = value.registry as SessionRegistry & {
+    removeIfMatch(nickname: string, expected: RegistrySession): Promise<boolean>;
+  };
+  registryWithFailedRemoval.removeIfMatch = async () => false;
+
+  await assert.rejects(value.lifecycle.reconcileRemoval("payments", required(value.registry)), (error: unknown) => {
+    assert.equal(error instanceof AppError && error.code === "OPERATION_UNCERTAIN", true);
+    return true;
+  });
+
+  assert.equal(required(value.registry).lifecycle_state, "unadopting");
+  assert.deepEqual(released, []);
 });
 
 test("startup completes exact unadopting and archiving mappings before managed resume", async () => {

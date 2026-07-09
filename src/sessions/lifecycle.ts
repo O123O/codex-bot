@@ -10,6 +10,7 @@ import { WorkspaceRouter } from "../endpoints/workspace-router.ts";
 import type { EndpointManager } from "../endpoints/manager.ts";
 import type { EndpointWorkLease } from "../endpoints/types.ts";
 import type { OwnershipInspection } from "./rollout-ownership.ts";
+import { isExactThreadNotLoaded } from "../app-server/thread-errors.ts";
 
 interface ThreadView { id: string; cwd: string; path?: string | null; threadSource?: string | null; status: { type: string }; turns: Array<{ id: string }> }
 interface ThreadResponse { thread: ThreadView; cwd?: string; model?: string; reasoningEffort?: string | null }
@@ -101,26 +102,41 @@ export class SessionLifecycle {
   ): Promise<void> {
     await this.withMutationLease(endpointId, (lease) => this.gate.run(endpointId, threadId, async () => {
       this.requireAvailable(nickname, endpointId, threadId);
-      const before = await this.read(endpointId, threadId, lease);
-      this.requireAdoptableBeforeResume(before.thread);
-      const project = await this.prepareExisting(endpointId, before.thread.cwd, lease);
-      await this.assertDispatchable(endpointId, project, lease);
-      await this.verifyCwd(endpointId, before.thread.cwd, project.path, lease);
-      onThreadRead?.(before.thread);
-      const reserved: RegistrySession = {
-        endpoint: endpointId,
-        thread_id: threadId,
-        project_dir: project.path,
-        mapping_id: mappingId,
-        lifecycle_state: "adopting",
-      };
-      await this.registry.reserve(nickname, reserved);
-      this.runtime.setSession(endpointId, threadId, reserved.mapping_id, "adopting", before.thread.status.type);
       let resumed = false;
+      let reserved: RegistrySession | undefined;
       try {
-        await this.pool.request<ThreadResponse>(endpointId, "thread/resume", { threadId }, undefined, lease);
-        resumed = true;
-        const after = await this.read(endpointId, threadId, lease);
+        let before: ThreadResponse;
+        try { before = await this.read(endpointId, threadId, lease); }
+        catch (error) {
+          if (!isExactThreadNotLoaded(error, threadId)) throw error;
+          const response = await this.pool.request<ThreadResponse>(endpointId, "thread/resume", { threadId }, undefined, lease);
+          resumed = true;
+          this.requireThreadIdentity(response.thread, threadId);
+          before = await this.read(endpointId, threadId, lease);
+        }
+        this.requireThreadIdentity(before.thread, threadId);
+        this.requireAdoptableBeforeResume(before.thread);
+        const project = await this.prepareExisting(endpointId, before.thread.cwd, lease);
+        await this.assertDispatchable(endpointId, project, lease);
+        await this.verifyCwd(endpointId, before.thread.cwd, project.path, lease);
+        onThreadRead?.(before.thread);
+        reserved = {
+          endpoint: endpointId,
+          thread_id: threadId,
+          project_dir: project.path,
+          mapping_id: mappingId,
+          lifecycle_state: "adopting",
+        };
+        await this.registry.reserve(nickname, reserved);
+        this.runtime.setSession(endpointId, threadId, reserved.mapping_id, "adopting", before.thread.status.type);
+        let after = before;
+        if (!resumed) {
+          const response = await this.pool.request<ThreadResponse>(endpointId, "thread/resume", { threadId }, undefined, lease);
+          resumed = true;
+          this.requireThreadIdentity(response.thread, threadId);
+          after = await this.read(endpointId, threadId, lease);
+        }
+        this.requireThreadIdentity(after.thread, threadId);
         this.requireIdle(after.thread);
         await this.assertDispatchable(endpointId, project, lease);
         await this.verifyCwd(endpointId, after.thread.cwd, project.path, lease);
@@ -129,11 +145,13 @@ export class SessionLifecycle {
         this.runtime.setSession(endpointId, threadId, reserved.mapping_id, "managed", after.thread.status.type);
         this.runtime.beginEpoch(endpointId, threadId, reserved.mapping_id, this.baseline(after.thread), this.clock.now());
       } catch (error) {
-        this.ownership?.release(reserved);
         if (resumed) {
           try {
-            await this.pool.request(endpointId, "thread/unsubscribe", { threadId }, undefined, lease);
-            await this.registry.removeIfMatch(nickname, reserved);
+            await this.unsubscribeOrConfirmAbsent(endpointId, threadId, lease);
+            if (reserved && !await this.registry.removeIfMatch(nickname, reserved)) {
+              throw new Error("adopting reservation changed during rollback");
+            }
+            if (reserved) this.ownership?.release(reserved);
           } catch {
             throw new AppError("OPERATION_UNCERTAIN", "adoption failed and its subscription rollback could not be confirmed");
           }
@@ -151,16 +169,26 @@ export class SessionLifecycle {
     const expected = this.requireManaged(nickname);
     await this.withMutationLease(expected.endpoint, (lease) => this.gate.run(expected.endpoint, expected.thread_id, async () => {
       const session = this.assertExact(nickname, expected, "managed");
-      const native = await this.read(session.endpoint, session.thread_id, lease);
-      this.requireIdle(native.thread);
+      let native: ThreadResponse | undefined;
+      try { native = await this.read(session.endpoint, session.thread_id, lease); }
+      catch (error) {
+        if (!isExactThreadNotLoaded(error, session.thread_id)) throw error;
+      }
+      if (native) this.requireThreadIdentity(native.thread, session.thread_id);
+      const alreadyUnsubscribed = native === undefined || native.thread.status.type === "notLoaded";
+      if (native && native.thread.status.type !== "notLoaded") this.requireIdle(native.thread);
       checkpoint?.(this.checkpoint(nickname, session, "unadopting", "transition_intent"));
       await this.registry.transition(nickname, session, "unadopting");
-      this.runtime.setSession(session.endpoint, session.thread_id, session.mapping_id, "unadopting", native.thread.status.type);
+      this.runtime.setSession(session.endpoint, session.thread_id, session.mapping_id, "unadopting", native?.thread.status.type ?? "notLoaded");
       checkpoint?.(this.checkpoint(nickname, session, "unadopting", "transitioned"));
-      await this.pool.request(session.endpoint, "thread/unsubscribe", { threadId: session.thread_id }, undefined, lease);
+      if (!alreadyUnsubscribed) {
+        await this.unsubscribeOrConfirmAbsent(session.endpoint, session.thread_id, lease);
+      }
       checkpoint?.(this.checkpoint(nickname, session, "unadopting", "native_unsubscribed"));
       this.runtime.endEpoch(session.endpoint, session.thread_id, session.mapping_id, this.clock.now());
-      if (!await this.registry.removeIfMatch(nickname, session)) throw new AppError("OPERATION_CONFLICT", "session mapping changed during unadoption");
+      if (!await this.registry.removeIfMatch(nickname, session)) {
+        throw new AppError("OPERATION_UNCERTAIN", "native unadoption completed but the exact session mapping was not removed");
+      }
       this.ownership?.release(session);
       checkpoint?.(this.checkpoint(nickname, session, "unadopting", "removed"));
     }), existingLease);
@@ -179,7 +207,9 @@ export class SessionLifecycle {
       await this.pool.request(session.endpoint, "thread/archive", { threadId: session.thread_id }, undefined, lease);
       checkpoint?.(this.checkpoint(nickname, session, "archiving", "native_archived"));
       this.runtime.endEpoch(session.endpoint, session.thread_id, session.mapping_id, this.clock.now());
-      if (!await this.registry.removeIfMatch(nickname, session)) throw new AppError("OPERATION_CONFLICT", "session mapping changed during archive");
+      if (!await this.registry.removeIfMatch(nickname, session)) {
+        throw new AppError("OPERATION_UNCERTAIN", "native archive completed but the exact session mapping was not removed");
+      }
       this.ownership?.release(session);
       checkpoint?.(this.checkpoint(nickname, session, "archiving", "removed"));
     }));
@@ -205,14 +235,28 @@ export class SessionLifecycle {
         try {
           await this.assertDispatchable(session.endpoint, project, lease);
           if (project.path !== session.project_dir) throw new AppError("CWD_MISMATCH", "adopting project directory changed");
-          const before = await this.read(session.endpoint, session.thread_id, lease);
+          let before: ThreadResponse;
+          try { before = await this.read(session.endpoint, session.thread_id, lease); }
+          catch (error) {
+            if (!isExactThreadNotLoaded(error, session.thread_id)) throw error;
+            const response = await this.pool.request<ThreadResponse>(session.endpoint, "thread/resume", { threadId: session.thread_id }, undefined, lease);
+            resumed = true;
+            this.requireThreadIdentity(response.thread, session.thread_id);
+            before = await this.read(session.endpoint, session.thread_id, lease);
+          }
+          this.requireThreadIdentity(before.thread, session.thread_id);
           this.requireAdoptableBeforeResume(before.thread);
           await this.verifyCwd(session.endpoint, before.thread.cwd, project.path, lease);
           this.assertExact(nickname, expected, "adopting");
-          await this.pool.request(session.endpoint, "thread/resume", { threadId: session.thread_id }, undefined, lease);
-          resumed = true;
-          const afterResume = this.assertExact(nickname, expected, "adopting");
-          const native = await this.read(afterResume.endpoint, afterResume.thread_id, lease);
+          let native = before;
+          if (!resumed) {
+            const response = await this.pool.request<ThreadResponse>(session.endpoint, "thread/resume", { threadId: session.thread_id }, undefined, lease);
+            resumed = true;
+            this.requireThreadIdentity(response.thread, session.thread_id);
+            const afterResume = this.assertExact(nickname, expected, "adopting");
+            native = await this.read(afterResume.endpoint, afterResume.thread_id, lease);
+          }
+          this.requireThreadIdentity(native.thread, session.thread_id);
           this.requireIdle(native.thread);
           await this.verifyCwd(session.endpoint, native.thread.cwd, project.path, lease);
           await this.assertDispatchable(session.endpoint, project, lease);
@@ -224,12 +268,12 @@ export class SessionLifecycle {
             this.runtime.beginEpoch(promotable.endpoint, promotable.thread_id, promotable.mapping_id, this.baseline(native.thread), this.clock.now());
           }
         } catch (error) {
-          this.ownership?.release(session);
           const current = this.registry.get(nickname);
           if (resumed && current?.lifecycle_state === "adopting" && sameMapping(current, expected)) {
             try {
-              await this.pool.request(current.endpoint, "thread/unsubscribe", { threadId: current.thread_id }, undefined, lease);
+              await this.unsubscribeOrConfirmAbsent(current.endpoint, current.thread_id, lease);
               if (!await this.registry.removeIfMatch(nickname, current)) throw new Error("adopting reservation changed during rollback");
+              this.ownership?.release(current);
             } catch {
               throw new AppError("OPERATION_UNCERTAIN", "adoption recovery failed and its subscription rollback could not be confirmed");
             }
@@ -270,8 +314,18 @@ export class SessionLifecycle {
           recovery: "ownership_unclassified",
         });
       }
-      const before = await this.read(session.endpoint, session.thread_id, lease);
+      let resumed: ThreadResponse | undefined;
+      let before: ThreadResponse;
+      try { before = await this.read(session.endpoint, session.thread_id, lease); }
+      catch (error) {
+        if (!isExactThreadNotLoaded(error, session.thread_id)) throw error;
+        resumed = await this.pool.request<ThreadResponse>(session.endpoint, "thread/resume", { threadId: session.thread_id }, undefined, lease);
+        assertCurrent();
+        this.requireThreadIdentity(resumed.thread, session.thread_id);
+        before = await this.read(session.endpoint, session.thread_id, lease);
+      }
       assertCurrent();
+      this.requireThreadIdentity(before.thread, session.thread_id);
       await this.verifyCwd(session.endpoint, before.thread.cwd, project.path, lease);
       assertCurrent();
       if (this.ownership) {
@@ -279,11 +333,16 @@ export class SessionLifecycle {
         assertCurrent();
       }
       this.assertExact(nickname, expected, "managed");
-      const resumed = await this.pool.request<ThreadResponse>(session.endpoint, "thread/resume", { threadId: session.thread_id }, undefined, lease);
+      let authoritative = before;
+      if (!resumed) {
+        resumed = await this.pool.request<ThreadResponse>(session.endpoint, "thread/resume", { threadId: session.thread_id }, undefined, lease);
+        assertCurrent();
+        this.requireThreadIdentity(resumed.thread, session.thread_id);
+        const afterResume = this.assertExact(nickname, expected, "managed");
+        authoritative = await this.read(afterResume.endpoint, afterResume.thread_id, lease);
+      }
       assertCurrent();
-      const afterResume = this.assertExact(nickname, expected, "managed");
-      const authoritative = await this.read(afterResume.endpoint, afterResume.thread_id, lease);
-      assertCurrent();
+      this.requireThreadIdentity(authoritative.thread, session.thread_id);
       await this.verifyCwd(session.endpoint, authoritative.thread.cwd, project.path, lease);
       assertCurrent();
       await this.assertDispatchable(session.endpoint, project, lease);
@@ -317,10 +376,26 @@ export class SessionLifecycle {
       const current = this.registry.get(nickname);
       if (!current || !sameMapping(current, expected)) return;
       if (current.lifecycle_state !== "unadopting" && current.lifecycle_state !== "archiving") return;
-      const method = current.lifecycle_state === "unadopting" ? "thread/unsubscribe" : "thread/archive";
-      await this.pool.request(current.endpoint, method, { threadId: current.thread_id }, undefined, lease);
+      if (current.lifecycle_state === "unadopting") {
+        let alreadyUnsubscribed = false;
+        try {
+          const native = await this.read(current.endpoint, current.thread_id, lease);
+          this.requireThreadIdentity(native.thread, current.thread_id);
+          alreadyUnsubscribed = native.thread.status.type === "notLoaded";
+        } catch (error) {
+          if (!isExactThreadNotLoaded(error, current.thread_id)) throw error;
+          alreadyUnsubscribed = true;
+        }
+        if (!alreadyUnsubscribed) {
+          await this.unsubscribeOrConfirmAbsent(current.endpoint, current.thread_id, lease);
+        }
+      } else {
+        await this.pool.request(current.endpoint, "thread/archive", { threadId: current.thread_id }, undefined, lease);
+      }
       this.runtime.endEpoch(current.endpoint, current.thread_id, current.mapping_id, this.clock.now());
-      await this.registry.removeIfMatch(nickname, current);
+      if (!await this.registry.removeIfMatch(nickname, current)) {
+        throw new AppError("OPERATION_UNCERTAIN", "native removal completed but the exact session mapping was not removed");
+      }
       this.ownership?.release(current);
     }), existingLease);
   }
@@ -358,10 +433,26 @@ export class SessionLifecycle {
     }
   }
 
+  private requireThreadIdentity(thread: ThreadView, threadId: string): void {
+    if (thread.id !== threadId) throw new AppError("OPERATION_UNCERTAIN", "thread recovery returned an unexpected identity");
+  }
+
+  private async unsubscribeOrConfirmAbsent(endpointId: string, threadId: string, lease?: EndpointWorkLease): Promise<void> {
+    try { await this.pool.request(endpointId, "thread/unsubscribe", { threadId }, undefined, lease); }
+    catch (error) {
+      if (!isExactThreadNotLoaded(error, threadId)) throw error;
+    }
+  }
+
   private async verifyCwd(endpointId: string, actual: string, expected: string, lease?: EndpointWorkLease): Promise<void> {
     let canonicalActual: string;
     try { canonicalActual = (await this.prepareExisting(endpointId, actual, lease)).path; }
-    catch { throw new AppError("CWD_MISMATCH", `thread cwd does not exist: ${actual}`); }
+    catch (error) {
+      if (error instanceof AppError && error.code === "CONFIGURATION_ERROR") {
+        throw new AppError("CWD_MISMATCH", "thread cwd could not be verified");
+      }
+      throw error;
+    }
     if (canonicalActual !== expected) throw new AppError("CWD_MISMATCH", `thread cwd ${canonicalActual} does not match ${expected}`);
   }
 

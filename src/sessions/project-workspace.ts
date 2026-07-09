@@ -77,15 +77,14 @@ export class ProjectWorkspacePolicy {
     if (!validIdentity(prepared.identity.device) || !validIdentity(prepared.identity.inode)) {
       throw managedError("project workspace identity is invalid");
     }
-    let value;
-    try { value = await this.host.lstat(prepared.path); }
-    catch { throw managedError("project workspace changed unexpectedly"); }
+    const value = await optionalWorkspaceEvidence(() => this.host.lstat(prepared.path));
+    if (!value) throw managedError("project workspace changed unexpectedly");
     if (value.kind !== "directory") throw managedError("project workspace must remain a real directory");
-    const canonical = await this.host.realpath(prepared.path).catch(() => undefined);
+    const canonical = await optionalWorkspaceEvidence(() => this.host.realpath(prepared.path));
     if (canonical !== prepared.path) throw managedError("project workspace changed unexpectedly");
     await this.assertSafe(canonical);
-    const current = await this.host.lstat(prepared.path).catch(() => undefined);
-    const currentCanonical = await this.host.realpath(prepared.path).catch(() => undefined);
+    const current = await optionalWorkspaceEvidence(() => this.host.lstat(prepared.path));
+    const currentCanonical = await optionalWorkspaceEvidence(() => this.host.realpath(prepared.path));
     if (current?.kind !== "directory" || currentCanonical !== prepared.path
       || current.device !== value.device || current.inode !== value.inode
       || current.device !== prepared.identity.device || current.inode !== prepared.identity.inode) {
@@ -117,15 +116,16 @@ export class ProjectWorkspacePolicy {
   }
 
   private async finalize(path: string, created: boolean, fallback: boolean, expectedCanonical?: string): Promise<PreparedProjectWorkspace> {
-    const value = await this.host.lstat(path).catch(() => undefined);
+    const value = await optionalWorkspaceEvidence(() => this.host.lstat(path));
     if (value?.kind !== "directory") throw managedError("project workspace must be a real directory");
-    const canonical = await this.host.realpath(path);
+    const canonical = await optionalWorkspaceEvidence(() => this.host.realpath(path));
+    if (!canonical) throw managedError("project workspace must be a real directory");
     if (expectedCanonical !== undefined && canonical !== expectedCanonical) {
       throw managedError("project workspace changed unexpectedly during creation");
     }
     await this.assertSafe(canonical);
-    const canonicalValue = await this.host.lstat(canonical);
-    if (canonicalValue.kind !== "directory" || canonicalValue.device === undefined || canonicalValue.inode === undefined) throw managedError("project workspace identity is unavailable");
+    const canonicalValue = await optionalWorkspaceEvidence(() => this.host.lstat(canonical));
+    if (canonicalValue?.kind !== "directory" || canonicalValue.device === undefined || canonicalValue.inode === undefined) throw managedError("project workspace identity is unavailable");
     return {
       path: canonical,
       created,
@@ -181,6 +181,14 @@ async function projectedCanonical(host: WorkspaceHost, path: string): Promise<st
 
 async function pathExists(host: WorkspaceHost, path: string): Promise<boolean> {
   return (await host.lstat(path)).kind !== "missing";
+}
+
+async function optionalWorkspaceEvidence<T>(read: () => Promise<T>): Promise<T | undefined> {
+  try { return await read(); }
+  catch (error) {
+    if (error instanceof AppError) throw error;
+    return undefined;
+  }
 }
 
 function overlaps(left: string, right: string): boolean {
