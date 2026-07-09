@@ -37,6 +37,7 @@ export interface AppServerRuntimeService {
   runtimeIdentity(): Promise<RuntimeIdentity | undefined>;
   classifyLoss(): Promise<EndpointLossKind>;
   shutdownRuntime(expected: RuntimeIdentity): Promise<void>;
+  closeTransport?(): Promise<void>;
 }
 
 export class EndpointAuthenticationRequiredError extends AppError {
@@ -116,12 +117,17 @@ export class ManagedAppServerEndpoint {
   async closeConnection(): Promise<void> {
     this.generation += 1;
     this.state = "stopped";
-    await this.disposeConnection();
+    let firstError: unknown;
+    try { await this.disposeConnection(); } catch (error) { firstError = error; }
+    try { await this.options.runtime.closeTransport?.(); } catch (error) { firstError ??= error; }
+    if (firstError !== undefined) throw firstError;
   }
 
   async shutdownRuntime(expected: RuntimeIdentity): Promise<void> {
+    this.generation += 1;
+    this.state = "stopped";
     let cleanupError: unknown;
-    try { await this.closeConnection(); } catch (error) { cleanupError = error; }
+    try { await this.disposeConnection(); } catch (error) { cleanupError = error; }
     await this.options.runtime.shutdownRuntime(expected);
     if (cleanupError !== undefined) throw cleanupError;
   }

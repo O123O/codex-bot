@@ -1,15 +1,16 @@
 import assert from "node:assert/strict";
-import type { SpawnOptions } from "node:child_process";
-import { EventEmitter } from "node:events";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
 import { chmod, lstat, mkdtemp, rm } from "node:fs/promises";
 import { createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { PassThrough } from "node:stream";
 import test from "node:test";
 import type { RpcWire } from "../../src/app-server/rpc-client.ts";
+import { AppError } from "../../src/core/errors.ts";
 import { SshAppServerRuntime } from "../../src/endpoints/ssh-app-server-runtime.ts";
 import type { SshConnectionPlan } from "../../src/endpoints/ssh-config.ts";
+import { localSshForwardSocketPath } from "../../src/endpoints/local-runtime.ts";
 import type { SshRuntimeController } from "../../src/endpoints/ssh-runtime.ts";
 import type { EndpointLossKind, RuntimeIdentity } from "../../src/endpoints/types.ts";
 
@@ -19,8 +20,8 @@ const plan: SshConnectionPlan = {
   alias: "devbox",
   destination: { hostname: "host.example", user: "xin", port: 22 },
   commonArgs: ["-o", "BatchMode=yes", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3"],
-  ownsControlMaster: true,
-  controlPath: "/tmp/helper-master",
+  ownsControlMaster: false,
+  controlPath: "/tmp/user-master",
 };
 
 class FakeWire implements RpcWire {
@@ -33,34 +34,13 @@ class FakeWire implements RpcWire {
     if (!this.closed) { this.closed = true; for (const listener of this.closes) listener(); }
     if (this.closeError) throw this.closeError;
   }
+  fail(error = new Error("wire lost")): void {
+    if (this.closed) return;
+    this.closed = true;
+    for (const listener of this.closes) listener(error);
+  }
   onMessage(listener: (message: string) => void): () => void { this.messages.add(listener); return () => this.messages.delete(listener); }
   onClose(listener: (error?: Error) => void): () => void { this.closes.add(listener); return () => this.closes.delete(listener); }
-}
-
-class FakeForwardChild extends EventEmitter {
-  stdin = new PassThrough();
-  stdout = new PassThrough();
-  stderr = new PassThrough();
-  exitCode: number | null = null;
-  signalCode: NodeJS.Signals | null = null;
-  server: Server | undefined;
-  killed = false;
-  delayKill = false;
-  private pendingKill?: () => void;
-  kill(signal?: NodeJS.Signals) {
-    this.killed = true;
-    this.signalCode = signal ?? "SIGTERM";
-    const finish = () => this.emit("exit", null, this.signalCode);
-    const close = () => { if (this.server?.listening) this.server.close(finish); else finish(); };
-    if (this.delayKill) this.pendingKill = close; else close();
-    return true;
-  }
-  releaseKill(): void { this.pendingKill?.(); delete this.pendingKill; }
-  fail(): void {
-    this.exitCode = 255;
-    const finish = () => this.emit("exit", 255, null);
-    if (this.server?.listening) this.server.close(finish); else finish();
-  }
 }
 
 class FakeRemoteRuntime implements SshRuntimeController {
@@ -75,105 +55,117 @@ class FakeRemoteRuntime implements SshRuntimeController {
   async stop(expected: RuntimeIdentity): Promise<void> { this.stops.push(expected); }
 }
 
+function controlOperation(args: readonly string[]): string {
+  return args[args.indexOf("-O") + 1] ?? "";
+}
+
+function forwarding(args: readonly string[]): string {
+  return args[args.indexOf("-L") + 1] ?? "";
+}
+
+function localSocket(args: readonly string[]): string {
+  const value = forwarding(args);
+  return value.slice(0, value.indexOf(":"));
+}
+
 function fixture(root: string, remote = new FakeRemoteRuntime(), options: {
   connectWire?: (socketPath: string) => Promise<RpcWire>;
-  afterSpawn?: (child: FakeForwardChild, localSocket: string) => void;
+  beforeControl?: (operation: string, args: readonly string[]) => void | Promise<void>;
+  cancelClosesForward?: () => boolean;
+  plan?: SshConnectionPlan;
 } = {}) {
-  const children: FakeForwardChild[] = [];
-  const args: string[][] = [];
+  const commands: string[][] = [];
   const wires: FakeWire[] = [];
-  let generation = 0;
+  const servers = new Map<string, Server>();
   const runtime = new SshAppServerRuntime({
     runtime: remote,
-    plan,
+    plan: options.plan ?? plan,
     socketRoot: root,
-    socketGeneration: () => `${++generation}`.padStart(8, "0"),
-    spawn: ((_command: string, childArgs: readonly string[], _options: SpawnOptions) => {
-      args.push([...childArgs]);
-      const spec = childArgs[childArgs.indexOf("-L") + 1]!;
-      const localSocket = spec.slice(0, spec.indexOf(":"));
-      const child = new FakeForwardChild();
-      const server = createServer();
-      child.server = server;
-      server.listen(localSocket, () => { void chmod(localSocket, 0o600); });
-      children.push(child);
-      options.afterSpawn?.(child, localSocket);
-      return child as never;
-    }) as never,
+    attestControlMaster: async () => undefined,
+    run: async (_command, args) => {
+      commands.push([...args]);
+      const operation = controlOperation(args);
+      await options.beforeControl?.(operation, args);
+      if (operation === "forward") {
+        const socketPath = localSocket(args);
+        const server = createServer();
+        await new Promise<void>((resolve, reject) => {
+          server.once("error", reject);
+          server.listen(socketPath, resolve);
+        });
+        await chmod(socketPath, 0o600);
+        servers.set(forwarding(args), server);
+      } else if (operation === "cancel") {
+        const server = servers.get(forwarding(args));
+        if (server && (options.cancelClosesForward?.() ?? true)) {
+          await new Promise<void>((resolve) => server.close(() => resolve()));
+          servers.delete(forwarding(args));
+        }
+      }
+      return { stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) };
+    },
     connectWire: options.connectWire ?? (async () => { const wire = new FakeWire(); wires.push(wire); return wire; }),
     connectionTimeoutMs: 2_000,
   });
-  return { runtime, remote, children, args, wires };
+  return { runtime, remote, commands, wires, servers };
 }
 
-test("an asynchronous SSH spawn error is observed during open", async (t) => {
+async function privateRoot(t: test.TestContext): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), "qiyan-forward-"));
   await chmod(root, 0o700);
   t.after(() => rm(root, { recursive: true, force: true }));
+  return root;
+}
+
+test("opening requires the existing authenticated ControlMaster", async (t) => {
+  const root = await privateRoot(t);
   const value = fixture(root, new FakeRemoteRuntime(), {
-    afterSpawn: (child) => queueMicrotask(() => child.emit("error", new Error("ssh missing"))),
+    beforeControl: (operation) => { if (operation === "check") throw new Error("authenticated master unavailable"); },
   });
 
-  await assert.rejects(value.runtime.open(), /ssh missing|forward/iu);
-  assert.equal(value.children[0]!.killed, true);
+  await assert.rejects(value.runtime.open(), /authenticated SSH ControlMaster is unavailable/u);
+  assert.deepEqual(value.commands.map(controlOperation), ["check"]);
+  assert.equal(value.remote.starts, 0, "an MFA endpoint must not attempt helper authentication without its user-owned master");
   assert.deepEqual(value.remote.stops, []);
 });
 
-test("wire connection failure removes the exact forward socket without stopping the remote runtime", async (t) => {
-  const root = await mkdtemp(join(tmpdir(), "qiyan-forward-"));
-  await chmod(root, 0o700);
-  t.after(() => rm(root, { recursive: true, force: true }));
+test("wire connection failure cancels the exact forward without stopping the remote runtime", async (t) => {
+  const root = await privateRoot(t);
   const value = fixture(root, new FakeRemoteRuntime(), {
     connectWire: async () => { throw new Error("wire connect failed"); },
   });
 
   await assert.rejects(value.runtime.open(), /wire connect failed/u);
 
-  const socketSpec = value.args[0]![value.args[0]!.indexOf("-L") + 1]!;
-  const socketPath = socketSpec.slice(0, socketSpec.indexOf(":"));
-  assert.equal(value.children[0]!.killed, true);
+  assert.deepEqual(value.commands.map(controlOperation), ["check", "forward", "cancel"]);
+  const socketPath = localSocket(value.commands[1]!);
   await assert.rejects(lstat(socketPath), (error: unknown) => (error as NodeJS.ErrnoException).code === "ENOENT");
   assert.deepEqual(value.remote.stops, []);
 });
 
-test("SSH exit while wire connection is pending rejects open", async (t) => {
-  const root = await mkdtemp(join(tmpdir(), "qiyan-forward-"));
-  await chmod(root, 0o700);
-  t.after(() => rm(root, { recursive: true, force: true }));
-  let beginConnect!: () => void;
-  const connecting = new Promise<void>((resolve) => { beginConnect = resolve; });
-  const value = fixture(root, new FakeRemoteRuntime(), {
-    connectWire: async () => { beginConnect(); return new Promise<RpcWire>(() => undefined); },
+test("open reclaims a stale master-owned forward socket left by a crashed process", async (t) => {
+  const root = await privateRoot(t);
+  const stalePath = localSshForwardSocketPath(root, "00000000");
+  const stale = createServer();
+  await new Promise<void>((resolve, reject) => {
+    stale.once("error", reject);
+    stale.listen(stalePath, resolve);
   });
-  const opening = value.runtime.open();
-  await connecting;
+  await chmod(stalePath, 0o600);
+  const value = fixture(root);
+  value.servers.set(`${stalePath}:${value.remote.remoteSocketPath}`, stale);
 
-  value.children[0]!.fail();
+  const connection = await value.runtime.open();
 
-  await assert.rejects(opening, /forward exited/iu);
+  assert.deepEqual(value.commands.map(controlOperation), ["check", "cancel", "forward"]);
+  assert.equal(stale.listening, false);
+  assert.equal(localSocket(value.commands[2]!), stalePath);
+  assert.equal((await lstat(stalePath)).isSocket(), true);
+  await connection.close();
 });
 
-test("process failure in the wire handoff closes the newly created wire", async (t) => {
-  const root = await mkdtemp(join(tmpdir(), "qiyan-forward-"));
-  await chmod(root, 0o700);
-  t.after(() => rm(root, { recursive: true, force: true }));
-  const wire = new FakeWire();
-  const value = fixture(root, new FakeRemoteRuntime(), {
-    connectWire: async () => {
-      queueMicrotask(() => value.children[0]!.emit("error", new Error("handoff failed")));
-      return wire;
-    },
-  });
-
-  await assert.rejects(value.runtime.open(), /handoff failed|forward/iu);
-  assert.equal(wire.closed, true);
-  assert.equal(value.children[0]!.killed, true);
-});
-
-test("overlapping opens reserve the single forward before the first await", async (t) => {
-  const root = await mkdtemp(join(tmpdir(), "qiyan-forward-"));
-  await chmod(root, 0o700);
-  t.after(() => rm(root, { recursive: true, force: true }));
+test("overlapping opens reserve one ControlMaster forward before the first await", async (t) => {
+  const root = await privateRoot(t);
   let release!: (wire: RpcWire) => void;
   let beginConnect!: () => void;
   const connecting = new Promise<void>((resolve) => { beginConnect = resolve; });
@@ -183,15 +175,13 @@ test("overlapping opens reserve the single forward before the first await", asyn
 
   await assert.rejects(value.runtime.open(), /already open/iu);
   await connecting;
-  assert.equal(value.children.length, 1);
+  assert.equal(value.commands.filter((args) => controlOperation(args) === "forward").length, 1);
   release(new FakeWire());
   await (await first).close();
 });
 
-test("SSH runtime service owns one independent forward and confirms exact remote identity", async (t) => {
-  const root = await mkdtemp(join(tmpdir(), "qiyan-forward-"));
-  await chmod(root, 0o700);
-  t.after(() => rm(root, { recursive: true, force: true }));
+test("SSH runtime reuses one authenticated ControlMaster and confirms exact remote identity", async (t) => {
+  const root = await privateRoot(t);
   const value = fixture(root);
 
   const connection = await value.runtime.open();
@@ -199,20 +189,21 @@ test("SSH runtime service owns one independent forward and confirms exact remote
 
   assert.deepEqual(confirmed, { runtime: identity });
   assert.equal(value.remote.starts, 1);
-  const rendered = value.args[0]!.join(" ");
-  assert.match(rendered, /ControlMaster=no/u);
-  assert.doesNotMatch(rendered, /helper-master|ControlPersist=60/u);
+  assert.deepEqual(value.commands.slice(0, 2).map(controlOperation), ["check", "forward"]);
+  for (const args of value.commands) {
+    assert.deepEqual(args.slice(args.indexOf("-S"), args.indexOf("-S") + 2), ["-S", "/tmp/user-master"]);
+    assert.doesNotMatch(args.join(" "), /ControlMaster=auto|ControlPath=none/u);
+    for (const standalone of ["-N", "-T", "-n"]) assert.equal(args.includes(standalone), false);
+  }
   assert.deepEqual(await value.runtime.runtimeIdentity(), identity);
 
   await connection.close();
-  assert.equal(value.children[0]!.killed, true);
+  assert.equal(controlOperation(value.commands.at(-1)!), "cancel");
   assert.deepEqual(value.remote.stops, [], "closing the forward must leave the detached runtime alive");
 });
 
 test("SSH connection refuses a changed detached runtime identity", async (t) => {
-  const root = await mkdtemp(join(tmpdir(), "qiyan-forward-"));
-  await chmod(root, 0o700);
-  t.after(() => rm(root, { recursive: true, force: true }));
+  const root = await privateRoot(t);
   const value = fixture(root);
   const connection = await value.runtime.open();
   value.remote.current = replacement;
@@ -221,63 +212,273 @@ test("SSH connection refuses a changed detached runtime identity", async (t) => 
   await connection.close();
 });
 
-test("forward loss is connection loss and explicit shutdown stops only the exact runtime", async (t) => {
-  const root = await mkdtemp(join(tmpdir(), "qiyan-forward-"));
-  await chmod(root, 0o700);
-  t.after(() => rm(root, { recursive: true, force: true }));
+test("App Server wire closure is the forward-loss signal", async (t) => {
+  const root = await privateRoot(t);
   const value = fixture(root);
   const connection = await value.runtime.open();
   await connection.confirmInitialized({});
   const losses: string[] = [];
   connection.onClose(() => losses.push("closed"));
 
-  value.children[0]!.fail();
+  value.wires[0]!.fail();
   await new Promise((resolve) => setImmediate(resolve));
 
   assert.deepEqual(losses, ["closed"]);
   assert.equal(await value.runtime.classifyLoss(), "connection-lost");
+  await connection.close();
   await value.runtime.shutdownRuntime(identity);
   assert.deepEqual(value.remote.stops, [identity]);
 });
 
-test("an old forward exit and socket cleanup cannot affect a new generation", async (t) => {
-  const root = await mkdtemp(join(tmpdir(), "qiyan-forward-"));
-  await chmod(root, 0o700);
-  t.after(() => rm(root, { recursive: true, force: true }));
-  const value = fixture(root);
+test("a new generation waits until the previous forward cancellation and cleanup finish", async (t) => {
+  const root = await privateRoot(t);
+  let cancelStarted!: () => void;
+  let releaseCancel!: () => void;
+  const cancelling = new Promise<void>((resolve) => { cancelStarted = resolve; });
+  const release = new Promise<void>((resolve) => { releaseCancel = resolve; });
+  let firstForward = "";
+  const value = fixture(root, new FakeRemoteRuntime(), {
+    beforeControl: async (operation, args) => {
+      if (operation === "forward" && !firstForward) firstForward = forwarding(args);
+      if (operation === "cancel" && forwarding(args) === firstForward) { cancelStarted(); await release; }
+    },
+  });
   const first = await value.runtime.open();
   await first.confirmInitialized({});
-  value.children[0]!.delayKill = true;
   const closing = first.close();
+  await cancelling;
+  let replacementOpened = false;
+  const replacementOpening = value.runtime.open().then((connection) => {
+    replacementOpened = true;
+    return connection;
+  });
   await new Promise((resolve) => setImmediate(resolve));
-  const second = await value.runtime.open();
-  await second.confirmInitialized({});
+  assert.equal(replacementOpened, false);
 
-  value.children[0]!.releaseKill();
+  releaseCancel();
   await closing;
 
-  assert.equal(value.wires[1]!.closed, false);
-  const secondSpec = value.args[1]![value.args[1]!.indexOf("-L") + 1]!;
-  const secondPath = secondSpec.slice(0, secondSpec.indexOf(":"));
+  const second = await replacementOpening;
+  await second.confirmInitialized({});
+  const forwardCommands = value.commands.filter((args) => controlOperation(args) === "forward");
+  const secondPath = localSocket(forwardCommands[1]!);
   assert.equal((await lstat(secondPath)).isSocket(), true);
-  assert.deepEqual(await value.runtime.runtimeIdentity(), identity);
+  assert.equal(value.wires[1]!.closed, false);
   await second.close();
 });
 
+test("cancel failure with a live master preserves the socket and blocks overlap until retry succeeds", async (t) => {
+  const root = await privateRoot(t);
+  let cancelFailures = 1;
+  const value = fixture(root, new FakeRemoteRuntime(), {
+    beforeControl: (operation) => {
+      if (operation === "cancel" && cancelFailures-- > 0) throw new Error("cancel timeout");
+    },
+  });
+  const connection = await value.runtime.open();
+  const socketPath = localSocket(value.commands.find((args) => controlOperation(args) === "forward")!);
+
+  await assert.rejects(connection.close(), /forward cleanup could not be confirmed/u);
+  assert.equal((await lstat(socketPath)).isSocket(), true);
+
+  const replacement = await value.runtime.open();
+  assert.equal((await lstat(socketPath)).isSocket(), true);
+  await replacement.close();
+});
+
+test("exit-zero cancel that leaves the listener alive preserves cleanup ownership", async (t) => {
+  const root = await privateRoot(t);
+  let closeForward = false;
+  const value = fixture(root, new FakeRemoteRuntime(), { cancelClosesForward: () => closeForward });
+  const connection = await value.runtime.open();
+  const socketPath = localSocket(value.commands.find((args) => controlOperation(args) === "forward")!);
+
+  await assert.rejects(connection.close(), /forward cleanup could not be confirmed/u);
+
+  assert.equal((await lstat(socketPath)).isSocket(), true);
+  closeForward = true;
+  const replacement = await value.runtime.open();
+  await replacement.close();
+});
+
+test("a failed control check cannot prove cancellation while the listener still accepts", async (t) => {
+  const root = await privateRoot(t);
+  let cleanup = false;
+  const value = fixture(root, new FakeRemoteRuntime(), {
+    beforeControl: (operation) => {
+      if (cleanup && operation === "cancel") throw new Error("cancel failed");
+      if (cleanup && operation === "check") {
+        throw new AppError("ENDPOINT_UNAVAILABLE", "SSH process failed (exit 255)");
+      }
+    },
+  });
+  const connection = await value.runtime.open();
+  const socketPath = localSocket(value.commands.find((args) => controlOperation(args) === "forward")!);
+  cleanup = true;
+
+  await assert.rejects(connection.close(), /forward cleanup could not be confirmed/u);
+
+  assert.equal((await lstat(socketPath)).isSocket(), true);
+  cleanup = false;
+  const replacement = await value.runtime.open();
+  await replacement.close();
+});
+
+test("opening rollback retains failed forward cleanup for the next open", async (t) => {
+  const root = await privateRoot(t);
+  let connectAttempts = 0;
+  let cancelFailures = 1;
+  const value = fixture(root, new FakeRemoteRuntime(), {
+    connectWire: async () => {
+      connectAttempts += 1;
+      if (connectAttempts === 1) throw new Error("wire failed");
+      return new FakeWire();
+    },
+    beforeControl: (operation) => {
+      if (operation === "cancel" && cancelFailures-- > 0) throw new Error("cancel timeout");
+    },
+  });
+
+  await assert.rejects(value.runtime.open(), /wire failed|cleanup/iu);
+  const socketPath = localSocket(value.commands.find((args) => controlOperation(args) === "forward")!);
+  assert.equal((await lstat(socketPath)).isSocket(), true);
+
+  const connection = await value.runtime.open();
+  assert.equal(connectAttempts, 2);
+  await connection.close();
+});
+
+test("a rejected forward request without a listener does not retain cleanup ownership", async (t) => {
+  const root = await privateRoot(t);
+  let rejectForward = true;
+  const value = fixture(root, new FakeRemoteRuntime(), {
+    beforeControl: (operation) => {
+      if (operation === "forward" && rejectForward) throw new Error("forward rejected");
+    },
+  });
+
+  await assert.rejects(value.runtime.open(), /forward rejected/u);
+
+  rejectForward = false;
+  const connection = await value.runtime.open();
+  await connection.close();
+});
+
+test("transport close waits for an in-flight owned open and exits the master last", async (t) => {
+  const root = await privateRoot(t);
+  let started!: () => void;
+  let release!: () => void;
+  const openingStarted = new Promise<void>((resolve) => { started = resolve; });
+  const blocked = new Promise<void>((resolve) => { release = resolve; });
+  const events: string[] = [];
+  class DelayedRemote extends FakeRemoteRuntime {
+    override async ensureStarted(): Promise<RuntimeIdentity> {
+      events.push("ensure");
+      started();
+      await blocked;
+      events.push("ensured");
+      return identity;
+    }
+    async closeTransport(): Promise<void> { events.push("exit"); }
+  }
+  const ownedPlan = { ...plan, ownsControlMaster: true, controlPath: join(root, "owned-master") };
+  const value = fixture(root, new DelayedRemote(), {
+    plan: ownedPlan,
+    beforeControl: (operation) => { events.push(operation); },
+  });
+  const opening = value.runtime.open();
+  await openingStarted;
+  let transportClosed = false;
+  const closing = value.runtime.closeTransport().then(() => { transportClosed = true; });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(transportClosed, false);
+
+  release();
+  const connection = await opening;
+  await closing;
+
+  assert.equal(connection.wire instanceof FakeWire && connection.wire.closed, true);
+  assert.equal(events.at(-1), "exit");
+  await assert.rejects(
+    lstat(localSshForwardSocketPath(root, "00000000")),
+    (error: unknown) => (error as NodeJS.ErrnoException).code === "ENOENT",
+  );
+});
+
+test("explicit runtime shutdown waits for an in-flight open before stopping the remote runtime", async (t) => {
+  const root = await privateRoot(t);
+  let started!: () => void;
+  let release!: () => void;
+  const openingStarted = new Promise<void>((resolve) => { started = resolve; });
+  const blocked = new Promise<void>((resolve) => { release = resolve; });
+  const events: string[] = [];
+  class DelayedRemote extends FakeRemoteRuntime {
+    override async ensureStarted(): Promise<RuntimeIdentity> {
+      events.push("ensure");
+      started();
+      await blocked;
+      events.push("ensured");
+      return identity;
+    }
+    override async stop(expected: RuntimeIdentity): Promise<void> {
+      await super.stop(expected);
+      events.push("stop");
+    }
+  }
+  const value = fixture(root, new DelayedRemote(), {
+    beforeControl: (operation) => { events.push(operation); },
+  });
+  const opening = value.runtime.open();
+  await openingStarted;
+  let stopped = false;
+  const stopping = value.runtime.shutdownRuntime(identity).then(() => { stopped = true; });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(stopped, false);
+
+  release();
+  const connection = await opening;
+  await stopping;
+
+  assert.equal(connection.wire instanceof FakeWire && connection.wire.closed, true);
+  assert.equal(events.at(-1), "stop");
+  await assert.rejects(
+    lstat(localSshForwardSocketPath(root, "00000000")),
+    (error: unknown) => (error as NodeJS.ErrnoException).code === "ENOENT",
+  );
+});
+
+test("closed stale Unix listener inode is reclaimed", async (t) => {
+  const root = await privateRoot(t);
+  const socketPath = localSshForwardSocketPath(root, "00000000");
+  const child = spawn(process.execPath, ["-e", [
+    "const net=require('node:net');",
+    "const fs=require('node:fs');",
+    "const server=net.createServer();",
+    "server.listen(process.argv[1],()=>{fs.chmodSync(process.argv[1],0o600);process.stdout.write('ready')});",
+  ].join(""), socketPath], { stdio: ["ignore", "pipe", "ignore"] });
+  await once(child.stdout!, "data");
+  child.kill("SIGKILL");
+  await once(child, "exit");
+  assert.equal((await lstat(socketPath)).isSocket(), true);
+  const value = fixture(root);
+
+  const connection = await value.runtime.open();
+
+  assert.equal((await lstat(socketPath)).isSocket(), true);
+  await connection.close();
+});
+
 test("wire cleanup failure cannot leak the forward or skip exact remote shutdown", async (t) => {
-  const root = await mkdtemp(join(tmpdir(), "qiyan-forward-"));
-  await chmod(root, 0o700);
-  t.after(() => rm(root, { recursive: true, force: true }));
+  const root = await privateRoot(t);
   const value = fixture(root);
   const connection = await value.runtime.open();
   await connection.confirmInitialized({});
-  const socketSpec = value.args[0]![value.args[0]!.indexOf("-L") + 1]!;
-  const socketPath = socketSpec.slice(0, socketSpec.indexOf(":"));
+  const socketPath = localSocket(value.commands.find((args) => controlOperation(args) === "forward")!);
   value.wires[0]!.closeError = new Error("wire cleanup failed");
 
   await assert.rejects(value.runtime.shutdownRuntime(identity), /wire cleanup failed/u);
 
-  assert.equal(value.children[0]!.killed, true);
+  assert.equal(value.commands.some((args) => controlOperation(args) === "cancel"), true);
   await assert.rejects(lstat(socketPath), (error: unknown) => (error as NodeJS.ErrnoException).code === "ENOENT");
   assert.deepEqual(value.remote.stops, [identity]);
 });

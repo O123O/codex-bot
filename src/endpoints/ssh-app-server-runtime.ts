@@ -1,6 +1,5 @@
-import { randomBytes } from "node:crypto";
-import { spawn as nodeSpawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { lstat, unlink } from "node:fs/promises";
+import { connect } from "node:net";
 import type {
   AppServerConnection,
   AppServerConnectionIdentity,
@@ -10,16 +9,25 @@ import type {
 import type { RpcWire } from "../app-server/rpc-client.ts";
 import { AppError } from "../core/errors.ts";
 import { localSshForwardSocketPath } from "./local-runtime.ts";
-import { buildSshStreamForwardArgs, type SshConnectionPlan } from "./ssh-config.ts";
-import type { SshRuntimeController } from "./ssh-runtime.ts";
+import {
+  buildControlMasterCheckArgs,
+  buildSshStreamForwardArgs,
+  buildSshStreamForwardCancelArgs,
+  type SshConnectionPlan,
+} from "./ssh-config.ts";
+import { runBoundedProcess } from "./ssh-process.ts";
+import { attestUserControlMaster, type SshRuntimeController } from "./ssh-runtime.ts";
 import type { EndpointLossKind, RuntimeIdentity } from "./types.ts";
 
-type Spawn = typeof nodeSpawn;
 interface SocketIdentity { device: string; inode: string }
+interface PendingForwardCleanup { socketPath: string; socketIdentity?: SocketIdentity }
 
 export class SshAppServerRuntime implements AppServerRuntimeService {
   private active?: SshForwardConnection;
-  private opening?: symbol;
+  private opening?: { token: symbol; done: Promise<void>; finish(): void };
+  private pendingCleanup?: PendingForwardCleanup;
+  private transportClose?: Promise<void>;
+  private transportClosing = false;
 
   constructor(private readonly options: {
     runtime: SshRuntimeController;
@@ -27,58 +35,66 @@ export class SshAppServerRuntime implements AppServerRuntimeService {
     socketRoot: string;
     connectWire(socketPath: string): Promise<RpcWire>;
     sshBinary?: string;
-    spawn?: Spawn;
-    socketGeneration?: () => string;
+    run?: typeof runBoundedProcess;
+    attestControlMaster?: typeof attestUserControlMaster;
     connectionTimeoutMs?: number;
+    listenerProbeTimeoutMs?: number;
     sleep?: (ms: number) => Promise<void>;
   }) {}
 
   async open(): Promise<AppServerConnection> {
-    if (this.active || this.opening) throw new AppError("OPERATION_CONFLICT", "SSH App Server connection is already open");
+    if (this.opening || this.transportClosing) throw new AppError("OPERATION_CONFLICT", "SSH App Server connection is already open");
     const opening = Symbol("ssh-forward-opening");
-    this.opening = opening;
-    let child: ChildProcessWithoutNullStreams | undefined;
-    let monitor: ForwardProcessMonitor | undefined;
+    let finishOpening!: () => void;
+    const openingDone = new Promise<void>((resolve) => { finishOpening = resolve; });
+    const openingState = { token: opening, done: openingDone, finish: finishOpening };
+    this.opening = openingState;
     let socketPath: string | undefined;
     let socketIdentity: SocketIdentity | undefined;
     let wire: RpcWire | undefined;
     let connection: SshForwardConnection | undefined;
+    let forwardRequested = false;
     try {
       await attestSocketRoot(this.options.socketRoot);
+      if (this.active) {
+        if (!this.active.cleanupPending) throw new AppError("OPERATION_CONFLICT", "SSH App Server connection is already open");
+        await this.active.close();
+      }
+      await this.settlePendingCleanup();
+      if (!this.options.plan.ownsControlMaster) await this.requireControlMaster();
       const expected = await this.options.runtime.ensureStarted();
       if (expected.kind !== "ssh") throw new AppError("ENDPOINT_UNAVAILABLE", "remote runtime returned a non-SSH identity");
-      const generation = this.options.socketGeneration?.() ?? randomBytes(4).toString("hex");
-      socketPath = localSshForwardSocketPath(this.options.socketRoot, generation);
-      const spawn = this.options.spawn ?? nodeSpawn;
-      child = spawn(this.options.sshBinary ?? "ssh", buildSshStreamForwardArgs(
+      if (this.options.plan.ownsControlMaster) await this.requireControlMaster();
+      socketPath = localSshForwardSocketPath(this.options.socketRoot, "00000000");
+      await this.reclaimStaleForward(socketPath);
+      forwardRequested = true;
+      await this.runControl(buildSshStreamForwardArgs(
         this.options.plan, socketPath, this.options.runtime.remoteSocketPath,
-      ), { stdio: ["pipe", "pipe", "pipe"], shell: false }) as ChildProcessWithoutNullStreams;
-      monitor = new ForwardProcessMonitor(child);
-      child.stdin.end();
-      child.stdout.on("data", () => { /* Drain unexpected SSH output without logging it. */ });
-      child.stderr.on("data", () => { /* Drain potentially sensitive SSH diagnostics. */ });
-      socketIdentity = await waitForSocket(monitor, socketPath, this.options.connectionTimeoutMs ?? 10_000, this.options.sleep);
-      const connecting = this.options.connectWire(socketPath);
-      try { wire = await monitor.race(connecting); }
-      catch (error) {
-        void connecting.then((lateWire) => { try { lateWire.close(); } catch { /* Preserve the opening failure. */ } }, () => undefined);
-        throw error;
-      }
-      connection = new SshForwardConnection(this, child, monitor, wire, socketPath, socketIdentity, expected);
+      ));
+      socketIdentity = await waitForSocket(socketPath, this.options.connectionTimeoutMs ?? 10_000, this.options.sleep);
+      wire = await this.options.connectWire(socketPath);
+      connection = new SshForwardConnection(this, wire, socketPath, socketIdentity, expected);
       this.active = connection;
-      if (!connection.activate()) throw new AppError("ENDPOINT_UNAVAILABLE", "SSH forward exited during connection");
+      if (connection.lost) throw new AppError("ENDPOINT_UNAVAILABLE", "SSH App Server wire closed during connection");
       return connection;
     } catch (error) {
-      if (connection) await connection.close().catch(() => undefined);
+      let cleanupError: unknown;
+      if (connection) {
+        try { await connection.close(); } catch (failure) { cleanupError = failure; }
+      }
       else {
         try { wire?.close(); } catch { /* Preserve the opening failure. */ }
-        if (child) await stopForwardChild(child).catch(() => undefined);
         if (socketPath && !socketIdentity) socketIdentity = await ownedSocketIdentity(socketPath).catch(() => undefined);
-        if (socketPath) await removeExactSocket(socketPath, socketIdentity).catch(() => undefined);
+        if (forwardRequested && socketPath) {
+          this.pendingCleanup = { socketPath, ...(socketIdentity ? { socketIdentity } : {}) };
+          try { await this.settlePendingCleanup(); } catch (failure) { cleanupError = failure; }
+        }
       }
+      if (cleanupError !== undefined) throw cleanupError;
       throw error;
     } finally {
-      if (this.opening === opening) delete this.opening;
+      openingState.finish();
+      if (this.opening?.token === opening) delete this.opening;
     }
   }
 
@@ -90,10 +106,48 @@ export class SshAppServerRuntime implements AppServerRuntimeService {
   }
 
   async shutdownRuntime(expected: RuntimeIdentity): Promise<void> {
-    let cleanupError: unknown;
-    try { await this.active?.close(); } catch (error) { cleanupError = error; }
-    await this.options.runtime.stop(expected);
-    if (cleanupError !== undefined) throw cleanupError;
+    if (this.transportClosing) throw new AppError("OPERATION_CONFLICT", "SSH transport teardown is already active");
+    this.transportClosing = true;
+    try {
+      await this.opening?.done;
+      let cleanupError: unknown;
+      try { await this.active?.close(); } catch (error) { cleanupError = error; }
+      try { await this.settlePendingCleanup(); } catch (error) { cleanupError ??= error; }
+      let stopError: unknown;
+      try { await this.options.runtime.stop(expected); } catch (error) { stopError = error; }
+      if (this.active?.cleanupPending) {
+        try { await this.active.close(); } catch (error) { cleanupError ??= error; }
+      }
+      try { await this.settlePendingCleanup(); } catch (error) { cleanupError ??= error; }
+      if (cleanupError !== undefined) throw cleanupError;
+      if (stopError !== undefined) throw stopError;
+    } finally {
+      this.transportClosing = false;
+    }
+  }
+
+  closeTransport(): Promise<void> {
+    if (this.transportClose) return this.transportClose;
+    this.transportClosing = true;
+    const closing = this.finishTransportClose().finally(() => {
+      if (this.transportClose === closing) delete this.transportClose;
+      this.transportClosing = false;
+    });
+    this.transportClose = closing;
+    return closing;
+  }
+
+  private async finishTransportClose(): Promise<void> {
+    await this.opening?.done;
+    let firstError: unknown;
+    try { await this.active?.close(); } catch (error) { firstError = error; }
+    try { await this.settlePendingCleanup(); } catch (error) { firstError ??= error; }
+    try { await this.options.runtime.closeTransport?.(); } catch (error) { firstError ??= error; }
+    if (this.active?.cleanupPending) {
+      try { await this.active.close(); } catch (error) { firstError ??= error; }
+    }
+    try { await this.settlePendingCleanup(); } catch (error) { firstError ??= error; }
+    if (firstError !== undefined) throw firstError;
   }
 
   async confirm(connection: SshForwardConnection, expected: RuntimeIdentity): Promise<AppServerConnectionIdentity> {
@@ -108,20 +162,70 @@ export class SshAppServerRuntime implements AppServerRuntimeService {
   release(connection: SshForwardConnection): void {
     if (this.active === connection) delete this.active;
   }
+
+  async cleanupForward(socketPath: string, socketIdentity?: SocketIdentity): Promise<void> {
+    await this.runControl(buildSshStreamForwardCancelArgs(
+      this.options.plan, socketPath, this.options.runtime.remoteSocketPath,
+    )).catch(() => undefined);
+    if (await forwardListenerAccepting(
+      socketPath, socketIdentity, this.options.listenerProbeTimeoutMs ?? 1_000,
+    )) throw new AppError("ENDPOINT_UNAVAILABLE", "SSH forward cleanup could not be confirmed");
+    await removeExactSocket(socketPath, socketIdentity);
+  }
+
+  private async runControl(args: readonly string[]): Promise<void> {
+    const run = this.options.run ?? runBoundedProcess;
+    await run(this.options.sshBinary ?? "ssh", args, {
+      timeoutMs: this.options.connectionTimeoutMs ?? 10_000,
+      maxOutputBytes: 64 * 1024,
+    });
+  }
+
+  private async requireControlMaster(): Promise<void> {
+    try {
+      await (this.options.attestControlMaster ?? attestUserControlMaster)(this.options.plan);
+      await this.runControl(buildControlMasterCheckArgs(this.options.plan));
+    }
+    catch {
+      throw new AppError(
+        "ENDPOINT_UNAVAILABLE",
+        `authenticated SSH ControlMaster is unavailable: ${this.options.plan.alias}`,
+      );
+    }
+  }
+
+  private async reclaimStaleForward(socketPath: string): Promise<void> {
+    let identity: SocketIdentity | undefined;
+    try { identity = await ownedSocketIdentity(socketPath); }
+    catch (error) { if (isErrno(error, "ENOENT")) return; throw error; }
+    if (!identity) throw new AppError("CONFIGURATION_ERROR", "invalid stale SSH forward socket");
+    this.pendingCleanup = { socketPath, socketIdentity: identity };
+    await this.settlePendingCleanup();
+  }
+
+  private async settlePendingCleanup(): Promise<void> {
+    const pending = this.pendingCleanup;
+    if (!pending) return;
+    await this.cleanupForward(pending.socketPath, pending.socketIdentity);
+    if (this.pendingCleanup === pending) delete this.pendingCleanup;
+  }
+
 }
 
 class SshForwardConnection implements AppServerConnection {
   private readonly closes = new Set<(error?: Error) => void>();
   private readonly removeWireClose: () => void;
-  private removeProcessFailure?: () => void;
   private intentional = false;
-  private disposed = false;
+  private wireDisposed = false;
+  private closed = false;
+  private closing?: Promise<void>;
+  private wireCloseError?: unknown;
+  private lossError?: Error;
+  cleanupPending = false;
   lost = false;
 
   constructor(
     private readonly runtime: SshAppServerRuntime,
-    private readonly child: ChildProcessWithoutNullStreams,
-    private readonly monitor: ForwardProcessMonitor,
     readonly wire: RpcWire,
     private readonly socketPath: string,
     private readonly socketIdentity: SocketIdentity,
@@ -130,12 +234,12 @@ class SshForwardConnection implements AppServerConnection {
     this.removeWireClose = wire.onClose((error) => this.fail(error ?? new Error("SSH App Server wire closed")));
   }
 
-  activate(): boolean {
-    this.removeProcessFailure = this.monitor.onFailure((error) => this.fail(error));
-    return !this.lost;
-  }
-
   onClose(listener: (error?: Error) => void): () => void {
+    if (this.lossError) {
+      const error = this.lossError;
+      queueMicrotask(() => listener(error));
+      return () => undefined;
+    }
     this.closes.add(listener);
     return () => this.closes.delete(listener);
   }
@@ -145,60 +249,32 @@ class SshForwardConnection implements AppServerConnection {
   }
 
   async close(): Promise<void> {
-    if (this.disposed) return;
-    this.disposed = true;
+    if (this.closed) return;
+    if (this.closing) return this.closing;
     this.intentional = true;
-    this.runtime.release(this);
-    this.removeProcessFailure?.();
-    this.removeWireClose();
-    let firstError: unknown;
-    try { this.wire.close(); } catch (error) { firstError = error; }
-    try { await stopForwardChild(this.child); } catch (error) { firstError ??= error; }
-    try { await removeExactSocket(this.socketPath, this.socketIdentity); } catch (error) { firstError ??= error; }
-    if (firstError !== undefined) throw firstError;
+    if (!this.wireDisposed) {
+      this.wireDisposed = true;
+      this.removeWireClose();
+      try { this.wire.close(); } catch (error) { this.wireCloseError = error; }
+    }
+    this.cleanupPending = true;
+    const closing = (async () => {
+      await this.runtime.cleanupForward(this.socketPath, this.socketIdentity);
+      this.cleanupPending = false;
+      this.closed = true;
+      this.runtime.release(this);
+      if (this.wireCloseError !== undefined) throw this.wireCloseError;
+    })();
+    this.closing = closing;
+    try { await closing; }
+    finally { if (this.closing === closing) delete this.closing; }
   }
 
   private fail(error: Error): void {
     if (this.intentional || this.lost) return;
     this.lost = true;
-    this.runtime.release(this);
+    this.lossError = error;
     for (const listener of this.closes) listener(error);
-  }
-}
-
-class ForwardProcessMonitor {
-  private readonly listeners = new Set<(error: Error) => void>();
-  private failure?: Error;
-
-  constructor(readonly child: ChildProcessWithoutNullStreams) {
-    child.once("error", (error) => this.fail(error));
-    child.once("exit", () => this.fail(new Error("SSH forward exited")));
-  }
-
-  onFailure(listener: (error: Error) => void): () => void {
-    this.listeners.add(listener);
-    if (this.failure) listener(this.failure);
-    return () => this.listeners.delete(listener);
-  }
-
-  race<T>(operation: Promise<T>): Promise<T> {
-    if (this.failure) return Promise.reject(this.failure);
-    return new Promise<T>((resolve, reject) => {
-      let settledByFailure = false;
-      let remove: () => void = () => undefined;
-      remove = this.onFailure((error) => { settledByFailure = true; remove(); reject(error); });
-      if (settledByFailure) remove();
-      operation.then(
-        (value) => { remove(); resolve(value); },
-        (error: unknown) => { remove(); reject(error); },
-      );
-    });
-  }
-
-  private fail(error: Error): void {
-    if (this.failure) return;
-    this.failure = error;
-    for (const listener of this.listeners) listener(error);
   }
 }
 
@@ -213,7 +289,6 @@ async function attestSocketRoot(path: string): Promise<void> {
 }
 
 async function waitForSocket(
-  monitor: ForwardProcessMonitor,
   path: string,
   timeoutMs: number,
   sleep: (ms: number) => Promise<void> = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
@@ -226,7 +301,7 @@ async function waitForSocket(
     } catch (error) {
       if (!isErrno(error, "ENOENT")) throw error;
     }
-    await monitor.race(sleep(20));
+    await sleep(20);
   }
   throw new AppError("ENDPOINT_UNAVAILABLE", "SSH stream-local forward did not become ready");
 }
@@ -248,19 +323,49 @@ async function removeExactSocket(path: string, expected?: SocketIdentity): Promi
   await unlink(path);
 }
 
-async function stopForwardChild(child: ChildProcessWithoutNullStreams): Promise<void> {
-  if (child.exitCode !== null || child.signalCode !== null) return;
-  await new Promise<void>((resolve) => {
-    let hard: ReturnType<typeof setTimeout> | undefined;
-    const force = setTimeout(() => {
-      child.kill("SIGKILL");
-      hard = setTimeout(resolve, 500);
-      hard.unref?.();
-    }, 2_000);
-    force.unref?.();
-    child.once("exit", () => { clearTimeout(force); if (hard) clearTimeout(hard); resolve(); });
-    child.kill("SIGTERM");
+async function forwardListenerAccepting(path: string, expected: SocketIdentity | undefined, timeoutMs: number): Promise<boolean> {
+  const before = await exactSocketState(path, expected);
+  if (before === "absent") return false;
+  if (before !== "exact") throw new AppError("ENDPOINT_UNAVAILABLE", "SSH forward socket identity changed during cleanup");
+  return new Promise<boolean>((resolve, reject) => {
+    const socket = connect(path);
+    let settled = false;
+    const finish = (result: boolean | Error): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      socket.destroy();
+      if (result instanceof Error) reject(result);
+      else resolve(result);
+    };
+    const verifyClosed = (): void => {
+      void exactSocketState(path, expected).then(
+        (state) => state === "exact" || state === "absent"
+          ? finish(false)
+          : finish(new AppError("ENDPOINT_UNAVAILABLE", "SSH forward socket identity changed during cleanup")),
+        () => finish(new AppError("ENDPOINT_UNAVAILABLE", "SSH forward cleanup could not be confirmed")),
+      );
+    };
+    socket.once("connect", () => finish(true));
+    socket.once("error", (error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT" || error.code === "ECONNREFUSED") verifyClosed();
+      else finish(new AppError("ENDPOINT_UNAVAILABLE", "SSH forward cleanup could not be confirmed"));
+    });
+    const timer = setTimeout(
+      () => finish(new AppError("ENDPOINT_UNAVAILABLE", "SSH forward cleanup could not be confirmed")),
+      timeoutMs,
+    );
   });
+}
+
+async function exactSocketState(path: string, expected: SocketIdentity | undefined): Promise<"absent" | "exact" | "changed"> {
+  let state;
+  try { state = await lstat(path, { bigint: true }); }
+  catch (error) { if (isErrno(error, "ENOENT")) return "absent"; throw error; }
+  if (!expected || !state.isSocket() || state.dev.toString(10) !== expected.device || state.ino.toString(10) !== expected.inode) {
+    return "changed";
+  }
+  return "exact";
 }
 
 function sameSshIdentity(expected: RuntimeIdentity, actual: RuntimeIdentity | undefined): boolean {

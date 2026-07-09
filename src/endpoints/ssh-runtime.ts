@@ -1,10 +1,15 @@
 import { createHash, randomBytes } from "node:crypto";
-import { lstat, mkdir, readFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, realpath } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { AppError } from "../core/errors.ts";
-import { buildControlMasterExitArgs, buildSshRemoteArgs, type SshConnectionPlan } from "./ssh-config.ts";
+import {
+  buildControlMasterCheckArgs,
+  buildControlMasterExitArgs,
+  buildSshRemoteArgs,
+  type SshConnectionPlan,
+} from "./ssh-config.ts";
 import { runBoundedProcess, type BoundedProcessResult } from "./ssh-process.ts";
 import { parseRuntimeIdentity, type EndpointLossKind, type RuntimeIdentity } from "./types.ts";
 
@@ -50,6 +55,25 @@ export interface RemoteBootstrapPayload {
   runtimeDir: string;
   helper: Buffer;
   launcher: Buffer;
+}
+
+export async function attestUserControlMaster(plan: SshConnectionPlan): Promise<void> {
+  if (plan.ownsControlMaster) return;
+  const controlPath = plan.controlPath;
+  const uid = process.getuid?.();
+  try {
+    if (!controlPath || resolve(controlPath) !== controlPath) throw new Error("invalid path");
+    const parent = dirname(controlPath);
+    if (await realpath(parent) !== parent) throw new Error("aliased parent");
+    const [directory, socket] = await Promise.all([lstat(parent), lstat(controlPath)]);
+    if (!directory.isDirectory() || directory.isSymbolicLink() || (directory.mode & 0o077) !== 0
+      || !socket.isSocket() || socket.isSymbolicLink() || (socket.mode & 0o077) !== 0
+      || (uid !== undefined && (directory.uid !== uid || socket.uid !== uid))) {
+      throw new Error("unsafe identity");
+    }
+  } catch {
+    throw new AppError("CONFIGURATION_ERROR", "unsafe user-owned SSH ControlMaster");
+  }
 }
 
 export interface SshRuntimeController {
@@ -220,6 +244,20 @@ export class SshRemoteClient implements RemoteRuntimeClient {
       }
     }
     const run = this.options.run ?? runBoundedProcess;
+    if (!this.options.plan.ownsControlMaster) {
+      await attestUserControlMaster(this.options.plan);
+      try {
+        await run(this.options.sshBinary ?? "ssh", buildControlMasterCheckArgs(this.options.plan), {
+          timeoutMs: 5_000,
+          maxOutputBytes: 64 * 1024,
+        });
+      } catch {
+        throw new AppError(
+          "ENDPOINT_UNAVAILABLE",
+          `authenticated SSH ControlMaster is unavailable: ${this.options.plan.alias}`,
+        );
+      }
+    }
     return run(this.options.sshBinary ?? "ssh", buildSshRemoteArgs(this.options.plan, command), {
       timeoutMs,
       maxOutputBytes,

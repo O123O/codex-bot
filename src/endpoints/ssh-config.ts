@@ -80,30 +80,29 @@ export function buildSshRemoteArgs(plan: SshConnectionPlan, command: readonly st
 }
 
 export function buildSshStreamForwardArgs(plan: SshConnectionPlan, localSocket: string, remoteSocket: string): string[] {
-  if (![localSocket, remoteSocket].every((value) => isAbsolute(value) && /^[A-Za-z0-9_./-]+$/u.test(value))) {
-    throw new AppError("CONFIGURATION_ERROR", "unsafe SSH stream-local forwarding path");
-  }
+  const forwarding = streamForwarding(localSocket, remoteSocket);
   return [
-    ...plan.commonArgs,
-    "-o", `HostName=${plan.destination.hostname}`,
-    "-l", plan.destination.user,
-    "-p", String(plan.destination.port),
-    "-o", "ControlMaster=no",
-    "-o", "ControlPath=none",
-    "-o", "ControlPersist=no",
+    ...baseArgs(plan, false),
     "-o", "ExitOnForwardFailure=yes",
-    "-o", "ForkAfterAuthentication=no",
     "-o", "StreamLocalBindUnlink=no",
     "-o", "StreamLocalBindMask=0177",
-    "-N", "-T", "-n",
-    "-L", `${localSocket}:${remoteSocket}`,
+    "-O", "forward",
+    "-L", forwarding,
     plan.alias,
   ];
 }
 
+export function buildSshStreamForwardCancelArgs(plan: SshConnectionPlan, localSocket: string, remoteSocket: string): string[] {
+  return [...baseArgs(plan, false), "-O", "cancel", "-L", streamForwarding(localSocket, remoteSocket), plan.alias];
+}
+
+export function buildControlMasterCheckArgs(plan: SshConnectionPlan): string[] {
+  return [...baseArgs(plan, false), "-O", "check", plan.alias];
+}
+
 export function buildControlMasterExitArgs(plan: SshConnectionPlan): string[] {
   if (!plan.ownsControlMaster) throw new AppError("OPERATION_CONFLICT", "cannot stop a user-owned SSH ControlMaster");
-  return [...baseArgs(plan, false), "-S", plan.controlPath!, "-O", "exit", plan.alias];
+  return [...baseArgs(plan, false), "-O", "exit", plan.alias];
 }
 
 export class SshGenerationPlanner {
@@ -128,10 +127,17 @@ export class SshGenerationPlanner {
 
 function baseArgs(plan: SshConnectionPlan, establishOwnedMaster: boolean): string[] {
   const pinned = ["-o", `HostName=${plan.destination.hostname}`, "-l", plan.destination.user, "-p", String(plan.destination.port)];
-  const control = plan.ownsControlMaster
-    ? ["-S", plan.controlPath!, ...(establishOwnedMaster ? ["-o", "ControlMaster=auto", "-o", "ControlPersist=60"] : [])]
-    : [];
+  const control = ["-S", plan.controlPath!, ...(plan.ownsControlMaster && establishOwnedMaster
+    ? ["-o", "ControlMaster=auto", "-o", "ControlPersist=yes"]
+    : !plan.ownsControlMaster ? ["-o", "ControlMaster=no"] : [])];
   return [...plan.commonArgs, ...pinned, ...control];
+}
+
+function streamForwarding(localSocket: string, remoteSocket: string): string {
+  if (![localSocket, remoteSocket].every((value) => isAbsolute(value) && /^[A-Za-z0-9_./-]+$/u.test(value))) {
+    throw new AppError("CONFIGURATION_ERROR", "unsafe SSH stream-local forwarding path");
+  }
+  return `${localSocket}:${remoteSocket}`;
 }
 
 function usableControlPath(value: string): boolean {

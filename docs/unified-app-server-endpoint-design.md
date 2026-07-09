@@ -2,7 +2,7 @@
 
 ## Status
 
-Revision 3, approved for implementation after three deep review passes.
+Revision 4, updated for ControlMaster-backed forwarding.
 
 ## Problem
 
@@ -25,7 +25,7 @@ The endpoint must not know whether its connection came from a local child proces
 
 - Use one implementation for App Server initialization, version checking, authentication checking, requests, notifications, approval handling, readiness, generation fencing, and connection-loss publication.
 - Keep local process management in a local runtime service.
-- Keep SSH, the detached remote App Server, the independent port-forward process, keepalive, and remote-runtime identity in an SSH runtime service.
+- Keep SSH, the detached remote App Server, ControlMaster-backed forwarding, and remote-runtime identity in an SSH runtime service.
 - Make the SSH forward terminate at a private local Unix socket. The unified endpoint connects to that socket exactly as it would connect to any other local socket.
 - Keep all session, pool, capacity, registry, and recovery code endpoint-neutral.
 - Delete duplicated endpoint lifecycle code and the custom SSH helper tunnel operation when the standard OpenSSH stream-local forward replaces it.
@@ -58,11 +58,11 @@ The endpoint must not know whether its connection came from a local child proces
                             v                      v
               LocalAppServerRuntime       SshAppServerRuntime
               - spawn local process       - ensure detached remote process
-              - stdio JsonlWire           - maintain independent ssh -N -L
+              - stdio JsonlWire           - use authenticated ControlMaster
               - CODEX_HOME check          - local private Unix socket
               - MCP PID identity          - WebSocketWire to local socket
               - stop local process        - exact remote runtime identity
-                                           - close forward or stop runtime
+                                           - cancel forward or stop runtime
 ```
 
 There is no `LocalEndpoint` protocol implementation and no `SshEndpoint` protocol implementation in the target structure. Production constructs the same `ManagedAppServerEndpoint` with one of the two runtime services.
@@ -163,36 +163,26 @@ This service does not implement initialize, authentication, notifications, or re
 - Run preflight and bootstrap the fixed remote helper assets once per runtime-service generation; repeated inspect/classify calls reuse the prepared paths and do not rerun bootstrap.
 - Ensure the detached remote `codex app-server` is healthy.
 - Capture its exact runtime identity.
-- Start one independent OpenSSH stream-local forward from a private local Unix socket to the private remote App Server Unix socket.
-- Keep the forward process alive with the existing server-alive policy and fail it when forwarding cannot be established.
+- Require the endpoint's exact authenticated ControlMaster before any user-owned-master helper operation.
+- Register one OpenSSH stream-local forward on that master from a private local Unix socket to the private remote App Server Unix socket.
 - Connect `WebSocketWire` to the local forwarded socket and return that wire as an `AppServerConnection`.
+- Treat WebSocket closure as the event-driven connection-loss signal; no forward process or polling monitor is needed.
 - During `confirmInitialized`, reread and compare the exact remote runtime identity.
-- On ordinary connection close, stop the local forward but leave the detached remote App Server running.
-- On `shutdownRuntime`, stop the forward and then stop only the exact expected remote runtime identity.
+- On ordinary connection close, cancel the exact local forward but leave the ControlMaster and detached remote App Server running.
+- On `shutdownRuntime`, cancel the forward and then stop only the exact expected remote runtime identity.
 - Classify a lost forward with a healthy runtime as `connection-lost`; classify an absent runtime as `runtime-lost`.
 
-The forward is a normal no-shell OpenSSH process using stream-local forwarding, conceptually:
+The forward is registered and cancelled through the endpoint's authenticated OpenSSH master:
 
 ```text
-ssh -N -L <private-local-socket>:<private-remote-socket> <pinned-alias>
+ssh -S <control-path> -O check <pinned-alias>
+ssh -S <control-path> -O forward -L <private-local-socket>:<private-remote-socket> <pinned-alias>
+ssh -S <control-path> -O cancel  -L <private-local-socket>:<private-remote-socket> <pinned-alias>
 ```
 
-The forward owns a dedicated SSH connection. It must not reuse either the user's or QiYan's helper ControlMaster. Its fixed arguments include:
+Every helper and control command explicitly pins the same resolved `ControlPath`, host, user, and port. Key-only endpoints use a private QiYan-owned master with `ControlPersist=yes`; normal service shutdown waits for in-flight open work, closes the forward, and exits only that owned master. An endpoint whose effective SSH configuration has `ControlMaster yes` or `auto` and a safe absolute `ControlPath` uses that user-owned master, allowing one interactive MFA authentication to serve later noninteractive QiYan operations. Before use, QiYan verifies that the user-owned master directory and socket are canonical same-UID owner-only objects. It checks the master before every helper or transfer and supplies `ControlMaster=no` on the actual command, so it never starts, stops, or replaces that master.
 
-```text
--N -T -n
--o ControlMaster=no
--o ControlPath=none
--o ControlPersist=no
--o ExitOnForwardFailure=yes
--o ForkAfterAuthentication=no
--o StreamLocalBindUnlink=no
--o StreamLocalBindMask=0177
-```
-
-It also retains batch mode, strict host-key checking, pinned host/user/port, connection timeout, and server-alive settings. The command is spawned directly without a shell. Helper commands may continue using their separate ControlMaster.
-
-Each forward generation receives a new short socket name inside the attested private endpoint directory. The service never pre-unlinks a socket. It waits for and attests the new owner-only socket, then associates the child PID, socket device/inode, wire, and generation. Close removes only the socket whose captured device/inode still matches that connection. A close or exit from an older generation cannot close or unlink a newer generation. Killing the forward child deterministically ends the forward because multiplexing is disabled. Socket-name generation has an explicit Unix path-length bound test.
+Control commands retain batch mode, strict host-key checking, bounded execution, and secret-safe output handling. `-O forward` must succeed before the App Server wire is opened. Each endpoint uses one short stable socket name inside its attested private directory. On open, an owner-only socket left by a crashed process is cancelled and reclaimed before the new forward is registered; an unsafe replacement fails closed. OpenSSH control-command exit status is not treated as cancellation proof. After every cancel attempt, QiYan probes the exact captured local Unix listener: an accepting listener preserves the socket and cleanup reservation, while `ENOENT` or `ECONNREFUSED` plus an exact inode recheck permits unlink. A live connection remains the runtime's active owner until listener shutdown and socket cleanup finish, so a newer generation cannot overlap an older cleanup.
 
 Remote SSH servers must permit local Unix-socket forwarding while continuing to deny TCP forwarding. The supported fixture and documented worker prerequisite are:
 
@@ -243,7 +233,9 @@ A lost `thread/start` response remains the legitimate uncertain case because nat
 
 - Close the unified endpoint connections.
 - Stop local App Server processes.
-- Stop remote forward processes.
+- Cancel remote ControlMaster forwards.
+- Exit QiYan-owned ControlMasters; never exit user-owned masters.
+- Serialize shutdown with an in-flight SSH open so an owned persistent master cannot appear after its exit step.
 - Leave detached remote App Servers running, as today.
 
 ### Explicit endpoint disconnect
@@ -296,7 +288,7 @@ The refactor should be mechanical and staged in tests, but land atomically so pr
 4. Change the SSH fixture and documented prerequisite to permit only local stream-forwarding, with a real forwarding contract test.
 5. Extract SSH runtime/forward/identity work into `SshAppServerRuntime` and run the existing SSH tests through the common endpoint. Cache preflight/bootstrap once per service generation.
 6. Switch production construction and integration tests to the common endpoint.
-7. Replace the helper byte-stream bridge with the dedicated non-multiplexed SSH stream-local forward and validate it against the real SSH fixture.
+7. Replace the helper byte-stream bridge with a ControlMaster stream-local forward and validate it against the real SSH fixture.
 8. Delete `LocalEndpoint`, `SshEndpoint`, duplicated approval/auth handlers, duplicated initialize/version code, `startAuthenticatedAssistantEndpoint`, and the remote helper `tunnel` operation.
 9. Change fresh ownership recording to accept a pathless empty sentinel, resolve it lazily by exact ID, and keep the already-reviewed no-helper session-create boundary.
 
@@ -327,8 +319,14 @@ Do not retain compatibility subclasses that reimplement or override protocol lif
 ### SSH runtime
 
 - Ensures or reconnects to one detached runtime.
-- Starts one independent stream-local forward with strict/pinned SSH options and keepalive.
-- The forward argv disables every ControlMaster/ControlPersist path.
+- Requires and pins one authenticated ControlMaster before user-owned-master remote work.
+- Checks every user-owned-master helper and transfer, then dispatches with `ControlMaster=no`.
+- Registers and cancels one exact stream-local forward on that master.
+- Uses App Server wire closure as the event-driven forwarding-loss signal.
+- Safely reclaims a stale master-owned listener left by a crashed QiYan process.
+- Preserves cleanup ownership across cancellation failure until the exact listener is proven closed.
+- Verifies exact listener shutdown instead of trusting `ssh -O cancel` exit status.
+- Rejects noncanonical, non-owner, or broadly accessible user ControlMaster paths before invoking SSH.
 - Applies owner-only permissions to the local socket.
 - The fixture permits local stream forwarding, denies TCP forwarding, and passes a real `-L local_socket:remote_socket` probe.
 - A forward loss with a healthy runtime is `connection-lost`.

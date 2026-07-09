@@ -6,7 +6,9 @@ QiYan can run ordinary project sessions on remote Linux machines while the assis
 
 Install Node.js 24 or newer, `tmux`, and Codex 0.142.5 or newer on the remote host. Authenticate Codex on that host as the SSH user and configure its normal Codex profile for non-interactive automatic work; chat approvals are unsupported. QiYan does not copy local authentication or configuration.
 
-Configure key-only OpenSSH access and verify the host key yourself. The SSH daemon must permit local Unix-socket forwarding (`AllowStreamLocalForwarding local`); TCP, agent, X11, and tunnel-device forwarding are not required. The endpoint name is an alias in the normal user SSH configuration. For example:
+Verify the host key yourself. The SSH daemon must permit local Unix-socket forwarding (`AllowStreamLocalForwarding local`); TCP, agent, X11, and tunnel-device forwarding are not required. The endpoint name is an alias in the normal user SSH configuration.
+
+For key authentication, a minimal configuration is:
 
 ```sshconfig
 Host devbox
@@ -22,6 +24,28 @@ Prove unattended access before asking QiYan to use it:
 ssh -o BatchMode=yes -o StrictHostKeyChecking=yes devbox true
 ssh devbox 'node --version; tmux -V; codex --version; codex login status'
 ```
+
+For an endpoint that requires interactive MFA, configure a persistent user-owned ControlMaster:
+
+```sshconfig
+Host devbox
+  HostName devbox.example
+  User xin
+  ControlMaster auto
+  ControlPath ~/.ssh/controlmasters/%C
+  ControlPersist yes
+```
+
+Create its private socket directory, authenticate once interactively, and verify the master before starting QiYan:
+
+```bash
+mkdir -p ~/.ssh/controlmasters
+chmod 700 ~/.ssh/controlmasters
+ssh devbox true
+ssh -O check devbox
+```
+
+QiYan requires both the ControlMaster directory and socket to be canonical same-user objects without group or world permissions. It reuses that authenticated connection and does not prompt for MFA. If the master exits or expires, the remote endpoint becomes unavailable until you authenticate a new master; QiYan does not stop or replace a user-owned master.
 
 QiYan never accepts a new host key automatically. Handle first connection and host-key changes through ordinary OpenSSH yourself, or explicitly ask QiYan to help inspect them.
 
@@ -53,7 +77,7 @@ Attachments cross the SSH boundary only through explicit tools. Files selected i
 
 QiYan resolves `ssh -G` on every connection generation and pins the resulting host, user, and port. If that destination changes while sessions or unresolved work still reference the endpoint, activation is rejected instead of silently moving thread IDs to another machine.
 
-Remote helper commands may reuse a ControlMaster. The long-lived App Server connection is a separate standard OpenSSH `ssh -N -L local_socket:remote_socket` process with multiplexing disabled, so its lifetime is owned independently. The remote App Server uses its ordinary WebSocket API and has no SSH-specific behavior. Local endpoints never use SSH.
+Remote helper commands and the App Server Unix-socket forward use the same endpoint ControlMaster. Every operation on a user-owned master first verifies it and cannot create a replacement. QiYan registers the forward with `ssh -O forward`, requests cancellation with `ssh -O cancel`, verifies that the exact local listener actually stopped, safely reclaims its private socket after a process crash, and uses App Server WebSocket closure as the connection-loss event. QiYan keeps its own key-authenticated master for the service lifetime and exits it during normal shutdown; it never exits a user-owned MFA master. The remote App Server uses its ordinary WebSocket API and has no SSH-specific behavior. Local endpoints never use SSH.
 
 Ordinary `tmux ls` does not inspect QiYan's isolated server. To inspect its detached App Servers without loading user tmux configuration, run this on the worker host:
 

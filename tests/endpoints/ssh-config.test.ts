@@ -2,8 +2,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   SshGenerationPlanner,
+  buildControlMasterCheckArgs,
   buildControlMasterExitArgs,
   buildSshArgs,
+  buildSshStreamForwardCancelArgs,
   buildSshStreamForwardArgs,
   parseSshConfig,
   planSshConnection,
@@ -22,6 +24,8 @@ test("parses effective SSH configuration and pins the final destination", () => 
   assert.ok(args.includes("HostName=host.example"));
   assert.ok(args.includes("xin"));
   assert.ok(args.includes("2222"));
+  assert.ok(args.includes("ControlPersist=yes"));
+  assert.equal(args.includes("ControlPersist=60"), false);
   assert.equal(args.at(-1), "devbox");
 });
 
@@ -30,22 +34,31 @@ test("honors a usable user ControlMaster without taking ownership", () => {
   const plan = planSshConnection("devbox", effective, "/private/runtime");
   assert.equal(plan.ownsControlMaster, false);
   assert.equal(plan.controlPath, "/tmp/user-master");
-  assert.doesNotMatch(buildSshArgs(plan, [] ).join(" "), /ControlPersist/u);
+  const args = buildSshArgs(plan, []);
+  assert.deepEqual(args.slice(args.indexOf("-S"), args.indexOf("-S") + 2), ["-S", "/tmp/user-master"]);
+  assert.ok(args.includes("ControlMaster=no"));
+  assert.doesNotMatch(args.join(" "), /ControlPersist/u);
   assert.throws(() => buildControlMasterExitArgs(plan), /user-owned/u);
 });
 
-test("stream-local forwarding owns a dedicated non-multiplexed SSH process", () => {
+test("stream-local forwarding is registered and cancelled on the authenticated ControlMaster", () => {
   const plan = planSshConnection("devbox", parseSshConfig(`${parsed}controlmaster auto\ncontrolpath /tmp/user-master\n`), "/private/runtime");
-  const args = buildSshStreamForwardArgs(plan, "/private/qiyan/f-01234567.sock", "/tmp/qiyan-1000/abcdef/app-server.sock");
-  const rendered = args.join(" ");
-  assert.match(rendered, /-N -T -n/u);
-  for (const option of [
-    "ControlMaster=no", "ControlPath=none", "ControlPersist=no", "ExitOnForwardFailure=yes",
-    "ForkAfterAuthentication=no", "StreamLocalBindUnlink=no", "StreamLocalBindMask=0177",
-  ]) assert.ok(args.includes(option), option);
-  assert.doesNotMatch(rendered, /user-master|ControlMaster=auto|ControlPersist=60/u);
-  assert.ok(args.includes("/private/qiyan/f-01234567.sock:/tmp/qiyan-1000/abcdef/app-server.sock"));
-  assert.equal(args.at(-1), "devbox");
+  const local = "/private/qiyan/f-01234567.sock";
+  const remote = "/tmp/qiyan-1000/abcdef/app-server.sock";
+  const check = buildControlMasterCheckArgs(plan);
+  const forward = buildSshStreamForwardArgs(plan, local, remote);
+  const cancel = buildSshStreamForwardCancelArgs(plan, local, remote);
+  for (const [args, command] of [[check, "check"], [forward, "forward"], [cancel, "cancel"]] as const) {
+    assert.deepEqual(args.slice(args.indexOf("-S"), args.indexOf("-S") + 2), ["-S", "/tmp/user-master"]);
+    assert.deepEqual(args.slice(args.indexOf("-O"), args.indexOf("-O") + 2), ["-O", command]);
+    assert.equal(args.at(-1), "devbox");
+    assert.doesNotMatch(args.join(" "), /ControlPath=none|ControlPersist=60|-N|-T|-n/u);
+  }
+  for (const option of ["ExitOnForwardFailure=yes", "StreamLocalBindUnlink=no", "StreamLocalBindMask=0177"]) {
+    assert.ok(forward.includes(option), option);
+  }
+  assert.ok(forward.includes(`${local}:${remote}`));
+  assert.ok(cancel.includes(`${local}:${remote}`));
 });
 
 test("rejects malformed effective configuration and unsafe aliases", () => {

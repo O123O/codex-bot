@@ -1,11 +1,44 @@
 import assert from "node:assert/strict";
+import { chmod, mkdtemp, rm, symlink } from "node:fs/promises";
+import { createServer, type Server } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import {
+  SshRemoteClient,
   SshRuntime,
   decodeRemoteArgument,
   encodeRemoteArgument,
   type RemoteRuntimeClient,
 } from "../../src/endpoints/ssh-runtime.ts";
+import { AppError } from "../../src/core/errors.ts";
+import type { SshConnectionPlan } from "../../src/endpoints/ssh-config.ts";
+
+const userMasterPlan: SshConnectionPlan = {
+  alias: "devbox",
+  destination: { hostname: "host.example", user: "xin", port: 22 },
+  commonArgs: ["-o", "BatchMode=yes"],
+  controlPath: "/tmp/user-master",
+  ownsControlMaster: false,
+};
+const helperPath = "/tmp/qiyan-1000/abcdef0123456789abcdef01/qiyan-ssh-helper.mjs";
+
+async function privateUserMaster(t: test.TestContext, mode = 0o600): Promise<{ plan: SshConnectionPlan; server: Server }> {
+  const root = await mkdtemp(join(tmpdir(), "qiyan-user-master-"));
+  await chmod(root, 0o700);
+  const controlPath = join(root, "master");
+  const server = createServer();
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(controlPath, resolve);
+  });
+  await chmod(controlPath, mode);
+  t.after(async () => {
+    if (server.listening) await new Promise<void>((resolve) => server.close(() => resolve()));
+    await rm(root, { recursive: true, force: true });
+  });
+  return { plan: { ...userMasterPlan, controlPath }, server };
+}
 
 class FakeRemote implements RemoteRuntimeClient {
   readonly calls: Array<{ operation: string; args: string[] }> = [];
@@ -33,6 +66,104 @@ test("remote arguments round-trip only as bounded base64url tokens", () => {
   }
   assert.throws(() => encodeRemoteArgument("x".repeat(20_000)), /too large/u);
   assert.throws(() => decodeRemoteArgument("not+base64"), /invalid/u);
+});
+
+test("user-owned helper and transfer calls check and reuse only the authenticated master", async (t) => {
+  const { plan } = await privateUserMaster(t);
+  const calls: string[][] = [];
+  const remote = new SshRemoteClient({
+    plan,
+    helperSource: Buffer.from("helper"),
+    run: async (_command, args) => {
+      calls.push([...args]);
+      const control = args[args.indexOf("-O") + 1];
+      return {
+        stdout: control === "check" ? Buffer.alloc(0) : Buffer.from('{"ok":true}'),
+        stderr: Buffer.alloc(0),
+      };
+    },
+  });
+
+  await remote.invoke("inspect", ["{}"], helperPath);
+  await remote.invokeTransfer("read-file", ["{}"], { maxOutputBytes: 1024 }, helperPath);
+
+  assert.deepEqual(calls.map((args) => args.includes("-O") ? args[args.indexOf("-O") + 1] : "helper"), ["check", "helper", "check", "helper"]);
+  for (const args of calls.filter((args) => !args.includes("-O"))) {
+    assert.deepEqual(args.slice(args.indexOf("-S"), args.indexOf("-S") + 2), ["-S", plan.controlPath]);
+    assert.ok(args.includes("ControlMaster=no"));
+  }
+  await remote.closeControlMaster();
+  assert.equal(calls.some((args) => args.includes("exit")), false);
+});
+
+test("a failed user-owned master check dispatches no helper command", async (t) => {
+  const { plan } = await privateUserMaster(t);
+  const calls: string[][] = [];
+  const remote = new SshRemoteClient({
+    plan,
+    helperSource: Buffer.from("helper"),
+    run: async (_command, args) => {
+      calls.push([...args]);
+      throw new AppError("ENDPOINT_UNAVAILABLE", "SSH process failed (exit 255)");
+    },
+  });
+
+  await assert.rejects(remote.invoke("inspect", ["{}"], helperPath), /authenticated SSH ControlMaster is unavailable/u);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0]!.includes("check"), true);
+});
+
+test("user-owned ControlMaster attestation rejects unsafe parents and sockets before SSH", async (t) => {
+  const calls: string[][] = [];
+  const run = async (_command: string, args: readonly string[]) => {
+    calls.push([...args]);
+    return { stdout: Buffer.from('{"ok":true}'), stderr: Buffer.alloc(0) };
+  };
+  const shared = new SshRemoteClient({
+    plan: { ...userMasterPlan, controlPath: join(tmpdir(), `qiyan-unsafe-master-${process.pid}`) },
+    helperSource: Buffer.from("helper"), run,
+  });
+  await assert.rejects(shared.invoke("inspect", ["{}"], helperPath), /unsafe user-owned SSH ControlMaster/u);
+
+  const { plan: broadPlan } = await privateUserMaster(t, 0o660);
+  const broad = new SshRemoteClient({ plan: broadPlan, helperSource: Buffer.from("helper"), run });
+  await assert.rejects(broad.invoke("inspect", ["{}"], helperPath), /unsafe user-owned SSH ControlMaster/u);
+
+  const root = await mkdtemp(join(tmpdir(), "qiyan-master-link-"));
+  const target = await mkdtemp(join(tmpdir(), "qiyan-master-target-"));
+  await chmod(root, 0o700);
+  await chmod(target, 0o700);
+  const server = createServer();
+  const targetSocket = join(target, "master");
+  await new Promise<void>((resolve, reject) => server.once("error", reject).listen(targetSocket, resolve));
+  await chmod(targetSocket, 0o600);
+  await symlink(target, join(root, "link"));
+  t.after(async () => {
+    if (server.listening) await new Promise<void>((resolve) => server.close(() => resolve()));
+    await Promise.all([rm(root, { recursive: true, force: true }), rm(target, { recursive: true, force: true })]);
+  });
+  const linked = new SshRemoteClient({
+    plan: { ...userMasterPlan, controlPath: join(root, "link", "master") }, helperSource: Buffer.from("helper"), run,
+  });
+  await assert.rejects(linked.invoke("inspect", ["{}"], helperPath), /unsafe user-owned SSH ControlMaster/u);
+  assert.equal(calls.length, 0);
+});
+
+test("owned transport cleanup exits only its persistent QiYan ControlMaster", async () => {
+  const calls: string[][] = [];
+  const remote = new SshRemoteClient({
+    plan: { ...userMasterPlan, ownsControlMaster: true },
+    helperSource: Buffer.from("helper"),
+    run: async (_command, args) => {
+      calls.push([...args]);
+      return { stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) };
+    },
+  });
+
+  await remote.closeControlMaster();
+
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0]!.slice(calls[0]!.indexOf("-O"), calls[0]!.indexOf("-O") + 2), ["-O", "exit"]);
 });
 
 test("reuses a healthy detached runtime and changes identity only after replacement", async () => {

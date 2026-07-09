@@ -14,7 +14,7 @@ import { SshHost } from "../../src/endpoints/ssh-host.ts";
 
 const enabled = process.env.QIYAN_SSH_ENDPOINT_INTEGRATION === "1";
 
-test("Docker SSH endpoint uses a standard stream-local forward and reconnects to the same detached App Server", { skip: !enabled }, async () => {
+test("Docker SSH endpoint uses a ControlMaster stream-local forward and reconnects to the same detached App Server", { skip: !enabled }, async () => {
   const config = resolve(".tmp/ssh-worker/config");
   await readFile(config).catch(() => { throw new Error("SSH fixture is unavailable; run npm run ssh-worker:up first"); });
   const root = await mkdtemp(join(tmpdir(), "qiyan-ssh-integration-"));

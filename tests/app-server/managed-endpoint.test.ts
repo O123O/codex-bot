@@ -53,6 +53,7 @@ class FakeConnection implements AppServerConnection {
 
 class FakeRuntime implements AppServerRuntimeService {
   readonly shutdowns: RuntimeIdentity[] = [];
+  transportCloses = 0;
   opens = 0;
   classify: EndpointLossKind | Error = "connection-lost";
   current: RuntimeIdentity | undefined = firstIdentity;
@@ -64,6 +65,7 @@ class FakeRuntime implements AppServerRuntimeService {
     return this.classify;
   }
   async shutdownRuntime(expected: RuntimeIdentity): Promise<void> { this.shutdowns.push(expected); }
+  async closeTransport(): Promise<void> { this.transportCloses += 1; }
 }
 
 test("one endpoint implementation initializes and authenticates every runtime connection", async () => {
@@ -154,6 +156,17 @@ test("stop during initialization cannot publish a stale generation", async () =>
   assert.equal(endpoint.state, "stopped");
   assert.equal(endpoint.mcpClientIdentity, undefined);
   assert.equal(connection.closed, true);
+});
+
+test("explicit connection close also closes runtime-owned transport", async () => {
+  const connection = new FakeConnection(new FakeWire(), { runtime: firstIdentity });
+  const runtime = new FakeRuntime([connection]);
+  const endpoint = new ManagedAppServerEndpoint({ id: "worker", runtime, minimumVersion: "0.142.5" });
+  await endpoint.start();
+
+  await endpoint.closeConnection();
+
+  assert.equal(runtime.transportCloses, 1);
 });
 
 test("confirmed connection identity is validated before readiness", async (t) => {
@@ -253,5 +266,6 @@ test("explicit shutdown delegates one mandatory exact runtime identity", async (
   await endpoint.shutdownRuntime(firstIdentity);
 
   assert.deepEqual(runtime.shutdowns, [firstIdentity]);
+  assert.equal(runtime.transportCloses, 0, "runtime shutdown owns transport teardown after its remote stop");
   assert.equal(endpoint.state, "stopped");
 });
