@@ -6,7 +6,7 @@ QiYan can run ordinary project sessions on remote Linux machines while the assis
 
 Install Node.js 24 or newer, `tmux`, and Codex 0.142.5 or newer on the remote host. Authenticate Codex on that host as the SSH user and configure its normal Codex profile for non-interactive automatic work; chat approvals are unsupported. QiYan does not copy local authentication or configuration.
 
-Configure key-only OpenSSH access and verify the host key yourself. The endpoint name is an alias in the normal user SSH configuration. For example:
+Configure key-only OpenSSH access and verify the host key yourself. The SSH daemon must permit local Unix-socket forwarding (`AllowStreamLocalForwarding local`); TCP, agent, X11, and tunnel-device forwarding are not required. The endpoint name is an alias in the normal user SSH configuration. For example:
 
 ```sshconfig
 Host devbox
@@ -52,6 +52,8 @@ You can then ask QiYan to create or adopt a session on `devbox`, inspect its mod
 Attachments cross the SSH boundary only through explicit tools. Files selected in `send_to_session({nickname, content, attachment_ids, mode})` are hash-verified and staged in the selected worker runtime before the turn is dispatched. `prepare_chat_attachment({owner, relative_path})` reads one regular file below that managed project's root, verifies it, and imports it into QiYan's local attachment store; `send_chat_attachment({file_handle, caption?})` remains chat-platform neutral. QiYan does not mirror project trees or upload unrelated chat attachments.
 
 QiYan resolves `ssh -G` on every connection generation and pins the resulting host, user, and port. If that destination changes while sessions or unresolved work still reference the endpoint, activation is rejected instead of silently moving thread IDs to another machine.
+
+Remote helper commands may reuse a ControlMaster. The long-lived App Server connection is a separate standard OpenSSH `ssh -N -L local_socket:remote_socket` process with multiplexing disabled, so its lifetime is owned independently. The remote App Server uses its ordinary WebSocket API and has no SSH-specific behavior. Local endpoints never use SSH.
 
 Ordinary `tmux ls` does not inspect QiYan's isolated server. To inspect its detached App Servers without loading user tmux configuration, run this on the worker host:
 

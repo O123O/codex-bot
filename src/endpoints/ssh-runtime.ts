@@ -8,11 +8,11 @@ import { buildControlMasterExitArgs, buildSshRemoteArgs, type SshConnectionPlan 
 import { runBoundedProcess, type BoundedProcessResult } from "./ssh-process.ts";
 import { parseRuntimeIdentity, type EndpointLossKind, type RuntimeIdentity } from "./types.ts";
 
-export const REMOTE_HELPER_SHA256 = "d4cbbfd2d647a19e6a5686ff2e1d3b892201c17e692b4205a26f2e702fe52178";
+export const REMOTE_HELPER_SHA256 = "281761252b16b86961bf2b27ae731d62cf219d30775982a54381eb772a9ee29d";
 export const REMOTE_LAUNCHER_SHA256 = "db138ff3173f9b72d1fa8cc5fbc94c4958247691a401232d84edf0e3417bd334";
 
 const MAX_REMOTE_ARGUMENT_BYTES = 16 * 1024;
-const helperOperations = new Set(["preflight", "bootstrap", "inspect", "start", "stop", "read-file", "write-file", "rollout-scan", "workspace", "tunnel"]);
+const helperOperations = new Set(["preflight", "bootstrap", "inspect", "start", "stop", "read-file", "write-file", "rollout-scan", "workspace"]);
 const preflightSchema = z.object({
   uid: z.number().int().positive(),
   home: z.string().startsWith("/"),
@@ -58,7 +58,7 @@ export interface SshRuntimeController {
   runtimeIdentity(): Promise<RuntimeIdentity | undefined>;
   classifyLoss?(): Promise<EndpointLossKind>;
   closeTransport?(): Promise<void>;
-  stop(expectedIdentity?: RuntimeIdentity): Promise<void>;
+  stop(expectedIdentity: RuntimeIdentity): Promise<void>;
 }
 
 export class SshRuntime implements SshRuntimeController {
@@ -112,7 +112,7 @@ export class SshRuntime implements SshRuntimeController {
     return (await this.inspectPrepared(prepared)).status === "absent" ? "runtime-lost" : "connection-lost";
   }
 
-  async stop(expectedIdentity?: RuntimeIdentity): Promise<void> {
+  async stop(expectedIdentity: RuntimeIdentity): Promise<void> {
     const prepared = await this.prepare();
     if (expectedIdentity?.kind !== "ssh") throw new AppError("OPERATION_CONFLICT", "exact SSH runtime identity is required for shutdown");
     try { await this.options.remote.invoke("stop", [JSON.stringify({ runtimeDir: prepared.runtimeDir, session: prepared.session, expected: expectedIdentity })], prepared.helperPath); }
@@ -122,6 +122,7 @@ export class SshRuntime implements SshRuntimeController {
   async closeTransport(): Promise<void> { await this.options.remote.closeControlMaster?.(); }
 
   private async prepare(): Promise<NonNullable<SshRuntime["prepared"]>> {
+    if (this.prepared) return this.prepared;
     const preflight = preflightSchema.parse(await this.options.remote.invoke("preflight", []));
     const endpointHash = createHash("sha256").update(this.options.endpointId).digest("hex").slice(0, 24);
     const runtimeDir = `/tmp/qiyan-${preflight.uid}/${endpointHash}`;

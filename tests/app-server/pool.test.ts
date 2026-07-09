@@ -3,7 +3,7 @@ import test from "node:test";
 import { AppServerPool, type AppServerEndpoint } from "../../src/app-server/pool.ts";
 import { AppError } from "../../src/core/errors.ts";
 import { EndpointManager } from "../../src/endpoints/manager.ts";
-import type { PermissionBlockedEvent } from "../../src/app-server/local-endpoint.ts";
+import type { PermissionBlockedEvent } from "../../src/app-server/managed-endpoint.ts";
 import type { EndpointLossKind, EndpointWorkLease, ManagedAppServerEndpoint, RuntimeIdentity } from "../../src/endpoints/types.ts";
 
 class FakeEndpoint implements AppServerEndpoint {

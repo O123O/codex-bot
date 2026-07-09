@@ -13,6 +13,7 @@ import {
   hasEarlierEndpointOperation,
   hasEarlierSessionCreation,
   isMissingUnmaterializedThread,
+  isSettledPathlessThreadLoss,
   isUncertainAssistantTransportFailure,
   managedRecoveryDisposition,
   managedRecoveryManagementState,
@@ -861,6 +862,22 @@ test("managed recovery uses only source-specific transient and external disposit
   assert.equal(managedRecoveryManagementState("unavailable", "external"), "managed");
   assert.equal(managedRecoveryManagementState("unadopting", "external"), "unadopting");
   assert.equal(managedRecoveryManagementState("managed", "retry"), "unavailable");
+});
+
+test("pathless thread loss is settled only after the exact registry generation is removed", () => {
+  const expected = {
+    endpoint: "endpoint-a",
+    thread_id: "thread-a",
+    project_dir: "/project",
+    mapping_id: "mapping-a",
+    lifecycle_state: "managed" as const,
+  };
+  const lost = new AppError("THREAD_NOT_FOUND", "lost", { recovery: "pathless_thread_lost" });
+
+  assert.equal(isSettledPathlessThreadLoss(lost, undefined, expected), true);
+  assert.equal(isSettledPathlessThreadLoss(lost, { ...expected, mapping_id: "mapping-b" }, expected), true);
+  assert.equal(isSettledPathlessThreadLoss(lost, expected, expected), false);
+  assert.equal(isSettledPathlessThreadLoss(new AppError("THREAD_NOT_FOUND", "ordinary"), undefined, expected), false);
 });
 
 test("managed endpoint-ready composition supplies any shared wake the owner has not completed", async () => {
@@ -1722,6 +1739,37 @@ test("permanent managed failure remains non-polling until the next explicit read
   assert.deepEqual(await owner.endpointReady("endpoint-a", lease), { recovery: "completed", sharedWake: "completed" });
   assert.equal(attempts, 2);
   assert.equal(timers.length, 0);
+  await owner.stop();
+});
+
+test("settled managed recovery removes the target without safety isolation or later retries", async () => {
+  const key = managedRetryKey("endpoint-a", "thread-a", "mapping-a");
+  const lease: EndpointWorkLease = {
+    endpointId: "endpoint-a", lifecycleGeneration: 1, endpointGeneration: 1, leaseId: "settled-managed",
+  };
+  let attempts = 0;
+  let safetyFailures = 0;
+  let errors = 0;
+  const owner = createManagedSessionRecoveryOwner({
+    endpoints: { withReadyWorkLease: async (_endpointId, run) => run(lease) },
+    isLeaseCurrent: () => true,
+    recover: async (_endpointId, keys) => {
+      attempts += 1;
+      return { restored: false, restoredKeys: [], settledKeys: keys, failures: [] };
+    },
+    beforeShared: async () => assert.fail("settled mappings have no ownership scan"),
+    wakeShared: async () => assert.fail("settled mappings have no managed shared wake"),
+    afterShared: async () => assert.fail("settled mappings have no ownership release"),
+    onSafetyFailure: () => { safetyFailures += 1; },
+    onError: () => { errors += 1; },
+  });
+  owner.recordFailure(key, "endpoint");
+
+  assert.deepEqual(await owner.endpointReady("endpoint-a", lease), { recovery: "none", sharedWake: "needed" });
+  assert.deepEqual(await owner.endpointReady("endpoint-a", lease), { recovery: "none", sharedWake: "needed" });
+  assert.equal(attempts, 1);
+  assert.equal(safetyFailures, 0);
+  assert.equal(errors, 0);
   await owner.stop();
 });
 

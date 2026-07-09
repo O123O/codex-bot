@@ -4,10 +4,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { AppError } from "../../src/core/errors.ts";
+import { JsonRpcResponseError } from "../../src/app-server/json-rpc-client.ts";
 import { OperationStore } from "../../src/storage/operation-store.ts";
 import { createTestDatabase } from "../../src/storage/database.ts";
 import { RuntimeStore } from "../../src/storage/runtime-store.ts";
-import { scanLocalRollout, SessionOwnershipGuard } from "../../src/sessions/rollout-ownership.ts";
+import { createAppServerRolloutPathResolver, scanLocalRollout, SessionOwnershipGuard } from "../../src/sessions/rollout-ownership.ts";
 import { RolloutAccessRouter } from "../../src/endpoints/rollout-access.ts";
 
 function line(type: string, payload: unknown): string {
@@ -304,6 +305,125 @@ test("initialization accepts only positive active external evidence from a malfo
   });
   assert.deepEqual(await externalGuard.inspect(externalIdentity), { state: "external", turnId: "external-active" });
   assert.equal(externalRuntime.getSession(externalIdentity.endpoint, externalIdentity.thread_id, externalIdentity.mapping_id)?.managementState, "unadopting");
+});
+
+test("recordUnmaterialized stores an idempotent offset-zero baseline without rollout access", () => {
+  const db = createTestDatabase();
+  const runtime = new RuntimeStore(db);
+  const identity = { endpoint: "devbox", thread_id: "thread-fresh", mapping_id: "mapping-fresh" };
+  let scans = 0;
+  const guard = new SessionOwnershipGuard(db, runtime, new OperationStore(db), {
+    scan: async () => { scans += 1; throw new Error("rollout access is forbidden"); },
+    scanUnmaterialized: async () => { scans += 1; throw new Error("rollout access is forbidden"); },
+  });
+  const path = "/tmp/rollout-thread-fresh.jsonl";
+
+  guard.recordUnmaterialized(identity, path);
+  guard.recordUnmaterialized(identity, path);
+
+  assert.equal(scans, 0);
+  const row = db.prepare(`SELECT rollout_path, device, inode, byte_offset, materialized, external_turn_id
+    FROM session_rollout_ownership WHERE endpoint_id = ? AND thread_id = ? AND mapping_id = ?`)
+    .get(identity.endpoint, identity.thread_id, identity.mapping_id);
+  assert.deepEqual({ ...row as object }, {
+    rollout_path: path, device: "", inode: "", byte_offset: 0, materialized: 0, external_turn_id: null,
+  });
+  assert.throws(() => guard.recordUnmaterialized(identity, "/tmp/rollout-other-thread.jsonl"), /path|rollout/iu);
+  assert.throws(() => guard.recordUnmaterialized(identity, "relative.jsonl"), /path|rollout/iu);
+});
+
+test("a pathless created thread stays pending until its exact rollout path can be bound", async () => {
+  const db = createTestDatabase();
+  const runtime = new RuntimeStore(db);
+  const identity = { endpoint: "devbox", thread_id: "thread-pathless", mapping_id: "mapping-pathless" };
+  let resolvedPath: string | undefined;
+  let scans = 0;
+  const guard = new SessionOwnershipGuard(db, runtime, new OperationStore(db), {
+    scan: async () => { scans += 1; throw new Error("materialized scan is not expected"); },
+    scanUnmaterialized: async (_endpoint, request) => {
+      scans += 1;
+      assert.equal(request.path, resolvedPath);
+      return { state: "missing" };
+    },
+  }, async (candidate) => {
+    assert.deepEqual(candidate, identity);
+    return resolvedPath ? { state: "resolved", path: resolvedPath } : { state: "pending" };
+  });
+
+  guard.recordUnmaterialized(identity);
+  assert.deepEqual(await guard.inspect(identity), { state: "pending" });
+  assert.equal(scans, 0);
+  assert.equal((db.prepare(`SELECT rollout_path FROM session_rollout_ownership
+    WHERE endpoint_id = ? AND thread_id = ? AND mapping_id = ?`).get(
+    identity.endpoint, identity.thread_id, identity.mapping_id,
+  ) as { rollout_path: string }).rollout_path, "");
+
+  resolvedPath = "/tmp/rollout-thread-pathless.jsonl";
+  assert.deepEqual(await guard.inspect(identity), { state: "owned" });
+  assert.equal(scans, 1);
+  guard.recordUnmaterialized(identity);
+  assert.equal((db.prepare(`SELECT rollout_path FROM session_rollout_ownership
+    WHERE endpoint_id = ? AND thread_id = ? AND mapping_id = ?`).get(
+    identity.endpoint, identity.thread_id, identity.mapping_id,
+  ) as { rollout_path: string }).rollout_path, resolvedPath);
+});
+
+test("a committed pathless mapping resumes a durable thread or terminally detects its missing rollout", async (t) => {
+  const identity = { endpoint: "local", thread_id: "thread-restart", mapping_id: "mapping-restart" };
+  await t.test("resumable", async () => {
+    const calls: string[] = [];
+    const resolver = createAppServerRolloutPathResolver({
+      request: async <T>(_endpoint: string, method: string) => {
+        calls.push(method);
+        if (method === "thread/read") throw new JsonRpcResponseError(-32600, "thread not loaded: thread-restart");
+        return { thread: { id: identity.thread_id, path: "/tmp/rollout-thread-restart.jsonl" } } as T;
+      },
+    });
+    assert.deepEqual(await resolver(identity), {
+      state: "resolved", path: "/tmp/rollout-thread-restart.jsonl",
+    });
+    assert.deepEqual(calls, ["thread/read", "thread/resume"]);
+  });
+  await t.test("volatile rollout lost", async () => {
+    const resolver = createAppServerRolloutPathResolver({
+      request: async <T>(_endpoint: string, method: string) => {
+        if (method === "thread/read") throw new JsonRpcResponseError(-32600, "thread not loaded: thread-restart");
+        throw new JsonRpcResponseError(-32600, "no rollout found for thread id thread-restart");
+      },
+    });
+    assert.deepEqual(await resolver(identity), { state: "lost" });
+  });
+  await t.test("live rollout not materialized", async () => {
+    const resolver = createAppServerRolloutPathResolver({
+      request: async <T>() => {
+        throw new JsonRpcResponseError(-32600, "no rollout found for thread id thread-restart");
+      },
+    });
+    assert.deepEqual(await resolver(identity), { state: "pending" });
+  });
+});
+
+test("recordUnmaterialized never downgrades existing materialized or external evidence", () => {
+  const db = createTestDatabase();
+  const runtime = new RuntimeStore(db);
+  const identity = { endpoint: "devbox", thread_id: "thread-existing", mapping_id: "mapping-existing" };
+  const path = "/tmp/rollout-thread-existing.jsonl";
+  db.prepare(`INSERT INTO session_rollout_ownership
+    (endpoint_id, thread_id, mapping_id, rollout_path, device, inode, byte_offset, materialized, external_turn_id, updated_at)
+    VALUES (?, ?, ?, ?, '10', '20', 30, 1, 'external-turn', 40)`)
+    .run(identity.endpoint, identity.thread_id, identity.mapping_id, path);
+  const guard = new SessionOwnershipGuard(db, runtime, new OperationStore(db), {
+    scan: async () => { throw new Error("unused"); },
+  });
+
+  guard.recordUnmaterialized(identity, path);
+
+  const row = db.prepare(`SELECT device, inode, byte_offset, materialized, external_turn_id, updated_at
+    FROM session_rollout_ownership WHERE endpoint_id = ? AND thread_id = ? AND mapping_id = ?`)
+    .get(identity.endpoint, identity.thread_id, identity.mapping_id);
+  assert.deepEqual({ ...row as object }, {
+    device: "10", inode: "20", byte_offset: 30, materialized: 1, external_turn_id: "external-turn", updated_at: 40,
+  });
 });
 
 test("an empty created thread promotes a completed owned first turn from the real rollout scanner", async () => {

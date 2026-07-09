@@ -79,6 +79,28 @@ export function buildSshRemoteArgs(plan: SshConnectionPlan, command: readonly st
   return [...baseArgs(plan, true), plan.alias, ...command];
 }
 
+export function buildSshStreamForwardArgs(plan: SshConnectionPlan, localSocket: string, remoteSocket: string): string[] {
+  if (![localSocket, remoteSocket].every((value) => isAbsolute(value) && /^[A-Za-z0-9_./-]+$/u.test(value))) {
+    throw new AppError("CONFIGURATION_ERROR", "unsafe SSH stream-local forwarding path");
+  }
+  return [
+    ...plan.commonArgs,
+    "-o", `HostName=${plan.destination.hostname}`,
+    "-l", plan.destination.user,
+    "-p", String(plan.destination.port),
+    "-o", "ControlMaster=no",
+    "-o", "ControlPath=none",
+    "-o", "ControlPersist=no",
+    "-o", "ExitOnForwardFailure=yes",
+    "-o", "ForkAfterAuthentication=no",
+    "-o", "StreamLocalBindUnlink=no",
+    "-o", "StreamLocalBindMask=0177",
+    "-N", "-T", "-n",
+    "-L", `${localSocket}:${remoteSocket}`,
+    plan.alias,
+  ];
+}
+
 export function buildControlMasterExitArgs(plan: SshConnectionPlan): string[] {
   if (!plan.ownsControlMaster) throw new AppError("OPERATION_CONFLICT", "cannot stop a user-owned SSH ControlMaster");
   return [...baseArgs(plan, false), "-S", plan.controlPath!, "-O", "exit", plan.alias];

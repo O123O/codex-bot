@@ -7,6 +7,8 @@ import { inTransaction, type Database } from "../storage/database.ts";
 import type { OperationStore } from "../storage/operation-store.ts";
 import type { RuntimeStore } from "../storage/runtime-store.ts";
 import type { EndpointWorkLease } from "../endpoints/types.ts";
+import type { AppServerPool } from "../app-server/pool.ts";
+import { isExactThreadNoRollout, isExactThreadNotLoaded, isExactThreadNotMaterialized } from "../app-server/thread-errors.ts";
 
 export interface RolloutCursor {
   device: string;
@@ -41,8 +43,48 @@ export interface RolloutAccess {
 
 export type OwnershipInspection =
   | { state: "owned" }
+  | { state: "pending" }
+  | { state: "lost" }
   | { state: "external"; turnId: string }
   | { state: "unclassified"; turnId: string };
+
+export type RolloutPathResolution =
+  | { state: "resolved"; path: string }
+  | { state: "pending" }
+  | { state: "lost" };
+
+export type RolloutPathResolver = (
+  identity: MappingIdentity,
+  lease?: EndpointWorkLease,
+) => Promise<RolloutPathResolution>;
+
+export function createAppServerRolloutPathResolver(
+  pool: Pick<AppServerPool, "request">,
+): RolloutPathResolver {
+  return async (identity, lease) => {
+    let response: unknown;
+    try {
+      response = await pool.request(identity.endpoint, "thread/read", {
+        threadId: identity.thread_id,
+        includeTurns: false,
+      }, undefined, lease);
+    } catch (error) {
+      if (isExactThreadNotMaterialized(error, identity.thread_id)) return { state: "pending" };
+      if (isExactThreadNoRollout(error, identity.thread_id)) return { state: "pending" };
+      if (!isExactThreadNotLoaded(error, identity.thread_id)) throw error;
+      try {
+        response = await pool.request(identity.endpoint, "thread/resume", {
+          threadId: identity.thread_id,
+        }, undefined, lease);
+      } catch (resumeError) {
+        if (isExactThreadNoRollout(resumeError, identity.thread_id)) return { state: "lost" };
+        throw resumeError;
+      }
+    }
+    const path = exactThreadPath(response, identity.thread_id);
+    return path === undefined ? { state: "pending" } : { state: "resolved", path };
+  };
+}
 
 const rolloutReadChunkBytes = 64 * 1024;
 const maxRolloutLineBytes = 64 * 1024 * 1024;
@@ -62,7 +104,32 @@ export class SessionOwnershipGuard {
     private readonly runtime: RuntimeStore,
     private readonly operations: OperationStore,
     private readonly access: RolloutAccess,
+    private readonly resolvePath?: RolloutPathResolver,
   ) {}
+
+  recordUnmaterialized(identity: MappingIdentity, path?: string): void {
+    if (path !== undefined && !validRolloutPath(path, identity.thread_id)) {
+      throw new AppError("OPERATION_UNCERTAIN", "managed rollout path is invalid");
+    }
+    inTransaction(this.db, () => {
+      this.db.prepare(`INSERT OR IGNORE INTO session_rollout_ownership
+        (endpoint_id, thread_id, mapping_id, rollout_path, device, inode, byte_offset, materialized, external_turn_id, updated_at)
+        VALUES (?, ?, ?, ?, '', '', 0, 0, NULL, ?)`).run(
+        identity.endpoint, identity.thread_id, identity.mapping_id, path ?? "", Date.now(),
+      );
+      let existing = this.row(identity);
+      if (path !== undefined && existing?.rolloutPath === undefined) {
+        this.db.prepare(`UPDATE session_rollout_ownership SET rollout_path = ?, updated_at = ?
+          WHERE endpoint_id = ? AND thread_id = ? AND mapping_id = ? AND rollout_path = ''`).run(
+          path, Date.now(), identity.endpoint, identity.thread_id, identity.mapping_id,
+        );
+        existing = this.row(identity);
+      }
+      if (path !== undefined && existing?.rolloutPath !== path) {
+        throw new AppError("OPERATION_UNCERTAIN", "managed rollout path changed");
+      }
+    });
+  }
 
   async initialize(
     identity: MappingIdentity,
@@ -70,9 +137,10 @@ export class SessionOwnershipGuard {
     lease?: EndpointWorkLease,
     options: { allowUnmaterialized?: boolean } = {},
   ): Promise<void> {
-    const existing = this.row(identity);
+    let existing = this.row(identity);
     if (existing) {
-      if (existing.rolloutPath !== path) throw new AppError("OPERATION_UNCERTAIN", "managed rollout path changed");
+      this.recordUnmaterialized(identity, path);
+      existing = this.row(identity)!;
       const inspection = await this.inspectCurrent(
         identity,
         lease,
@@ -129,15 +197,24 @@ export class SessionOwnershipGuard {
     lease: EndpointWorkLease | undefined,
     requireClassifiedTurn: boolean,
   ): Promise<OwnershipInspection> {
-    const existing = this.row(identity);
+    let existing = this.row(identity);
     if (!existing) throw ownershipUnclassified("session ownership guard is not initialized");
+    if (!existing.rolloutPath) {
+      if (!this.resolvePath) return { state: "pending" };
+      const resolution = await this.resolvePath(identity, lease);
+      if (resolution.state !== "resolved") return resolution;
+      this.recordUnmaterialized(identity, resolution.path);
+      existing = this.row(identity)!;
+    }
+    const rolloutPath = existing.rolloutPath;
+    if (!rolloutPath) throw ownershipUnclassified("managed rollout path is not materialized");
     const materialization = existing.materialized
-      ? await this.scanMaterialized(identity, existing.rolloutPath, lease, {
+      ? await this.scanMaterialized(identity, rolloutPath, lease, {
         device: existing.device,
         inode: existing.inode,
         offset: existing.byteOffset,
       })
-      : await this.scanUnmaterialized(identity, existing.rolloutPath, lease);
+      : await this.scanUnmaterialized(identity, rolloutPath, lease);
     if (materialization.state === "missing") {
       if (requireClassifiedTurn) throw ownershipUnclassified("pending rollout does not prove the native turns are owned");
       return { state: "owned" };
@@ -191,21 +268,23 @@ export class SessionOwnershipGuard {
     const row = this.db.prepare(`SELECT rollout_path, device, inode, byte_offset, materialized, external_turn_id
       FROM session_rollout_ownership WHERE endpoint_id = ? AND thread_id = ? AND mapping_id = ?`)
       .get(identity.endpoint, identity.thread_id, identity.mapping_id) as Record<string, unknown> | undefined;
+    const rolloutPath = row ? String(row.rollout_path) : "";
     return row ? {
-      rolloutPath: String(row.rollout_path), device: String(row.device), inode: String(row.inode), byteOffset: Number(row.byte_offset),
+      ...(rolloutPath ? { rolloutPath } : {}), device: String(row.device), inode: String(row.inode), byteOffset: Number(row.byte_offset),
       materialized: Number(row.materialized) === 1,
       ...(row.external_turn_id ? { externalTurnId: String(row.external_turn_id) } : {}),
     } : undefined;
   }
 
   private updateCursor(identity: MappingIdentity, expected: OwnershipRow, cursor: RolloutCursor, externalTurnId?: string): void {
+    if (!expected.rolloutPath) throw ownershipUnclassified("managed rollout path is not materialized");
     const changed = this.db.prepare(`UPDATE session_rollout_ownership
       SET device = ?, inode = ?, byte_offset = ?, materialized = 1, external_turn_id = COALESCE(external_turn_id, ?), updated_at = ?
       WHERE endpoint_id = ? AND thread_id = ? AND mapping_id = ?
-        AND device = ? AND inode = ? AND byte_offset = ? AND materialized = ? AND external_turn_id IS ?`).run(
+        AND rollout_path = ? AND device = ? AND inode = ? AND byte_offset = ? AND materialized = ? AND external_turn_id IS ?`).run(
       cursor.device, cursor.inode, cursor.offset, externalTurnId ?? null, Date.now(),
       identity.endpoint, identity.thread_id, identity.mapping_id,
-      expected.device, expected.inode, expected.byteOffset, expected.materialized ? 1 : 0, expected.externalTurnId ?? null,
+      expected.rolloutPath, expected.device, expected.inode, expected.byteOffset, expected.materialized ? 1 : 0, expected.externalTurnId ?? null,
     ).changes;
     if (changed !== 1) throw new AppError("OPERATION_UNCERTAIN", "session ownership cursor changed concurrently");
   }
@@ -234,7 +313,7 @@ export class SessionOwnershipGuard {
 }
 
 interface OwnershipRow {
-  rolloutPath: string;
+  rolloutPath?: string;
   device: string;
   inode: string;
   byteOffset: number;
@@ -248,8 +327,7 @@ export async function scanLocalRollout(request: {
   cursor?: RolloutCursor;
   collectFromStart?: true;
 }): Promise<RolloutScanResult> {
-  const name = basename(request.path);
-  if (!isAbsolute(request.path) || !safeThreadId(request.threadId) || !name.startsWith("rollout-") || !name.endsWith(`-${request.threadId}.jsonl`)) {
+  if (!validRolloutPath(request.path, request.threadId)) {
     throw new Error("invalid rollout ownership scan request");
   }
   const offset = request.cursor?.offset ?? 0;
@@ -271,6 +349,26 @@ export async function scanLocalRollout(request: {
   } finally {
     await file.close();
   }
+}
+
+function validRolloutPath(path: string, threadId: string): boolean {
+  const name = basename(path);
+  return isAbsolute(path) && safeThreadId(threadId) && name.startsWith("rollout-") && name.endsWith(`-${threadId}.jsonl`);
+}
+
+function exactThreadPath(response: unknown, threadId: string): string | undefined {
+  if (!response || typeof response !== "object" || Array.isArray(response)) {
+    throw new AppError("OPERATION_UNCERTAIN", "rollout path lookup returned invalid data");
+  }
+  const thread = (response as Record<string, unknown>).thread;
+  if (!thread || typeof thread !== "object" || Array.isArray(thread)
+    || (thread as Record<string, unknown>).id !== threadId) {
+    throw new AppError("OPERATION_UNCERTAIN", "rollout path lookup returned a different thread");
+  }
+  const path = (thread as Record<string, unknown>).path;
+  if (path === null || path === undefined) return undefined;
+  if (typeof path !== "string") throw new AppError("OPERATION_UNCERTAIN", "rollout path lookup returned invalid data");
+  return path;
 }
 
 interface PendingTurn extends RolloutTurnStart { startOffset: number; sawUserMessage: boolean }

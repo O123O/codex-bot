@@ -4,6 +4,7 @@ import {
   SshGenerationPlanner,
   buildControlMasterExitArgs,
   buildSshArgs,
+  buildSshStreamForwardArgs,
   parseSshConfig,
   planSshConnection,
 } from "../../src/endpoints/ssh-config.ts";
@@ -31,6 +32,20 @@ test("honors a usable user ControlMaster without taking ownership", () => {
   assert.equal(plan.controlPath, "/tmp/user-master");
   assert.doesNotMatch(buildSshArgs(plan, [] ).join(" "), /ControlPersist/u);
   assert.throws(() => buildControlMasterExitArgs(plan), /user-owned/u);
+});
+
+test("stream-local forwarding owns a dedicated non-multiplexed SSH process", () => {
+  const plan = planSshConnection("devbox", parseSshConfig(`${parsed}controlmaster auto\ncontrolpath /tmp/user-master\n`), "/private/runtime");
+  const args = buildSshStreamForwardArgs(plan, "/private/qiyan/f-01234567.sock", "/tmp/qiyan-1000/abcdef/app-server.sock");
+  const rendered = args.join(" ");
+  assert.match(rendered, /-N -T -n/u);
+  for (const option of [
+    "ControlMaster=no", "ControlPath=none", "ControlPersist=no", "ExitOnForwardFailure=yes",
+    "ForkAfterAuthentication=no", "StreamLocalBindUnlink=no", "StreamLocalBindMask=0177",
+  ]) assert.ok(args.includes(option), option);
+  assert.doesNotMatch(rendered, /user-master|ControlMaster=auto|ControlPersist=60/u);
+  assert.ok(args.includes("/private/qiyan/f-01234567.sock:/tmp/qiyan-1000/abcdef/app-server.sock"));
+  assert.equal(args.at(-1), "devbox");
 });
 
 test("rejects malformed effective configuration and unsafe aliases", () => {

@@ -17,7 +17,8 @@ import {
   chatMessageDeliveryId,
   createChatOutputActions,
 } from "./chat/output-actions.ts";
-import { LocalEndpoint } from "./app-server/local-endpoint.ts";
+import { LocalAppServerRuntime } from "./app-server/local-runtime.ts";
+import { EndpointAuthenticationRequiredError, ManagedAppServerEndpoint } from "./app-server/managed-endpoint.ts";
 import { AppServerPool } from "./app-server/pool.ts";
 import { RpcRequestTimeoutError } from "./app-server/rpc-client.ts";
 import { MINIMUM_SUPPORTED_CODEX_VERSION } from "./app-server/protocol.ts";
@@ -34,8 +35,8 @@ import type { OperationalEvent, OperationalEventSink } from "./core/operational-
 import type { CanonicalChatSource, ManagementState, OperationState } from "./core/types.ts";
 import { SessionDashboard } from "./assistant/session-dashboard.ts";
 import { activateAssistantProfileIdentity, resumeAssistantIdentity } from "./assistant/identity.ts";
-import { recordAssistantAuthenticationFailure } from "./assistant/auth-recovery.ts";
-import { buildAssistantChildEnvironment, prepareAssistantProfile, startAuthenticatedAssistantEndpoint, type PreparedAssistantProfile } from "./assistant/profile.ts";
+import { assistantAuthenticationStartupError, recordAssistantAuthenticationFailure } from "./assistant/auth-recovery.ts";
+import { buildAssistantChildEnvironment, prepareAssistantProfile, type PreparedAssistantProfile } from "./assistant/profile.ts";
 import { AssistantRuntime } from "./assistant/runtime.ts";
 import { AssistantScheduler } from "./assistant/scheduler.ts";
 import { ConversationDispatcher, type AssistantTurnPort } from "./assistant/conversation-dispatcher.ts";
@@ -63,7 +64,7 @@ import {
   type ExternalOwnershipReleaseStatus,
   type ExternalTurnIncident,
 } from "./sessions/ownership-watcher.ts";
-import { SessionOwnershipGuard } from "./sessions/rollout-ownership.ts";
+import { createAppServerRolloutPathResolver, SessionOwnershipGuard } from "./sessions/rollout-ownership.ts";
 import { preparedProjectWorkspaceFromCheckpoint, ProjectWorkspacePolicy, type PreparedProjectWorkspace } from "./sessions/project-workspace.ts";
 import { SessionService } from "./sessions/service.ts";
 import { ThreadGate } from "./sessions/thread-gate.ts";
@@ -94,12 +95,18 @@ import { EndpointBindingStore } from "./endpoints/binding-store.ts";
 import { EndpointManager } from "./endpoints/manager.ts";
 import { SshGenerationPlanner } from "./endpoints/ssh-config.ts";
 import { SshRemoteClient, SshRuntime } from "./endpoints/ssh-runtime.ts";
-import { openSshUnixTunnel, SshEndpoint } from "./endpoints/ssh-endpoint.ts";
-import { prepareLocalSshEndpointSocket, prepareLocalSshRuntimeRoot } from "./endpoints/local-runtime.ts";
+import { SshAppServerRuntime } from "./endpoints/ssh-app-server-runtime.ts";
+import { prepareLocalSshEndpointSocketRoot, prepareLocalSshRuntimeRoot } from "./endpoints/local-runtime.ts";
 import { WebSocketWire } from "./app-server/websocket-wire.ts";
 import { SshHost } from "./endpoints/ssh-host.ts";
 import { WorkspaceRouter } from "./endpoints/workspace-router.ts";
-import { parseRuntimeIdentity, type EndpointLossKind, type EndpointWorkLease, type ManagedAppServerEndpoint, type RuntimeIdentity } from "./endpoints/types.ts";
+import {
+  parseRuntimeIdentity,
+  type EndpointLossKind,
+  type EndpointWorkLease,
+  type ManagedAppServerEndpoint as ManagedEndpointContract,
+  type RuntimeIdentity,
+} from "./endpoints/types.ts";
 import { WorkerFileBridge } from "./endpoints/worker-file-bridge.ts";
 import { EndpointCapacityRecovery, recoverableCapacityHint } from "./endpoints/capacity-recovery.ts";
 import { RolloutAccessRouter } from "./endpoints/rollout-access.ts";
@@ -974,6 +981,17 @@ export function managedRecoveryDisposition(error: unknown, currentReadyLease = f
   return "permanent";
 }
 
+export function isSettledPathlessThreadLoss(
+  error: unknown,
+  current: RegistrySession | undefined,
+  expected: RegistrySession,
+): boolean {
+  if (!(error instanceof AppError) || error.code !== "THREAD_NOT_FOUND"
+    || error.details?.recovery !== "pathless_thread_lost") return false;
+  return !current || current.endpoint !== expected.endpoint || current.thread_id !== expected.thread_id
+    || current.mapping_id !== expected.mapping_id;
+}
+
 export function managedRecoveryManagementState(
   current: ManagementState | undefined,
   disposition: ManagedRecoveryDisposition,
@@ -1640,8 +1658,8 @@ export async function buildProductionApp(
   let backgroundFailures!: BackgroundFailureStore;
   let runtime!: RuntimeStore;
   let finals!: FinalMessageStore;
-  let endpoint!: LocalEndpoint;
-  let assistantEndpoint!: LocalEndpoint;
+  let endpoint!: ManagedAppServerEndpoint;
+  let assistantEndpoint!: ManagedAppServerEndpoint;
   let endpointCatalog!: EndpointCatalog;
   let endpointBindings!: EndpointBindingStore;
   let endpointManager!: EndpointManager;
@@ -1681,7 +1699,7 @@ export async function buildProductionApp(
   const projectReadyRetryTimers = new Map<string, { generation: number; timer: ReturnType<typeof setTimeout> }>();
   type RemoteContext = { runtime: SshRuntime; remote: SshRemoteClient; projectsRoot: string };
   const remoteContexts = new Map<string, RemoteContext>();
-  const remoteCandidateContexts = new WeakMap<ManagedAppServerEndpoint, RemoteContext>();
+  const remoteCandidateContexts = new WeakMap<ManagedEndpointContract, RemoteContext>();
   const reconnectTimers = new Map<string, ReturnType<typeof setTimeout>>();
   const reconnectAttempts = new Map<string, number>();
   const terminalProcessing = new Map<string, Promise<void>>();
@@ -2050,13 +2068,19 @@ export async function buildProductionApp(
       start: async () => {
         recoveryOwnersStop = undefined;
         try {
-        endpoint = new LocalEndpoint({ id: "local", codexBinary: config.codexBinary, env: buildWorkerChildEnvironment(process.env), minimumVersion: MINIMUM_SUPPORTED_CODEX_VERSION });
-        assistantEndpoint = new LocalEndpoint({
+        endpoint = new ManagedAppServerEndpoint({
+          id: "local",
+          runtime: new LocalAppServerRuntime({ codexBinary: config.codexBinary, env: buildWorkerChildEnvironment(process.env) }),
+          minimumVersion: MINIMUM_SUPPORTED_CODEX_VERSION,
+        });
+        assistantEndpoint = new ManagedAppServerEndpoint({
           id: "assistant-local",
-          codexBinary: config.codexBinary,
-          env: buildAssistantChildEnvironment(process.env, assistantProfile, token),
-          expectedCodexHome: assistantProfile.codexHome,
-          validateEnvironment: () => assistantProfile.assertIntact(),
+          runtime: new LocalAppServerRuntime({
+            codexBinary: config.codexBinary,
+            env: buildAssistantChildEnvironment(process.env, assistantProfile, token),
+            expectedCodexHome: assistantProfile.codexHome,
+            validateEnvironment: () => assistantProfile.assertIntact(),
+          }),
           minimumVersion: MINIMUM_SUPPORTED_CODEX_VERSION,
         });
         const sshRuntimeRoot = await prepareLocalSshRuntimeRoot(dataDir);
@@ -2074,13 +2098,16 @@ export async function buildProductionApp(
             const generation = await planner.createGeneration(definition.id);
             const remote = new SshRemoteClient({ plan: generation.plan, helperSource });
             const remoteRuntime = new SshRuntime({ endpointId: definition.id, remote, assetRoot: remoteAssetRoot });
-            const { socketRoot, socketPath: localSocket } = await prepareLocalSshEndpointSocket(sshRuntimeRoot, definition.id);
-            const remoteEndpoint = new SshEndpoint({
+            const socketRoot = await prepareLocalSshEndpointSocketRoot(sshRuntimeRoot, definition.id);
+            const remoteEndpoint = new ManagedAppServerEndpoint({
               id: definition.id,
-              runtime: remoteRuntime,
+              runtime: new SshAppServerRuntime({
+                runtime: remoteRuntime,
+                plan: generation.plan,
+                socketRoot,
+                connectWire: (socketPath) => WebSocketWire.connect(socketPath, { timeoutMs: 10_000, trustedRoot: socketRoot }),
+              }),
               minimumVersion: MINIMUM_SUPPORTED_CODEX_VERSION,
-              openTunnel: (remoteSocketPath) => openSshUnixTunnel({ plan: generation.plan, localSocketPath: localSocket, remoteSocketPath }),
-              connectWire: () => WebSocketWire.connect(localSocket, { timeoutMs: 10_000, trustedRoot: socketRoot }),
             });
             remoteCandidateContexts.set(remoteEndpoint, { runtime: remoteRuntime, remote, projectsRoot: definition.projectsRoot });
             return { endpoint: remoteEndpoint, pendingBinding: generation.pendingBinding };
@@ -2147,7 +2174,9 @@ export async function buildProductionApp(
           },
           validateLease: (id, lease) => endpointManager.validateWorkLease(lease, id),
         });
-        ownership = new SessionOwnershipGuard(db, runtime, operations, rolloutAccess);
+        ownership = new SessionOwnershipGuard(
+          db, runtime, operations, rolloutAccess, createAppServerRolloutPathResolver(pool),
+        );
         lifecycle = new SessionLifecycle(pool, registry, runtime, { now: () => Date.now() }, workspaceRouter as never, threadGate, endpointManager, ownership);
         sessions = new SessionService(pool, registry, runtime, finals, deliveries, workspaceRouter, threadGate, endpointManager, ownership);
         observations = new SessionObservationProcessor(dashboardStore, registry, runtime, {
@@ -2279,7 +2308,7 @@ export async function buildProductionApp(
         stopping = false;
         endpointsCommitted = false;
         try {
-          await startAuthenticatedAssistantEndpoint(assistantEndpoint, assistantProfile);
+          await assistantEndpoint.start();
           if (assistantEndpoint.state !== "ready") {
             throw new AppError("ENDPOINT_UNAVAILABLE", "the assistant app-server became unavailable during initial startup");
           }
@@ -2289,8 +2318,8 @@ export async function buildProductionApp(
           for (const timer of reconnectTimers.values()) clearTimeout(timer);
           reconnectTimers.clear();
           await stopRecoveryOwners().catch(() => undefined);
-          await Promise.all([assistantEndpoint.stop(), endpointManager.closeConnections()]).catch(() => undefined);
-          throw error;
+          await Promise.all([assistantEndpoint.closeConnection(), endpointManager.closeConnections()]).catch(() => undefined);
+          throw assistantAuthenticationStartupError(error);
         }
       },
       stop: async () => {
@@ -2298,7 +2327,7 @@ export async function buildProductionApp(
         endpointsCommitted = false;
         for (const timer of reconnectTimers.values()) clearTimeout(timer);
         reconnectTimers.clear();
-        await Promise.all([assistantEndpoint.stop(), endpointManager.closeConnections()]);
+        await Promise.all([assistantEndpoint.closeConnection(), endpointManager.closeConnections()]);
       },
     },
     {
@@ -2886,7 +2915,7 @@ export async function buildProductionApp(
     }));
   }
 
-  function bindProjectEndpoint(target: ManagedAppServerEndpoint, generation: number): void {
+  function bindProjectEndpoint(target: ManagedEndpointContract, generation: number): void {
     for (const unsubscribe of projectEndpointSubscriptions.get(target.id) ?? []) unsubscribe();
     const previousRetry = projectReadyRetryTimers.get(target.id);
     if (previousRetry) clearTimeout(previousRetry.timer);
@@ -3458,13 +3487,17 @@ export async function buildProductionApp(
         restoredKeys.push(key);
       } catch (error) {
         if (options.isCurrent && !options.isCurrent()) throw error;
+        const current = registry.get(nickname);
+        if (isSettledPathlessThreadLoss(error, current, session)) {
+          settledKeys.push(key);
+          continue;
+        }
         const disposition = managedRecoveryDisposition(
           error,
           Boolean(options.lease && isManagedRecoveryLeaseCurrent(session.endpoint, options.lease)),
         );
         failures.push({ key, disposition });
         if (!exactKeys) managedRecoveryOwner?.recordFailure(key, disposition);
-        const current = registry.get(nickname);
         if (current?.mapping_id === session.mapping_id && current.endpoint === session.endpoint
           && current.thread_id === session.thread_id && current.lifecycle_state === "managed") {
           const state = runtime.getSession(session.endpoint, session.thread_id, session.mapping_id);
@@ -3596,7 +3629,7 @@ export async function buildProductionApp(
     return recovery;
   }
 
-  async function handleEndpointUnavailable(target: ManagedAppServerEndpoint, kind: EndpointLossKind = "runtime-lost"): Promise<void> {
+  async function handleEndpointUnavailable(target: ManagedEndpointContract, kind: EndpointLossKind = "runtime-lost"): Promise<void> {
     if (stopping || !endpointsCommitted) return;
     const endpointIncident = endpointRecoveryIncidents.record(target.id);
     markEndpointOwnersUnavailable({
@@ -3653,9 +3686,9 @@ export async function buildProductionApp(
   async function recoverAssistantEndpoint(): Promise<void> {
     if (stopping) return;
     try {
-      await startAuthenticatedAssistantEndpoint(assistantEndpoint, assistantProfile);
+      await assistantEndpoint.start();
     } catch (error) {
-      if (error instanceof AppError && error.details?.reason === "assistant_auth_required") {
+      if (error instanceof EndpointAuthenticationRequiredError) {
         recordAssistantAuthenticationFailure(deliveries, currentOwnerBinding, endpointRecoveryIncidents.latestSequence);
       }
       throw error;
@@ -3734,7 +3767,7 @@ export function createChatHistoryAction(
   return (args, context) => registry().getHistory(binding(context.attemptId), args);
 }
 
-export function isUncertainAssistantTransportFailure(error: unknown, endpointState: LocalEndpoint["state"]): boolean {
+export function isUncertainAssistantTransportFailure(error: unknown, endpointState: ManagedEndpointContract["state"]): boolean {
   return endpointState !== "ready" || (error instanceof AppError && new Set(["ENDPOINT_UNAVAILABLE", "OPERATION_UNCERTAIN"]).has(error.code));
 }
 

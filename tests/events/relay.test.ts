@@ -55,7 +55,7 @@ class RelayEndpoint implements AppServerEndpoint {
 async function fixture(
   onTerminal?: (event: any, lease?: EndpointWorkLease) => void | Promise<void>,
   ownershipOverride?: {
-    inspect(): Promise<{ state: "owned" } | { state: "external"; turnId: string } | { state: "unclassified"; turnId: string }>;
+    inspect(): Promise<{ state: "owned" | "pending" | "lost" } | { state: "external"; turnId: string } | { state: "unclassified"; turnId: string }>;
     ownsTurn(identity: unknown, turnId: string): boolean;
   },
   relayOptions: {
@@ -365,6 +365,24 @@ test("an unclassified task-start boundary blocks relay history reads", async () 
   assert.deepEqual(deliveries.listReady(), []);
 });
 
+test("a pathless ownership boundary blocks notification and ready-history reads", async () => {
+  let reads = 0;
+  const value = await fixture(undefined, {
+    inspect: async () => ({ state: "pending" }),
+    ownsTurn: () => false,
+  });
+  value.endpoint.request = async <T>() => { reads += 1; return { thread: { turns: value.endpoint.turns } } as T; };
+
+  assert.equal(await value.relay.handleNotification(
+    "local", "turn/completed", { threadId: "worker", turn: terminal("pending-turn") }, workLease,
+  ), "retry");
+  await value.relay.reconcileEndpoint("local");
+
+  assert.equal(reads, 0);
+  assert.equal(value.runtime.getSession("local", "worker", mappingId)?.deliveryCursor, undefined);
+  assert.deepEqual(value.deliveries.listReady(), []);
+});
+
 test("ready reconciliation reads history after baseline and advances a durable cursor", async () => {
   const { endpoint, deliveries, relay } = await fixture();
   endpoint.turns = [terminal("adopted"), terminal("baseline"), terminal("missed")];
@@ -561,6 +579,15 @@ test("terminal projection exposes exact handled, conclusively ignored, and retry
   unclassified.endpoint.turns = [terminal("baseline"), terminal("uncertain")];
   assert.equal(await unclassified.relay.handleNotification(
     "local", "turn/completed", { threadId: "worker", turn: terminal("uncertain") }, workLease,
+  ), "retry");
+
+  const pending = await fixture(undefined, {
+    inspect: async () => ({ state: "pending" }),
+    ownsTurn: () => false,
+  });
+  pending.endpoint.turns = [terminal("baseline"), terminal("pending")];
+  assert.equal(await pending.relay.handleNotification(
+    "local", "turn/completed", { threadId: "worker", turn: terminal("pending") }, workLease,
   ), "retry");
 
   const absent = await fixture();

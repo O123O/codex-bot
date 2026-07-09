@@ -4,7 +4,6 @@ import { chmod, lstat, mkdir, open, readFile, realpath, rm, stat, unlink } from 
 import { userInfo } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
-import { createConnection } from "node:net";
 
 const TMUX = ["-L", "qiyan-bot", "-f", "/dev/null"];
 const SAFE_PATH = /^\/[A-Za-z0-9_./+-]+$/u;
@@ -17,11 +16,8 @@ const operation = process.argv[2];
 const encoded = process.argv.slice(3);
 
 try {
-  if (operation === "tunnel") {
-    await tunnelSocket(decodeJson(encoded, 1));
-  } else {
-    let result;
-    switch (operation) {
+  let result;
+  switch (operation) {
     case "preflight": result = preflight(); break;
     case "bootstrap": result = await bootstrap(decodeJson(encoded, 1)); break;
     case "inspect": result = await inspect(decodeJson(encoded, 1)); break;
@@ -32,25 +28,11 @@ try {
     case "rollout-scan": result = await scanRollouts(decodeJson(encoded, 1)); break;
     case "workspace": result = await workspace(decodeJson(encoded, 1)); break;
     default: throw new Error("unsupported helper operation");
-    }
-    process.stdout.write(`${JSON.stringify(result)}\n`);
   }
+  process.stdout.write(`${JSON.stringify(result)}\n`);
 } catch {
   process.stderr.write("qiyan remote helper failed\n");
   process.exitCode = 1;
-}
-
-async function tunnelSocket(value) {
-  const socketPath = value?.socketPath;
-  if (typeof socketPath !== "string" || !socketPath.endsWith("/app-server.sock")) throw new Error("invalid tunnel request");
-  const runtimeDir = dirname(socketPath);
-  requireRuntimeDir(runtimeDir);
-  if (socketPath !== join(runtimeDir, "app-server.sock")) throw new Error("invalid tunnel request");
-  const socket = createConnection({ path: socketPath, allowHalfOpen: true });
-  await new Promise((resolve, reject) => socket.once("connect", resolve).once("error", reject));
-  process.stdin.pipe(socket);
-  socket.pipe(process.stdout);
-  await new Promise((resolve, reject) => socket.once("close", resolve).once("error", reject));
 }
 
 function decodeJson(values, count) {

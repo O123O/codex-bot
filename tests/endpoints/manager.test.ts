@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import test from "node:test";
 import { EndpointManager } from "../../src/endpoints/manager.ts";
-import type { PermissionBlockedEvent } from "../../src/app-server/local-endpoint.ts";
+import type { PermissionBlockedEvent } from "../../src/app-server/managed-endpoint.ts";
 import type { EndpointLossKind, ManagedAppServerEndpoint, RuntimeIdentity } from "../../src/endpoints/types.ts";
 import { RpcRequestTimeoutError } from "../../src/app-server/rpc-client.ts";
 import { AppError } from "../../src/core/errors.ts";

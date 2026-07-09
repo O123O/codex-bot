@@ -251,6 +251,8 @@ export class SessionService {
     if (!this.ownership) return;
     const ownership = await this.ownership.inspect(session, lease);
     if (ownership.state === "external") throw new AppError("SESSION_DETACHED", `${nickname} is being used outside QiYan`);
+    if (ownership.state === "lost") throw new AppError("THREAD_NOT_FOUND", `${nickname} has no durable rollout after restart`);
+    if (ownership.state === "pending") throw new AppError("SESSION_BUSY", `${nickname} is waiting for its rollout to materialize`);
     if (ownership.state === "unclassified") throw new AppError("SESSION_BUSY", `${nickname} has a turn whose ownership is not yet classified`);
   }
 

@@ -65,6 +65,10 @@ function relayTargetKey(target: RelayTarget): string {
   return [target.endpointId, target.threadId, target.turnId, target.mappingId, target.epochId].join("\0");
 }
 
+function ownershipNeedsRetry(inspection: OwnershipInspection): boolean {
+  return inspection.state === "unclassified" || inspection.state === "pending" || inspection.state === "lost";
+}
+
 export class EventRelay {
   private readonly retryTargets = new Map<string, RelayTarget>();
   private readonly retryTimers = new Map<string, RelayTimer>();
@@ -243,7 +247,7 @@ export class EventRelay {
     const mappingBefore = this.mapping(target.endpointId, target.threadId)!;
     const firstOwnership = await this.inspectOwnership(mappingBefore.session, lease);
     if (!this.runIsCurrent(target.endpointId, generation)) return "retry";
-    if (firstOwnership.state === "unclassified") return "retry";
+    if (ownershipNeedsRetry(firstOwnership)) return "retry";
 
     const history = await this.pool.request<{ thread: { turns: TerminalTurn[] } }>(
       target.endpointId,
@@ -258,7 +262,7 @@ export class EventRelay {
     if (!current || current.session.mapping_id !== target.mappingId) return "conclusively_ignored";
     const secondOwnership = await this.inspectOwnership(current.session, lease);
     if (!this.runIsCurrent(target.endpointId, generation)) return "retry";
-    if (secondOwnership.state === "unclassified") return "retry";
+    if (ownershipNeedsRetry(secondOwnership)) return "retry";
 
     const stateAfter = this.targetState(target);
     if (stateAfter !== "deliverable") return stateAfter === "stale" ? "conclusively_ignored" : "retry";
@@ -293,14 +297,14 @@ export class EventRelay {
           || !state || !this.isDeliverableState(state.managementState) || !epoch) return true;
         const targetGeneration = { mappingId: session.mapping_id, epochId: epoch.id };
         const before = await this.inspectOwnership(session, lease);
-        if (!this.runIsCurrent(endpointId, generation) || before.state === "unclassified") return false;
+        if (!this.runIsCurrent(endpointId, generation) || ownershipNeedsRetry(before)) return false;
         const response = await this.readHistory(endpointId, session.thread_id, lease);
         if (!this.runIsCurrent(endpointId, generation)) return false;
         const current = this.mapping(endpointId, session.thread_id);
         if (!current) return true;
         if (current.session.mapping_id !== session.mapping_id) return false;
         const after = await this.inspectOwnership(current.session, lease);
-        if (!this.runIsCurrent(endpointId, generation) || after.state === "unclassified"
+        if (!this.runIsCurrent(endpointId, generation) || ownershipNeedsRetry(after)
           || !this.isDeliverableGeneration(endpointId, session.thread_id, targetGeneration)) return false;
         const turns = response.thread.turns;
         let index = epoch.baselineTurnId ? turns.findIndex((turn) => turn.id === epoch.baselineTurnId) + 1 : 0;

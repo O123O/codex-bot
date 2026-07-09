@@ -45,6 +45,8 @@ test("reuses a healthy detached runtime and changes identity only after replacem
   assert.match(runtime.remoteSocketPath, /^\/tmp\/qiyan-1000\/[a-f0-9]{24}\/app-server\.sock$/u);
 
   assert.deepEqual(await runtime.runtimeIdentity(), first);
+  assert.equal(remote.calls.filter((call) => call.operation === "preflight").length, 1);
+  assert.equal(remote.calls.filter((call) => call.operation === "bootstrap").length, 1);
   remote.identity = { ...remote.identity, token: "b".repeat(32), linuxStartTime: "303" };
   assert.notDeepEqual(await runtime.runtimeIdentity(), first);
 });

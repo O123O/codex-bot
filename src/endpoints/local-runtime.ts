@@ -33,28 +33,37 @@ export async function prepareLocalSshRuntimeRoot(
   return namespaceRoot;
 }
 
-export function localSshEndpointSocketPaths(runtimeRoot: string, endpointId: string): { socketRoot: string; socketPath: string } {
+export function localSshEndpointSocketRoot(runtimeRoot: string, endpointId: string): string {
   if (!isAbsolute(runtimeRoot) || !/^[a-z0-9][a-z0-9_-]{0,63}$/u.test(endpointId)) throw runtimeDirectoryError();
   const endpointNamespace = createHash("sha256").update(endpointId).digest("hex").slice(0, 16);
   const socketRoot = join(runtimeRoot, "s", endpointNamespace);
-  const socketPath = join(socketRoot, "a.sock");
+  const socketPath = join(socketRoot, "00000000");
   if (Buffer.byteLength(socketPath) > maxUnixSocketPathBytes) {
     throw new AppError("CONFIGURATION_ERROR", "local SSH Unix socket path is too long");
   }
-  return { socketRoot, socketPath };
+  return socketRoot;
 }
 
-export async function prepareLocalSshEndpointSocket(
+export function localSshForwardSocketPath(socketRoot: string, generation: string): string {
+  if (!isAbsolute(socketRoot) || !/^[a-f0-9]{8}$/u.test(generation)) throw runtimeDirectoryError("local SSH forward socket path is invalid");
+  const socketPath = join(socketRoot, generation);
+  if (Buffer.byteLength(socketPath) > maxUnixSocketPathBytes) {
+    throw new AppError("CONFIGURATION_ERROR", "local SSH Unix socket path is too long");
+  }
+  return socketPath;
+}
+
+export async function prepareLocalSshEndpointSocketRoot(
   runtimeRoot: string,
   endpointId: string,
   expectedUid = process.geteuid?.() ?? process.getuid?.(),
-): Promise<{ socketRoot: string; socketPath: string }> {
-  const paths = localSshEndpointSocketPaths(runtimeRoot, endpointId);
+): Promise<string> {
+  const socketRoot = localSshEndpointSocketRoot(runtimeRoot, endpointId);
   await ensurePrivateOwnerDirectory(runtimeRoot, expectedUid, false);
   const socketsRoot = join(runtimeRoot, "s");
   await ensurePrivateOwnerDirectory(socketsRoot, expectedUid, true);
-  await ensurePrivateOwnerDirectory(paths.socketRoot, expectedUid, true);
-  return paths;
+  await ensurePrivateOwnerDirectory(socketRoot, expectedUid, true);
+  return socketRoot;
 }
 
 function defaultRuntimeBase(uid: number | undefined, options: LocalRuntimeOptions): string {
@@ -84,8 +93,8 @@ async function ensurePrivateOwnerDirectory(path: string, expectedUid: number | u
   } finally { await directory.close(); }
 }
 
-function runtimeDirectoryError(): AppError {
-  return new AppError("CONFIGURATION_ERROR", "local SSH runtime must be a private owner directory");
+function runtimeDirectoryError(message = "local SSH runtime must be a private owner directory"): AppError {
+  return new AppError("CONFIGURATION_ERROR", message);
 }
 
 function isErrno(error: unknown, code: string): error is NodeJS.ErrnoException {

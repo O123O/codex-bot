@@ -160,6 +160,16 @@ test("execution checks rollout ownership before reading or mutating the native t
   assert.deepEqual(value.endpoint.calls, []);
 });
 
+test("execution waits for a pathless rollout before native dispatch", async () => {
+  const value = await fixture({ inspect: async () => ({ state: "pending" }) });
+
+  await assert.rejects(value.service.send("payments", "must not run"), (error: unknown) => (
+    error instanceof AppError && error.code === "SESSION_BUSY"
+  ));
+
+  assert.deepEqual(value.endpoint.calls, []);
+});
+
 test("execution rechecks rollout ownership after input preparation and immediately before dispatch", async () => {
   let external = false;
   let checks = 0;

@@ -23,6 +23,7 @@ export interface LifecycleCheckpoint extends MappingIdentity {
 }
 
 interface SessionOwnershipLifecycle {
+  recordUnmaterialized(identity: MappingIdentity, path?: string): void;
   initialize(
     identity: MappingIdentity,
     path: string,
@@ -66,29 +67,20 @@ export class SessionLifecycle {
     await this.assertDispatchable(endpointId, project, lease);
     onDispatching?.();
     const response = await this.pool.request<ThreadResponse>(endpointId, "thread/start", workerThreadStartParams(project.path, threadSource), undefined, lease);
-    if (response.thread.threadSource !== threadSource) throw new AppError("OPERATION_UNCERTAIN", "new thread returned an unexpected creation source");
+    this.requireFreshThread(response.thread, threadSource, project.path);
     const settings = this.responseSettings(response);
     onThreadCreated?.(response.thread, settings);
     await this.gate.run(endpointId, response.thread.id, async () => {
-      const managedThread = this.ownership && !response.thread.path
-        ? (await this.read(endpointId, response.thread.id, lease)).thread
-        : response.thread;
-      if (managedThread.id !== response.thread.id) throw new AppError("OPERATION_UNCERTAIN", "new thread read returned an unexpected identity");
-      await this.assertDispatchable(endpointId, project, lease);
-      await this.verifyCwd(endpointId, managedThread.cwd, project.path, lease);
-      if (managedThread.status.type !== "idle") throw new AppError("OPERATION_UNCERTAIN", `new thread ${managedThread.id} was created in ${managedThread.status.type} state`);
       const identity = {
         endpoint: endpointId,
         thread_id: response.thread.id,
         project_dir: project.path,
         mapping_id: mappingId,
       };
-      if (this.ownership) await this.ownership.initialize(identity, this.requireRolloutPath(managedThread), lease, {
-        allowUnmaterialized: managedThread.turns.length === 0,
-      });
+      this.ownership?.recordUnmaterialized(identity, response.thread.path ?? undefined);
       await this.registry.createManaged(nickname, identity);
-      this.runtime.setSession(endpointId, managedThread.id, mappingId, "managed", managedThread.status.type);
-      this.runtime.beginEpoch(endpointId, managedThread.id, mappingId, this.baseline(managedThread), this.clock.now());
+      this.runtime.setSession(endpointId, response.thread.id, mappingId, "managed", response.thread.status.type);
+      this.runtime.beginEpoch(endpointId, response.thread.id, mappingId, this.baseline(response.thread), this.clock.now());
     });
     return settings;
     }, existingLease);
@@ -324,6 +316,22 @@ export class SessionLifecycle {
       if (guarded?.state === "external") {
         throw new AppError("SESSION_BUSY", `thread ${session.thread_id} has an externally started turn`, { recovery: "external_turn" });
       }
+      if (guarded?.state === "lost") {
+        assertCurrent();
+        this.runtime.endEpoch(session.endpoint, session.thread_id, session.mapping_id, this.clock.now());
+        if (!await this.registry.removeIfMatch(nickname, session)) {
+          throw new AppError("OPERATION_UNCERTAIN", "lost volatile thread mapping changed before removal");
+        }
+        this.ownership?.release(session);
+        throw new AppError("THREAD_NOT_FOUND", `thread ${session.thread_id} had no durable rollout after restart`, {
+          recovery: "pathless_thread_lost",
+        });
+      }
+      if (guarded?.state === "pending") {
+        throw new AppError("OPERATION_UNCERTAIN", `thread ${session.thread_id} rollout is not materialized`, {
+          recovery: "ownership_unclassified",
+        });
+      }
       if (guarded?.state === "unclassified") {
         throw new AppError("OPERATION_UNCERTAIN", `thread ${session.thread_id} has a turn whose ownership is not yet classified`, {
           recovery: "ownership_unclassified",
@@ -468,6 +476,22 @@ export class SessionLifecycle {
 
   private requireThreadIdentity(thread: ThreadView, threadId: string): void {
     if (thread.id !== threadId) throw new AppError("OPERATION_UNCERTAIN", "thread recovery returned an unexpected identity");
+  }
+
+  private requireFreshThread(thread: ThreadView, threadSource: string, cwd: string, threadId?: string): void {
+    if (typeof thread.id !== "string" || thread.id.length === 0 || (threadId !== undefined && thread.id !== threadId)) {
+      throw new AppError("OPERATION_UNCERTAIN", "new thread returned an unexpected identity");
+    }
+    if (thread.threadSource !== threadSource) {
+      throw new AppError("OPERATION_UNCERTAIN", "new thread returned an unexpected creation source");
+    }
+    if (thread.cwd !== cwd) throw new AppError("CWD_MISMATCH", "new thread returned an unexpected cwd");
+    if (thread.status.type !== "idle") {
+      throw new AppError("OPERATION_UNCERTAIN", `new thread ${thread.id} was created in ${thread.status.type} state`);
+    }
+    if (!Array.isArray(thread.turns) || thread.turns.length !== 0) {
+      throw new AppError("OPERATION_UNCERTAIN", "new thread response unexpectedly contained turns");
+    }
   }
 
   private async unsubscribeOrConfirmAbsent(endpointId: string, threadId: string, lease?: EndpointWorkLease): Promise<void> {

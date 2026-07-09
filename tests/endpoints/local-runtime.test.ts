@@ -5,8 +5,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
-  localSshEndpointSocketPaths,
-  prepareLocalSshEndpointSocket,
+  localSshEndpointSocketRoot,
+  localSshForwardSocketPath,
+  prepareLocalSshEndpointSocketRoot,
   prepareLocalSshRuntimeRoot,
 } from "../../src/endpoints/local-runtime.ts";
 import { parseSshConfig, planSshConnection } from "../../src/endpoints/ssh-config.ts";
@@ -45,7 +46,8 @@ test("the production socket path binds under XDG-style and fallback runtime base
     await mkdir(base, { recursive: true, mode: 0o700 });
     const runtimeRoot = await prepareLocalSshRuntimeRoot("/nfs/home/user/.qiyan-bot/data", { expectedUid: uid, ...options });
     assert.ok(runtimeRoot.startsWith(`${base}/`));
-    const { socketPath } = await prepareLocalSshEndpointSocket(runtimeRoot, "dfw-vscode");
+    const socketRoot = await prepareLocalSshEndpointSocketRoot(runtimeRoot, "dfw-vscode");
+    const socketPath = localSshForwardSocketPath(socketRoot, "01234567");
     assert.ok(Buffer.byteLength(socketPath) <= 103);
     const server = createServer();
     await new Promise<void>((resolve, reject) => server.once("error", reject).listen(socketPath, resolve));
@@ -58,7 +60,8 @@ test("keeps representative Linux runtime sockets within the portable path bound"
     "/run/user/104284/qiyan/0123456789abcdef",
     "/tmp/qiyan-104284/qiyan/0123456789abcdef",
   ]) {
-    const socketPath = localSshEndpointSocketPaths(runtimeRoot, "dfw-vscode").socketPath;
+    const socketRoot = localSshEndpointSocketRoot(runtimeRoot, "dfw-vscode");
+    const socketPath = localSshForwardSocketPath(socketRoot, "01234567");
     assert.ok(Buffer.byteLength(socketPath) <= 103);
     const owned = planSshConnection("dfw-vscode", parseSshConfig(
       "hostname host.example\nuser xin\nport 22\ncontrolmaster no\ncontrolpath none\n",
@@ -66,9 +69,10 @@ test("keeps representative Linux runtime sockets within the portable path bound"
     assert.ok(Buffer.byteLength(owned.controlPath!) <= 100);
   }
   assert.throws(
-    () => localSshEndpointSocketPaths(`/${"x".repeat(100)}`, "dfw-vscode"),
+    () => localSshEndpointSocketRoot(`/${"x".repeat(100)}`, "dfw-vscode"),
     /Unix socket path is too long/u,
   );
+  assert.throws(() => localSshForwardSocketPath("/private/runtime", "unsafe"), /socket path/u);
 });
 
 test("rejects a symlink in the private SSH runtime path", async (t) => {
