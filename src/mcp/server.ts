@@ -11,7 +11,7 @@ import { ASSISTANT_TOOL_SCHEMAS, TOOL_NAMES } from "../assistant/tools.ts";
 import { APP_VERSION } from "../version.ts";
 
 export interface AssistantContextProvider {
-  current(): { contextId: string; attemptId: string; turnId: string; toolFence?: number } | undefined;
+  current(): { contextId: string; attemptId: string; turnId?: string; toolFence?: number } | undefined;
   registerTool?(attemptId: string): number;
   finishTool?(attemptId: string): void;
 }
@@ -136,8 +136,8 @@ export class LoopbackMcpServer {
         const context: ToolCallContext = {
           sourceContextId: active.contextId,
           attemptId: active.attemptId,
-          turnId: active.turnId,
           callId: `mcp:${String(extra.requestId)}`,
+          ...(active.turnId ? { turnId: active.turnId } : {}),
           ...(toolFence === undefined ? {} : { toolFence }),
         };
         try {

@@ -44,7 +44,7 @@ class ServiceEndpoint implements AppServerEndpoint {
       if (this.failNextStart) { this.failNextStart = false; throw new Error("start failed"); }
       this.onTurnStart?.();
       this.lastClientId = params.clientUserMessageId;
-      return { turn: { id: "started-1" } } as T;
+      return { turn: { id: "started-1", ...(this.historyTurnStatus ? { status: this.historyTurnStatus } : {}) } } as T;
     }
     if (method === "turn/steer") return { turnId: params.expectedTurnId } as T;
     if (method === "thread/read") {

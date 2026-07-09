@@ -12,6 +12,7 @@ import { buildWorkerChildEnvironment, assistantTurnConfig, LoopbackMcpServer, tc
 import { createTestDatabase } from "../../src/storage/database.ts";
 import { DeliveryStore } from "../../src/storage/delivery-store.ts";
 import { OperationStore } from "../../src/storage/operation-store.ts";
+import { ConversationStore } from "../../src/storage/conversation-store.ts";
 
 test("loopback MCP requires bearer auth, advertises instructions, lists tools, and propagates request IDs", async (t) => {
   const operations = new OperationStore(createTestDatabase());
@@ -126,12 +127,15 @@ test("post-tool callback follows finish for successful and rejected handlers", a
 test("shutdown fences a pending attempt after readiness but before tool registration", async (t) => {
   const db = createTestDatabase();
   const operations = new OperationStore(db);
-  operations.createSourceContext({ id: "ctx", kind: "event_batch", sourceId: "ctx", rawText: "", attachmentIds: [] });
+  const conversations = new ConversationStore(db, new DeliveryStore(db));
+  conversations.createInternalSource({ id: "ctx", kind: "event_batch", sourceId: "ctx", rawText: "", attachmentIds: [], receivedAt: 1 });
+  const lease = conversations.acquireLease({ kind: "internal", contextId: "ctx" }, "claim");
+  conversations.reserveStart("ctx");
   const runtime = new AssistantRuntime(db, operations, new DeliveryStore(db), {
     binding: { adapterId: "telegram", conversationKey: "telegram:42", destination: { chatId: "42" } },
   });
-  runtime.prepareAttempt("ctx", "attempt", "internal");
-  assert.equal(runtime.current()?.turnId, "pending:attempt");
+  runtime.hydrateActive();
+  assert.equal(runtime.current()?.turnId, undefined);
 
   const gate = new ToolReadinessGate();
   gate.ready();
@@ -162,7 +166,7 @@ test("shutdown fences a pending attempt after readiness but before tool registra
   gate.stop();
   runtime.fenceToolAdmission();
   await runtime.waitForTools();
-  assert.throws(() => runtime.registerTool("attempt"), /terminal/u);
+  assert.throws(() => runtime.registerTool(lease.attemptId), /terminal/u);
   continueRegistration();
   assert.equal((await pending).isError, true);
   assert.equal(handlerCalled, false);

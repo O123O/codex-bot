@@ -39,6 +39,11 @@ import { buildAssistantChildEnvironment, prepareAssistantProfile, startAuthentic
 import { AssistantRuntime } from "./assistant/runtime.ts";
 import { AssistantScheduler } from "./assistant/scheduler.ts";
 import { ConversationDispatcher, type AssistantTurnPort } from "./assistant/conversation-dispatcher.ts";
+import {
+  AssistantLifecycleBuffer,
+  parseAssistantLifecycleNotification,
+  type AssistantLifecycleNotification,
+} from "./assistant/lifecycle-buffer.ts";
 import { AttemptScope } from "./assistant/attempt-scope.ts";
 import { SessionObservationProcessor } from "./assistant/session-observer.ts";
 import { createAssistantTools, type AssistantToolName } from "./assistant/tools.ts";
@@ -1569,6 +1574,7 @@ export async function buildProductionApp(
   const reconnectTimers = new Map<string, ReturnType<typeof setTimeout>>();
   const reconnectAttempts = new Map<string, number>();
   const terminalProcessing = new Map<string, Promise<void>>();
+  const assistantLifecycleBuffer = new AssistantLifecycleBuffer();
   const assistantToolReadiness = new ToolReadinessGate();
   const endpointRecoveryIncidents = new EndpointRecoveryIncidents();
   let stopping = false;
@@ -2228,6 +2234,7 @@ export async function buildProductionApp(
           ),
         });
         dispatcherAvailable = true;
+        await assistantLifecycleBuffer.activate(handleAssistantLifecycleNotification);
         await dispatcher.recover();
         await dispatcher.idle();
         assistant.hydrateActive();
@@ -2267,10 +2274,10 @@ export async function buildProductionApp(
         stopping = true;
         assistantToolReadiness.stop();
         schedulerAccepting = false;
+        const active = assistant.current();
         assistant.fenceToolAdmission();
         await assistant.waitForTools();
-        const active = assistant.current();
-        if (active && !active.turnId.startsWith("pending:")) {
+        if (active?.turnId) {
           let interruptTimer: ReturnType<typeof setTimeout> | undefined;
           await Promise.race([
             pool.interrupt(assistantEndpoint.id, registry.snapshot().assistant.thread_id, active.turnId).catch(() => undefined),
@@ -2326,6 +2333,7 @@ export async function buildProductionApp(
       ...(relay && observations ? { finishDashboard: renderDashboardSafely } : {}),
     }).finally(() => {
       dispatcherAvailable = false;
+      assistantLifecycleBuffer.clear();
     });
     return recoveryOwnersStop;
   }
@@ -2829,8 +2837,9 @@ export async function buildProductionApp(
 
   async function onNotification(endpointId: string, method: string, params: any): Promise<void> {
     const identity = registry.snapshot().assistant;
-    if (endpointId === identity.endpoint && method === "turn/completed" && params.threadId === identity.thread_id) {
-      await processAssistantTerminal(params);
+    const assistantLifecycle = parseAssistantLifecycleNotification(method, params);
+    if (assistantLifecycle && endpointId === identity.endpoint && assistantLifecycle.params.threadId === identity.thread_id) {
+      await assistantLifecycleBuffer.accept(assistantLifecycle, handleAssistantLifecycleNotification);
       return;
     }
     if (method === "turn/completed") {
@@ -2844,6 +2853,14 @@ export async function buildProductionApp(
     } else {
       await relay.handleNotification(endpointId, method, params);
     }
+  }
+
+  async function handleAssistantLifecycleNotification(notification: AssistantLifecycleNotification): Promise<void> {
+    if (notification.method === "turn/started") {
+      await dispatcher.started(notification.params.turn as any);
+      return;
+    }
+    await processAssistantTerminal(notification.params);
   }
 
   function processAssistantTerminal(params: any): Promise<void> {
@@ -2861,11 +2878,13 @@ export async function buildProductionApp(
     const identity = registry.snapshot().assistant;
     await dispatcher.terminal(params.turn);
     await dispatcher.idle();
-    const attemptBefore = assistant.contextForTurn(params.turn.id);
+    const terminalLease = conversations.lease();
+    if (!terminalLease || terminalLease.phase !== "terminalizing" || terminalLease.turnId !== params.turn.id) return;
+    const attemptBefore = assistant.contextForLease(terminalLease.attemptId, params.turn.id);
     if (!attemptBefore) return;
     if (conversations.membersForAttempt(attemptBefore.attemptId)
       .some((member) => new Set(["start_submitting", "steer_submitting", "uncertain"]).has(member.state))) return;
-    assistant.beginTerminalizing(params.turn.id);
+    if (!assistant.beginLeaseTerminalizing(attemptBefore.attemptId, params.turn.id)) return;
     const settled = await settleAssistantTerminalTools({
       fenceTools: () => assistant.fenceTools(attemptBefore.attemptId, 1_000),
       reconcileOperations,

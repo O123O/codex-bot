@@ -5,7 +5,7 @@ import { parseDirective } from "../directives/parser.ts";
 import type { OperationRecord, OperationStore } from "../storage/operation-store.ts";
 import type { AttemptScope } from "./attempt-scope.ts";
 
-export interface ToolCallContext { sourceContextId: string; attemptId: string; turnId: string; callId: string; toolFence?: number }
+export interface ToolCallContext { sourceContextId: string; attemptId: string; turnId?: string; callId: string; toolFence?: number }
 export type ToolHandler = (context: ToolCallContext, args: unknown) => Promise<unknown>;
 export interface ToolActionContext extends ToolCallContext { effectiveSourceContextId: string; operationId: string; operationCreatedAt: number; operationSequence: number; checkpoint(receipt: unknown): void }
 
