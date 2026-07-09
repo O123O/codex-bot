@@ -497,6 +497,20 @@ export function operationRecoveryPreflight(
   return "attempt";
 }
 
+export function recoverableCreateHasNoDispatch(receipt: unknown, recoveryProtocol: number): boolean {
+  if (receipt === undefined) return recoveryProtocol >= 1;
+  if (!receipt || typeof receipt !== "object" || Array.isArray(receipt)) return false;
+  return Object.hasOwn(receipt, "dispatchStarted")
+    && (receipt as Record<string, unknown>).dispatchStarted === false;
+}
+
+export function isMissingUnmaterializedThread(error: unknown, threadId: string): boolean {
+  return error instanceof AppError
+    && error.code === "THREAD_NOT_FOUND"
+    && error.details?.recovery === "thread_not_durable"
+    && error.details.threadId === threadId;
+}
+
 export function runOperationRecoveryTarget<T>(
   target: OperationRecoveryTarget,
   endpoints: Pick<EndpointManager, "withReadyWorkLease">,
@@ -3088,7 +3102,8 @@ export async function buildProductionApp(
           }
           const expectedThread = args.thread_id as string | undefined ?? (operation.kind === "create_session" ? checkpoint?.threadId : undefined);
           const expectedDir = project?.path;
-          if (!session && operation.kind === "create_session" && checkpoint?.dispatchStarted === false) {
+          if (!session && operation.kind === "create_session"
+            && recoverableCreateHasNoDispatch(operation.receipt, operation.recoveryProtocol)) {
             failRecoveredNoEffect(operation.id, "project workspace was prepared before worker dispatch began");
             return;
           }
@@ -3105,10 +3120,16 @@ export async function buildProductionApp(
           }
           if (!session && operation.kind === "create_session" && checkpoint?.threadId && project) {
             if (!checkpoint.mappingId) return;
-            await lifecycle.adopt(args.nickname, recoveryEndpointId, checkpoint.threadId, (thread) => {
-              if (thread.threadSource !== operation.id) throw new AppError("OPERATION_UNCERTAIN", "recovered worker thread has the wrong creation source");
-              hydrateThreadOrder(recoveryEndpointId, thread);
-            }, checkpoint.mappingId, lease);
+            try {
+              await lifecycle.adopt(args.nickname, recoveryEndpointId, checkpoint.threadId, (thread) => {
+                if (thread.threadSource !== operation.id) throw new AppError("OPERATION_UNCERTAIN", "recovered worker thread has the wrong creation source");
+                hydrateThreadOrder(recoveryEndpointId, thread);
+              }, checkpoint.mappingId, lease);
+            } catch (error) {
+              if (!isMissingUnmaterializedThread(error, checkpoint.threadId)) throw error;
+              failRecoveredNoEffect(operation.id, "allocated worker thread was lost before its rollout materialized");
+              return;
+            }
             session = registry.get(args.nickname);
           }
           if (session?.lifecycle_state === "adopting" && session.mapping_id === checkpoint?.mappingId && session.endpoint === recoveryEndpointId) {

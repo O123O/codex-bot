@@ -10,7 +10,7 @@ import { WorkspaceRouter } from "../endpoints/workspace-router.ts";
 import type { EndpointManager } from "../endpoints/manager.ts";
 import type { EndpointWorkLease } from "../endpoints/types.ts";
 import type { OwnershipInspection } from "./rollout-ownership.ts";
-import { isExactThreadNotLoaded, isExactThreadNotMaterialized } from "../app-server/thread-errors.ts";
+import { isExactThreadNoRollout, isExactThreadNotLoaded, isExactThreadNotMaterialized } from "../app-server/thread-errors.ts";
 
 interface ThreadView { id: string; cwd: string; path?: string | null; threadSource?: string | null; status: { type: string }; turns: Array<{ id: string }> }
 interface ThreadResponse { thread: ThreadView; cwd?: string; model?: string; reasoningEffort?: string | null }
@@ -112,7 +112,12 @@ export class SessionLifecycle {
         try { before = await this.read(endpointId, threadId, lease); }
         catch (error) {
           if (!isExactThreadNotLoaded(error, threadId)) throw error;
-          const response = await this.pool.request<ThreadResponse>(endpointId, "thread/resume", { threadId }, undefined, lease);
+          let response: ThreadResponse;
+          try { response = await this.pool.request<ThreadResponse>(endpointId, "thread/resume", { threadId }, undefined, lease); }
+          catch (resumeError) {
+            if (isExactThreadNoRollout(resumeError, threadId)) throw this.threadNotDurable(threadId);
+            throw resumeError;
+          }
           resumed = true;
           this.requireThreadIdentity(response.thread, threadId);
           before = await this.read(endpointId, threadId, lease);
@@ -453,6 +458,12 @@ export class SessionLifecycle {
 
   private requiresResume(thread: ThreadView): boolean {
     return thread.status.type === "notLoaded" || thread.turns.length > 0;
+  }
+
+  private threadNotDurable(threadId: string): AppError {
+    return new AppError("THREAD_NOT_FOUND", "thread is no longer restorable because it has no durable rollout", {
+      recovery: "thread_not_durable", threadId,
+    });
   }
 
   private requireThreadIdentity(thread: ThreadView, threadId: string): void {

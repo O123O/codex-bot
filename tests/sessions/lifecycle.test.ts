@@ -6,7 +6,7 @@ import test from "node:test";
 import type { AppServerEndpoint } from "../../src/app-server/pool.ts";
 import { AppServerPool } from "../../src/app-server/pool.ts";
 import { JsonRpcResponseError } from "../../src/app-server/json-rpc-client.ts";
-import { isExactThreadNotLoaded, isExactThreadNotMaterialized } from "../../src/app-server/thread-errors.ts";
+import { isExactThreadNoRollout, isExactThreadNotLoaded, isExactThreadNotMaterialized } from "../../src/app-server/thread-errors.ts";
 import { AppError } from "../../src/core/errors.ts";
 import { SessionRegistry, type RegistrySession } from "../../src/registry/session-registry.ts";
 import { SessionLifecycle } from "../../src/sessions/lifecycle.ts";
@@ -33,6 +33,7 @@ class LifecycleEndpoint implements AppServerEndpoint {
   pathOnStart: string | null | undefined;
   unmaterialized = false;
   failResume = false;
+  resumeError: Error | undefined;
   readonly readErrors: Error[] = [];
   unsubscribeError: Error | undefined;
   archiveError: Error | undefined;
@@ -59,6 +60,7 @@ class LifecycleEndpoint implements AppServerEndpoint {
     if (method === "thread/resume") {
       this.onResume?.();
       await this.resumeBarrier;
+      if (this.resumeError) throw this.resumeError;
       if (this.failResume) throw new Error("resume response lost");
       return { thread: { ...thread, id: this.resumeThreadId ?? thread.id }, cwd: this.cwd, model: "gpt-5", reasoningEffort: "high" } as T;
     }
@@ -133,6 +135,13 @@ test("thread-not-materialized evidence requires the exact RPC code, message, and
   assert.equal(isExactThreadNotMaterialized(new JsonRpcResponseError(-32000, message), "thread-1"), false);
   assert.equal(isExactThreadNotMaterialized(new JsonRpcResponseError(-32600, message), "thread-2"), false);
   assert.equal(isExactThreadNotMaterialized(new Error(message), "thread-1"), false);
+});
+
+test("thread-without-rollout evidence requires the exact RPC code, message, and thread identity", () => {
+  assert.equal(isExactThreadNoRollout(new JsonRpcResponseError(-32600, "no rollout found for thread id thread-1"), "thread-1"), true);
+  assert.equal(isExactThreadNoRollout(new JsonRpcResponseError(-32000, "no rollout found for thread id thread-1"), "thread-1"), false);
+  assert.equal(isExactThreadNoRollout(new JsonRpcResponseError(-32600, "no rollout found for thread id thread-2"), "thread-1"), false);
+  assert.equal(isExactThreadNoRollout(new Error("no rollout found for thread id thread-1"), "thread-1"), false);
 });
 
 test("create establishes one generation-safe managed epoch", async () => {
@@ -263,6 +272,21 @@ test("adopt resumes an exact read-not-loaded thread and validates it before prom
   assert.equal(session.lifecycle_state, "managed");
   assert.equal(runtime.getSession("local", "thread-1", session.mapping_id)?.managementState, "managed");
   assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/read", "thread/resume", "thread/read"]);
+});
+
+test("adopt proves a not-loaded empty thread without a rollout is no longer restorable", async () => {
+  const { registry, endpoint, lifecycle } = await fixture();
+  endpoint.readErrors.push(new JsonRpcResponseError(-32600, "thread not loaded: thread-1"));
+  endpoint.resumeError = new JsonRpcResponseError(-32600, "no rollout found for thread id thread-1");
+
+  await assert.rejects(lifecycle.adopt("payments", "local", "thread-1"), (error: unknown) => {
+    assert.equal(error instanceof AppError && error.code === "THREAD_NOT_FOUND", true);
+    assert.deepEqual((error as AppError).details, { recovery: "thread_not_durable", threadId: "thread-1" });
+    return true;
+  });
+
+  assert.equal(registry.get("payments"), undefined);
+  assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/read", "thread/resume"]);
 });
 
 test("adopt validates the immediate resume response identity before trusting a later read", async () => {

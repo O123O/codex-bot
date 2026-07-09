@@ -12,6 +12,7 @@ import {
   createChatHistoryAction,
   hasEarlierEndpointOperation,
   hasEarlierSessionCreation,
+  isMissingUnmaterializedThread,
   isUncertainAssistantTransportFailure,
   managedRecoveryDisposition,
   managedRecoveryManagementState,
@@ -21,6 +22,7 @@ import {
   operationRecoveryAction,
   operationRecoveryFailureDisposition,
   operationRecoveryPreflight,
+  recoverableCreateHasNoDispatch,
   projectReadyRecoveryDisposition,
   parseEndpointLifecycleCheckpoint,
   processWorkerTerminalNotification,
@@ -210,6 +212,23 @@ test("operation recovery waits only for the exact in-process tool handler", () =
   assert.equal(operationRecoveryAction({ state: "uncertain", activeHandler: true }), "wait_for_tool");
   assert.equal(operationRecoveryAction({ state: "uncertain", activeHandler: false }), "attempt");
   assert.equal(operationRecoveryAction({ state: "dispatched", activeHandler: false }), "attempt");
+});
+
+test("create recovery terminalizes only exact no-dispatch and lost-empty-thread proofs", () => {
+  assert.equal(recoverableCreateHasNoDispatch(undefined, 1), true);
+  assert.equal(recoverableCreateHasNoDispatch(undefined, 0), false);
+  assert.equal(recoverableCreateHasNoDispatch({ dispatchStarted: false }, 0), true);
+  assert.equal(recoverableCreateHasNoDispatch({ dispatchStarted: true }, 1), false);
+  assert.equal(recoverableCreateHasNoDispatch({}, 1), false);
+  assert.equal(recoverableCreateHasNoDispatch(null, 1), false);
+
+  const exact = new AppError("THREAD_NOT_FOUND", "thread is no longer restorable", {
+    recovery: "thread_not_durable", threadId: "thread-1",
+  });
+  assert.equal(isMissingUnmaterializedThread(exact, "thread-1"), true);
+  assert.equal(isMissingUnmaterializedThread(exact, "thread-2"), false);
+  assert.equal(isMissingUnmaterializedThread(new AppError("THREAD_NOT_FOUND", "other absence"), "thread-1"), false);
+  assert.equal(isMissingUnmaterializedThread(new Error("thread_not_durable: thread-1"), "thread-1"), false);
 });
 
 test("recoverable operation targets are exhaustive and fail closed", () => {
@@ -631,6 +650,28 @@ test("per-endpoint recovery chains preserve durable lifecycle order and unrelate
     return false;
   });
   assert.deepEqual(dynamicSeen, ["restart-a", "rename"], "later targets are resolved after earlier durable mutations");
+});
+
+test("terminalizing a proven no-effect operation lets the next same-endpoint recovery run", async () => {
+  const store = new OperationStore(createTestDatabase());
+  const first = store.prepare({ contextId: "ctx", attemptId: "attempt", callId: "first", kind: "create_session", args: {} });
+  const second = store.prepare({ contextId: "ctx", attemptId: "attempt", callId: "second", kind: "create_session", args: {} });
+  store.markDispatched(first.id);
+  store.markDispatched(second.id);
+  const seen: string[] = [];
+
+  await runOperationRecoveryChains(
+    store.listRecoverable().map((operation) => ({ operation })),
+    () => ({ policy: "ready_endpoint", endpointId: "devbox" }),
+    async ({ operation }) => {
+      seen.push(operation.id);
+      if (operation.id === first.id) store.failAndUnbind(operation.id, { message: "proven no effect" });
+      return store.get(operation.id)?.state === "dispatched" || store.get(operation.id)?.state === "uncertain";
+    },
+  );
+
+  assert.deepEqual(seen, [first.id, second.id]);
+  assert.equal(store.get(first.id)?.state, "failed");
 });
 
 test("removal recovery concludes locally and leases only an actionable reconciliation", async () => {

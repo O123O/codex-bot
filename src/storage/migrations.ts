@@ -579,4 +579,11 @@ export const migrations: readonly Migration[] = [
   ALTER TABLE session_rollout_ownership
     ADD COLUMN materialized INTEGER NOT NULL DEFAULT 1 CHECK(materialized IN (0, 1));
   `,
+  (db) => {
+    const columns = new Set((db.prepare("PRAGMA table_info(operations)").all() as Array<{ name: string }>).map((row) => row.name));
+    if (!columns.has("recovery_protocol")) {
+      db.exec(`ALTER TABLE operations ADD COLUMN recovery_protocol INTEGER NOT NULL DEFAULT 0
+        CHECK(recovery_protocol IN (0, 1))`);
+    }
+  },
 ];

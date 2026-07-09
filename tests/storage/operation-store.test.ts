@@ -72,6 +72,8 @@ test("recoverable operations retain their canonical arguments and stable call id
   assert.deepEqual(store.listRecoverable().map(({ contextId, attemptId, callId, kind, args, state }) => ({ contextId, attemptId, callId, kind, args, state })), [{
     contextId: "ctx", attemptId: "attempt", callId: "call", kind: "send_chat_message", args: { content: "hello" }, state: "dispatched",
   }]);
+  assert.equal(operation.recoveryProtocol, 1);
+  assert.equal(store.listRecoverable()[0]?.recoveryProtocol, 1);
 });
 
 test("a durable current attempt is actionable after process-local tool handlers are lost", () => {
