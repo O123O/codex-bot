@@ -42,6 +42,7 @@ import {
   reportOperationalSafely,
   requestOperationRecoveryForAttempt,
   settleAssistantTerminalTools,
+  startupProjectEndpointReferences,
   runOperationRecoveryTarget,
   runOperationRecoveryChains,
   stopRelayRecovery,
@@ -320,6 +321,41 @@ test("durable operation endpoints survive restart as startup identity references
     recovered = true;
   });
   assert.equal(recovered, true);
+});
+
+test("startup requires only durably referenced project endpoints", () => {
+  const db = createTestDatabase();
+  const operations = new OperationStore(db);
+  const localCreate = operations.prepare({
+    contextId: "ctx", attemptId: "attempt", callId: "local-create", kind: "create_session",
+    args: { nickname: "local-worker", project_dir: "/project" },
+  });
+  operations.markDispatched(localCreate.id);
+  operations.checkpoint(localCreate.id, {
+    endpoint: "local", dispatchStarted: true, projectDir: "/project",
+  });
+  const operationEndpointIds = recoverableOperationActivationReferences(operations.listRecoverable(), {
+    defaultProjectEndpointId: "local",
+    session: () => undefined,
+  });
+
+  assert.deepEqual(startupProjectEndpointReferences({
+    sessionEndpoints: [],
+    recoveredEndpointIds: [],
+    operationEndpointIds,
+    lifecycleOwnedEndpointIds: new Set(),
+    assistantEndpointId: "assistant-local",
+  }), ["local"], "an uncertain local creation is a durable startup reference");
+
+  assert.deepEqual(startupProjectEndpointReferences({
+    sessionEndpoints: ["local", "devbox", "devbox"],
+    recoveredEndpointIds: ["recovery-box"],
+    operationEndpointIds: ["operation-box", "assistant-local", ...operationEndpointIds],
+    lifecycleOwnedEndpointIds: new Set(["recovery-box"]),
+    assistantEndpointId: "assistant-local",
+  }), ["local", "devbox", "operation-box"], "durable references activate once unless lifecycle recovery owns them");
+
+  db.close();
 });
 
 test("a ready event deferred during startup drains the complete endpoint pipeline once", async () => {

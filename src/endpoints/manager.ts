@@ -59,7 +59,11 @@ export class EndpointManager {
     const record = this.record(endpointId);
     if (record.gate.desiredState === "draining") throw new AppError("ENDPOINT_UNAVAILABLE", `endpoint is draining: ${endpointId}`);
     record.gate.requestAutomatic();
-    return this.activate(endpointId, false);
+    try { return await this.activate(endpointId, false); }
+    catch (error) {
+      this.scheduleActivationRetry(endpointId, record);
+      throw error;
+    }
   }
 
   async withWorkLease<T>(
@@ -154,7 +158,7 @@ export class EndpointManager {
     const unavailable: string[] = [];
     for (const id of [...new Set(ids)]) {
       try { await this.ensureReady(id); }
-      catch { unavailable.push(id); this.scheduleColdReconnect(id, this.record(id)); }
+      catch { unavailable.push(id); }
     }
     return { unavailable };
   }
@@ -479,10 +483,13 @@ export class EndpointManager {
     }).catch(() => undefined);
   }
 
-  private scheduleColdReconnect(endpointId: string, record: EndpointRecord): void {
-    if (this.closing || record.gate.desiredState !== "automatic" || record.reconnect) return;
+  private scheduleActivationRetry(endpointId: string, record: EndpointRecord): void {
+    const generation = record.generation;
+    if (this.closing || record.gate.desiredState !== "automatic" || record.reconnect
+      || record.endpoint?.state === "ready") return;
     void Promise.resolve(this.options.hasIdentityReferences(endpointId)).then((referenced) => {
-      if (this.closing || !referenced || record.endpoint || record.gate.desiredState !== "automatic" || record.reconnect) return;
+      if (this.closing || !referenced || record.generation !== generation
+        || record.endpoint?.state === "ready" || record.gate.desiredState !== "automatic" || record.reconnect) return;
       const delay = Math.min(30_000, 1_000 * 2 ** Math.min(record.reconnectAttempt, 5));
       record.reconnectAttempt += 1;
       const schedule = this.options.schedule ?? ((delayMs: number, run: () => void) => {
@@ -492,8 +499,13 @@ export class EndpointManager {
       });
       record.reconnect = schedule(delay, () => {
         delete record.reconnect;
-        if (this.closing || record.endpoint || record.gate.desiredState !== "automatic") return;
-        void this.ensureReady(endpointId).catch(() => this.scheduleColdReconnect(endpointId, record));
+        if (this.closing || record.generation !== generation
+          || record.endpoint?.state === "ready" || record.gate.desiredState !== "automatic") return;
+        void Promise.resolve(this.options.hasIdentityReferences(endpointId)).then((stillReferenced) => {
+          if (this.closing || !stillReferenced || record.generation !== generation || record.reconnect
+            || record.endpoint?.state === "ready" || record.gate.desiredState !== "automatic") return;
+          void this.ensureReady(endpointId).catch(() => undefined);
+        }).catch(() => undefined);
       });
     }).catch(() => undefined);
   }

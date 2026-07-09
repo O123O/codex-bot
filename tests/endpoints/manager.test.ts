@@ -149,6 +149,77 @@ test("an unavailable referenced endpoint keeps retrying without blocking startup
   assert.equal(manager.endpointGeneration("offline").endpoint.state, "ready");
 });
 
+test("a failed referenced local activation retries and publishes its first generation", async () => {
+  const local = new FakeEndpoint("local");
+  local.failStart = true;
+  const scheduled: Array<() => void> = [];
+  const publications: number[] = [];
+  const manager = new EndpointManager({
+    localEndpoint: local,
+    catalog: { reload: async () => undefined, require: () => assert.fail("local activation must not read the SSH catalog") },
+    createRemote: async () => assert.fail("local activation must not create an SSH endpoint"),
+    hasIdentityReferences: (endpointId) => endpointId === "local",
+    managedThreadIds: () => [],
+    schedule: (_delay, run) => { scheduled.push(run); return { cancel: () => undefined }; },
+  });
+  manager.onEndpoint((_endpoint, generation) => { publications.push(generation); });
+
+  assert.deepEqual(await manager.activateReferenced(["local"]), { unavailable: ["local"] });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(scheduled.length, 1);
+  assert.equal(publications.length, 0);
+
+  local.failStart = false;
+  scheduled.shift()!();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(manager.endpointGeneration("local").endpoint, local);
+  assert.deepEqual(publications, [1]);
+});
+
+test("a failed first on-demand local activation retries only while durably referenced", async () => {
+  const local = new FakeEndpoint("local");
+  local.failStart = true;
+  const scheduled: Array<() => void> = [];
+  let referenced = true;
+  const manager = new EndpointManager({
+    localEndpoint: local,
+    catalog: { reload: async () => undefined, require: () => assert.fail("local activation must not read the SSH catalog") },
+    createRemote: async () => assert.fail("local activation must not create an SSH endpoint"),
+    hasIdentityReferences: () => referenced,
+    managedThreadIds: () => [],
+    schedule: (_delay, run) => { scheduled.push(run); return { cancel: () => undefined }; },
+  });
+
+  await assert.rejects(manager.ensureReady("local"), /offline/u);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(scheduled.length, 1, "the durable operation keeps first-use activation alive");
+
+  referenced = false;
+  local.failStart = false;
+  scheduled.shift()!();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.throws(() => manager.endpointGeneration("local"), /unavailable/u);
+  assert.equal(local.starts, 1, "the fenced retry stops when its durable reference disappears");
+});
+
+test("an unreferenced local endpoint remains dormant during startup activation", async () => {
+  const local = new FakeEndpoint("local");
+  const scheduled: Array<() => void> = [];
+  const manager = new EndpointManager({
+    localEndpoint: local,
+    catalog: { reload: async () => undefined, require: () => assert.fail("no endpoint should activate") },
+    createRemote: async () => assert.fail("no endpoint should activate"),
+    hasIdentityReferences: () => false,
+    managedThreadIds: () => [],
+    schedule: (_delay, run) => { scheduled.push(run); return { cancel: () => undefined }; },
+  });
+
+  assert.deepEqual(await manager.activateReferenced([]), { unavailable: [] });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(local.starts, 0);
+  assert.equal(scheduled.length, 0);
+});
+
 test("disconnect drains admitted work, rejects new work, proves idle, and stops only that runtime", async () => {
   const value = fixture();
   await value.manager.ensureReady("devbox");

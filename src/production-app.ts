@@ -448,9 +448,24 @@ export function recoverableOperationActivationReferences(
   const references = new Set<string>();
   for (const operation of operations) {
     const target = recoverableOperationTarget(operation, resolver);
-    if (target.policy === "ready_endpoint" && target.endpointId !== resolver.defaultProjectEndpointId) references.add(target.endpointId);
+    if (target.policy === "ready_endpoint") references.add(target.endpointId);
   }
   return [...references].sort();
+}
+
+export function startupProjectEndpointReferences(options: {
+  sessionEndpoints: readonly string[];
+  recoveredEndpointIds: readonly string[];
+  operationEndpointIds: readonly string[];
+  lifecycleOwnedEndpointIds: ReadonlySet<string>;
+  assistantEndpointId: string;
+}): string[] {
+  return [...new Set([
+    ...options.sessionEndpoints,
+    ...options.recoveredEndpointIds,
+    ...options.operationEndpointIds,
+  ])].filter((endpointId) => endpointId !== options.assistantEndpointId
+    && !options.lifecycleOwnedEndpointIds.has(endpointId));
 }
 
 export function recoverableLifecycleEndpointReferences(
@@ -2144,11 +2159,9 @@ export async function buildProductionApp(
         stopping = false;
         endpointsCommitted = false;
         try {
-          const lifecycleOwned = lifecycleOwnedEndpointIds();
-          if (!lifecycleOwned.has("local")) await endpointManager.ensureReady("local");
           await startAuthenticatedAssistantEndpoint(assistantEndpoint, assistantProfile);
-          if ((!lifecycleOwned.has("local") && endpoint.state !== "ready") || assistantEndpoint.state !== "ready") {
-            throw new AppError("ENDPOINT_UNAVAILABLE", "an app-server became unavailable during initial startup");
+          if (assistantEndpoint.state !== "ready") {
+            throw new AppError("ENDPOINT_UNAVAILABLE", "the assistant app-server became unavailable during initial startup");
           }
           endpointsCommitted = true;
         } catch (error) {
@@ -2219,11 +2232,13 @@ export async function buildProductionApp(
         await dispatcher.idle();
         assistant.hydrateActive();
         const lifecycleOwned = lifecycleOwnedEndpointIds();
-        const referencedEndpoints = [...new Set([
-          ...Object.values(registry.snapshot().sessions).map((session) => session.endpoint),
-          ...recoveredEndpointIds,
-          ...recoverableActivationReferences(),
-        ])].filter((id) => id !== "local" && id !== assistantEndpoint.id && !lifecycleOwned.has(id));
+        const referencedEndpoints = startupProjectEndpointReferences({
+          sessionEndpoints: Object.values(registry.snapshot().sessions).map((session) => session.endpoint),
+          recoveredEndpointIds,
+          operationEndpointIds: recoverableActivationReferences(),
+          lifecycleOwnedEndpointIds: lifecycleOwned,
+          assistantEndpointId: assistantEndpoint.id,
+        });
         const activation = await endpointManager.activateReferenced(referencedEndpoints);
         await reconcileOperations();
         conversations.repairQueueNotices();
@@ -2720,7 +2735,8 @@ export async function buildProductionApp(
     return Object.values(registry.snapshot().sessions).some((session) => session.endpoint === endpointId)
       || Boolean(pool?.hasClaims(endpointId))
       || Boolean(operations?.listRecoverable().some((operation) => recoverableCapacityHint(operation)?.endpoint === endpointId))
-      || recoverableEndpointReferences().includes(endpointId);
+      || recoverableEndpointReferences().includes(endpointId)
+      || recoverableActivationReferences().includes(endpointId);
   }
 
   function recoverableEndpointReferences(): string[] {
