@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
+import { request } from "node:http";
 import test from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
@@ -122,6 +123,72 @@ test("post-tool callback follows finish for successful and rejected handlers", a
 
   await client.close();
   await server.stop();
+});
+
+test("long SSE tool calls receive heartbeats and still deliver their final response", async (t) => {
+  let releaseTool!: () => void;
+  const blocked = new Promise<void>((resolve) => { releaseTool = resolve; });
+  const tools = {} as Record<AssistantToolName, ToolHandler>;
+  for (const name of TOOL_NAMES) {
+    tools[name] = async () => {
+      if (name === "list_managed_sessions") await blocked;
+      return { sessions: {} };
+    };
+  }
+  const server = new LoopbackMcpServer(
+    tools,
+    { current: () => ({ contextId: "ctx", attemptId: "attempt", turnId: "turn" }) },
+    { host: "127.0.0.1", port: 0, token: "secret", sseHeartbeatIntervalMs: 10 },
+  );
+  await server.start();
+  t.after(async () => { releaseTool(); await server.stop(); });
+
+  const url = new URL(server.url);
+  const payload = JSON.stringify({
+    jsonrpc: "2.0",
+    id: 1,
+    method: "tools/call",
+    params: { name: "list_managed_sessions", arguments: {} },
+  });
+  const response = await new Promise<import("node:http").IncomingMessage>((resolve, reject) => {
+    const outgoing = request({
+      hostname: url.hostname,
+      port: url.port,
+      path: url.pathname,
+      method: "POST",
+      headers: {
+        authorization: "Bearer secret",
+        accept: "application/json, text/event-stream",
+        "content-type": "application/json",
+        "content-length": Buffer.byteLength(payload),
+        "mcp-protocol-version": "2025-11-25",
+      },
+    }, resolve);
+    outgoing.once("error", reject);
+    outgoing.end(payload);
+  });
+  assert.equal(response.headers["content-type"], "text/event-stream");
+  let body = "";
+  let observedHeartbeat!: () => void;
+  const heartbeat = new Promise<void>((resolve) => { observedHeartbeat = resolve; });
+  response.on("data", (chunk: Buffer) => {
+    body += chunk.toString("utf8");
+    if (body.includes(": qiyan-keepalive\n\n")) observedHeartbeat();
+  });
+  await Promise.race([
+    heartbeat,
+    new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("SSE heartbeat was not emitted")), 250)),
+  ]);
+
+  releaseTool();
+  await once(response, "end");
+  const messages = body.split("\n").filter((line) => line.startsWith("data: "))
+    .map((line) => JSON.parse(line.slice("data: ".length)) as Record<string, unknown>);
+  assert.deepEqual(messages, [{
+    result: { content: [{ type: "text", text: JSON.stringify({ sessions: {} }) }] },
+    jsonrpc: "2.0",
+    id: 1,
+  }]);
 });
 
 test("shutdown fences a pending attempt after readiness but before tool registration", async (t) => {
@@ -284,6 +351,7 @@ test("worker environment preserves user configuration while removing only exact 
   });
   const manager = (config.mcp_servers as { qiyan_bot_manager: Record<string, unknown> }).qiyan_bot_manager;
   assert.equal(manager.default_tools_approval_mode, "approve");
+  assert.equal(manager.tool_timeout_sec, 600);
   assert.deepEqual((config["shell_environment_policy.exclude"] as any).includes("QIYAN_BOT_MCP_TOKEN"), true);
   assert.deepEqual(config["shell_environment_policy.set"], {
     HOME: "/home/user",

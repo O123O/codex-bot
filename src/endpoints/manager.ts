@@ -319,7 +319,23 @@ export class EndpointManager {
 
   private async restartInternal(endpointId: string, record: EndpointRecord, checkpoint?: (value: unknown) => void): Promise<void> {
     this.cancelReconnect(record);
-    if (record.gate.desiredState === "disconnected") record.gate.requestAutomatic();
+    if (record.gate.desiredState === "disconnected") {
+      record.gate.requestAutomatic();
+      const prepared = await this.prepareCandidate(endpointId);
+      const drain = await record.gate.beginDrain();
+      let replacement: ManagedAppServerEndpoint | undefined;
+      try {
+        replacement = await this.startCandidate(prepared);
+        const identity = await this.requireRuntimeIdentity(replacement);
+        checkpoint?.({ phase: "runtime_started", identity });
+        this.publishAfterReopen(record, drain, replacement);
+      } catch (error) {
+        if (replacement?.state !== "stopped") await replacement?.closeConnection().catch(() => undefined);
+        this.reopenAfterLifecycleFailure(record, drain);
+        throw error;
+      }
+      return;
+    }
     const preparedReplacement = await this.prepareCandidate(endpointId);
     const drain = await record.gate.beginDrain();
     let target: ShutdownTarget | undefined;

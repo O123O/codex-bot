@@ -34,6 +34,10 @@ import {
   reconcileOwnershipBeforeRelayWithLease,
   recoverManagedEndpointReady,
   recoverStartupManagedEndpoint,
+  requireManagedRecoveryAcknowledged,
+  recoverCancelGoalInterrupt,
+  interruptCancelledGoalTurn,
+  restoredGoalControlIsActive,
   recoverReadyEndpointOwners,
   releaseRestoredOwnershipIncidents,
   recoverRemovalOperation,
@@ -1873,6 +1877,75 @@ test("startup managed recovery acknowledges only the exact ready generation", as
     acknowledge: () => { acknowledged += 1; },
   }), "publication");
   assert.equal(acknowledged, 1, "a replacement generation keeps its buffered manager publication");
+  assert.throws(
+    () => requireManagedRecoveryAcknowledged("publication", "endpoint-a"),
+    (error: unknown) => error instanceof AppError && error.code === "ENDPOINT_UNAVAILABLE",
+  );
+});
+
+test("managed restart preserves only a validated active goal marker", () => {
+  assert.equal(restoredGoalControlIsActive({ goal: { status: "active" } }), true);
+  for (const status of ["paused", "blocked", "usageLimited", "budgetLimited", "complete"]) {
+    assert.equal(restoredGoalControlIsActive({ goal: { status } }), false);
+  }
+  assert.equal(restoredGoalControlIsActive({ goal: null }), false);
+  for (const malformed of [{}, { goal: "active" }, { goal: {} }, { goal: { status: "unknown" } }]) {
+    assert.throws(
+      () => restoredGoalControlIsActive(malformed),
+      (error: unknown) => error instanceof AppError && error.code === "OPERATION_UNCERTAIN",
+    );
+  }
+});
+
+test("cancel-goal recovery resumes a checkpointed active interrupt only after goal clear", async () => {
+  const events: string[] = [];
+  const active = [{ id: "goal-turn", status: "inProgress" }];
+  assert.equal(await recoverCancelGoalInterrupt({
+    requested: true,
+    checkpoint: { turnId: "goal-turn" },
+    goal: null,
+    nativeStatus: "active",
+    turns: active,
+    checkpointTurn: (turnId) => { events.push(`checkpoint:${String(turnId)}`); },
+    authorize: (turnId) => { events.push(`authorize:${turnId}`); },
+    interrupt: async (turnId) => { events.push(`interrupt:${turnId}`); },
+  }), true);
+  assert.deepEqual(events, ["authorize:goal-turn", "interrupt:goal-turn"]);
+
+  events.length = 0;
+  assert.equal(await recoverCancelGoalInterrupt({
+    requested: true,
+    checkpoint: { turnId: "goal-turn" },
+    goal: { status: "active" },
+    nativeStatus: "active",
+    turns: active,
+    checkpointTurn: (turnId) => { events.push(`checkpoint:${String(turnId)}`); },
+    authorize: (turnId) => { events.push(`authorize:${turnId}`); },
+    interrupt: async (turnId) => { events.push(`interrupt:${turnId}`); },
+  }), false);
+  assert.equal(events.length, 0);
+
+  assert.equal(await recoverCancelGoalInterrupt({
+    requested: true,
+    checkpoint: { turnId: null },
+    goal: null,
+    nativeStatus: "active",
+    turns: active,
+    checkpointTurn: (turnId) => { events.push(`checkpoint:${String(turnId)}`); },
+    authorize: (turnId) => { events.push(`authorize:${turnId}`); },
+    interrupt: async (turnId) => { events.push(`interrupt:${turnId}`); },
+  }), true);
+  assert.deepEqual(events, ["checkpoint:goal-turn", "authorize:goal-turn", "interrupt:goal-turn"]);
+});
+
+test("cancel goal never interrupts an active turn unless explicitly requested", async () => {
+  const interrupted: string[] = [];
+  const interrupt = async (turnId: string) => { interrupted.push(turnId); };
+
+  assert.equal(await interruptCancelledGoalTurn(false, "goal-turn", interrupt), false);
+  assert.deepEqual(interrupted, []);
+  assert.equal(await interruptCancelledGoalTurn(true, "goal-turn", interrupt), true);
+  assert.deepEqual(interrupted, ["goal-turn"]);
 });
 
 test("a partial managed restore survives another mapping entering endpoint wait", async () => {

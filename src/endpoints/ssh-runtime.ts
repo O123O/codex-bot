@@ -13,12 +13,13 @@ import {
 import { runBoundedProcess, type BoundedProcessResult } from "./ssh-process.ts";
 import { parseRuntimeIdentity, type EndpointLossKind, type RuntimeIdentity } from "./types.ts";
 
-export const REMOTE_HELPER_SHA256 = "396a17e7635fb224e4d8d278de56d84bd5b46f9de820d5a7491951cd2952c9a7";
+export const REMOTE_HELPER_SHA256 = "88c85fa042ff0966732df3a5ab286c5976f260d9f855fd241d244f8e92e28def";
 export const REMOTE_LAUNCHER_SHA256 = "db138ff3173f9b72d1fa8cc5fbc94c4958247691a401232d84edf0e3417bd334";
 
 const MAX_REMOTE_ARGUMENT_BYTES = 16 * 1024;
 const NFS_SUPER_MAGIC = 0x6969;
 const REMOTE_HELPER_RESPONSE_PREFIX = "qiyan-helper-v1:";
+const REMOTE_HELPER_TIMEOUT_MS = 300_000;
 const helperOperations = new Set(["preflight", "bootstrap", "inspect", "start", "stop", "read-file", "write-file", "rollout-scan", "workspace"]);
 const preflightSchema = z.object({
   uid: z.number().int().positive(),
@@ -229,7 +230,7 @@ export class SshRemoteClient implements RemoteRuntimeClient {
     installedHelperPath: string,
   ): Promise<T> {
     const command = buildInstalledHelperCommand(installedHelperPath, operation, args);
-    const result = await this.executePrepared(command, options.input, options.maxOutputBytes, options.timeoutMs ?? 60_000);
+    const result = await this.executePrepared(command, options.input, options.maxOutputBytes, options.timeoutMs ?? REMOTE_HELPER_TIMEOUT_MS);
     return parseRemoteHelperResponse<T>(result.stdout, operation);
   }
 
@@ -249,7 +250,7 @@ export class SshRemoteClient implements RemoteRuntimeClient {
     command: readonly string[],
     input?: Uint8Array | AsyncIterable<Uint8Array | string>,
     maxOutputBytes = 1024 * 1024,
-    timeoutMs = 30_000,
+    timeoutMs = REMOTE_HELPER_TIMEOUT_MS,
   ): Promise<BoundedProcessResult> {
     if (this.options.plan.ownsControlMaster) {
       const directory = dirname(this.options.plan.controlPath!);

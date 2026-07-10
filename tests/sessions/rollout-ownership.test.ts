@@ -30,7 +30,7 @@ test("incremental rollout scan returns only turn ownership metadata", async () =
 
   const result = await scanLocalRollout({ path, threadId: "thread-1", cursor: baseline.cursor });
 
-  assert.deepEqual(result.starts, [{ turnId: "turn-1", clientId: "context-1:call-1" }]);
+  assert.deepEqual(result.starts, [{ turnId: "turn-1", clientId: "context-1:call-1", hasUserMessage: true }]);
   assert.equal(result.openTurn, undefined);
   assert.equal(result.cursor.offset, Buffer.byteLength(await readFile(path)));
   assert.equal(JSON.stringify(result).includes(secret), false);
@@ -52,8 +52,8 @@ test("a malformed complete record is an uncertainty boundary but later external 
 
   assert.deepEqual(result, {
     cursor: baseline.cursor,
-    starts: [{ turnId: "external-after-malformed", clientId: "ctx:external" }],
-    openTurn: { turnId: "external-after-malformed", clientId: "ctx:external" },
+    starts: [{ turnId: "external-after-malformed", clientId: "ctx:external", hasUserMessage: true }],
+    openTurn: { turnId: "external-after-malformed", clientId: "ctx:external", hasUserMessage: true },
     malformed: true,
   });
   assert.equal(JSON.stringify(result).includes(secret), false);
@@ -97,7 +97,7 @@ test("a fully evidenced turn before a malformed record remains reportable", asyn
 
   assert.deepEqual(result, {
     cursor: { ...baseline.cursor, offset: malformedOffset },
-    starts: [{ turnId: "before-malformed", clientId: "ctx:before" }],
+    starts: [{ turnId: "before-malformed", clientId: "ctx:before", hasUserMessage: true }],
     malformed: true,
   });
 });
@@ -121,7 +121,7 @@ test("syntactically valid non-object rollout records are ignored", async () => {
 
   const result = await scanLocalRollout({ path, threadId: "thread-json-values", cursor: baseline.cursor });
 
-  assert.deepEqual(result.starts, [{ turnId: "after-json-values" }]);
+  assert.deepEqual(result.starts, [{ turnId: "after-json-values", hasUserMessage: true }]);
   assert.equal(result.openTurn, undefined);
   assert.equal(result.malformed, undefined);
   assert.equal(result.cursor.offset, Buffer.byteLength(await readFile(path)));
@@ -141,8 +141,8 @@ test("an ownerless user turn is external while an incomplete line remains uncons
 
   await appendFile(path, `\n${line("event_msg", { type: "user_message" })}`);
   const detected = await scanLocalRollout({ path, threadId: "thread-2", cursor: baseline.cursor });
-  assert.deepEqual(detected.starts, [{ turnId: "external" }]);
-  assert.deepEqual(detected.openTurn, { turnId: "external" });
+  assert.deepEqual(detected.starts, [{ turnId: "external", hasUserMessage: true }]);
+  assert.deepEqual(detected.openTurn, { turnId: "external", hasUserMessage: true });
   assert.equal(detected.cursor.offset, Buffer.byteLength(await readFile(path)));
 });
 
@@ -162,6 +162,234 @@ test("a complete task start without its user record remains unclassified", async
   await appendFile(path, line("event_msg", { type: "task_started", turn_id: "not-yet-classified" }));
 
   assert.deepEqual(await guard.inspect(identity), { state: "unclassified", turnId: "not-yet-classified" });
+  assert.equal(runtime.getSession(identity.endpoint, identity.thread_id, identity.mapping_id)?.managementState, "managed");
+});
+
+test("an ownerless autonomous turn is owned only while QiYan controls the goal", async () => {
+  const root = await mkdtemp(join(tmpdir(), "qiyan-rollout-"));
+  const path = join(root, "rollout-thread-goal.jsonl");
+  await writeFile(path, line("event_msg", { type: "task_complete", turn_id: "historical" }));
+  const db = createTestDatabase();
+  const runtime = new RuntimeStore(db);
+  const operations = new OperationStore(db);
+  const identity = { endpoint: "local", thread_id: "thread-goal", mapping_id: "mapping-goal" };
+  runtime.setSession(identity.endpoint, identity.thread_id, identity.mapping_id, "managed", "idle");
+  const guard = new SessionOwnershipGuard(db, runtime, operations, {
+    scan: async (_endpointId, requests) => Promise.all(requests.map((request) => scanLocalRollout(request))),
+  });
+  await guard.initialize(identity, path);
+  runtime.setGoalControlled(identity.endpoint, identity.thread_id, identity.mapping_id, true);
+  guard.authorizeTurn(identity, "goal-turn");
+  runtime.setGoalControlled(identity.endpoint, identity.thread_id, identity.mapping_id, false);
+  await appendFile(path, line("event_msg", { type: "task_started", turn_id: "goal-turn" }));
+
+  assert.deepEqual(await guard.inspect(identity), { state: "owned" });
+  assert.equal(guard.ownsTurn(identity, "goal-turn"), true);
+});
+
+test("goal control leaves an unproven open turn unclassified until user evidence identifies it", async () => {
+  const root = await mkdtemp(join(tmpdir(), "qiyan-rollout-"));
+  const path = join(root, "rollout-thread-goal-pending.jsonl");
+  await writeFile(path, line("event_msg", { type: "task_complete", turn_id: "historical" }));
+  const db = createTestDatabase();
+  const runtime = new RuntimeStore(db);
+  const identity = { endpoint: "local", thread_id: "thread-goal-pending", mapping_id: "mapping-goal-pending" };
+  runtime.setSession(identity.endpoint, identity.thread_id, identity.mapping_id, "managed", "idle");
+  const guard = new SessionOwnershipGuard(db, runtime, new OperationStore(db), {
+    scan: async (_endpointId, requests) => Promise.all(requests.map((request) => scanLocalRollout(request))),
+  });
+  await guard.initialize(identity, path);
+  runtime.setGoalControlled(identity.endpoint, identity.thread_id, identity.mapping_id, true);
+  await appendFile(path, line("event_msg", { type: "task_started", turn_id: "pending-goal-turn" }));
+
+  assert.deepEqual(await guard.inspect(identity), { state: "unclassified", turnId: "pending-goal-turn" });
+  assert.equal(guard.ownsTurn(identity, "pending-goal-turn"), false);
+
+  await appendFile(path, line("event_msg", { type: "user_message", client_id: "external-client" }));
+
+  assert.deepEqual(await guard.inspect(identity), { state: "external", turnId: "pending-goal-turn" });
+});
+
+test("goal control recognizes a completed autonomous turn when its notification was missed", async () => {
+  const root = await mkdtemp(join(tmpdir(), "qiyan-rollout-"));
+  const path = join(root, "rollout-thread-goal-completed.jsonl");
+  await writeFile(path, line("event_msg", { type: "task_complete", turn_id: "historical" }));
+  const db = createTestDatabase();
+  const runtime = new RuntimeStore(db);
+  const identity = { endpoint: "local", thread_id: "thread-goal-completed", mapping_id: "mapping-goal-completed" };
+  runtime.setSession(identity.endpoint, identity.thread_id, identity.mapping_id, "managed", "idle");
+  const guard = new SessionOwnershipGuard(db, runtime, new OperationStore(db), {
+    scan: async (_endpointId, requests) => Promise.all(requests.map((request) => scanLocalRollout(request))),
+  });
+  await guard.initialize(identity, path);
+  const baseline = db.prepare(`SELECT byte_offset FROM session_rollout_ownership
+    WHERE endpoint_id = ? AND thread_id = ? AND mapping_id = ?`)
+    .get(identity.endpoint, identity.thread_id, identity.mapping_id) as { byte_offset: number };
+  runtime.setGoalControlled(identity.endpoint, identity.thread_id, identity.mapping_id, true, 1);
+  await appendFile(path, [
+    line("event_msg", { type: "task_started", turn_id: "completed-goal-turn" }),
+    line("event_msg", { type: "task_complete", turn_id: "completed-goal-turn" }),
+  ].join(""));
+
+  assert.deepEqual(await guard.inspect(identity), { state: "owned" });
+  const recovered = db.prepare(`SELECT byte_offset, external_turn_id FROM session_rollout_ownership
+    WHERE endpoint_id = ? AND thread_id = ? AND mapping_id = ?`)
+    .get(identity.endpoint, identity.thread_id, identity.mapping_id) as { byte_offset: number; external_turn_id: string | null };
+  assert.ok(recovered.byte_offset > baseline.byte_offset);
+  assert.equal(recovered.external_turn_id, null);
+  assert.equal(guard.ownsTurn(identity, "completed-goal-turn"), true);
+});
+
+test("an exact terminal goal authorization resolves an open restart boundary after goal control clears", async () => {
+  const root = await mkdtemp(join(tmpdir(), "qiyan-rollout-"));
+  const path = join(root, "rollout-thread-goal-restart-terminal.jsonl");
+  await writeFile(path, line("event_msg", { type: "task_complete", turn_id: "historical" }));
+  const db = createTestDatabase();
+  const runtime = new RuntimeStore(db);
+  const identity = { endpoint: "local", thread_id: "thread-goal-restart-terminal", mapping_id: "mapping-goal-restart-terminal" };
+  runtime.setSession(identity.endpoint, identity.thread_id, identity.mapping_id, "managed", "idle");
+  const guard = new SessionOwnershipGuard(db, runtime, new OperationStore(db), {
+    scan: async (_endpointId, requests) => Promise.all(requests.map((request) => scanLocalRollout(request))),
+  });
+  await guard.initialize(identity, path);
+  runtime.setGoalControlled(identity.endpoint, identity.thread_id, identity.mapping_id, true);
+  await appendFile(path, line("event_msg", { type: "task_started", turn_id: "restart-goal-turn" }));
+  assert.deepEqual(await guard.inspect(identity), { state: "unclassified", turnId: "restart-goal-turn" });
+
+  guard.authorizeTurn(identity, "restart-goal-turn");
+  runtime.setGoalControlled(identity.endpoint, identity.thread_id, identity.mapping_id, false);
+  await appendFile(path, line("event_msg", { type: "task_complete", turn_id: "restart-goal-turn" }));
+
+  assert.deepEqual(await guard.inspect(identity), { state: "owned" });
+  assert.equal(guard.ownsTurn(identity, "restart-goal-turn"), true);
+});
+
+test("initialization persists an exact active legacy goal turn when the ownership row is missing", async () => {
+  const root = await mkdtemp(join(tmpdir(), "qiyan-rollout-"));
+  const path = join(root, "rollout-thread-legacy-active-goal.jsonl");
+  await writeFile(path, line("event_msg", { type: "task_started", turn_id: "legacy-active-goal-turn" }));
+  const db = createTestDatabase();
+  const runtime = new RuntimeStore(db);
+  const identity = { endpoint: "local", thread_id: "thread-legacy-active-goal", mapping_id: "mapping-legacy-active-goal" };
+  runtime.setSession(identity.endpoint, identity.thread_id, identity.mapping_id, "managed", "active");
+  runtime.setGoalControlled(identity.endpoint, identity.thread_id, identity.mapping_id, true);
+  const guard = new SessionOwnershipGuard(db, runtime, new OperationStore(db), {
+    scan: async (_endpointId, requests) => Promise.all(requests.map((request) => scanLocalRollout(request))),
+  });
+
+  assert.equal(guard.authorizeTurnIfInitialized(identity, "legacy-active-goal-turn"), false);
+  await guard.initialize(identity, path, undefined, { authorizedTurnId: "legacy-active-goal-turn" });
+
+  assert.deepEqual(await guard.inspect(identity), { state: "owned" });
+  assert.equal(guard.ownsTurn(identity, "legacy-active-goal-turn"), true);
+});
+
+test("initialization persists active legacy authorization before its rollout start is visible", async () => {
+  const root = await mkdtemp(join(tmpdir(), "qiyan-rollout-"));
+  const path = join(root, "rollout-thread-legacy-late-start.jsonl");
+  await writeFile(path, line("event_msg", { type: "task_complete", turn_id: "historical" }));
+  const db = createTestDatabase();
+  const runtime = new RuntimeStore(db);
+  const identity = { endpoint: "local", thread_id: "thread-legacy-late-start", mapping_id: "mapping-legacy-late-start" };
+  runtime.setSession(identity.endpoint, identity.thread_id, identity.mapping_id, "managed", "active");
+  runtime.setGoalControlled(identity.endpoint, identity.thread_id, identity.mapping_id, true);
+  const guard = new SessionOwnershipGuard(db, runtime, new OperationStore(db), {
+    scan: async (_endpointId, requests) => Promise.all(requests.map((request) => scanLocalRollout(request))),
+  });
+
+  await guard.initialize(identity, path, undefined, { authorizedTurnId: "legacy-late-start" });
+  assert.equal(guard.ownsTurn(identity, "legacy-late-start"), true);
+  await appendFile(path, line("event_msg", { type: "task_started", turn_id: "legacy-late-start" }));
+
+  assert.deepEqual(await guard.inspect(identity), { state: "owned" });
+});
+
+test("user evidence overrides exact migration authorization during ownership initialization", async () => {
+  const root = await mkdtemp(join(tmpdir(), "qiyan-rollout-"));
+  const path = join(root, "rollout-thread-legacy-external-goal.jsonl");
+  await writeFile(path, [
+    line("event_msg", { type: "task_started", turn_id: "legacy-external-goal-turn" }),
+    line("event_msg", { type: "user_message", client_id: "external-client" }),
+  ].join(""));
+  const db = createTestDatabase();
+  const runtime = new RuntimeStore(db);
+  const identity = { endpoint: "local", thread_id: "thread-legacy-external-goal", mapping_id: "mapping-legacy-external-goal" };
+  runtime.setSession(identity.endpoint, identity.thread_id, identity.mapping_id, "managed", "active");
+  runtime.setGoalControlled(identity.endpoint, identity.thread_id, identity.mapping_id, true);
+  const guard = new SessionOwnershipGuard(db, runtime, new OperationStore(db), {
+    scan: async (_endpointId, requests) => Promise.all(requests.map((request) => scanLocalRollout(request))),
+  });
+
+  await assert.rejects(
+    guard.initialize(identity, path, undefined, { authorizedTurnId: "legacy-external-goal-turn" }),
+    (error: unknown) => error instanceof AppError && error.code === "SESSION_BUSY",
+  );
+  assert.equal(guard.ownsTurn(identity, "legacy-external-goal-turn"), false);
+});
+
+test("goal control never authorizes an external client turn", async () => {
+  const root = await mkdtemp(join(tmpdir(), "qiyan-rollout-"));
+  const path = join(root, "rollout-thread-goal-external.jsonl");
+  await writeFile(path, line("event_msg", { type: "task_complete", turn_id: "historical" }));
+  const db = createTestDatabase();
+  const runtime = new RuntimeStore(db);
+  const identity = { endpoint: "local", thread_id: "thread-goal-external", mapping_id: "mapping-goal-external" };
+  runtime.setSession(identity.endpoint, identity.thread_id, identity.mapping_id, "managed", "idle");
+  const guard = new SessionOwnershipGuard(db, runtime, new OperationStore(db), {
+    scan: async (_endpointId, requests) => Promise.all(requests.map((request) => scanLocalRollout(request))),
+  });
+  await guard.initialize(identity, path);
+  runtime.setGoalControlled(identity.endpoint, identity.thread_id, identity.mapping_id, true);
+  await appendFile(path, [
+    line("event_msg", { type: "task_started", turn_id: "external-during-goal" }),
+    line("event_msg", { type: "user_message", client_id: "external-client" }),
+  ].join(""));
+
+  assert.deepEqual(await guard.inspect(identity), { state: "external", turnId: "external-during-goal" });
+  assert.equal(guard.ownsTurn(identity, "external-during-goal"), false);
+});
+
+test("external user evidence overrides an earlier exact goal-turn authorization", async () => {
+  const root = await mkdtemp(join(tmpdir(), "qiyan-rollout-"));
+  const path = join(root, "rollout-thread-authorized-goal-external.jsonl");
+  await writeFile(path, line("event_msg", { type: "task_complete", turn_id: "historical" }));
+  const db = createTestDatabase();
+  const runtime = new RuntimeStore(db);
+  const identity = { endpoint: "local", thread_id: "thread-authorized-goal-external", mapping_id: "mapping-authorized-goal-external" };
+  runtime.setSession(identity.endpoint, identity.thread_id, identity.mapping_id, "managed", "idle");
+  const guard = new SessionOwnershipGuard(db, runtime, new OperationStore(db), {
+    scan: async (_endpointId, requests) => Promise.all(requests.map((request) => scanLocalRollout(request))),
+  });
+  await guard.initialize(identity, path);
+  runtime.setGoalControlled(identity.endpoint, identity.thread_id, identity.mapping_id, true);
+  guard.authorizeTurn(identity, "authorized-goal-external");
+  await appendFile(path, [
+    line("event_msg", { type: "task_started", turn_id: "authorized-goal-external" }),
+    line("event_msg", { type: "user_message", client_id: "external-client" }),
+  ].join(""));
+
+  assert.deepEqual(await guard.inspect(identity), { state: "external", turnId: "authorized-goal-external" });
+  assert.equal(guard.ownsTurn(identity, "authorized-goal-external"), false);
+});
+
+test("a legacy completed turn without user evidence or a goal marker remains unclassified", async () => {
+  const root = await mkdtemp(join(tmpdir(), "qiyan-rollout-"));
+  const path = join(root, "rollout-thread-legacy-goal.jsonl");
+  await writeFile(path, line("event_msg", { type: "task_complete", turn_id: "historical" }));
+  const db = createTestDatabase();
+  const runtime = new RuntimeStore(db);
+  const identity = { endpoint: "local", thread_id: "thread-legacy-goal", mapping_id: "mapping-legacy-goal" };
+  runtime.setSession(identity.endpoint, identity.thread_id, identity.mapping_id, "managed", "idle");
+  const guard = new SessionOwnershipGuard(db, runtime, new OperationStore(db), {
+    scan: async (_endpointId, requests) => Promise.all(requests.map((request) => scanLocalRollout(request))),
+  });
+  await guard.initialize(identity, path);
+  await appendFile(path, [
+    line("event_msg", { type: "task_started", turn_id: "legacy-goal-turn" }),
+    line("event_msg", { type: "task_complete", turn_id: "legacy-goal-turn" }),
+  ].join(""));
+
+  assert.deepEqual(await guard.inspect(identity), { state: "unclassified", turnId: "legacy-goal-turn" });
   assert.equal(runtime.getSession(identity.endpoint, identity.thread_id, identity.mapping_id)?.managementState, "managed");
 });
 
@@ -292,8 +520,8 @@ test("initialization accepts only positive active external evidence from a malfo
   const externalGuard = new SessionOwnershipGuard(externalDb, externalRuntime, new OperationStore(externalDb), {
     scan: async () => [{
       cursor,
-      starts: [{ turnId: "external-active" }],
-      openTurn: { turnId: "external-active" },
+      starts: [{ turnId: "external-active", hasUserMessage: true }],
+      openTurn: { turnId: "external-active", hasUserMessage: true },
       malformed: true,
     }],
   });
@@ -742,7 +970,11 @@ test("initialization durably fences an already active external turn for managed-
   runtime.setSession(identity.endpoint, identity.thread_id, identity.mapping_id, "managed", "idle");
   const cursor = { device: "1", inode: "2", offset: 100 };
   const guard = new SessionOwnershipGuard(db, runtime, operations, {
-    scan: async () => [{ cursor, starts: [{ turnId: "external-active" }], openTurn: { turnId: "external-active" } }],
+    scan: async () => [{
+      cursor,
+      starts: [{ turnId: "external-active", hasUserMessage: true }],
+      openTurn: { turnId: "external-active", hasUserMessage: true },
+    }],
   });
 
   await assert.rejects(guard.initialize(identity, "/tmp/rollout-thread-recovery.jsonl"), (error: unknown) => {

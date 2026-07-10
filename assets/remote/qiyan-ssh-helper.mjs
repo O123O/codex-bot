@@ -157,6 +157,15 @@ async function scanRolloutAllowMissing(request, collectFromStart) {
 }
 
 async function scanRollout(request, collectFromStart = false) {
+  for (let attempt = 1; ; attempt += 1) {
+    try { return await scanRolloutSnapshot(request, collectFromStart); }
+    catch (error) {
+      if (attempt >= 3 || error?.message !== "rollout appended while scanning") throw error;
+    }
+  }
+}
+
+async function scanRolloutSnapshot(request, collectFromStart = false) {
   const path = request?.path;
   const threadId = request?.threadId;
   const cursor = request?.cursor;
@@ -177,7 +186,10 @@ async function scanRollout(request, collectFromStart = false) {
     if (BigInt(offset) > state.size) throw new Error("rollout was truncated");
     const parsed = await parseRolloutFile(file, offset, Number(state.size), cursor !== undefined || collectFromStart);
     const after = await file.stat({ bigint: true });
-    if (after.dev !== state.dev || after.ino !== state.ino || after.size !== state.size || after.mtimeNs !== state.mtimeNs) throw new Error("rollout changed while scanning");
+    if (after.dev !== state.dev || after.ino !== state.ino) throw new Error("rollout identity changed");
+    if (after.size < state.size) throw new Error("rollout was truncated");
+    if (after.size > state.size) throw new Error("rollout appended while scanning");
+    if (after.mtimeNs !== state.mtimeNs) throw new Error("rollout changed while scanning");
     return parsed.result({ device, inode, offset });
   } finally { await file.close(); }
 }
@@ -190,7 +202,7 @@ async function parseRolloutFile(file, offset, size, collectStarts) {
   while (position < size) {
     const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, size - position));
     const { bytesRead } = await file.read(chunk, 0, chunk.byteLength, position);
-    if (bytesRead === 0) throw new Error("rollout changed while scanning");
+    if (bytesRead === 0) throw new Error("rollout was truncated");
     position += bytesRead;
     const bytes = carry.byteLength === 0 ? chunk.subarray(0, bytesRead) : Buffer.concat([carry, chunk.subarray(0, bytesRead)]);
     let lineStart = 0;
@@ -264,7 +276,11 @@ function createRolloutParser(baseOffset, collectStarts) {
 }
 
 function publicRolloutStart(turn) {
-  return { turnId: turn.turnId, ...(turn.clientId ? { clientId: turn.clientId } : {}) };
+  return {
+    turnId: turn.turnId,
+    ...(turn.clientId ? { clientId: turn.clientId } : {}),
+    ...(turn.sawUserMessage ? { hasUserMessage: true } : {}),
+  };
 }
 
 async function readFileDescriptor(value) {

@@ -586,4 +586,25 @@ export const migrations: readonly Migration[] = [
         CHECK(recovery_protocol IN (0, 1))`);
     }
   },
+  (db) => {
+    const columns = new Set((db.prepare("PRAGMA table_info(session_runtime)").all() as Array<{ name: string }>).map((row) => row.name));
+    if (!columns.has("goal_controlled")) {
+      db.exec(`ALTER TABLE session_runtime ADD COLUMN goal_controlled INTEGER NOT NULL DEFAULT 0
+        CHECK(goal_controlled IN (0, 1))`);
+    }
+  },
+  (db) => {
+    const columns = new Set((db.prepare("PRAGMA table_info(session_runtime)").all() as Array<{ name: string }>).map((row) => row.name));
+    if (!columns.has("goal_control_sequence")) {
+      db.exec(`ALTER TABLE session_runtime ADD COLUMN goal_control_sequence INTEGER NOT NULL DEFAULT 0
+        CHECK(goal_control_sequence >= 0)`);
+    }
+  },
+  (db) => {
+    const columns = new Set((db.prepare("PRAGMA table_info(session_runtime)").all() as Array<{ name: string }>).map((row) => row.name));
+    if (!columns.has("goal_control_known")) {
+      db.exec(`ALTER TABLE session_runtime ADD COLUMN goal_control_known INTEGER NOT NULL DEFAULT 0
+        CHECK(goal_control_known IN (0, 1))`);
+    }
+  },
 ];

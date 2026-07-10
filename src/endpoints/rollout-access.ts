@@ -15,7 +15,11 @@ const cursorSchema = z.object({
   inode: z.string().regex(/^\d+$/u),
   offset: z.number().int().nonnegative().safe(),
 }).strict();
-const startSchema = z.object({ turnId: z.string().min(1), clientId: z.string().min(1).optional() }).strict();
+const startSchema = z.object({
+  turnId: z.string().min(1),
+  clientId: z.string().min(1).optional(),
+  hasUserMessage: z.literal(true).optional(),
+}).strict();
 const resultSchema = z.object({
   cursor: cursorSchema,
   starts: z.array(startSchema).max(1024),
@@ -37,17 +41,22 @@ export class RolloutAccessRouter implements RolloutAccess {
   constructor(private readonly options: {
     remote(endpointId: string): { remote: RemoteRuntimeClient; helperPath: string } | undefined;
     validateLease?(endpointId: string, lease: EndpointWorkLease): boolean;
+    scanLocal?: typeof scanLocalRollout;
   }) {}
 
   async scan(endpointId: string, requests: readonly RolloutScanRequest[], lease?: EndpointWorkLease): Promise<RolloutScanResult[]> {
     if (requests.length === 0) return [];
     if (requests.length > 128) throw new AppError("CONFIGURATION_ERROR", "too many rollout scan requests");
-    this.requireLease(endpointId, lease);
     if (endpointId === "local") {
-      const results = await Promise.all(requests.map((request) => scanLocalRollout(request)));
+      const scan = this.options.scanLocal ?? scanLocalRollout;
+      const results = await retryConcurrentRolloutAppend(() => {
+        this.requireLease(endpointId, lease);
+        return Promise.all(requests.map((request) => scan(request)));
+      });
       this.requireLease(endpointId, lease);
       return results;
     }
+    this.requireLease(endpointId, lease);
     const context = this.options.remote(endpointId);
     if (!context) throw new AppError("ENDPOINT_UNAVAILABLE", `SSH rollout helper is unavailable: ${endpointId}`);
     const response = await context.remote.invoke("rollout-scan", [JSON.stringify({ requests })], context.helperPath);
@@ -61,10 +70,13 @@ export class RolloutAccessRouter implements RolloutAccess {
 
   async scanUnmaterialized(endpointId: string, request: RolloutScanRequest, lease?: EndpointWorkLease): Promise<RolloutMaterialization> {
     if (request.cursor) throw new AppError("CONFIGURATION_ERROR", "unmaterialized rollout scan cannot use a cursor");
-    this.requireLease(endpointId, lease);
     if (endpointId === "local") {
       try {
-        const result = await scanLocalRollout({ ...request, collectFromStart: true });
+        const scan = this.options.scanLocal ?? scanLocalRollout;
+        const result = await retryConcurrentRolloutAppend(() => {
+          this.requireLease(endpointId, lease);
+          return scan({ ...request, collectFromStart: true });
+        });
         this.requireLease(endpointId, lease);
         return { state: "present", result };
       } catch (error) {
@@ -73,6 +85,7 @@ export class RolloutAccessRouter implements RolloutAccess {
         return { state: "missing" };
       }
     }
+    this.requireLease(endpointId, lease);
     const context = this.options.remote(endpointId);
     if (!context) throw new AppError("ENDPOINT_UNAVAILABLE", `SSH rollout helper is unavailable: ${endpointId}`);
     const response = await context.remote.invoke("rollout-scan", [JSON.stringify({
@@ -95,12 +108,29 @@ export class RolloutAccessRouter implements RolloutAccess {
   }
 }
 
+async function retryConcurrentRolloutAppend<T>(scan: () => Promise<T>): Promise<T> {
+  for (let attempt = 1; ; attempt += 1) {
+    try { return await scan(); }
+    catch (error) {
+      if (attempt >= 3 || !(error instanceof Error) || error.message !== "rollout appended while scanning") throw error;
+    }
+  }
+}
+
 function publicResult(result: z.infer<typeof resultSchema>): RolloutScanResult {
   return {
     cursor: result.cursor,
-    starts: result.starts.map((turn) => ({ turnId: turn.turnId, ...(turn.clientId === undefined ? {} : { clientId: turn.clientId }) })),
+    starts: result.starts.map((turn) => ({
+      turnId: turn.turnId,
+      ...(turn.clientId === undefined ? {} : { clientId: turn.clientId }),
+      ...(turn.hasUserMessage === undefined ? {} : { hasUserMessage: true as const }),
+    })),
     ...(result.openTurn === undefined ? {} : {
-      openTurn: { turnId: result.openTurn.turnId, ...(result.openTurn.clientId === undefined ? {} : { clientId: result.openTurn.clientId }) },
+      openTurn: {
+        turnId: result.openTurn.turnId,
+        ...(result.openTurn.clientId === undefined ? {} : { clientId: result.openTurn.clientId }),
+        ...(result.openTurn.hasUserMessage === undefined ? {} : { hasUserMessage: true as const }),
+      },
     }),
     ...(result.malformed === undefined ? {} : { malformed: true }),
   };

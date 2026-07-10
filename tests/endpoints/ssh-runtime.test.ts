@@ -72,12 +72,12 @@ test("remote arguments round-trip only as bounded base64url tokens", () => {
 
 test("user-owned helper and transfer calls check and reuse only the authenticated master", async (t) => {
   const { plan } = await privateUserMaster(t);
-  const calls: string[][] = [];
+  const calls: Array<{ args: string[]; timeoutMs: number }> = [];
   const remote = new SshRemoteClient({
     plan,
     helperSource: Buffer.from("helper"),
-    run: async (_command, args) => {
-      calls.push([...args]);
+    run: async (_command, args, options) => {
+      calls.push({ args: [...args], timeoutMs: options.timeoutMs });
       const control = args[args.indexOf("-O") + 1];
       return {
         stdout: control === "check" ? Buffer.alloc(0) : framedOk,
@@ -89,13 +89,14 @@ test("user-owned helper and transfer calls check and reuse only the authenticate
   await remote.invoke("inspect", ["{}"], helperPath);
   await remote.invokeTransfer("read-file", ["{}"], { maxOutputBytes: 1024 }, helperPath);
 
-  assert.deepEqual(calls.map((args) => args.includes("-O") ? args[args.indexOf("-O") + 1] : "helper"), ["check", "helper", "check", "helper"]);
-  for (const args of calls.filter((args) => !args.includes("-O"))) {
+  assert.deepEqual(calls.map(({ args }) => args.includes("-O") ? args[args.indexOf("-O") + 1] : "helper"), ["check", "helper", "check", "helper"]);
+  assert.deepEqual(calls.map((call) => call.timeoutMs), [5_000, 300_000, 5_000, 300_000]);
+  for (const { args } of calls.filter(({ args }) => !args.includes("-O"))) {
     assert.deepEqual(args.slice(args.indexOf("-S"), args.indexOf("-S") + 2), ["-S", plan.controlPath]);
     assert.ok(args.includes("ControlMaster=no"));
   }
   await remote.closeControlMaster();
-  assert.equal(calls.some((args) => args.includes("exit")), false);
+  assert.equal(calls.some(({ args }) => args.includes("exit")), false);
 });
 
 test("helper response framing ignores unrelated remote shell stdout", async (t) => {

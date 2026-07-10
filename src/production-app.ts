@@ -47,7 +47,7 @@ import {
 } from "./assistant/lifecycle-buffer.ts";
 import { AttemptScope } from "./assistant/attempt-scope.ts";
 import { SessionObservationProcessor } from "./assistant/session-observer.ts";
-import { createAssistantTools, type AssistantToolName } from "./assistant/tools.ts";
+import { createAssistantTools, type AssistantToolName, type ToolHandler } from "./assistant/tools.ts";
 import { prepareAssistantWorkspace } from "./assistant/workspace.ts";
 import { EventRelay } from "./events/relay.ts";
 import { persistDeliveryStateEvent, reconcileDeliveryStateEvents } from "./events/delivery-status.ts";
@@ -1124,6 +1124,81 @@ export async function recoverStartupManagedEndpoint(options: {
   }
 }
 
+export function requireManagedRecoveryAcknowledged(
+  outcome: "acknowledged" | "publication",
+  endpointId: string,
+): void {
+  if (outcome !== "acknowledged") {
+    throw new AppError("ENDPOINT_UNAVAILABLE", `managed sessions were not restored on endpoint ${endpointId}`);
+  }
+}
+
+const threadGoalStatuses = new Set(["active", "paused", "blocked", "usageLimited", "budgetLimited", "complete"]);
+
+export function restoredGoalControlIsActive(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value) || !Object.hasOwn(value, "goal")) {
+    throw new AppError("OPERATION_UNCERTAIN", "managed goal state is invalid");
+  }
+  const goal = (value as { goal: unknown }).goal;
+  if (goal === null) return false;
+  if (!goal || typeof goal !== "object" || Array.isArray(goal)) {
+    throw new AppError("OPERATION_UNCERTAIN", "managed goal state is invalid");
+  }
+  const status = (goal as { status?: unknown }).status;
+  if (typeof status !== "string" || !threadGoalStatuses.has(status)) {
+    throw new AppError("OPERATION_UNCERTAIN", "managed goal status is invalid");
+  }
+  return status === "active";
+}
+
+export async function recoverCancelGoalInterrupt(options: {
+  requested: boolean;
+  checkpoint?: { turnId?: string | null };
+  goal: unknown;
+  nativeStatus: string;
+  turns: ReadonlyArray<{ id: string; status?: unknown }>;
+  checkpointTurn(turnId: string | null): void;
+  authorize(turnId: string): void;
+  interrupt(turnId: string): Promise<void>;
+}): Promise<boolean> {
+  if (!options.requested) return true;
+  if (options.goal !== null) return false;
+  const activeTurn = options.nativeStatus === "active"
+    ? [...options.turns].reverse().find((candidate) => !isRecoveryTerminalStatus(candidate.status))
+    : undefined;
+  let turnId = typeof options.checkpoint?.turnId === "string" ? options.checkpoint.turnId : undefined;
+  if (activeTurn && activeTurn.id !== turnId) {
+    turnId = activeTurn.id;
+    options.checkpointTurn(turnId);
+  }
+  if (!turnId) {
+    if (options.nativeStatus !== "idle") return false;
+    options.checkpointTurn(null);
+    return true;
+  }
+  options.authorize(turnId);
+  const turn = options.turns.find((candidate) => candidate.id === turnId);
+  if (turn && isRecoveryTerminalStatus(turn.status)) return true;
+  if (!turn) return false;
+  await options.interrupt(turnId);
+  return true;
+}
+
+function isRecoveryTerminalStatus(status: unknown): boolean {
+  const type = typeof status === "string" ? status : String((status as { type?: unknown } | null)?.type ?? "");
+  return type === "completed" || type === "failed" || type === "interrupted";
+}
+
+export async function interruptCancelledGoalTurn(
+  requested: boolean,
+  turnId: string | null,
+  interrupt: (turnId: string) => Promise<void>,
+): Promise<boolean> {
+  if (!requested || !turnId) return false;
+  await interrupt(turnId);
+  return true;
+}
+
 export function createManagedSessionRecoveryOwner(options: {
   endpoints: Pick<EndpointManager, "withReadyWorkLease">;
   isLeaseCurrent(endpointId: string, lease: EndpointWorkLease): boolean;
@@ -1622,6 +1697,13 @@ export async function buildProductionApp(
     weixinCredential?: WeixinCredentialHandle;
     onOperationalEvent?: OperationalEventSink;
     requestRestart?: () => void;
+    testing?: {
+      holdAssistantScheduler?: boolean;
+      onManagerToolsBuilt?(
+        tools: Readonly<Record<AssistantToolName, ToolHandler>>,
+        activity: { registerTool(attemptId: string): number; finishTool(attemptId: string): void },
+      ): void;
+    };
     storage?: {
       acquireDatabaseLease?: (path: string) => Promise<DatabaseLease>;
       openDatabase?: (path: string) => Database;
@@ -2053,6 +2135,10 @@ export async function buildProductionApp(
             return operationReconciler.waitForTerminal(operationId, signal);
           },
         });
+        options.testing?.onManagerToolsBuilt?.(tools, {
+          registerTool: (attemptId) => assistant.registerTool(attemptId),
+          finishTool: (attemptId) => assistant.finishTool(attemptId),
+        });
         mcp = new LoopbackMcpServer(tools, assistant, {
           host: config.mcpHost,
           port: config.mcpPort,
@@ -2178,7 +2264,44 @@ export async function buildProductionApp(
         ownership = new SessionOwnershipGuard(
           db, runtime, operations, rolloutAccess, createAppServerRolloutPathResolver(pool),
         );
-        lifecycle = new SessionLifecycle(pool, registry, runtime, { now: () => Date.now() }, workspaceRouter as never, threadGate, endpointManager, ownership);
+        lifecycle = new SessionLifecycle(
+          pool,
+          registry,
+          runtime,
+          { now: () => Date.now() },
+          workspaceRouter as never,
+          threadGate,
+          endpointManager,
+          ownership,
+          async (identity, lease, thread) => {
+            const control = runtime.goalControl(identity.endpoint, identity.thread_id, identity.mapping_id);
+            if (control.known && !control.controlled) return;
+            const currentGoal = await pool.request<any>(
+              identity.endpoint,
+              "thread/goal/get",
+              { threadId: identity.thread_id },
+              undefined,
+              lease,
+            );
+            const registered = registry.getByIdentity(identity.endpoint, identity.thread_id);
+            if (!registered || registered.session.mapping_id !== identity.mapping_id) {
+              throw new AppError("OPERATION_CONFLICT", "managed goal mapping changed during recovery");
+            }
+            const active = restoredGoalControlIsActive(currentGoal);
+            const hasGoal = currentGoal.goal !== null;
+            if (!control.known) setGoalControlled(registered.nickname, hasGoal);
+            let authorizedTurnId: string | undefined;
+            if ((control.controlled || hasGoal) && active) {
+              const activeTurn = [...(thread?.turns ?? [])].reverse().find((turn) => !isTerminalStatus(turn.status));
+              authorizedTurnId = activeTurn?.id;
+            }
+            observeGoal(registered.nickname, currentGoal);
+            const after = (control.controlled || hasGoal) && !active
+              ? () => setGoalControlled(registered.nickname, false)
+              : undefined;
+            if (authorizedTurnId || after) return { ...(authorizedTurnId ? { authorizedTurnId } : {}), ...(after ? { after } : {}) };
+          },
+        );
         sessions = new SessionService(pool, registry, runtime, finals, deliveries, workspaceRouter, threadGate, endpointManager, ownership);
         observations = new SessionObservationProcessor(dashboardStore, registry, runtime, {
           now: () => Date.now(),
@@ -2196,6 +2319,9 @@ export async function buildProductionApp(
             relay,
             reconcileOperations,
           }, endpointId, "turn/completed", { threadId, turn: { id: turnId } }),
+          onGoalTurnStarted: ({ endpointId, threadId, mappingId, turnId }) => {
+            ownership.authorizeTurn({ endpoint: endpointId, thread_id: threadId, mapping_id: mappingId }, turnId);
+          },
           onChanged: () => runBackground(() => renderDashboardSafely(), () => recordBackgroundFailure("dashboard rendering")),
           classifyFailure: (error) => error instanceof RpcRequestTimeoutError
             ? "retry"
@@ -2419,7 +2545,12 @@ export async function buildProductionApp(
     },
     {
       name: "scheduler",
-      start: async () => { schedulerAccepting = true; await enqueuePendingEvents(); await dispatcher.enqueueInternal("startup"); },
+      start: async () => {
+        if (options.testing?.holdAssistantScheduler) return;
+        schedulerAccepting = true;
+        await enqueuePendingEvents();
+        await dispatcher.enqueueInternal("startup");
+      },
       stop: async () => {
         stopping = true;
         assistantToolReadiness.stop();
@@ -2682,6 +2813,7 @@ export async function buildProductionApp(
         const endpointId = projectEndpoint(args.endpoint);
         assertEndpointLifecycleOrder(context.operationSequence, endpointId);
         await endpointManager.restart(endpointId, (checkpoint) => context.checkpoint({ endpoint: endpointId, ...(checkpoint as object) }));
+        await resumeManagedEndpoint(endpointId, true);
         return { endpoint: endpointId, state: "ready" };
       },
       set_session_model: async (args) => { await sessions.setModel(args.nickname, args.model); observeLifecycle(args.nickname); await renderDashboardSafely(); return { pending: true }; },
@@ -2693,33 +2825,58 @@ export async function buildProductionApp(
         return result;
       },
       set_goal: async (args) => {
-        const result = await sessions.setGoal(args.nickname, args.objective, args.token_budget);
+        const result = await sessions.setGoal(
+          args.nickname,
+          args.objective,
+          args.token_budget,
+          () => armGoalControl(args.nickname),
+          () => setGoalControlled(args.nickname, false),
+        );
         observeGoal(args.nickname, result);
         await renderDashboardSafely();
         return result;
       },
       pause_goal: async (args) => {
+        try { sessions.authorizeTurn(args.nickname, sessions.activeTurnId(args.nickname)); }
+        catch (error) { if (!(error instanceof AppError && error.code === "SESSION_IDLE")) throw error; }
+        await sessions.authorizeActiveTurn(args.nickname);
         const result = await sessions.pauseGoal(args.nickname);
+        await sessions.authorizeActiveTurn(args.nickname);
+        setGoalControlled(args.nickname, false);
         observeGoal(args.nickname, result);
         await renderDashboardSafely();
         return result;
       },
       resume_goal: async (args) => {
-        const result = await sessions.resumeGoal(args.nickname);
+        const result = await sessions.resumeGoal(
+          args.nickname,
+          () => armGoalControl(args.nickname),
+          () => setGoalControlled(args.nickname, false),
+        );
         observeGoal(args.nickname, result);
         await renderDashboardSafely();
         return result;
       },
       cancel_goal: async (args, context) => {
-        if (args.interrupt_active_turn) {
-          let turnId: string | null = null;
-          try { turnId = sessions.activeTurnId(args.nickname); }
-          catch (error) { if (!(error instanceof AppError && error.code === "SESSION_IDLE")) throw error; }
-          context.checkpoint({ turnId });
-          if (turnId) await sessions.interrupt(args.nickname, turnId);
-          if (turnId) advanceNativeWatermark(args.nickname);
-        }
+        let turnId: string | null = null;
+        try { turnId = sessions.activeTurnId(args.nickname); }
+        catch (error) { if (!(error instanceof AppError && error.code === "SESSION_IDLE")) throw error; }
+        if (turnId) sessions.authorizeTurn(args.nickname, turnId);
+        turnId = await sessions.authorizeActiveTurn(args.nickname) ?? turnId;
+        if (args.interrupt_active_turn) context.checkpoint({ turnId });
         const result = await sessions.cancelGoal(args.nickname);
+        const activeAfterClear = await sessions.authorizeActiveTurn(args.nickname);
+        if (args.interrupt_active_turn && activeAfterClear && activeAfterClear !== turnId) {
+          turnId = activeAfterClear;
+          context.checkpoint({ turnId });
+        }
+        setGoalControlled(args.nickname, false);
+        if (await interruptCancelledGoalTurn(args.interrupt_active_turn, turnId, async (currentTurnId) => {
+          try { await sessions.interrupt(args.nickname, currentTurnId); }
+          catch (error) { if (!(error instanceof AppError && error.code === "SESSION_IDLE")) throw error; }
+        })) {
+          advanceNativeWatermark(args.nickname);
+        }
         observeGoal(args.nickname, result);
         observeLifecycle(args.nickname);
         await renderDashboardSafely();
@@ -2847,6 +3004,22 @@ export async function buildProductionApp(
       status: String(goal.status ?? "unknown"),
       token_budget: typeof goal.tokenBudget === "number" ? goal.tokenBudget : typeof goal.token_budget === "number" ? goal.token_budget : null,
     }, updatedAt, sequence, updatedAt);
+  }
+
+  function setGoalControlled(nickname: string, controlled: boolean): void {
+    const identity = dashboardIdentity(nickname);
+    runtime.setGoalControlled(identity.endpointId, identity.threadId, identity.mappingId, controlled);
+  }
+
+  function armGoalControl(nickname: string): void {
+    const identity = dashboardIdentity(nickname);
+    runtime.setGoalControlled(
+      identity.endpointId,
+      identity.threadId,
+      identity.mappingId,
+      true,
+      dashboardStore.allocateObservationSequence(),
+    );
   }
 
   function hydrateThreadOrder(endpointId: string, thread: { id: string; turns?: Array<{ id: string; startedAt?: number | null }> }): void {
@@ -3181,6 +3354,7 @@ export async function buildProductionApp(
           if (saved) await endpointManager.recoverRestart(endpointId, saved.phase, saved.identity,
             (checkpoint) => operations.checkpoint(operation.id, { endpoint: endpointId, ...(checkpoint as object) }));
           else await endpointManager.restart(endpointId, (checkpoint) => operations.checkpoint(operation.id, { endpoint: endpointId, ...(checkpoint as object) }));
+          await resumeManagedEndpoint(endpointId, true);
           operations.succeed(operation.id, { endpoint: endpointId, state: "ready" });
         } else if (operation.kind === "collect_messages") {
           const checkpoint = operation.receipt as { messageIds?: string[] } | undefined;
@@ -3327,17 +3501,36 @@ export async function buildProductionApp(
           let cancelInterruptProven = true;
           if (operation.kind === "cancel_goal" && args.interrupt_active_turn) {
             const checkpoint = operation.receipt as { turnId?: string | null } | undefined;
-            cancelInterruptProven = checkpoint !== undefined && checkpoint.turnId === null;
-            if (checkpoint?.turnId) {
-              const history = await pool.request<any>(session.endpoint, "thread/read", { threadId: session.thread_id, includeTurns: true }, undefined, recoveryLease);
-              cancelInterruptProven = history.thread.turns.some((turn: any) => turn.id === checkpoint.turnId && isTerminalStatus(turn.status));
-            }
+            const history = await pool.request<any>(session.endpoint, "thread/read", { threadId: session.thread_id, includeTurns: true }, undefined, recoveryLease);
+            cancelInterruptProven = await recoverCancelGoalInterrupt({
+              requested: true,
+              ...(checkpoint ? { checkpoint } : {}),
+              goal,
+              nativeStatus: String(history.thread.status?.type ?? "unknown"),
+              turns: history.thread.turns,
+              checkpointTurn: (turnId) => operations.checkpoint(operation.id, { turnId }),
+              authorize: (turnId) => sessions.authorizeTurn(args.nickname, turnId),
+              interrupt: (turnId) => sessions.interrupt(args.nickname, turnId, {
+                ...(recoveryLease ? { existingLease: recoveryLease } : {}),
+                recoverExactTurn: true,
+              }),
+            });
           }
           const proven = operation.kind === "set_goal" ? goal?.objective === args.objective && goal?.status === "active" && actualBudget === (args.token_budget ?? null)
             : operation.kind === "pause_goal" ? goal?.status === "paused"
               : operation.kind === "resume_goal" ? goal?.status === "active"
                 : goal == null && cancelInterruptProven;
+          if (!proven && (operation.kind === "set_goal" || operation.kind === "resume_goal")) {
+            restoredGoalControlIsActive(current);
+            await sessions.authorizeActiveTurn(args.nickname, recoveryLease);
+            setGoalControlled(args.nickname, false);
+          }
+          if (proven && (operation.kind === "pause_goal" || operation.kind === "cancel_goal")) {
+            await sessions.authorizeActiveTurn(args.nickname, recoveryLease);
+          }
           if (proven) await succeedRecovered(operation, current, () => {
+            if (operation.kind === "set_goal" || operation.kind === "resume_goal") armGoalControl(args.nickname);
+            else setGoalControlled(args.nickname, false);
             observeGoal(args.nickname, current);
             if (operation.kind === "cancel_goal") observeLifecycle(args.nickname);
           });
@@ -3426,16 +3619,19 @@ export async function buildProductionApp(
     const excluded = lifecycleOwnedEndpointIds();
     const endpointIds = [...new Set(Object.values(registry.managedSnapshot().sessions).map((session) => session.endpoint))]
       .filter((endpointId) => !excluded.has(endpointId) && endpointManager.desiredState(endpointId) === "automatic");
-    for (const endpointId of endpointIds) {
-      await recoverStartupManagedEndpoint({
-        endpointId,
-        withReadyLease: (run) => endpointManager.withReadyWorkLease(endpointId, run),
-        isLeaseCurrent: (lease) => isManagedRecoveryLeaseCurrent(endpointId, lease),
-        recover: (lease, isCurrent) => resumeManagedSessions(endpointId, { lease, isCurrent }),
-        reconcile: (lease) => reconcileRestoredEndpoint(endpointId, lease),
-        acknowledge: () => endpointReadyBuffer?.acknowledge(endpointId),
-      });
-    }
+    for (const endpointId of endpointIds) await resumeManagedEndpoint(endpointId);
+  }
+
+  async function resumeManagedEndpoint(endpointId: string, requireAcknowledged = false): Promise<void> {
+    const outcome = await recoverStartupManagedEndpoint({
+      endpointId,
+      withReadyLease: (run) => endpointManager.withReadyWorkLease(endpointId, run),
+      isLeaseCurrent: (lease) => isManagedRecoveryLeaseCurrent(endpointId, lease),
+      recover: (lease, isCurrent) => resumeManagedSessions(endpointId, { lease, isCurrent }),
+      reconcile: (lease) => reconcileRestoredEndpoint(endpointId, lease),
+      acknowledge: () => endpointReadyBuffer?.acknowledge(endpointId),
+    });
+    if (requireAcknowledged) requireManagedRecoveryAcknowledged(outcome, endpointId);
   }
 
   async function resumeManagedSessions(endpointFilter?: string, options: {

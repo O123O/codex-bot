@@ -19,6 +19,7 @@ export interface RolloutCursor {
 export interface RolloutTurnStart {
   turnId: string;
   clientId?: string;
+  hasUserMessage?: true;
 }
 
 export interface RolloutScanResult {
@@ -135,11 +136,12 @@ export class SessionOwnershipGuard {
     identity: MappingIdentity,
     path: string,
     lease?: EndpointWorkLease,
-    options: { allowUnmaterialized?: boolean } = {},
+    options: { allowUnmaterialized?: boolean; authorizedTurnId?: string } = {},
   ): Promise<void> {
     let existing = this.row(identity);
     if (existing) {
       this.recordUnmaterialized(identity, path);
+      if (options.authorizedTurnId) this.recordOwnedTurn(identity, options.authorizedTurnId);
       existing = this.row(identity)!;
       const inspection = await this.inspectCurrent(
         identity,
@@ -163,15 +165,23 @@ export class SessionOwnershipGuard {
     }
     const result = materialization.result;
     if (!result) throw ownershipUnclassified("rollout ownership scan returned no result");
-    const pendingUnclassified = options.allowUnmaterialized && result.openTurn
+    const goalControlled = this.runtime.goalControlled(identity.endpoint, identity.thread_id, identity.mapping_id);
+    const pendingUnclassified = result.openTurn
       && !result.starts.some((turn) => turn.turnId === result.openTurn!.turnId)
-      && !this.operations.ownsWorkerTurn(result.openTurn) ? result.openTurn : undefined;
-    const candidates = options.allowUnmaterialized ? [...result.starts] : result.openTurn ? [result.openTurn] : [];
-    if (options.allowUnmaterialized && result.openTurn && !candidates.some((turn) => turn.turnId === result.openTurn!.turnId)
-      && this.operations.ownsWorkerTurn(result.openTurn)) candidates.push(result.openTurn);
-    const classified = candidates.map((turn) => ({ turn, owned: this.operations.ownsWorkerTurn(turn) }));
-    const external = classified.find((item) => !item.owned)?.turn;
-    if ((result.malformed || pendingUnclassified) && !external) throw ownershipUnclassified("rollout ownership is temporarily uncertain");
+      && !this.ownsObservedTurn(identity, result.openTurn)
+      && result.openTurn.turnId !== options.authorizedTurnId
+      && result.openTurn.hasUserMessage !== true ? result.openTurn : undefined;
+    const candidates = options.allowUnmaterialized ? [...result.starts] : [];
+    if (result.openTurn && !candidates.some((turn) => turn.turnId === result.openTurn!.turnId)
+      && (result.openTurn.hasUserMessage === true || this.ownsObservedTurn(identity, result.openTurn)
+        || result.openTurn.turnId === options.authorizedTurnId)) candidates.push(result.openTurn);
+    const classified = candidates.map((turn) => ({
+      turn,
+      state: this.classifyObservedTurn(identity, turn, goalControlled, options.authorizedTurnId),
+    }));
+    const external = classified.find((item) => item.state === "external")?.turn;
+    const pending = pendingUnclassified ?? classified.find((item) => item.state === "unclassified")?.turn;
+    if ((result.malformed || pending) && !external) throw ownershipUnclassified("rollout ownership is temporarily uncertain");
     inTransaction(this.db, () => {
       this.db.prepare(`INSERT INTO session_rollout_ownership
         (endpoint_id, thread_id, mapping_id, rollout_path, device, inode, byte_offset, materialized, external_turn_id, updated_at)
@@ -179,8 +189,10 @@ export class SessionOwnershipGuard {
         identity.endpoint, identity.thread_id, identity.mapping_id, path,
         result.cursor.device, result.cursor.inode, result.cursor.offset, external?.turnId ?? null, Date.now(),
       );
-      for (const item of classified) if (item.owned) this.recordOwnedTurn(identity, item.turn.turnId);
+      if (options.authorizedTurnId && !external) this.recordOwnedTurn(identity, options.authorizedTurnId);
+      for (const item of classified) if (item.state === "owned") this.recordOwnedTurn(identity, item.turn.turnId);
       if (external) {
+        this.revokeAuthorizedTurn(identity, external.turnId);
         const state = this.runtime.getSession(identity.endpoint, identity.thread_id, identity.mapping_id);
         if (state) this.runtime.setSession(identity.endpoint, identity.thread_id, identity.mapping_id, "unadopting", state.nativeStatus);
       }
@@ -221,20 +233,24 @@ export class SessionOwnershipGuard {
     }
     const result = materialization.result;
     if (!result) throw ownershipUnclassified("rollout ownership scan returned no result");
+    const goalControlled = this.runtime.goalControlled(identity.endpoint, identity.thread_id, identity.mapping_id);
     const unclassified = result.openTurn && !result.starts.some((turn) => turn.turnId === result.openTurn!.turnId)
-      && !this.operations.ownsWorkerTurn(result.openTurn) ? result.openTurn : undefined;
+      && !this.ownsObservedTurn(identity, result.openTurn) ? result.openTurn : undefined;
     const candidates = [...result.starts];
     if (result.openTurn && !candidates.some((turn) => turn.turnId === result.openTurn!.turnId)
-      && this.operations.ownsWorkerTurn(result.openTurn)) candidates.push(result.openTurn);
-    const classified = candidates.map((turn) => ({ turn, owned: this.operations.ownsWorkerTurn(turn) }));
-    const external = classified.find((item) => !item.owned)?.turn;
+      && this.ownsObservedTurn(identity, result.openTurn)) candidates.push(result.openTurn);
+    const classified = candidates.map((turn) => ({ turn, state: this.classifyObservedTurn(identity, turn, goalControlled) }));
+    const external = classified.find((item) => item.state === "external")?.turn;
+    const pending = unclassified ?? classified.find((item) => item.state === "unclassified")?.turn;
     const incidentTurnId = existing.externalTurnId ?? external?.turnId;
     if (result.malformed && !incidentTurnId) throw ownershipUnclassified("rollout ownership is temporarily uncertain");
-    if (requireClassifiedTurn && !incidentTurnId && classified.length === 0) {
+    if (requireClassifiedTurn && !incidentTurnId && (classified.length === 0 || pending)) {
       throw ownershipUnclassified("pending rollout does not prove the native turns are owned");
     }
+    if (pending && !incidentTurnId) return { state: "unclassified", turnId: pending.turnId };
     inTransaction(this.db, () => {
-      for (const item of classified) if (item.owned) this.recordOwnedTurn(identity, item.turn.turnId);
+      for (const item of classified) if (item.state === "owned") this.recordOwnedTurn(identity, item.turn.turnId);
+      if (incidentTurnId) this.revokeAuthorizedTurn(identity, incidentTurnId);
       this.updateCursor(identity, existing, result.cursor, external?.turnId);
       if (incidentTurnId) {
         const state = this.runtime.getSession(identity.endpoint, identity.thread_id, identity.mapping_id);
@@ -242,7 +258,6 @@ export class SessionOwnershipGuard {
       }
     });
     if (incidentTurnId) return { state: "external", turnId: incidentTurnId };
-    if (unclassified) return { state: "unclassified", turnId: unclassified.turnId };
     return { state: "owned" };
   }
 
@@ -262,6 +277,39 @@ export class SessionOwnershipGuard {
     return this.db.prepare(`SELECT 1 FROM session_rollout_owned_turns
       WHERE endpoint_id = ? AND thread_id = ? AND mapping_id = ? AND turn_id = ?`)
       .get(identity.endpoint, identity.thread_id, identity.mapping_id, turnId) !== undefined;
+  }
+
+  authorizeTurn(identity: MappingIdentity, turnId: string): void {
+    if (!this.row(identity)) throw ownershipUnclassified("session ownership guard is not initialized");
+    this.recordOwnedTurn(identity, turnId);
+  }
+
+  authorizeTurnIfInitialized(identity: MappingIdentity, turnId: string): boolean {
+    if (!this.row(identity)) return false;
+    this.recordOwnedTurn(identity, turnId);
+    return true;
+  }
+
+  private ownsObservedTurn(identity: MappingIdentity, turn: RolloutTurnStart): boolean {
+    return this.operations.ownsWorkerTurn(turn) || this.isAuthorizedTurn(identity, turn.turnId);
+  }
+
+  private isAuthorizedTurn(identity: MappingIdentity, turnId: string): boolean {
+    return this.db.prepare(`SELECT 1 FROM session_rollout_owned_turns
+      WHERE endpoint_id = ? AND thread_id = ? AND mapping_id = ? AND turn_id = ?`)
+      .get(identity.endpoint, identity.thread_id, identity.mapping_id, turnId) !== undefined;
+  }
+
+  private classifyObservedTurn(
+    identity: MappingIdentity,
+    turn: RolloutTurnStart,
+    goalControlled: boolean,
+    authorizedTurnId?: string,
+  ): "owned" | "external" | "unclassified" {
+    if (this.operations.ownsWorkerTurn(turn)) return "owned";
+    if (turn.hasUserMessage === true) return "external";
+    if (turn.turnId === authorizedTurnId || this.isAuthorizedTurn(identity, turn.turnId) || goalControlled) return "owned";
+    return "unclassified";
   }
 
   private row(identity: MappingIdentity): OwnershipRow | undefined {
@@ -293,6 +341,12 @@ export class SessionOwnershipGuard {
     this.db.prepare(`INSERT OR IGNORE INTO session_rollout_owned_turns
       (endpoint_id, thread_id, mapping_id, turn_id, recorded_at) VALUES (?, ?, ?, ?, ?)`)
       .run(identity.endpoint, identity.thread_id, identity.mapping_id, turnId, Date.now());
+  }
+
+  private revokeAuthorizedTurn(identity: MappingIdentity, turnId: string): void {
+    this.db.prepare(`DELETE FROM session_rollout_owned_turns
+      WHERE endpoint_id = ? AND thread_id = ? AND mapping_id = ? AND turn_id = ?`)
+      .run(identity.endpoint, identity.thread_id, identity.mapping_id, turnId);
   }
 
   private async scanMaterialized(
@@ -342,9 +396,10 @@ export async function scanLocalRollout(request: {
     if (BigInt(offset) > state.size) throw new Error("rollout was truncated");
     const parsed = await parseRolloutFile(file, offset, Number(state.size), request.cursor !== undefined || request.collectFromStart === true);
     const after = await file.stat({ bigint: true });
-    if (after.dev !== state.dev || after.ino !== state.ino || after.size !== state.size || after.mtimeNs !== state.mtimeNs) {
-      throw new Error("rollout changed while scanning");
-    }
+    if (after.dev !== state.dev || after.ino !== state.ino) throw new Error("rollout identity changed");
+    if (after.size < state.size) throw new Error("rollout was truncated");
+    if (after.size > state.size) throw new Error("rollout appended while scanning");
+    if (after.mtimeNs !== state.mtimeNs) throw new Error("rollout changed while scanning");
     return parsed.result({ device, inode, offset });
   } finally {
     await file.close();
@@ -450,7 +505,7 @@ async function parseRolloutFile(
   while (position < size) {
     const chunk = Buffer.allocUnsafe(Math.min(rolloutReadChunkBytes, size - position));
     const { bytesRead } = await file.read(chunk, 0, chunk.byteLength, position);
-    if (bytesRead === 0) throw new Error("rollout changed while scanning");
+    if (bytesRead === 0) throw new Error("rollout was truncated");
     position += bytesRead;
     const bytes = carry.byteLength === 0 ? chunk.subarray(0, bytesRead) : Buffer.concat([carry, chunk.subarray(0, bytesRead)]);
     let lineStart = 0;
@@ -467,7 +522,11 @@ async function parseRolloutFile(
 }
 
 function publicStart(turn: PendingTurn): RolloutTurnStart {
-  return { turnId: turn.turnId, ...(turn.clientId ? { clientId: turn.clientId } : {}) };
+  return {
+    turnId: turn.turnId,
+    ...(turn.clientId ? { clientId: turn.clientId } : {}),
+    ...(turn.sawUserMessage ? { hasUserMessage: true as const } : {}),
+  };
 }
 
 function safeThreadId(value: string): boolean {

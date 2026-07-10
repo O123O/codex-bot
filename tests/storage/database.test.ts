@@ -11,6 +11,7 @@ import { migrations } from "../../src/storage/migrations.ts";
 import { AppError } from "../../src/core/errors.ts";
 import { preflightConversationCutover } from "../../src/storage/conversation-cutover.ts";
 import { OperationStore } from "../../src/storage/operation-store.ts";
+import { RuntimeStore } from "../../src/storage/runtime-store.ts";
 
 test("fresh absent and empty databases receive the QiYan identity marker", async () => {
   for (const kind of ["absent", "empty"]) {
@@ -299,6 +300,30 @@ test("operation recovery protocol migration marks old rows legacy and new rows c
     contextId: "ctx", attemptId: "attempt", callId: "current", kind: "create_session", args: {},
   });
   assert.equal(current.recoveryProtocol, 1);
+  db.close();
+});
+
+test("goal ownership migration distinguishes legacy mappings from newly created mappings", () => {
+  const knownMigrationIndex = migrations.findIndex((migration) =>
+    typeof migration === "function" && migration.toString().includes("goal_control_known"));
+  assert.ok(knownMigrationIndex > 0);
+  const db = new DatabaseSync(":memory:");
+  for (const migration of migrations.slice(0, knownMigrationIndex)) {
+    if (typeof migration === "function") migration(db);
+    else db.exec(migration);
+  }
+  db.prepare(`INSERT INTO session_runtime
+    (endpoint_id, thread_id, mapping_id, management_state, native_status)
+    VALUES ('local', 'legacy-thread', 'legacy-mapping', 'managed', 'idle')`).run();
+  const migration = migrations[knownMigrationIndex];
+  assert.equal(typeof migration, "function");
+  (migration as (database: DatabaseSync) => void)(db);
+
+  assert.equal(db.prepare(`SELECT goal_control_known FROM session_runtime
+    WHERE mapping_id = 'legacy-mapping'`).get()!.goal_control_known, 0);
+  new RuntimeStore(db).setSession("local", "new-thread", "new-mapping", "managed", "idle");
+  assert.equal(db.prepare(`SELECT goal_control_known FROM session_runtime
+    WHERE mapping_id = 'new-mapping'`).get()!.goal_control_known, 1);
   db.close();
 });
 

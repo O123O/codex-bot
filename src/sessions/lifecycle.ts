@@ -12,7 +12,7 @@ import type { EndpointWorkLease } from "../endpoints/types.ts";
 import type { OwnershipInspection } from "./rollout-ownership.ts";
 import { isExactThreadNoRollout, isExactThreadNotLoaded, isExactThreadNotMaterialized } from "../app-server/thread-errors.ts";
 
-interface ThreadView { id: string; cwd: string; path?: string | null; threadSource?: string | null; status: { type: string }; turns: Array<{ id: string }> }
+interface ThreadView { id: string; cwd: string; path?: string | null; threadSource?: string | null; status: { type: string }; turns: Array<{ id: string; status?: unknown }> }
 interface ThreadResponse { thread: ThreadView; cwd?: string; model?: string; reasoningEffort?: string | null }
 export interface CurrentSessionSettings { model?: string; effort?: string | null }
 export interface LifecycleCheckpoint extends MappingIdentity {
@@ -28,12 +28,18 @@ interface SessionOwnershipLifecycle {
     identity: MappingIdentity,
     path: string,
     lease?: EndpointWorkLease,
-    options?: { allowUnmaterialized?: boolean },
+    options?: { allowUnmaterialized?: boolean; authorizedTurnId?: string },
   ): Promise<void>;
+  authorizeTurnIfInitialized?(identity: MappingIdentity, turnId: string): boolean;
   inspectIfInitialized?(identity: MappingIdentity, lease?: EndpointWorkLease): Promise<
     { state: "uninitialized" } | OwnershipInspection
   >;
   release(identity: MappingIdentity): void;
+}
+
+interface ManagedOwnershipPreparation {
+  authorizedTurnId?: string;
+  after?: () => void | Promise<void>;
 }
 
 export function workerThreadStartParams(cwd: string, threadSource: string): { cwd: string; ephemeral: false; threadSource: string } {
@@ -50,6 +56,11 @@ export class SessionLifecycle {
     private readonly gate: ThreadGate,
     private readonly endpoints?: Pick<EndpointManager, "withWorkLease" | "runWithWorkLease">,
     private readonly ownership?: SessionOwnershipLifecycle,
+    private readonly beforeManagedOwnership?: (
+      identity: MappingIdentity,
+      lease?: EndpointWorkLease,
+      thread?: ThreadView,
+    ) => Promise<void | ManagedOwnershipPreparation>,
   ) {}
 
   async create(
@@ -311,6 +322,26 @@ export class SessionLifecycle {
       await this.assertDispatchable(session.endpoint, project, lease);
       assertCurrent();
       if (project.path !== session.project_dir) throw new AppError("CWD_MISMATCH", "managed project directory changed");
+      let resumed: ThreadResponse | undefined;
+      let before: ThreadResponse;
+      try { before = await this.read(session.endpoint, session.thread_id, lease); }
+      catch (error) {
+        if (!isExactThreadNotLoaded(error, session.thread_id)) throw error;
+        resumed = await this.pool.request<ThreadResponse>(session.endpoint, "thread/resume", { threadId: session.thread_id }, undefined, lease);
+        assertCurrent();
+        this.requireThreadIdentity(resumed.thread, session.thread_id);
+        before = await this.read(session.endpoint, session.thread_id, lease);
+      }
+      assertCurrent();
+      this.requireThreadIdentity(before.thread, session.thread_id);
+      await this.verifyCwd(session.endpoint, before.thread.cwd, project.path, lease);
+      assertCurrent();
+      this.runtime.restoreMissingManagedSession(session.endpoint, session.thread_id, session.mapping_id);
+      const ownershipPreparation = await this.beforeManagedOwnership?.(session, lease, before.thread);
+      assertCurrent();
+      if (ownershipPreparation?.authorizedTurnId) {
+        this.ownership?.authorizeTurnIfInitialized?.(session, ownershipPreparation.authorizedTurnId);
+      }
       const guarded = await this.ownership?.inspectIfInitialized?.(session, lease);
       assertCurrent();
       if (guarded?.state === "external") {
@@ -337,26 +368,15 @@ export class SessionLifecycle {
           recovery: "ownership_unclassified",
         });
       }
-      let resumed: ThreadResponse | undefined;
-      let before: ThreadResponse;
-      try { before = await this.read(session.endpoint, session.thread_id, lease); }
-      catch (error) {
-        if (!isExactThreadNotLoaded(error, session.thread_id)) throw error;
-        resumed = await this.pool.request<ThreadResponse>(session.endpoint, "thread/resume", { threadId: session.thread_id }, undefined, lease);
-        assertCurrent();
-        this.requireThreadIdentity(resumed.thread, session.thread_id);
-        before = await this.read(session.endpoint, session.thread_id, lease);
-      }
-      assertCurrent();
-      this.requireThreadIdentity(before.thread, session.thread_id);
-      await this.verifyCwd(session.endpoint, before.thread.cwd, project.path, lease);
-      assertCurrent();
       if (this.ownership) {
         await this.ownership.initialize(session, this.requireRolloutPath(before.thread), lease, {
           allowUnmaterialized: before.thread.turns.length === 0,
+          ...(ownershipPreparation?.authorizedTurnId ? { authorizedTurnId: ownershipPreparation.authorizedTurnId } : {}),
         });
         assertCurrent();
       }
+      await ownershipPreparation?.after?.();
+      assertCurrent();
       this.assertExact(nickname, expected, "managed");
       let authoritative = before;
       if (!resumed && this.requiresResume(before.thread)) {

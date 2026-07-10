@@ -514,6 +514,30 @@ test("restart checkpoints and reopens admission before publishing its replacemen
   assert.equal(manager.endpointGeneration("devbox").endpoint, replacement);
 });
 
+test("restart after disconnect starts a fresh runtime without proving stopped threads idle", async () => {
+  const first = new FakeEndpoint("devbox");
+  const replacement = new FakeEndpoint("devbox");
+  replacement.identityToken = "b".repeat(32);
+  const { manager, candidateCount } = queuedFixture([first, replacement], ["thread-1"]);
+  await manager.ensureReady("devbox");
+  await manager.disconnect("devbox");
+  const checkpoints: unknown[] = [];
+
+  await manager.restart("devbox", (checkpoint) => { checkpoints.push(checkpoint); });
+
+  assert.equal(candidateCount(), 2);
+  assert.equal(first.runtimeStops, 1);
+  assert.equal(replacement.starts, 1);
+  assert.equal(replacement.state, "ready");
+  assert.deepEqual(replacement.requests, [], "a stopped endpoint has no live thread state to prove");
+  assert.deepEqual(checkpoints, [{
+    phase: "runtime_started",
+    identity: { kind: "ssh", token: "b".repeat(32), pid: 10, linuxStartTime: "20", processGroupId: 10 },
+  }]);
+  assert.equal(manager.desiredState("devbox"), "automatic");
+  assert.equal(manager.endpointGeneration("devbox").endpoint, replacement);
+});
+
 test("restart recovery validates stopped and started checkpoint identities before publication", async () => {
   const stoppedIdentity = { kind: "ssh" as const, token: "a".repeat(32), pid: 10, linuxStartTime: "20", processGroupId: 10 };
 

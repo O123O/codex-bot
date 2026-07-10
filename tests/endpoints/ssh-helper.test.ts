@@ -164,7 +164,7 @@ test("the remote helper scans rollout ownership without returning message bodies
   const result = await runBoundedProcess(process.execPath, [helperPath.pathname, "rollout-scan", argument], { timeoutMs: 5_000, maxOutputBytes: 64 * 1024 });
   const body = result.stdout.toString("utf8");
   assert.equal(body.includes(secret), false);
-  assert.deepEqual(parseRemoteHelperResponse<any>(result.stdout, "rollout-scan").results[0].starts, [{ turnId: "turn-remote", clientId: "ctx:call" }]);
+  assert.deepEqual(parseRemoteHelperResponse<any>(result.stdout, "rollout-scan").results[0].starts, [{ turnId: "turn-remote", clientId: "ctx:call", hasUserMessage: true }]);
 });
 
 test("the remote helper reports an allowed missing rollout without masking it as SSH failure", async (t) => {
@@ -226,7 +226,7 @@ test("the remote helper collects a completed first turn only for explicit pendin
   });
 
   assert.deepEqual(parseRemoteHelperResponse<any>(ordinary.stdout, "rollout-scan").results[0].starts, []);
-  assert.deepEqual(parseRemoteHelperResponse<any>(promotion.stdout, "rollout-scan").results[0].starts, [{ turnId: "external-first" }]);
+  assert.deepEqual(parseRemoteHelperResponse<any>(promotion.stdout, "rollout-scan").results[0].starts, [{ turnId: "external-first", hasUserMessage: true }]);
 });
 
 test("the remote helper reports a malformed boundary and later independent external evidence", async (t) => {
@@ -257,8 +257,8 @@ test("the remote helper reports a malformed boundary and later independent exter
   assert.equal(stderr.includes(secret), false);
   assert.deepEqual(parseRemoteHelperResponse<any>(scanned.stdout, "rollout-scan").results[0], {
     cursor,
-    starts: [{ turnId: "external-remote", clientId: "ctx:remote" }],
-    openTurn: { turnId: "external-remote", clientId: "ctx:remote" },
+    starts: [{ turnId: "external-remote", clientId: "ctx:remote", hasUserMessage: true }],
+    openTurn: { turnId: "external-remote", clientId: "ctx:remote", hasUserMessage: true },
     malformed: true,
   });
 });
@@ -313,7 +313,7 @@ test("the remote helper ignores syntactically valid non-object JSON records", as
   });
   const result = parseRemoteHelperResponse<any>(scanned.stdout, "rollout-scan").results[0];
   assert.equal(result.malformed, undefined);
-  assert.deepEqual(result.starts, [{ turnId: "after-values" }]);
-  assert.deepEqual(result.openTurn, { turnId: "after-values" });
+  assert.deepEqual(result.starts, [{ turnId: "after-values", hasUserMessage: true }]);
+  assert.deepEqual(result.openTurn, { turnId: "after-values", hasUserMessage: true });
   assert.equal(result.cursor.offset, (await stat(path)).size);
 });
