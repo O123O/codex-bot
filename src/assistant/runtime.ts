@@ -216,9 +216,10 @@ export class AssistantRuntime {
     if (unresolved) return {};
     this.beginTerminalizing(turnId);
     this.operations.markAttemptOperationsUncertain(String(attempt.id));
-    const result = status === "completed"
+    const missingChatFinal = status === "completed" && this.triggerKind(attempt) === "chat" && !text;
+    const result = status === "completed" && !missingChatFinal
       ? this.completeAttempt(attempt, text)
-      : this.failAttemptGroup(attempt, error ?? status);
+      : this.failAttemptGroup(attempt, error ?? (missingChatFinal ? "assistant turn completed without a final response" : status));
     if (this.active?.attemptId === String(attempt.id)) this.active = undefined;
     return result;
   }

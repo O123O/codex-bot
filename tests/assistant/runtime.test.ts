@@ -59,6 +59,21 @@ test("terminalization rolls back attempt and source state if final delivery prep
   assert.equal((db.prepare("SELECT state FROM source_contexts WHERE id = 'ctx-atomic'").get() as any).state, "active");
 });
 
+test("a completed chat without final text is restored instead of silently dropped", () => {
+  const db = createTestDatabase();
+  const operations = new OperationStore(db);
+  const deliveries = new DeliveryStore(db);
+  operations.createSourceContext({ id: "ctx-empty", kind: "telegram", sourceId: "empty", rawText: "question", attachmentIds: [], binding });
+  const runtime = new AssistantRuntime(db, operations, deliveries, { binding });
+  runtime.beginUserAttempt("ctx-empty", "attempt-empty", "turn-empty");
+
+  runtime.handleTerminal("turn-empty", "completed");
+
+  assert.equal((db.prepare("SELECT state FROM assistant_attempts WHERE id = 'attempt-empty'").get() as any).state, "failed");
+  assert.equal((db.prepare("SELECT state FROM source_contexts WHERE id = 'ctx-empty'").get() as any).state, "pending");
+  assert.deepEqual(deliveries.listReady(), []);
+});
+
 test("failed-attempt terminalization rolls back if recovery creation fails", () => {
   const db = createTestDatabase();
   const operations = new OperationStore(db);
@@ -82,8 +97,8 @@ test("source attachment retention is released exactly once at terminalization", 
   operations.createSourceContext({ id: "ctx-file", kind: "telegram", sourceId: "file", rawText: "", attachmentIds: ["file-one"], binding });
   const runtime = new AssistantRuntime(db, operations, new DeliveryStore(db), { binding });
   runtime.beginUserAttempt("ctx-file", "attempt-file", "turn-file");
-  runtime.handleTerminal("turn-file");
-  runtime.handleTerminal("turn-file");
+  runtime.handleTerminal("turn-file", "answer");
+  runtime.handleTerminal("turn-file", "answer");
   assert.equal((db.prepare("SELECT ref_count FROM attachments WHERE id = 'file-one'").get() as any).ref_count, 0);
 });
 
@@ -230,6 +245,14 @@ test("effect-free multi-source failure restores every source without releasing a
   assert.equal(db.prepare("SELECT ref_count FROM attachments WHERE id = 'file-one'").get()!.ref_count, 1);
 });
 
+test("a completed multi-source chat without final text restores every source", () => {
+  const { db, conversations, runtime } = multiSourceAttempt();
+  runtime.handleTerminal("turn", "completed");
+  assert.deepEqual((db.prepare("SELECT state FROM source_contexts ORDER BY id").all() as any[]).map((row) => row.state), ["pending", "pending"]);
+  assert.deepEqual((db.prepare("SELECT state FROM assistant_attempt_sources ORDER BY source_ordinal").all() as any[]).map((row) => row.state), ["failed", "failed"]);
+  assert.equal(conversations.lease(), undefined);
+});
+
 test("effectful multi-source failure creates one inherited-route recovery and supersedes the group", () => {
   const { db, operations, lease, runtime } = multiSourceAttempt();
   const operation = operations.prepare({ contextId: "two", attemptId: lease.attemptId, callId: "send", kind: "send_chat_message", args: {}, effectClass: "side_effecting", toolFence: 0 });
@@ -239,6 +262,32 @@ test("effectful multi-source failure creates one inherited-route recovery and su
   assert.equal(db.prepare("SELECT COUNT(*) AS n FROM source_contexts WHERE kind = 'recovery'").get()!.n, 1);
   assert.deepEqual((db.prepare("SELECT state FROM source_contexts WHERE id IN ('one','two') ORDER BY id").all() as any[]).map((row) => row.state), ["superseded", "superseded"]);
   assert.equal(db.prepare("SELECT conversation_key FROM source_contexts WHERE id = ?").get(result.recoveryContextId!)!.conversation_key, binding.conversationKey);
+});
+
+test("a completed chat without final text preserves effect receipts in one recovery context", () => {
+  const { db, operations, lease, runtime } = multiSourceAttempt();
+  const operation = operations.prepare({ contextId: "two", attemptId: lease.attemptId, callId: "send-empty", kind: "send_chat_message", args: {}, effectClass: "side_effecting", toolFence: 0 });
+  operations.succeed(operation.id, { messageId: "delivered" });
+  const result = runtime.handleTerminal("turn", "completed");
+  assert.ok(result.recoveryContextId);
+  assert.deepEqual((db.prepare("SELECT state FROM source_contexts WHERE id IN ('one','two') ORDER BY id").all() as any[]).map((row) => row.state), ["superseded", "superseded"]);
+  const recovery = db.prepare("SELECT raw_text FROM source_contexts WHERE id = ?").get(result.recoveryContextId!) as { raw_text: string };
+  assert.deepEqual(JSON.parse(recovery.raw_text), [{ operationId: operation.id, state: "succeeded", receipt: { messageId: "delivered" }, error: "assistant turn completed without a final response" }]);
+});
+
+test("a completed internal attempt does not require final text", () => {
+  const db = createTestDatabase();
+  const operations = new OperationStore(db);
+  const deliveries = new DeliveryStore(db);
+  const conversations = new ConversationStore(db, deliveries);
+  conversations.createInternalSource({ id: "internal-empty", kind: "event_batch", sourceId: "internal-empty", rawText: "", attachmentIds: [], receivedAt: 1 });
+  const lease = conversations.acquireLease({ kind: "internal", contextId: "internal-empty" }, "claim-internal-empty");
+  conversations.reserveStart("internal-empty");
+  conversations.markSubmitted(lease.attemptId, "internal-empty", "internal-empty-turn");
+  const runtime = new AssistantRuntime(db, operations, deliveries, { binding });
+  runtime.handleTerminal("internal-empty-turn", "completed");
+  assert.equal(db.prepare("SELECT state FROM source_contexts WHERE id = 'internal-empty'").get()!.state, "completed");
+  assert.deepEqual(deliveries.listReady(), []);
 });
 
 test("attempt effect classification is explicit and conservative", () => {

@@ -49,6 +49,7 @@ import {
   reportAssistantTerminalFailure,
   reportOperationalSafely,
   requestOperationRecoveryForAttempt,
+  resolveAssistantTerminalTurn,
   settleAssistantTerminalTools,
   startupProjectEndpointReferences,
   runOperationRecoveryTarget,
@@ -2256,6 +2257,46 @@ test("assistant terminal tool settlement restarts on timeout and reconciles only
     requestRestartOnce: () => { settled.push("restart"); },
   }), true);
   assert.deepEqual(settled, ["fence", "operations"]);
+});
+
+test("a full assistant completion is authoritative without a history read", async () => {
+  const notification = {
+    id: "turn",
+    status: "completed",
+    itemsView: "full",
+    items: [{ type: "agentMessage", id: "final", text: "answer", phase: "final_answer" }],
+  };
+  let reads = 0;
+
+  const resolved = await resolveAssistantTerminalTurn(notification, async () => {
+    reads += 1;
+    return [{ id: "turn", status: "completed", itemsView: "full", items: [] }];
+  });
+
+  assert.equal(resolved, notification);
+  assert.equal(reads, 0);
+});
+
+test("only a full exact history turn can enrich a partial assistant completion", async () => {
+  const notification = { id: "turn", status: "completed", itemsView: "summary", items: [] };
+  const full = {
+    id: "turn",
+    status: "completed",
+    itemsView: "full",
+    items: [{ type: "agentMessage", id: "final", text: "answer", phase: "final_answer" }],
+  };
+  assert.equal(await resolveAssistantTerminalTurn(notification, async () => [full]), full);
+
+  const degraded = { id: "turn", status: "completed", itemsView: "full", items: [] };
+  const richerNotification = { ...notification, items: [{ type: "agentMessage", id: "partial", text: "kept", phase: "final_answer" }] };
+  assert.equal(await resolveAssistantTerminalTurn(
+    richerNotification,
+    async () => [degraded],
+  ), richerNotification);
+  assert.equal(await resolveAssistantTerminalTurn(notification, async () => [
+    { id: "other", status: "completed", itemsView: "full", items: full.items },
+  ]), notification);
+  assert.equal(await resolveAssistantTerminalTurn(notification, async () => { throw new Error("history unavailable"); }), notification);
 });
 
 test("assistant uncertainty is preserved even while the endpoint still reports ready", () => {

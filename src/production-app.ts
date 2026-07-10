@@ -130,6 +130,33 @@ export function reportAssistantTerminalFailure(
   finally { dispatcher?.requestRecovery(); }
 }
 
+type AssistantTerminalTurn = {
+  id: string;
+  status: string;
+  itemsView: string;
+  items: Array<Record<string, unknown>>;
+  [key: string]: unknown;
+};
+
+export async function resolveAssistantTerminalTurn<T extends AssistantTerminalTurn>(
+  notification: T,
+  readTurns: () => Promise<T[]>,
+): Promise<T> {
+  if (notification.itemsView === "full") return notification;
+  let turns: T[];
+  try { turns = await readTurns(); }
+  catch { return notification; }
+  const candidate = turns.find((turn) => turn.id === notification.id);
+  if (!candidate || candidate.itemsView !== "full" || candidate.status !== notification.status) return notification;
+  const retainsNotification = notification.items.every((item) => {
+    const id = item.id;
+    if (typeof id !== "string") return false;
+    const match = candidate.items.find((value) => value.id === id);
+    return !!match && Object.entries(item).every(([key, value]) => isDeepStrictEqual(match[key], value));
+  });
+  return retainsNotification ? candidate : notification;
+}
+
 export function createAttachmentCleanupOwner(
   cleanup: () => Promise<number>,
   report: OperationalEventSink,
@@ -3218,8 +3245,10 @@ export async function buildProductionApp(
       requestRestartOnce,
     });
     if (!settled) return;
-    const history = await pool.request<any>(identity.endpoint, "thread/read", { threadId: identity.thread_id, includeTurns: true });
-    const turn = history.thread.turns.find((candidate: any) => candidate.id === params.turn.id) ?? params.turn;
+    const turn = await resolveAssistantTerminalTurn(params.turn, async () => {
+      const history = await pool.request<any>(identity.endpoint, "thread/read", { threadId: identity.thread_id, includeTurns: true });
+      return history.thread.turns ?? [];
+    });
     const messages = finals.persistTerminalTurn(identity.endpoint, identity.thread_id, turn, Date.now());
     const memberIds = conversations.membersForAttempt(attemptBefore.attemptId).map((member) => member.contextId);
     assistant.handleTerminal(
