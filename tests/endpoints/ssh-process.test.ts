@@ -33,19 +33,20 @@ test("hard timeout closes inherited output pipes after the direct child exits", 
   const writer = [
     "const fs = require('node:fs');",
     `process.stdout.on('error', () => { fs.writeFileSync(${JSON.stringify(marker)}, 'closed'); process.exit(0); });`,
-    "setTimeout(() => process.stdout.write('late'), 2200);",
+    "process.send('ready');",
+    "setTimeout(() => process.stdout.write('late'), 3200);",
   ].join("\n");
   const parent = [
     "const { spawn } = require('node:child_process');",
-    `const child = spawn(process.execPath, ['-e', ${JSON.stringify(writer)}], { stdio: ['ignore', 1, 2] });`,
-    "child.unref();",
+    `const child = spawn(process.execPath, ['-e', ${JSON.stringify(writer)}], { stdio: ['ignore', 1, 2, 'ipc'] });`,
+    "child.once('message', () => process.exit(0));",
   ].join("\n");
 
   await assert.rejects(
-    runBoundedProcess(process.execPath, ["-e", parent], { timeoutMs: 25, maxOutputBytes: 64 }),
+    runBoundedProcess(process.execPath, ["-e", parent], { timeoutMs: 1_000, maxOutputBytes: 64 }),
     /timed out/u,
   );
-  for (let attempt = 0; attempt < 20; attempt += 1) {
+  for (let attempt = 0; attempt < 80; attempt += 1) {
     try { assert.equal(await readFile(marker, "utf8"), "closed"); return; }
     catch { await new Promise((resolve) => setTimeout(resolve, 25)); }
   }
