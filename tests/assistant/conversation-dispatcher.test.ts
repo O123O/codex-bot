@@ -24,6 +24,7 @@ import { AssistantRuntime } from "../../src/assistant/runtime.ts";
 import { AssistantCompletedItems, parseAssistantLifecycleNotification } from "../../src/assistant/lifecycle-buffer.ts";
 import { OperationStore } from "../../src/storage/operation-store.ts";
 import { commitAssistantTerminalFinals } from "../../src/production-app.ts";
+import { FinalMessageStore } from "../../src/sessions/final-messages.ts";
 
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -733,6 +734,59 @@ test("terminal notification resumes after a late nonsteerable response restores 
   assert.deepEqual({ phase: store.lease()?.phase, reason: store.lease()?.pauseReason }, { phase: "terminalizing", reason: "terminalizing" });
   assert.deepEqual(deferred, ["turn-1"]);
   await dispatcher.stop();
+});
+
+test("an empty completion after an admitted steer restores both chat sources", async () => {
+  const db = createTestDatabase();
+  const deliveries = new DeliveryStore(db);
+  const store = new ConversationStore(db, deliveries);
+  const endpoint: AppServerEndpoint = { id: "assistant-local", state: "ready", request: async () => { throw new Error("unused"); } };
+  const pool = new AppServerPool([endpoint], { maxConcurrentTurns: 1 });
+  const runner = new FakeRunner();
+  const runtime = new AssistantRuntime(db, new OperationStore(db), deliveries, { binding: route("chat-1") });
+  const finals = new FinalMessageStore(db);
+  let deferredTerminal: Promise<void> | undefined;
+  const dispatcher = new ConversationDispatcher(store, pool, runner, {
+    endpointId: "assistant-local",
+    threadId: "assistant",
+    runtimeObserver: runtime,
+    onDeferredTerminal: (turn) => {
+      deferredTerminal = commitAssistantTerminalFinals(
+        { ...turn, items: turn.items.map((item) => ({ ...item })) as Array<Record<string, unknown>> },
+        new AssistantCompletedItems(),
+        async () => [{ ...turn, itemsView: "full" as const, items: [] }],
+        (resolved) => {
+          const messages = finals.persistTerminalTurn("assistant-local", "assistant", {
+            ...resolved,
+            completedAt: null,
+            items: resolved.items as Array<{ type: string; id: string; text?: string; phase?: string | null }>,
+          }, 10);
+          runtime.handleTerminal(resolved.id, "completed", messages.map((message) => message.body).join("\n") || undefined);
+        },
+      );
+    },
+  });
+
+  await dispatcher.accept(chat("first"));
+  runner.starts[0]!.result.resolve({ turn: { id: "turn-empty", status: "inProgress", itemsView: "full", items: [] } });
+  await dispatcher.idle();
+  await dispatcher.accept(chat("follow-up"));
+  await dispatcher.terminal({ id: "turn-empty", status: "completed", itemsView: "full", items: [] });
+  runner.steers[0]!.result.resolve({ turnId: "turn-empty" });
+  await waitFor(() => deferredTerminal !== undefined);
+  await deferredTerminal;
+
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM assistant_attempts WHERE state = 'failed'").get()!.n, 1);
+  assert.deepEqual(
+    db.prepare("SELECT state FROM assistant_attempt_sources WHERE attempt_id = (SELECT id FROM assistant_attempts WHERE turn_id = 'turn-empty') ORDER BY source_ordinal").all().map((row) => row.state),
+    ["failed", "failed"],
+  );
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM source_contexts WHERE state = 'completed'").get()!.n, 0);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM logical_final_messages").get()!.n, 0);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM deliveries WHERE kind = 'assistant_final'").get()!.n, 0);
+  const stopping = dispatcher.stop();
+  runner.starts[1]?.result.reject(new Error("stopped"));
+  await stopping;
 });
 
 test("a correlated started notification consumes a matching buffered early completion", async () => {
