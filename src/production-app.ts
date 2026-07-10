@@ -11,6 +11,8 @@ import { ChatAdapterRegistry } from "./chat-apps/shared/adapter-registry.ts";
 import { OwnerRouteCatalog, OwnerRouteStore } from "./chat-apps/shared/owner-route-store.ts";
 import type { ChatHistoryRequest } from "./chat-apps/shared/contracts.ts";
 import { DeliveryWorker } from "./chat-apps/shared/delivery-worker.ts";
+import type { ChatAppDeps } from "./chat-apps/shared/plugin.ts";
+import { CHAT_APPS } from "./chat-apps/registry.ts";
 import {
   chatAttachmentDeliveryId,
   chatAttachmentFileHandle,
@@ -78,7 +80,6 @@ import { finalizeConversationCutover, preflightConversationCutover, runConversat
 import { OperationStore, type RecoverableOperation } from "./storage/operation-store.ts";
 import { RuntimeStore } from "./storage/runtime-store.ts";
 import { SessionDashboardStore } from "./storage/session-dashboard-store.ts";
-import { TelegramChatAdapter } from "./chat-apps/telegram/chat-adapter.ts";
 import type { SlackContextService } from "./chat-apps/slack/context-service.ts";
 import { SlackChatAdapter } from "./chat-apps/slack/chat-adapter.ts";
 import type { WeixinCredentialHandle } from "./chat-apps/weixin/credential-store.ts";
@@ -2060,13 +2061,22 @@ export async function buildProductionApp(
       start: async () => {
         conversations = new ConversationStore(db, deliveries, attachments);
         const configured: ChatAdapter[] = options.chatAdapters ? [...options.chatAdapters] : [];
-        if (!options.chatAdapters && telegramConfig) configured.push(new TelegramChatAdapter(db, attachments, {
-            token: telegramConfig.token,
-            ownerId: telegramConfig.ownerId,
-            maxMessageBytes: config.attachmentMaxBytes,
-            onMessage: (source, commitNativeCheckpoint) => acceptChat(source, { commitNativeCheckpoint }),
+        const readyHooks: Array<() => Promise<void> | void> = [];
+        if (!options.chatAdapters) {
+          const appDeps: ChatAppDeps = {
+            db, attachments, conversations, deliveries,
+            onMessage: acceptChat,
             onOperationalEvent: report,
-          }));
+            maxMessageBytes: config.attachmentMaxBytes,
+          };
+          for (const app of CHAT_APPS) {
+            const appConfig = (config.chat as unknown as Record<string, unknown>)[app.id];
+            if (appConfig === undefined) continue;
+            const instance = app.create(appDeps, appConfig);
+            configured.push(instance.adapter);
+            if (instance.onAllReady) readyHooks.push(() => instance.onAllReady!());
+          }
+        }
         let slack: SlackChatAdapter | undefined;
         if (!options.chatAdapters && config.chat.slack) {
           slack = new SlackChatAdapter(db, attachments, conversations, deliveries, {
@@ -2162,6 +2172,7 @@ export async function buildProductionApp(
           config.chat.primary,
         );
         await weixinIncidents?.reconcileUnwarned();
+        for (const hook of readyHooks) await hook();
         chatRegistry = new ChatAdapterRegistry(chats);
         slackContextService = slack?.context;
         queueStartupWarnings();
@@ -4069,7 +4080,7 @@ async function shutdownAdapter(adapter: ChatAdapter): Promise<void> {
 
 function adapterPrimaryBinding(adapter: ChatAdapter | undefined, expectedId: string): ConversationBinding | undefined {
   if (!adapter) return undefined;
-  const binding = (adapter as ChatAdapter & { primaryBinding?: ConversationBinding }).primaryBinding;
+  const binding = adapter.primaryBinding;
   if (!binding || binding.adapterId !== expectedId) throw new AppError("CONFIGURATION_ERROR", `${expectedId} primary binding is unavailable`);
   return binding;
 }

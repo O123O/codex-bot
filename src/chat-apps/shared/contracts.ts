@@ -45,6 +45,8 @@ export interface ChatAdapterCapabilities {
 }
 
 export interface ChatAdapter extends ChatAdapterCapabilities {
+  /** The owner/administrative binding for this adapter, once known (e.g. after `initialize`). */
+  readonly primaryBinding?: ConversationBinding | undefined;
   initialize(): Promise<void>;
   start(): void | Promise<void>;
   stop(): Promise<void>;
