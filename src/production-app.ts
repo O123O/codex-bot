@@ -41,7 +41,6 @@ import { AssistantRuntime } from "./assistant/runtime.ts";
 import { AssistantScheduler } from "./assistant/scheduler.ts";
 import { ConversationDispatcher, type AssistantTurnPort } from "./assistant/conversation-dispatcher.ts";
 import {
-  AssistantCompletedItems,
   AssistantLifecycleBuffer,
   parseAssistantLifecycleNotification,
   type AssistantTurnLifecycleNotification,
@@ -142,20 +141,15 @@ type AssistantTerminalTurn = {
 export async function resolveAssistantTerminalTurn<T extends AssistantTerminalTurn>(
   notification: T,
   readTurns: () => Promise<T[]>,
-  liveFinalItems: readonly Record<string, unknown>[] = [],
 ): Promise<T> {
   if (notification.itemsView === "full") return notification;
-  if (liveFinalItems.length > 0) {
-    return {
-      ...notification,
-      items: [...notification.items.filter((item) => !isAssistantFinalCandidate(item)), ...liveFinalItems],
-    };
-  }
   let turns: T[];
   try { turns = await readTurns(); }
   catch { return notification; }
   const candidate = turns.find((turn) => turn.id === notification.id);
   if (!candidate || candidate.itemsView !== "full" || candidate.status !== notification.status) return notification;
+  // Only adopt the history turn when it still contains everything the notification observed;
+  // a divergent/empty "full" read must not drop a final the notification already captured.
   const retainsNotification = notification.items.every((item) => {
     const id = item.id;
     if (typeof id !== "string") return false;
@@ -167,18 +161,11 @@ export async function resolveAssistantTerminalTurn<T extends AssistantTerminalTu
 
 export async function commitAssistantTerminalFinals<T extends AssistantTerminalTurn>(
   notification: T,
-  completedItems: AssistantCompletedItems,
   readTurns: () => Promise<T[]>,
   commit: (turn: T) => void | Promise<void>,
 ): Promise<void> {
-  const turn = await resolveAssistantTerminalTurn(notification, readTurns, completedItems.peek(notification.id));
+  const turn = await resolveAssistantTerminalTurn(notification, readTurns);
   await commit(turn);
-  completedItems.discard(notification.id);
-}
-
-function isAssistantFinalCandidate(item: Record<string, unknown>): boolean {
-  return item.type === "agentMessage" && typeof item.text === "string" && !!item.text
-    && (item.phase === "final_answer" || item.phase == null);
 }
 
 export function createAttachmentCleanupOwner(
@@ -1838,7 +1825,6 @@ export async function buildProductionApp(
   const reconnectAttempts = new Map<string, number>();
   const terminalProcessing = new Map<string, Promise<void>>();
   const assistantLifecycleBuffer = new AssistantLifecycleBuffer();
-  const assistantCompletedItems = new AssistantCompletedItems();
   const assistantToolReadiness = new ToolReadinessGate();
   const endpointRecoveryIncidents = new EndpointRecoveryIncidents();
   let stopping = false;
@@ -2671,7 +2657,6 @@ export async function buildProductionApp(
     }).finally(() => {
       dispatcherAvailable = false;
       assistantLifecycleBuffer.clear();
-      assistantCompletedItems.clear();
     });
     return recoveryOwnersStop;
   }
@@ -3220,10 +3205,6 @@ export async function buildProductionApp(
     const identity = registry.snapshot().assistant;
     const assistantLifecycle = parseAssistantLifecycleNotification(method, params);
     if (assistantLifecycle && endpointId === identity.endpoint && assistantLifecycle.params.threadId === identity.thread_id) {
-      if (assistantLifecycle.method === "item/completed") {
-        assistantCompletedItems.record(assistantLifecycle);
-        return;
-      }
       await assistantLifecycleBuffer.accept(assistantLifecycle, handleAssistantLifecycleNotification);
       return;
     }
@@ -3277,7 +3258,7 @@ export async function buildProductionApp(
     });
     if (!settled) return;
     const memberIds = conversations.membersForAttempt(attemptBefore.attemptId).map((member) => member.contextId);
-    await commitAssistantTerminalFinals(params.turn, assistantCompletedItems, async () => {
+    await commitAssistantTerminalFinals(params.turn, async () => {
       const history = await pool.request<any>(identity.endpoint, "thread/read", { threadId: identity.thread_id, includeTurns: true });
       return history.thread.turns ?? [];
     }, (resolved) => {

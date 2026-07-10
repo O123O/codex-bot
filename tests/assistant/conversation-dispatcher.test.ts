@@ -21,7 +21,6 @@ import { ConversationStore } from "../../src/storage/conversation-store.ts";
 import { DeliveryStore } from "../../src/storage/delivery-store.ts";
 import { AssistantScheduler } from "../../src/assistant/scheduler.ts";
 import { AssistantRuntime } from "../../src/assistant/runtime.ts";
-import { AssistantCompletedItems, parseAssistantLifecycleNotification } from "../../src/assistant/lifecycle-buffer.ts";
 import { OperationStore } from "../../src/storage/operation-store.ts";
 import { commitAssistantTerminalFinals } from "../../src/production-app.ts";
 import { FinalMessageStore } from "../../src/sessions/final-messages.ts";
@@ -178,17 +177,7 @@ test("turn/started remains authoritative when the pending start response rejects
 
 test("a correlated completion waits for the authoritative start response before terminalizing", async () => {
   const deferred: string[] = [];
-  const completedItems = new AssistantCompletedItems();
-  const completed = parseAssistantLifecycleNotification("item/completed", {
-    threadId: "assistant", turnId: "turn-a",
-    item: { type: "agentMessage", id: "current-final", text: "current answer", phase: "final_answer" },
-    completedAtMs: 10,
-  });
-  assert.equal(completed?.method, "item/completed");
-  if (completed?.method !== "item/completed") return;
-  completedItems.record(completed);
   let deferredCommit: Promise<unknown> | undefined;
-  let delivered = "";
   const { store, pool, runner, dispatcher } = fixture(1, { onDeferredTerminal: (turn) => {
     deferred.push(turn.id);
     const terminal = {
@@ -199,12 +188,11 @@ test("a correlated completion waits for the authoritative start response before 
     };
     deferredCommit = commitAssistantTerminalFinals(
       terminal,
-      completedItems,
       async () => [{
         ...terminal, itemsView: "full" as const,
         items: [{ type: "agentMessage", id: "old-final", text: "old answer", phase: "final_answer" }],
       }],
-      (resolved) => { delivered = String(resolved.items.find((item) => item.type === "agentMessage")?.text); },
+      () => undefined,
     );
   } });
   const markedTerminal: string[] = [];
@@ -227,8 +215,6 @@ test("a correlated completion waits for the authoritative start response before 
   assert.deepEqual(deferred, ["turn-a"]);
   assert.deepEqual(markedTerminal, ["turn-a"]);
   await deferredCommit;
-  assert.equal(delivered, "current answer");
-  assert.deepEqual(completedItems.peek("turn-a"), []);
   await dispatcher.stop();
 });
 
@@ -753,7 +739,6 @@ test("an empty completion after an admitted steer restores both chat sources", a
     onDeferredTerminal: (turn) => {
       deferredTerminal = commitAssistantTerminalFinals(
         { ...turn, items: turn.items.map((item) => ({ ...item })) as Array<Record<string, unknown>> },
-        new AssistantCompletedItems(),
         async () => [{ ...turn, itemsView: "full" as const, items: [] }],
         (resolved) => {
           const messages = finals.persistTerminalTurn("assistant-local", "assistant", {

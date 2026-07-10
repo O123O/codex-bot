@@ -44,13 +44,15 @@ test("nullable completion time is observed once and reused across replay", () =>
   assert.equal(replay[0]?.completedAt, 500);
 });
 
-test("an identical native final cannot be rebound while same-id changed content remains deliverable", () => {
+test("a repeated final under a new turn is persisted; only same turn+item is idempotent", () => {
   const store = new FinalMessageStore(createTestDatabase());
   const first = store.persistTerminalTurn("local", "thread", turn({
     id: "turn-old",
     items: [{ type: "agentMessage", id: "shared", text: "old answer", phase: "final_answer" }],
   }), 1);
-  const rebound = store.persistTerminalTurn("local", "thread", turn({
+  // Same item id and body but a different turn is a distinct logical final and must not be dropped;
+  // idempotency is provided solely by the deterministic per-turn primary key + INSERT OR IGNORE.
+  const repeated = store.persistTerminalTurn("local", "thread", turn({
     id: "turn-new",
     items: [{ type: "agentMessage", id: "shared", text: "old answer", phase: "final_answer" }],
   }), 2);
@@ -59,9 +61,16 @@ test("an identical native final cannot be rebound while same-id changed content 
     items: [{ type: "agentMessage", id: "shared", text: "new answer", phase: "final_answer" }],
   }), 3);
 
-  assert.equal(first.length, 1);
-  assert.deepEqual(rebound, []);
+  assert.deepEqual(first.map((message) => message.body), ["old answer"]);
+  assert.deepEqual(repeated.map((message) => ({ turnId: message.turnId, body: message.body })), [{ turnId: "turn-new", body: "old answer" }]);
   assert.deepEqual(changed.map((message) => message.body), ["new answer"]);
+  // Re-persisting the same turn+item is idempotent via the primary key: no new row is created.
+  const replay = store.persistTerminalTurn("local", "thread", turn({
+    id: "turn-old",
+    items: [{ type: "agentMessage", id: "shared", text: "old answer", phase: "final_answer" }],
+  }), 4);
+  assert.deepEqual(replay.map((message) => ({ turnId: message.turnId, body: message.body })), [{ turnId: "turn-old", body: "old answer" }]);
+  assert.equal(store.list("local", "thread", 20).length, 3);
 });
 
 test("failed and interrupted terminal turns retain eligible text and successful no-message turns remain empty", () => {
