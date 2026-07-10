@@ -573,6 +573,15 @@ export function isMissingUnmaterializedThread(error: unknown, threadId: string):
     && error.details.threadId === threadId;
 }
 
+// reconcileManaged's create-completion durability gate drops the phantom mapping and throws
+// THREAD_NOT_FOUND with recovery "pathless_thread_lost"; "thread_not_durable" is accepted
+// defensively so any future non-durable signal on this path fails the create with no effect.
+function isRecoveredThreadNotDurable(error: unknown): boolean {
+  return error instanceof AppError
+    && error.code === "THREAD_NOT_FOUND"
+    && (error.details?.recovery === "pathless_thread_lost" || error.details?.recovery === "thread_not_durable");
+}
+
 export function runOperationRecoveryTarget<T>(
   target: OperationRecoveryTarget,
   endpoints: Pick<EndpointManager, "withReadyWorkLease">,
@@ -3502,9 +3511,25 @@ export async function buildProductionApp(
           if (session?.lifecycle_state === "managed" && session.mapping_id === checkpoint?.mappingId && session.endpoint === recoveryEndpointId
             && (!expectedThread || session.thread_id === expectedThread) && (!expectedDir || session.project_dir === expectedDir)) {
             const state = runtime.getSession(session.endpoint, session.thread_id, session.mapping_id);
-            const native = state?.managementState !== "managed" || !runtime.currentEpoch(session.endpoint, session.thread_id, session.mapping_id)
-              ? await lifecycle.reconcileManaged(args.nickname, session, lease)
-              : await pool.request<any>(session.endpoint, "thread/read", { threadId: session.thread_id, includeTurns: false }, undefined, lease);
+            const needsReconcile = state?.managementState !== "managed" || !runtime.currentEpoch(session.endpoint, session.thread_id, session.mapping_id);
+            let native: any;
+            if (needsReconcile) {
+              try {
+                native = await lifecycle.reconcileManaged(args.nickname, session, lease, undefined,
+                  operation.kind === "create_session" ? { requireDurableRollout: true } : undefined);
+              } catch (error) {
+                // A create whose worker thread never durably materialized is unrecoverable;
+                // reconcileManaged has already removed the phantom mapping, so fail with no effect
+                // instead of blessing it as managed (mirrors the adopt-branch gate above).
+                if (operation.kind === "create_session" && isRecoveredThreadNotDurable(error)) {
+                  failRecoveredNoEffect(operation.id, "allocated worker thread was lost before its rollout materialized");
+                  return;
+                }
+                throw error;
+              }
+            } else {
+              native = await pool.request<any>(session.endpoint, "thread/read", { threadId: session.thread_id, includeTurns: false }, undefined, lease);
+            }
             await verifySessionCwd(session.endpoint, native.thread.cwd, session.project_dir, lease);
             hydrateThreadOrder(session.endpoint, native.thread);
             await succeedRecovered(operation, { nickname: args.nickname, mapping_id: session.mapping_id }, () => {

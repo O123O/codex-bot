@@ -165,6 +165,24 @@ test("a complete task start without its user record remains unclassified", async
   assert.equal(runtime.getSession(identity.endpoint, identity.thread_id, identity.mapping_id)?.managementState, "managed");
 });
 
+test("materialization-required inspection reports a never-written rollout as lost", async () => {
+  const root = await mkdtemp(join(tmpdir(), "qiyan-rollout-"));
+  const path = join(root, "rollout-thread-nodurable.jsonl");
+  const db = createTestDatabase();
+  const runtime = new RuntimeStore(db);
+  const identity = { endpoint: "local", thread_id: "thread-nodurable", mapping_id: "mapping-nodurable" };
+  const guard = new SessionOwnershipGuard(db, runtime, new OperationStore(db), {
+    scan: async () => assert.fail("a missing rollout must not be scanned as materialized"),
+    scanUnmaterialized: async () => ({ state: "missing" as const }),
+  });
+  guard.recordUnmaterialized(identity, path);
+
+  // Default inspection treats an unmaterialized (in-flight) rollout as still owned...
+  assert.deepEqual(await guard.inspect(identity), { state: "owned" });
+  // ...but the create-completion durability gate must classify a never-written rollout as lost.
+  assert.deepEqual(await guard.inspect(identity, undefined, { requireMaterialized: true }), { state: "lost" });
+});
+
 test("an ownerless autonomous turn is owned only while QiYan controls the goal", async () => {
   const root = await mkdtemp(join(tmpdir(), "qiyan-rollout-"));
   const path = join(root, "rollout-thread-goal.jsonl");

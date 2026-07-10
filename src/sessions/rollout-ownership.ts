@@ -200,14 +200,15 @@ export class SessionOwnershipGuard {
     if (external) throw externalTurn(identity.thread_id);
   }
 
-  async inspect(identity: MappingIdentity, lease?: EndpointWorkLease): Promise<OwnershipInspection> {
-    return this.inspectCurrent(identity, lease, false);
+  async inspect(identity: MappingIdentity, lease?: EndpointWorkLease, options?: { requireMaterialized?: boolean }): Promise<OwnershipInspection> {
+    return this.inspectCurrent(identity, lease, false, options?.requireMaterialized ?? false);
   }
 
   private async inspectCurrent(
     identity: MappingIdentity,
     lease: EndpointWorkLease | undefined,
     requireClassifiedTurn: boolean,
+    requireMaterialized = false,
   ): Promise<OwnershipInspection> {
     let existing = this.row(identity);
     if (!existing) throw ownershipUnclassified("session ownership guard is not initialized");
@@ -228,6 +229,10 @@ export class SessionOwnershipGuard {
       })
       : await this.scanUnmaterialized(identity, rolloutPath, lease);
     if (materialization.state === "missing") {
+      // A rollout that was recorded but never durably written to disk is not recoverable after
+      // the endpoint forgets its in-memory thread. Create-completion recovery asks for this
+      // strict check so a never-materialized thread is dropped instead of blessed as owned.
+      if (requireMaterialized) return { state: "lost" };
       if (requireClassifiedTurn) throw ownershipUnclassified("pending rollout does not prove the native turns are owned");
       return { state: "owned" };
     }
@@ -261,10 +266,10 @@ export class SessionOwnershipGuard {
     return { state: "owned" };
   }
 
-  async inspectIfInitialized(identity: MappingIdentity, lease?: EndpointWorkLease): Promise<
+  async inspectIfInitialized(identity: MappingIdentity, lease?: EndpointWorkLease, options?: { requireMaterialized?: boolean }): Promise<
     { state: "uninitialized" } | OwnershipInspection
   > {
-    return this.row(identity) ? this.inspect(identity, lease) : { state: "uninitialized" };
+    return this.row(identity) ? this.inspect(identity, lease, options) : { state: "uninitialized" };
   }
 
   release(identity: MappingIdentity): void {

@@ -31,7 +31,7 @@ interface SessionOwnershipLifecycle {
     options?: { allowUnmaterialized?: boolean; authorizedTurnId?: string },
   ): Promise<void>;
   authorizeTurnIfInitialized?(identity: MappingIdentity, turnId: string): boolean;
-  inspectIfInitialized?(identity: MappingIdentity, lease?: EndpointWorkLease): Promise<
+  inspectIfInitialized?(identity: MappingIdentity, lease?: EndpointWorkLease, options?: { requireMaterialized?: boolean }): Promise<
     { state: "uninitialized" } | OwnershipInspection
   >;
   release(identity: MappingIdentity): void;
@@ -310,6 +310,7 @@ export class SessionLifecycle {
     expected: RegistrySession,
     existingLease?: EndpointWorkLease,
     canPublish: () => boolean = () => true,
+    options?: { requireDurableRollout?: boolean },
   ): Promise<ThreadResponse> {
     return this.withMutationLease(expected.endpoint, (lease) => this.gate.run(expected.endpoint, expected.thread_id, async () => {
       const assertCurrent = (): void => {
@@ -342,7 +343,8 @@ export class SessionLifecycle {
       if (ownershipPreparation?.authorizedTurnId) {
         this.ownership?.authorizeTurnIfInitialized?.(session, ownershipPreparation.authorizedTurnId);
       }
-      const guarded = await this.ownership?.inspectIfInitialized?.(session, lease);
+      const guarded = await this.ownership?.inspectIfInitialized?.(session, lease,
+        options?.requireDurableRollout ? { requireMaterialized: true } : undefined);
       assertCurrent();
       if (guarded?.state === "external") {
         throw new AppError("SESSION_BUSY", `thread ${session.thread_id} has an externally started turn`, { recovery: "external_turn" });
@@ -370,7 +372,7 @@ export class SessionLifecycle {
       }
       if (this.ownership) {
         await this.ownership.initialize(session, this.requireRolloutPath(before.thread), lease, {
-          allowUnmaterialized: before.thread.turns.length === 0,
+          allowUnmaterialized: options?.requireDurableRollout ? false : before.thread.turns.length === 0,
           ...(ownershipPreparation?.authorizedTurnId ? { authorizedTurnId: ownershipPreparation.authorizedTurnId } : {}),
         });
         assertCurrent();

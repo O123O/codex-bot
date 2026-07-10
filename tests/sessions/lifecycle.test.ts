@@ -92,7 +92,7 @@ async function fixture(ownership?: {
     lease?: EndpointWorkLease,
     options?: { allowUnmaterialized?: boolean; authorizedTurnId?: string },
   ): Promise<void>;
-  inspectIfInitialized?(identity: { endpoint: string; thread_id: string; mapping_id: string }): Promise<
+  inspectIfInitialized?(identity: { endpoint: string; thread_id: string; mapping_id: string }, lease?: EndpointWorkLease, options?: { requireMaterialized?: boolean }): Promise<
     { state: "uninitialized" | "owned" | "pending" | "lost" } | { state: "external" | "unclassified"; turnId: string }
   >;
   release(identity: { endpoint: string; thread_id: string; mapping_id: string }): void;
@@ -674,6 +674,56 @@ test("managed recovery restores a loaded empty thread without rollout resume", a
     ["thread/read", true],
     ["thread/read", false],
   ]);
+});
+
+test("create-completion recovery drops a managed mapping whose rollout never materialized", async () => {
+  const requireFlags: Array<boolean | undefined> = [];
+  const released: string[] = [];
+  const { dir, registry, endpoint, runtime, lifecycle } = await fixture({
+    initialize: async () => { assert.fail("a non-durable create must be dropped before ownership initialization"); },
+    inspectIfInitialized: async (_identity, _lease, options) => {
+      requireFlags.push(options?.requireMaterialized);
+      // The guard reports "lost" only under the materialization-required create-recovery check.
+      return options?.requireMaterialized ? { state: "lost" } : { state: "owned" };
+    },
+    release: (identity) => { released.push(identity.mapping_id); },
+  });
+  await registry.createManaged("payments", {
+    endpoint: "local", thread_id: "thread-1", project_dir: dir, mapping_id: "mapping-phantom",
+  });
+  endpoint.turns = [];
+  endpoint.unmaterialized = true;
+  endpoint.failResume = true;
+
+  await assert.rejects(
+    lifecycle.reconcileManaged("payments", required(registry), undefined, undefined, { requireDurableRollout: true }),
+    (error: unknown) => error instanceof AppError && error.code === "THREAD_NOT_FOUND",
+  );
+
+  assert.deepEqual(requireFlags, [true]);
+  assert.equal(registry.get("payments"), undefined, "the phantom mapping must be removed");
+  assert.deepEqual(released, ["mapping-phantom"]);
+  assert.equal(runtime.currentEpoch("local", "thread-1", "mapping-phantom"), undefined);
+});
+
+test("default managed recovery still restores an unmaterialized 0-turn thread", async () => {
+  const { dir, registry, runtime, endpoint, lifecycle } = await fixture({
+    initialize: async () => undefined,
+    inspectIfInitialized: async (_identity, _lease, options) => (options?.requireMaterialized ? { state: "lost" } : { state: "owned" }),
+    release: () => undefined,
+  });
+  await registry.createManaged("payments", {
+    endpoint: "local", thread_id: "thread-1", project_dir: dir, mapping_id: "mapping-live",
+  });
+  endpoint.turns = [];
+  endpoint.unmaterialized = true;
+  endpoint.failResume = true;
+
+  const recovered = await lifecycle.reconcileManaged("payments", required(registry));
+
+  assert.equal(recovered.thread.id, "thread-1");
+  assert.equal(registry.get("payments")?.lifecycle_state, "managed");
+  assert.equal(runtime.getSession("local", "thread-1", "mapping-live")?.managementState, "managed");
 });
 
 test("managed recovery validates native goal state before ownership after resuming an exact read-not-loaded mapping", async () => {
