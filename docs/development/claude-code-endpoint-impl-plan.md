@@ -7,8 +7,11 @@ findings. **Stop for review at each ⬛ checkpoint before proceeding.**
 Guiding invariants (from the design):
 - The only provider-aware code is the **adapter** (`ClaudeCodeRuntime`). Everything above `send_to_session`
   (lifecycle, relay, ownership, scheduling, steer, manager tools) is provider-blind.
-- Firing (schedule/monitor/cron/steer) = **call `send_to_session`**; one durable store + one firing path +
-  four trigger sources.
+- Scheduling (wakeup/cron/monitor) fires by **calling `send_to_session`**: one durable store + one firing path
+  + **three** trigger sources (timer / cron / condition-poll). **Steer is separate** — provider-specific, in
+  the adapter: Codex is native `turn/steer`; Claude *reuses the store* but fires via the adapter, not the
+  scheduling engine (§2.3). It is not a fourth scheduling trigger and Codex steer does not go through
+  `send_to_session`.
 - Everything QiYan owns is **durable + single-fire idempotent**; everything the session owns is the transcript.
 
 ---
@@ -52,6 +55,10 @@ unchanged. Test each unit against the real lifecycle/relay with a **faked** runt
   **Name the dispatch seam:** `RolloutAccessRouter` (`endpoints/rollout-access.ts`) today routes local-vs-ssh
   for the Codex scanner; add **provider dispatch** (Codex scanner vs Claude scanner) keyed by the
   endpoint/session provider. Reuse the ownership DB tables + `inspect`/`initialize` state machine unchanged.
+  **Remote implication:** for remote sessions the scan runs in the shipped `qiyan-ssh-helper.mjs`, which is
+  Codex-jsonl-aware — a remote *Claude* transcript needs either a Claude-aware helper or a raw-bytes-back-then-
+  parse-locally path. The 1.1 dispatch seam covers the local case; call out the remote-helper work so it isn't
+  discovered mid-Phase-1.
   *Verify:* unit tests over sample transcripts — materialized/unmaterialized/missing; owned-vs-external via the
   user-message marker.
 - **1.2 Event translator** (pure function): stream-json → Codex-shaped turn/item notifications; synthesize
@@ -126,21 +133,40 @@ One module, provider-blind, firing via `send_to_session`. Built once, tested aga
   (`production-app.ts:2218`, MCP token stripped). Sub-parts: (a) **worker auth model** + **per-session
   identity injection** (the tool must learn which worker called); (b) **remote reachability** — the tool logic
   runs in the LOCAL QiYan (store + engine live there); a remote worker reaches it by **reverse-forwarding the
-  loopback MCP over the session's own SSH** (`ssh -R <remoteport>:127.0.0.1:<mcpPort>`, added to the existing
-  ControlMaster via `-O forward`), so the remote `--mcp-config` targets `http://127.0.0.1:<remoteport>/mcp`.
-  Session transport stays forward-only (unchanged) and this adds NO inbound path to the local host — the
-  tunnel terminates at loopback on both ends. **The hard part is auth, not transport:** `LoopbackMcpServer`'s
-  `allowedClientProcess` peer-PID check (`mcp/server.ts:90`) CANNOT hold for a tunneled connection (the peer
-  is `sshd`, not the worker). Remote workers need a distinct auth mode — **bearer token as sole credential,
-  minted per-session, scoped to that worker's identity, peer-PID check relaxed ONLY for the forwarded
-  listener** (never for real loopback callers). This is a security-model decision — design it explicitly.
-  (stdio alternative rejected: a remote stdio MCP command would need remote→local SSH — wrong direction,
-  inbound creds the local host may not grant.)
+  loopback MCP over the session's own SSH** (`ssh -R <remoteport>:127.0.0.1:<mcpPort>`, added to the
+  QiYan-owned ControlMaster via `-O forward`), so the remote `--mcp-config` targets
+  `http://127.0.0.1:<remoteport>/mcp`. This is **provider-agnostic and keyed on local-vs-remote, NOT
+  Codex-vs-Claude** — a remote worker of *either* provider needs the tunnel (its `--mcp-config` is interpreted
+  on the remote host); a local worker of *either* provider hits loopback directly and needs nothing. Remote
+  Codex already rides a QiYan-owned master with `-O forward -L` to reach its daemon, so `-R` is the same
+  connection; this layer belongs to the endpoint's remote transport, not either adapter. Session transport
+  stays forward-only (unchanged) and this adds NO inbound path to the local host — the tunnel terminates at
+  loopback on both ends.
+  **The hard part is auth, and the right posture is bind-not-relax:** the connection that lands on the LOCAL
+  MCP port is opened by the **local ssh ControlMaster process QiYan itself spawned and owns** (sshd is on the
+  *remote* end) — so `allowedClientProcess` (`mcp/server.ts:90`, `requestBelongsToProcess` :210) still applies,
+  **re-pointed at the ControlMaster's identity** (ssh `RuntimeIdentity` carries pid/start-time; `/proc/<pid>/
+  fd` is readable since it's QiYan's child; the tunnel is IPv4 loopback so the inode match is clean). So:
+  **bearer token → which worker** (per-session scope; all workers on an endpoint share one master and are
+  peer-PID-indistinguishable), **peer-PID = owned ControlMaster → proves the call arrived through QiYan's
+  tunnel**, not from an arbitrary local process that merely obtained the token (keeps the deliberate
+  defense-in-depth; a leaked token alone is NOT sufficient). Use a **separate listener/port for tunneled
+  worker traffic**, ControlMaster-pid-bound; the assistant listener is unchanged. Three constraints to design
+  explicitly: **(i)** `-O forward` **throws `OPERATION_CONFLICT` on a user-owned master** (`ssh-config.ts:69`)
+  — so remote-worker scheduling requires a QiYan-owned master, else fall back to a dedicated QiYan-owned
+  forwarding channel; **(ii)** the remote port must be **stable for the session's life and byte-identical
+  across restart** (it's baked into the cache-prefix `--mcp-config`) — allocate a deterministic per-session
+  port with collision handling, re-established identically on recovery; **(iii)** the per-session token is
+  written to the remote `--mcp-config` on the remote worker's disk — it MUST be a worker-scoped token in a
+  **different namespace from the assistant's `QIYAN_BOT_MCP_TOKEN`** (which authorizes the full assistant
+  surface, `mcp/server.ts:283`). (stdio alternative rejected: a remote stdio MCP command would need
+  remote→local SSH — wrong direction, inbound creds the local host may not grant.)
   (c) attach via per-invocation `--mcp-config`, additive, byte-identical per turn; drop-in descriptions;
   writes to 2.1.
   *Verify:* a worker session (Codex and Claude, **local and remote**) calls each tool; it registers a row;
-  `list`/`cancel` work. Remote: the forwarded-listener auth accepts the scoped token and a real loopback
-  caller presenting that same token is still rejected by the peer-PID check.
+  `list`/`cancel` work. Remote: the tunneled-worker listener accepts the scoped token from a call whose peer
+  is the owned ControlMaster, and **rejects a non-tunneled local process that presents the same token** (peer
+  PID ≠ master). Restart: the remote port and `--mcp-config` are byte-identical before/after.
 - **2.5 Recovery**: on QiYan restart, reload the store + re-arm (timers recompute next-fire / fire missed
   one-shots per policy; monitors restart poll loops; steer queues reload; goal reloads).
   *Verify:* a `schedule_wakeup` set before a QiYan restart fires **exactly one** resumed turn after restart —
