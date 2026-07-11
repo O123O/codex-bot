@@ -188,3 +188,20 @@ test("remote Claude rollout scan fails loudly until the Claude-aware helper exis
     (error: unknown) => error instanceof AppError && error.code === "UNSUPPORTED_CAPABILITY",
   );
 });
+
+test("a Claude local scan retries on the shared concurrent-append sentinel", async () => {
+  let attempts = 0;
+  const stable = { cursor: { device: "1", inode: "2", offset: 5 }, starts: [] };
+  const router = new RolloutAccessRouter({
+    remote: () => undefined,
+    provider: () => "claude",
+    scanLocalClaude: async () => {
+      attempts += 1;
+      if (attempts < 2) throw new Error("rollout appended while scanning"); // the shared sentinel
+      return stable;
+    },
+  });
+
+  assert.deepEqual(await router.scan("local", [{ path: "/h/.claude/projects/x/s.jsonl", threadId: "s" }]), [stable]);
+  assert.equal(attempts, 2);
+});

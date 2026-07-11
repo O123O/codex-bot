@@ -21,7 +21,7 @@
 import { constants } from "node:fs";
 import { open } from "node:fs/promises";
 import { basename, isAbsolute } from "node:path";
-import type { RolloutCursor, RolloutScanResult, RolloutTurnStart } from "./rollout-ownership.ts";
+import { ROLLOUT_APPENDED_WHILE_SCANNING, type RolloutCursor, type RolloutScanResult, type RolloutTurnStart } from "./rollout-ownership.ts";
 
 const readChunkBytes = 64 * 1024;
 const maxLineBytes = 64 * 1024 * 1024;
@@ -31,6 +31,18 @@ const maxReportedStarts = 1024;
 // from the verbatim-stored user row to prove ownership (spike 0.2: message content
 // is persisted verbatim). The clientId is `<contextId>:<callId>` of the driving
 // `send_to_session` operation, which `OperationStore.ownsWorkerTurn` matches.
+//
+// The capture is bounded (`{1,256}`, no nested quantifiers → no ReDoS). Forgery is
+// possible in principle — a human who embeds a marker matching a REAL existing
+// `send_to_session` operation's `<contextId>:<callId>` would have their turn read as
+// owned — but that requires knowing internal UUIDs never exposed to users, so it is
+// infeasible in practice.
+//
+// ORDERING CONSTRAINT: because this scanner sets `hasUserMessage: true` on every
+// turn, a QiYan-driven turn whose marker is ABSENT classifies as external
+// (`SESSION_BUSY` + unadopt). Marker stamping lands in 1.3 — so 1.4 must NOT wire a
+// Claude endpoint before 1.3. Safe today: provider() defaults to codex; no Claude
+// endpoint exists yet.
 const clientMarkerPattern = /<!--\s*qiyan-cid:([A-Za-z0-9:_.-]{1,256})\s*-->/u;
 
 export function encodeClaudeClientMarker(clientId: string): string {
@@ -71,7 +83,10 @@ export async function scanLocalClaudeTranscript(request: {
     const after = await file.stat({ bigint: true });
     if (after.dev !== state.dev || after.ino !== state.ino) throw new Error("claude transcript identity changed");
     if (after.size < state.size) throw new Error("claude transcript was truncated");
-    if (after.size > state.size) throw new Error("claude transcript appended while scanning");
+    // Must be the SHARED sentinel: `claude -p` writes the transcript live during a
+    // turn, so a scan racing an append is the common case; the retry harness keys
+    // on this exact message to retry into a stable snapshot.
+    if (after.size > state.size) throw new Error(ROLLOUT_APPENDED_WHILE_SCANNING);
     if (after.mtimeNs !== state.mtimeNs) throw new Error("claude transcript changed while scanning");
     return parser.result({ device, inode, offset });
   } finally {
@@ -79,7 +94,7 @@ export async function scanLocalClaudeTranscript(request: {
   }
 }
 
-interface PendingTurn extends RolloutTurnStart { startOffset: number }
+type PendingTurn = RolloutTurnStart;
 
 class ClaudeTranscriptParser {
   private readonly starts: RolloutTurnStart[] = [];
@@ -115,13 +130,13 @@ class ClaudeTranscriptParser {
       const turnId = turnIdOf(record);
       if (!turnId) return;
       if (this.current) this.report(this.current);
-      const pending: PendingTurn = { turnId, startOffset: lineStart, hasUserMessage: true };
+      const pending: PendingTurn = { turnId, hasUserMessage: true };
       const clientId = extractClientMarker(record.message);
       if (clientId) pending.clientId = clientId;
       this.current = pending;
       return;
     }
-    if (type === "assistant" && this.current && isEndTurn(record)) {
+    if (type === "assistant" && this.current && isTurnEnd(record)) {
       this.report(this.current);
       this.current = undefined;
     }
@@ -184,10 +199,16 @@ function turnIdOf(record: Record<string, unknown>): string | undefined {
   return undefined;
 }
 
-function isEndTurn(record: Record<string, unknown>): boolean {
+// A turn continues only across a tool call (`stop_reason: "tool_use"` → the next
+// user row is that tool's result). ANY other concrete stop_reason terminates the
+// turn — `end_turn` normally, but also `max_tokens` / `stop_sequence` / `refusal`,
+// which must close the turn too or a truncated turn would be reported "open"
+// forever. A null/absent stop_reason (not yet persisted) leaves the turn open.
+function isTurnEnd(record: Record<string, unknown>): boolean {
   const message = record.message;
-  return !!message && typeof message === "object" && !Array.isArray(message)
-    && (message as Record<string, unknown>).stop_reason === "end_turn";
+  if (!message || typeof message !== "object" || Array.isArray(message)) return false;
+  const stopReason = (message as Record<string, unknown>).stop_reason;
+  return typeof stopReason === "string" && stopReason.length > 0 && stopReason !== "tool_use";
 }
 
 // Extracts ONLY QiYan's own clientId marker; the message body is never returned.

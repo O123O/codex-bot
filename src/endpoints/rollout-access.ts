@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { AppError } from "../core/errors.ts";
 import {
+  ROLLOUT_APPENDED_WHILE_SCANNING,
   scanLocalRollout,
   type RolloutAccess,
   type RolloutCursor,
@@ -53,10 +54,19 @@ export class RolloutAccessRouter implements RolloutAccess {
     // unchanged; a Claude endpoint resolves to the transcript scanner.
     provider?(endpointId: string): SessionProvider;
     scanLocalClaude?: typeof scanLocalClaudeTranscript;
+    // Local detection (Phase 1.1). A local Claude endpoint has an id other than the
+    // Codex `"local"`, so local-vs-remote can't be keyed on that literal alone. When
+    // omitted this defaults to the exact `"local"` id (unchanged behavior); 1.4
+    // supplies a callback that also recognizes the local Claude endpoint id.
+    local?(endpointId: string): boolean;
   }) {}
 
   private provider(endpointId: string): SessionProvider {
     return this.options.provider?.(endpointId) ?? "codex";
+  }
+
+  private isLocal(endpointId: string): boolean {
+    return this.options.local?.(endpointId) ?? endpointId === "local";
   }
 
   private localScanner(endpointId: string): LocalScanner {
@@ -78,7 +88,7 @@ export class RolloutAccessRouter implements RolloutAccess {
   async scan(endpointId: string, requests: readonly RolloutScanRequest[], lease?: EndpointWorkLease): Promise<RolloutScanResult[]> {
     if (requests.length === 0) return [];
     if (requests.length > 128) throw new AppError("CONFIGURATION_ERROR", "too many rollout scan requests");
-    if (endpointId === "local") {
+    if (this.isLocal(endpointId)) {
       const scan = this.localScanner(endpointId);
       const results = await retryConcurrentRolloutAppend(() => {
         this.requireLease(endpointId, lease);
@@ -102,7 +112,7 @@ export class RolloutAccessRouter implements RolloutAccess {
 
   async scanUnmaterialized(endpointId: string, request: RolloutScanRequest, lease?: EndpointWorkLease): Promise<RolloutMaterialization> {
     if (request.cursor) throw new AppError("CONFIGURATION_ERROR", "unmaterialized rollout scan cannot use a cursor");
-    if (endpointId === "local") {
+    if (this.isLocal(endpointId)) {
       try {
         const scan = this.localScanner(endpointId);
         const result = await retryConcurrentRolloutAppend(() => {
@@ -145,7 +155,7 @@ async function retryConcurrentRolloutAppend<T>(scan: () => Promise<T>): Promise<
   for (let attempt = 1; ; attempt += 1) {
     try { return await scan(); }
     catch (error) {
-      if (attempt >= 3 || !(error instanceof Error) || error.message !== "rollout appended while scanning") throw error;
+      if (attempt >= 3 || !(error instanceof Error) || error.message !== ROLLOUT_APPENDED_WHILE_SCANNING) throw error;
     }
   }
 }
