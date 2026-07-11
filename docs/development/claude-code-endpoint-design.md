@@ -70,14 +70,17 @@ speaks Codex's request surface (§4.3) — not a drop-in.
   primitive needed. **(b) "keep pursuing" persistence** → QiYan drives turns (orchestrator owns the loop)
   and/or the §5 `monitor`/`schedule_cron` tools; optionally a session-self-persistence Stop hook via
   `--settings`. Resolve the persistence choice in Phase 1; the ownership half is already designed.
-- **steer — DIVERGES from Codex (no mid-turn steer):** Codex allows a steer message injected *while a turn
-  runs*, incorporated at the next tool boundary (dispatcher `steer_submitting`). Claude `-p` has **no
-  mid-turn steer**: fire-and-resume is atomic (one msg → one turn → exit), and even warm stream-json queues
-  additional messages for the *next* turn (it offers a hard interrupt/abort, not a soft steer). So map QiYan's
-  "steer" to **turn-boundary queueing** — the steer message becomes the next turn's input (natural under
-  fire-and-resume) — with **interrupt (kill subprocess) + resume** as the abort escape hatch (lossy for
-  in-flight work; transcript up to the abort survives). Confirm the exact stream-json queue-vs-interrupt
-  behavior in the spike; the dispatcher's start/steer states need this explicit Claude mapping.
+- **steer — DIVERGES from Codex (adapter must emulate `turn/steer`):** there is no separate steer tool —
+  `send_to_session(…, mode: "auto"|"start"|"steer")` (`service.ts:35`) makes QiYan **pick the mode and call a
+  distinct Codex method**: `turn/start` (new turn) or **`turn/steer`** (`service.ts:58`, inject into the
+  running turn; Codex does the in-turn queueing). For Claude, `turn/start` → `claude -p --resume` works, but
+  **`turn/steer` has no native equivalent** (Claude `-p` is atomic; warm stream-json queues for the *next*
+  turn and offers only a hard interrupt, not a soft steer). So the **adapter implements `turn/steer` as
+  turn-boundary queueing** — finish the current subprocess, then start the queued message as the next turn —
+  with **interrupt (kill subprocess) + resume** as the abort escape hatch (transcript up to the abort
+  survives). Under fire-and-resume a Claude session is only "mid-turn" while QiYan awaits the subprocess, so
+  `mode:"auto"` resolves to start (idle) or queue-for-next. Confirm stream-json queue-vs-interrupt in the
+  spike.
 
 ### 4.2 Event translation
 
