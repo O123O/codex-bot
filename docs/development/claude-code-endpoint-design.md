@@ -44,7 +44,11 @@ speaks Codex's request surface (§4.3) — not a drop-in.
 
 ## 3. Assumptions (confirm in the spike)
 
-- A1. Headless auth is **API key** (`ANTHROPIC_API_KEY`) or an existing host credential; not interactive OAuth.
+- A1. ~~Headless auth is **API key** (`ANTHROPIC_API_KEY`).~~ **Corrected by spike (2026-07-11):** headless
+  auth uses the host's **existing Claude Code login (subscription OAuth)** — resolved with no
+  `ANTHROPIC_API_KEY`, no `~/.claude/.credentials.json`, no `apiKeyHelper` (token lives in the CLI's own
+  store/keyring). QiYan runs `claude` as the target user and inherits that login; it manages neither
+  credentials nor permissions. *Open (R6): OAuth token refresh/expiry over a long-running bot — Phase 1.*
 - A2. Managed sessions **inherit the user's `~/.claude` config** (CLAUDE.md, skills, MCP) — not `--bare` —
   consistent with "rely on the user's home settings" for Codex workers.
 - A3. Single-writer per session, enforced by QiYan's lease/ownership **plus** a Claude-specific external-turn
@@ -118,7 +122,10 @@ subprocesses, honoring §7 (no changes to shared session/delivery internals). It
 
 The alternative — refactoring pool/lifecycle/relay to a provider-agnostic session interface — is a large
 change §7 forbids for now; revisit only if a third provider appears. The transcript-reconstruction of
-`thread/read` and the `turn/completed` synthesis are the non-trivial parts and are the spike's real risk.
+`thread/read` and the `turn/completed` synthesis are the non-trivial parts and were the spike's real risk —
+**now de-risked (2026-07-11):** the reconstruction rule and interrupted-turn shape are pinned above with
+committed fixtures, and remote round-trip + remote→local MCP reachability were proven end-to-end (Phase-0
+FINDINGS 0.2/0.6/0.7).
 
 **Adapter contract (must meet — verified against the code; fold into Phase-1 scope):**
 - **Endpoint-lifecycle shape:** be a **parallel `ManagedAppServerEndpoint`-shaped class** that satisfies the
@@ -131,6 +138,23 @@ change §7 forbids for now; revisit only if a third provider appears. The transc
 - **`clientUserMessageId` round-trip:** `turn/start` stamps a `clientUserMessageId` (`pool.ts:319`) and
   reconciliation finds the `thread/read` item `type:"userMessage"` with matching `clientId` (`:475-486`);
   ownership keys on `client_id` too. The synthesized user item MUST echo back QiYan's clientId.
+  **Spike-verified (2026-07-11):** the message content is stored **verbatim** in the turn-start `user` row, so
+  QiYan stamps its clientId into the message and reads it back — the round-trip mechanism is proven; 1.1
+  picks the encoding.
+- **Transcript reconstruction rule (spike-verified 2026-07-11; fixtures in `spike/fixtures/`):** a turn does
+  **NOT** boundary on "any `user` row" — a tool result is itself a `user`-type row. **A turn starts on a
+  `user` row whose `promptSource` is non-null** (`"sdk"` for headless/QiYan-driven); a `user` row with
+  `promptSource=null` + `tool_result` content is mid-turn. Coalesce all `assistant` rows of a turn (it emits
+  `thinking`/`text`/`tool_use` as **separate** rows) plus interleaved `tool_result` `user` rows until
+  `stop_reason=end_turn` (or the next non-null-`promptSource` `user` row). **Subagents are NOT interleaved** —
+  a `Task`/`Agent` subagent appears only as an `assistant` `tool_use:Agent` + its `tool_result`; the
+  subagent's own transcript is a **sidecar file** (`<session_id>/subagents/agent-*.jsonl`), and `isSidechain`
+  stays `False` in the main transcript. **An interrupted turn** (subprocess killed mid-generation) leaves the
+  turn-start `user` row but **no `assistant` row and no `result` row** (disk lags the stream) → so
+  `turn/completed` must be synthesized from the **stream**, never by re-reading the transcript mid-turn, and
+  recovery detects an interrupted turn as a non-null-`promptSource` `user` row with no following `end_turn`.
+  *(Still to capture in 1.1: the exact `promptSource` value of a human-interactive turn — for external-turn
+  classification — and a compaction/summary transcript.)*
 - **Specific item shapes:** final delivery extracts `type:"agentMessage"` + `phase:"final_answer"` (or null) +
   `text`, keyed by `item.id` (`final-messages.ts:29`); turn identity needs `type:"userMessage"` + `clientId`.
   The translator must emit exactly these.
@@ -295,15 +319,28 @@ survives the tool disable):
    drop-in, unpreferred. **Per-skill disabling of `/loop` is therefore optional insurance, not needed.**
 (Codex sessions get the same MCP tools; Codex has no native scheduler to disable.)
 
+**Tool-disable is porous — and that is fine (verified 2026-07-11).** Spike 0.3 showed the disable removes the
+named *tool*, not the *capability*: with `Bash` disabled and no redirect, the model still ran a shell command
+by routing through other exposed tools (`Monitor`/`TaskOutput`). We deliberately do **not** try to wall off
+every alternate path — the goal is only that the model reaches for QiYan's durable MCP tools, and step 3's
+redirect achieves that (with all five disabled + the redirect, the model invoked none of them and reached for
+the `qiyan_*` tools by name). Any alternate route the model might improvise (background Bash, hooks) is itself
+**process-bound** — it dies on `claude -p` exit and cannot deliver durable scheduling anyway, so it is
+harmless. So: **redirect to the MCP tools; don't chase model workarounds.** The positive control confirmed the
+disable is a real block (when *allowed*, the model does invoke `ScheduleWakeup`/`Bash`; when disallowed it
+cannot), and both `--disallowedTools "A B C"` (space-joined) and per-flag forms parse correctly.
+
 **Launch flags must be stable per session (a caching requirement, tested).** `--append-system-prompt` is a
 *per-invocation* parameter — it is not stored in the session/transcript, so it must be re-passed on **every**
 turn, and it sits at the **front of the cached prefix**, so it must be **byte-identical** each turn or the
 cache breaks from that point on. Measured: identical append → full hit (`creation≈8`, `read≈27.7k`); a changed
 append re-creates ~12.5k tokens (tools + history) **every turn**. So `ClaudeCodeRuntime` must launch each turn
 of a session with **deterministic, identical** prompt-affecting flags (`--append-system-prompt`,
-`--disallowedTools`, `--mcp-config`, model). Also confirm the disabled tool-name strings are exact — a
-mismatched name makes `--disallowedTools` a **silent no-op** (downgrades enforcement to prompt-only); assert
-in Phase 0 that the model genuinely cannot invoke each named native tool.
+`--disallowedTools`, `--mcp-config`, model). The disabled tool-name strings must be exact — a mismatched name
+makes `--disallowedTools` a **silent no-op** (downgrades to prompt-only). Phase 0 verified (2026-07-11) the
+exact strings `Monitor ScheduleWakeup CronCreate CronList CronDelete`, that the space-joined form parses, and
+via a positive control that the model genuinely cannot invoke each once disabled (it invokes them when
+allowed).
 
 ## 6. Ownership, durability, recovery (state machine reusable; scanner is NEW)
 
@@ -383,7 +420,9 @@ in Phase 0 that the model genuinely cannot invoke each named native tool.
   external-turn detection (A3) weakens — confirm early.
 - R4: goal has no Claude-native equivalent (§4.1) — decide emulation vs MCP-standing-prompt in Phase 1.
 - R5: stream-json is stable but version-sensitive — pin a Claude Code version, translate defensively.
-- R6: auth/config on the worker host (API key, `~/.claude` inheritance) — confirm in Phase 0.
+- R6: auth/config on the worker host — Phase 0 found it is the host's **OAuth login** (not an API key; A1
+  corrected) with `~/.claude` inheritance confirmed. Residual: OAuth token **refresh/expiry** over a
+  long-running bot — confirm in Phase 1.
 - R7: **re-hydration cost** for infrequent scheduled fires (turns spaced beyond the ~5-min prompt-cache TTL
   pay full `cache_creation`). With warm mode removed, the only mitigations are prompt-cache reuse for
   closely-spaced turns, the extended 1-hour cache TTL, and **deterministic launch flags** (§5 — a changed
