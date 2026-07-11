@@ -147,6 +147,15 @@ export function assistantAccessWarning(mode: BotConfig["assistantSandboxMode"]):
   return mode === "danger-full-access" ? fullAccessWarning : undefined;
 }
 
+// An endpoint runs on QiYan's own host (no ssh) when it is the Codex `"local"` endpoint or
+// the configured local Claude endpoint (CLAUDE_CODE_ENDPOINT_ID). Local endpoints resolve to
+// the local project workspace and in-process file handling; every other id is remote (ssh).
+// One predicate for the workspace router, rollout-access, and the worker file bridge so they
+// cannot diverge (they did — the local Claude endpoint was mis-sent through the ssh path).
+export function isLocalEndpointId(endpointId: string, localClaudeEndpointId?: string): boolean {
+  return endpointId === "local" || (localClaudeEndpointId !== undefined && endpointId === localClaudeEndpointId);
+}
+
 export function reportAssistantTerminalFailure(
   dispatcher: Pick<ConversationDispatcher, "requestRecovery"> | undefined,
   report: () => void,
@@ -2400,12 +2409,9 @@ export async function buildProductionApp(
           pool,
           quarantine: (operation, reason) => operations.failAndUnbind(operation.id, { message: reason }),
         }).restoreBeforeIngress();
-        // A local endpoint runs on QiYan's own host with no ssh: the Codex "local" plus the
-        // optional local Claude endpoint (CLAUDE_CODE_ENDPOINT_ID). Both resolve to the local
-        // project workspace and count as local for ownership scans. Shared so the workspace
-        // router and the rollout-access router cannot diverge (they did — see the local Claude
-        // "SSH workspace host is unavailable" regression).
-        const isLocalEndpoint = (id: string): boolean => id === "local" || id === claudeCodeConfig?.endpointId;
+        // Bind the shared locality predicate to this deployment's local Claude endpoint id,
+        // then inject it into the workspace router, rollout-access, and worker file bridge.
+        const isLocalEndpoint = (id: string): boolean => isLocalEndpointId(id, claudeCodeConfig?.endpointId);
         workspaceRouter = new WorkspaceRouter(async (id) => {
           if (isLocalEndpoint(id)) return projectWorkspaces;
           await endpointManager.ensureReady(id);
