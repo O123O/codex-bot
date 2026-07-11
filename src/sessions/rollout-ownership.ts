@@ -52,6 +52,11 @@ export type OwnershipInspection =
 export type RolloutPathResolution =
   | { state: "resolved"; path: string }
   | { state: "pending" }
+  // No rollout exists and none will until the first turn runs (e.g. a Claude session, whose
+  // transcript is written only by `claude -p`). Distinct from "pending" (a transient window
+  // where a path is expected to bind shortly, as for Codex) so the guard can safely dispatch
+  // the first turn instead of deadlocking waiting for a rollout the first turn itself creates.
+  | { state: "unstarted" }
   | { state: "lost" };
 
 export type RolloutPathResolver = (
@@ -115,7 +120,7 @@ export class SessionOwnershipGuard {
   ) {}
 
   recordUnmaterialized(identity: MappingIdentity, path?: string): void {
-    if (path !== undefined && !validRolloutPath(path, identity.thread_id)) {
+    if (path !== undefined && !validManagedRolloutPath(path, identity.thread_id)) {
       throw new AppError("OPERATION_UNCERTAIN", "managed rollout path is invalid");
     }
     inTransaction(this.db, () => {
@@ -221,6 +226,17 @@ export class SessionOwnershipGuard {
     if (!existing.rolloutPath) {
       if (!this.resolvePath) return { state: "pending" };
       const resolution = await this.resolvePath(identity, lease);
+      if (resolution.state === "unstarted") {
+        // The endpoint reports no rollout exists and none will until the first turn runs
+        // (a Claude session's transcript is only written by the first `claude -p`). No turn —
+        // ours or external — has run, so there is nothing to conflict with and the first
+        // dispatch is safe; this mirrors the "missing" materialization case below (path known
+        // but file absent). A Codex thread instead binds its path shortly after create, so its
+        // pathless window is a transient "pending" (below), NOT "unstarted".
+        if (requireMaterialized) return { state: "lost" };
+        if (requireClassifiedTurn) throw ownershipUnclassified("pending rollout does not prove the native turns are owned");
+        return { state: "owned" };
+      }
       if (resolution.state !== "resolved") return resolution;
       this.recordUnmaterialized(identity, resolution.path);
       existing = this.row(identity)!;
@@ -420,6 +436,19 @@ export async function scanLocalRollout(request: {
 function validRolloutPath(path: string, threadId: string): boolean {
   const name = basename(path);
   return isAbsolute(path) && safeThreadId(threadId) && name.startsWith("rollout-") && name.endsWith(`-${threadId}.jsonl`);
+}
+
+// The ownership guard is provider-neutral: it records paths for both Codex rollouts
+// (`rollout-*-<id>.jsonl`) and Claude transcripts (`<id>.jsonl`). recordUnmaterialized may
+// receive either, so it must accept both shapes — otherwise a Claude transcript path is
+// rejected as "invalid", the ownership scan throws, and the session's turns never commit as
+// owned (their result is never delivered). The Codex local scanner keeps the strict
+// `validRolloutPath`; a Claude path never reaches it (provider dispatch routes to the Claude
+// scanner, which enforces its own `<id>.jsonl` shape).
+function validManagedRolloutPath(path: string, threadId: string): boolean {
+  const name = basename(path);
+  if (!isAbsolute(path) || !safeThreadId(threadId)) return false;
+  return name === `${threadId}.jsonl` || (name.startsWith("rollout-") && name.endsWith(`-${threadId}.jsonl`));
 }
 
 function exactThreadPath(response: unknown, threadId: string): string | undefined {

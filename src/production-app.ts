@@ -67,7 +67,7 @@ import {
   type ExternalOwnershipReleaseStatus,
   type ExternalTurnIncident,
 } from "./sessions/ownership-watcher.ts";
-import { createAppServerRolloutPathResolver, SessionOwnershipGuard } from "./sessions/rollout-ownership.ts";
+import { createAppServerRolloutPathResolver, type RolloutPathResolver, SessionOwnershipGuard } from "./sessions/rollout-ownership.ts";
 import { preparedProjectWorkspaceFromCheckpoint, ProjectWorkspacePolicy, type PreparedProjectWorkspace } from "./sessions/project-workspace.ts";
 import { SessionService } from "./sessions/service.ts";
 import { ThreadGate } from "./sessions/thread-gate.ts";
@@ -145,6 +145,15 @@ const externalOwnershipFailureEpisode = "external-ownership-detection";
 
 export function assistantAccessWarning(mode: BotConfig["assistantSandboxMode"]): string | undefined {
   return mode === "danger-full-access" ? fullAccessWarning : undefined;
+}
+
+// An endpoint runs on QiYan's own host (no ssh) when it is the Codex `"local"` endpoint or
+// the configured local Claude endpoint (CLAUDE_CODE_ENDPOINT_ID). Local endpoints resolve to
+// the local project workspace and in-process file handling; every other id is remote (ssh).
+// One predicate for the workspace router, rollout-access, and the worker file bridge so they
+// cannot diverge (they did — the local Claude endpoint was mis-sent through the ssh path).
+export function isLocalEndpointId(endpointId: string, localClaudeEndpointId?: string): boolean {
+  return endpointId === "local" || (localClaudeEndpointId !== undefined && endpointId === localClaudeEndpointId);
 }
 
 export function reportAssistantTerminalFailure(
@@ -1655,13 +1664,20 @@ export function reportOperationalSafely(sink: OperationalEventSink, event: Opera
   catch { /* operational logging must not change runtime behavior */ }
 }
 
-export function parseEndpointLifecycleCheckpoint(value: unknown): { endpoint: string; phase: "draining" | "idle_proven" | "runtime_stopped" | "runtime_started"; identity: RuntimeIdentity } | undefined {
+export function parseEndpointLifecycleCheckpoint(value: unknown): { endpoint: string; phase: "draining" | "idle_proven" | "runtime_stopped" | "runtime_started"; identity?: RuntimeIdentity } | undefined {
   if (!value || typeof value !== "object") return undefined;
   const item = value as Record<string, unknown>;
   if (Object.keys(item).some((key) => !new Set(["endpoint", "phase", "identity"]).has(key))) return undefined;
   if (typeof item.endpoint !== "string" || !new Set(["draining", "idle_proven", "runtime_stopped", "runtime_started"]).has(String(item.phase))) return undefined;
   try {
-    return { endpoint: item.endpoint, phase: item.phase as "draining" | "idle_proven" | "runtime_stopped" | "runtime_started", identity: parseRuntimeIdentity(item.identity) };
+    // A daemonless endpoint (Claude) checkpoints with no runtime identity, so `identity` is
+    // absent from the persisted receipt — accept that instead of failing the parse (which
+    // would strand the recovery and permanently lock out the endpoint's lifecycle ops).
+    return {
+      endpoint: item.endpoint,
+      phase: item.phase as "draining" | "idle_proven" | "runtime_stopped" | "runtime_started",
+      ...(item.identity === undefined ? {} : { identity: parseRuntimeIdentity(item.identity) }),
+    };
   } catch { return undefined; }
 }
 
@@ -2400,8 +2416,11 @@ export async function buildProductionApp(
           pool,
           quarantine: (operation, reason) => operations.failAndUnbind(operation.id, { message: reason }),
         }).restoreBeforeIngress();
+        // Bind the shared locality predicate to this deployment's local Claude endpoint id,
+        // then inject it into the workspace router, rollout-access, and worker file bridge.
+        const isLocalEndpoint = (id: string): boolean => isLocalEndpointId(id, claudeCodeConfig?.endpointId);
         workspaceRouter = new WorkspaceRouter(async (id) => {
-          if (id === "local") return projectWorkspaces;
+          if (isLocalEndpoint(id)) return projectWorkspaces;
           await endpointManager.ensureReady(id);
           const context = remoteContexts.get(id);
           if (!context) throw new AppError("ENDPOINT_UNAVAILABLE", `SSH workspace host is unavailable: ${id}`);
@@ -2426,6 +2445,7 @@ export async function buildProductionApp(
             const context = remoteContexts.get(id);
             return context ? { remote: context.remote, helperPath: context.host.remoteHelperPath, runtimeDir: context.host.remoteRuntimeDir } : undefined;
           },
+          isLocal: isLocalEndpoint,
           maxFileBytes: config.attachmentMaxBytes,
         });
         const durableLease = conversations.lease();
@@ -2439,7 +2459,6 @@ export async function buildProductionApp(
         }
         discovery = new SessionDiscovery(db, pool);
         threadGate = new ThreadGate();
-        const claudeEndpointId = config.claudeCode?.endpointId;
         const rolloutAccess = new RolloutAccessRouter({
           remote: (id) => {
             const context = remoteContexts.get(id);
@@ -2450,11 +2469,22 @@ export async function buildProductionApp(
           // scanner. Only the built-in local Claude endpoint is local; a catalog
           // claude-code endpoint is remote (scans over ssh).
           provider: (id) => sessionProvider(id),
-          local: (id) => id === "local" || id === claudeEndpointId,
+          local: isLocalEndpoint,
           scanLocalClaude: scanLocalClaudeTranscript,
         });
+        // A Claude session's transcript is only written by the first `claude -p`, so its
+        // rollout path is unresolvable ("pending") until then — but that is terminal-safe (no
+        // turn has run), not a transient binding window like Codex. Report it as "unstarted"
+        // so the ownership guard lets the first turn dispatch instead of deadlocking.
+        const baseRolloutPathResolver = createAppServerRolloutPathResolver(pool);
+        const rolloutPathResolver: RolloutPathResolver = async (identity, lease) => {
+          const resolution = await baseRolloutPathResolver(identity, lease);
+          return resolution.state === "pending" && sessionProvider(identity.endpoint) === "claude"
+            ? { state: "unstarted" }
+            : resolution;
+        };
         ownership = new SessionOwnershipGuard(
-          db, runtime, operations, rolloutAccess, createAppServerRolloutPathResolver(pool),
+          db, runtime, operations, rolloutAccess, rolloutPathResolver,
         );
         lifecycle = new SessionLifecycle(
           pool,
@@ -3027,6 +3057,8 @@ export async function buildProductionApp(
       restart_endpoint: async (args, context) => {
         const endpointId = projectEndpoint(args.endpoint);
         assertEndpointLifecycleOrder(context.operationSequence, endpointId);
+        // Daemonless (Claude) endpoints go through the same restart flow; the manager skips the
+        // runtime-identity drain/shutdown for them (see EndpointManager.shutdownTarget).
         await endpointManager.restart(endpointId, (checkpoint) => context.checkpoint({ endpoint: endpointId, ...(checkpoint as object) }));
         await resumeManagedEndpoint(endpointId, true);
         return { endpoint: endpointId, state: "ready" };

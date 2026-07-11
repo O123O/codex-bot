@@ -30,6 +30,10 @@ interface ThreadState {
 
 export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
   readonly id: string;
+  // No persistent daemon: turns are ephemeral `claude -p` subprocesses, so there is no
+  // runtime identity and no drain/shutdown to prove. The endpoint manager treats
+  // restart/disconnect as "reset the adapter", not the Codex identity dance.
+  readonly daemonless = true;
   private endpointState: "starting" | "ready" | "unavailable" | "stopped" = "starting";
   private readonly emitter = new EventEmitter();
   private readonly threads = new Map<string, ThreadState>();
@@ -102,7 +106,9 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
       case "thread/unsubscribe": return { status: "unsubscribed" } as T;
       case "thread/name/set": return {} as T;
       case "model/list": return { models: this.options.launchFlags.model ? [{ id: this.options.launchFlags.model }] : [] } as T;
-      case "thread/goal/get": return { goal: this.goals().get(this.id, requireString(args.threadId, "threadId")) } as T;
+      // An endpoint without a goal store (e.g. a remote Claude endpoint — goals are scoped to
+      // the local endpoint) simply has no goal; reading it must not fail get_session_status.
+      case "thread/goal/get": return { goal: this.options.goals ? this.options.goals.get(this.id, requireString(args.threadId, "threadId")) : null } as T;
       case "thread/goal/set": return this.goalSet(args) as T;
       case "thread/goal/clear": { this.goals().clear(this.id, requireString(args.threadId, "threadId")); return { goal: null } as T; }
       case "turn/steer": return await this.turnSteer(args) as T;
