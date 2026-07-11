@@ -11,6 +11,7 @@ import { ScheduleStore, type ScheduleRow } from "./schedule-store.ts";
 import { ScheduledSendOutbox } from "./send-outbox.ts";
 import { TriggerEngine } from "./trigger-engine.ts";
 import { WorkerScheduleMcpServer, type WorkerScheduleSession } from "./worker-mcp.ts";
+import type { ClaudeGoalStore } from "../sessions/claude-goals.ts";
 
 export interface SchedulingServiceDeps {
   db: Database;
@@ -23,6 +24,9 @@ export interface SchedulingServiceDeps {
   // Directory for per-session worker --mcp-config files (0700).
   mcpConfigDir: string;
   pollIntervalMs?: number;
+  // Enables the set_goal_status worker tool: the worker marks its own goal
+  // complete/blocked, and QiYan's goal driver stops.
+  goals?: ClaudeGoalStore;
 }
 
 export class SchedulingService {
@@ -36,7 +40,10 @@ export class SchedulingService {
   constructor(private readonly deps: SchedulingServiceDeps) {
     this.store = new ScheduleStore(deps.db);
     this.outbox = new ScheduledSendOutbox(deps.db);
-    this.server = new WorkerScheduleMcpServer({ store: this.store, now: deps.now, resolveToken: (token) => this.sessionByToken.get(token) });
+    this.server = new WorkerScheduleMcpServer({
+      store: this.store, now: deps.now, resolveToken: (token) => this.sessionByToken.get(token),
+      ...(deps.goals ? { setGoalStatus: (session, status) => deps.goals!.setStatus(session.endpointId, session.threadId, status, deps.now()) } : {}),
+    });
     this.engine = new TriggerEngine({
       store: this.store,
       now: deps.now,
@@ -93,7 +100,16 @@ export class SchedulingService {
   // Claude steer: enqueue the message as an immediate one-shot so the engine delivers
   // it as the next turn (retrying while the session is busy). Durable + recovers.
   enqueueSteer(session: WorkerScheduleSession, message: string): void {
-    this.store.create({ nickname: session.nickname, endpointId: session.endpointId, threadId: session.threadId, kind: "wakeup", spec: "steer", message, nextFireAt: this.deps.now() }, this.deps.now());
+    this.enqueueImmediate(session, "steer", message);
+  }
+
+  // Goal auto-drive: deliver the next goal-pursuit turn (same durable immediate path).
+  enqueueGoalDrive(session: WorkerScheduleSession, message: string): void {
+    this.enqueueImmediate(session, "goal", message);
+  }
+
+  private enqueueImmediate(session: WorkerScheduleSession, spec: string, message: string): void {
+    this.store.create({ nickname: session.nickname, endpointId: session.endpointId, threadId: session.threadId, kind: "wakeup", spec, message, nextFireAt: this.deps.now() }, this.deps.now());
   }
 
   // Register a worker session so it can reach the scheduling tools; returns the stable

@@ -22,15 +22,22 @@ export class ClaudeGoalStore {
     return { objective: row.objective, status: row.status, ...(row.token_budget === null ? {} : { tokenBudget: Number(row.token_budget) }) };
   }
 
-  // Set a fresh objective (status defaults to "active"); returns the stored goal.
+  // Set a fresh objective (status defaults to "active"); resets the auto-drive counter.
   set(endpointId: string, threadId: string, goal: { objective: string; status?: string; tokenBudget?: number }, now: number): ClaudeGoal {
     const status = goal.status ?? "active";
     this.db.prepare(
-      `INSERT INTO claude_session_goals(endpoint_id, thread_id, objective, status, token_budget, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?)
-       ON CONFLICT(endpoint_id, thread_id) DO UPDATE SET objective = excluded.objective, status = excluded.status, token_budget = excluded.token_budget, updated_at = excluded.updated_at`,
+      `INSERT INTO claude_session_goals(endpoint_id, thread_id, objective, status, token_budget, driven_turns, updated_at)
+       VALUES (?, ?, ?, ?, ?, 0, ?)
+       ON CONFLICT(endpoint_id, thread_id) DO UPDATE SET objective = excluded.objective, status = excluded.status, token_budget = excluded.token_budget, driven_turns = 0, updated_at = excluded.updated_at`,
     ).run(endpointId, threadId, goal.objective, status, goal.tokenBudget ?? null, now);
     return this.get(endpointId, threadId)!;
+  }
+
+  // Increment and return the auto-drive count for an active goal (backstop cap).
+  recordDrivenTurn(endpointId: string, threadId: string, now: number): number {
+    this.db.prepare("UPDATE claude_session_goals SET driven_turns = driven_turns + 1, updated_at = ? WHERE endpoint_id = ? AND thread_id = ?").run(now, endpointId, threadId);
+    const row = this.db.prepare("SELECT driven_turns FROM claude_session_goals WHERE endpoint_id = ? AND thread_id = ?").get(endpointId, threadId) as { driven_turns: number } | undefined;
+    return row ? Number(row.driven_turns) : 0;
   }
 
   // Update only the status (pause/resume/blocked/complete) of an existing goal.
