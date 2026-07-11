@@ -139,6 +139,10 @@ export class SchedulingService {
       this.tokenBySession.set(sessionKey, token);
       this.sessionByToken.set(token, session);
     }
+    // Ensure the config dir exists independently of start() ordering — a session's first
+    // turn can write here before (or without) the scheduler component's start() mkdir,
+    // e.g. the very first Claude session on a fresh dataDir.
+    await mkdir(this.deps.mcpConfigDir, { recursive: true, mode: 0o700 });
     const path = join(this.deps.mcpConfigDir, `${session.threadId}.json`);
     await writeFile(path, JSON.stringify({
       mcpServers: { "qiyan-worker-scheduling": { type: "http", url: this.server.url, headers: { Authorization: `Bearer ${token}` } } },

@@ -16,6 +16,10 @@ export interface EndpointWorkLease {
 }
 
 export interface ManagedAppServerEndpoint extends AppServerEndpoint {
+  // True when the endpoint has no persistent daemon to restart/shut down (a Claude
+  // endpoint drives ephemeral `claude -p` subprocesses), so it never has a runtime
+  // identity to prove. The manager skips the identity-based drain/shutdown dance for it.
+  readonly daemonless?: boolean;
   start(): Promise<void>;
   closeConnection(): Promise<void>;
   shutdownRuntime(expectedIdentity: RuntimeIdentity): Promise<void>;

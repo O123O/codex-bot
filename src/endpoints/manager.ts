@@ -17,7 +17,8 @@ interface ActivationCandidate {
 
 interface ShutdownTarget {
   endpoint: ManagedAppServerEndpoint;
-  identity: RuntimeIdentity;
+  // Absent for a daemonless endpoint (no runtime identity to prove).
+  identity?: RuntimeIdentity;
   startedForProof: boolean;
 }
 
@@ -188,7 +189,7 @@ export class EndpointManager {
       checkpoint?.({ phase: "draining", identity: target.identity });
       await this.requireManagedThreadsIdle(endpointId, target.endpoint);
       checkpoint?.({ phase: "idle_proven", identity: target.identity });
-      await target.endpoint.shutdownRuntime(target.identity);
+      await this.stopEndpointRuntime(target);
       runtimeStopped = true;
       checkpoint?.({ phase: "runtime_stopped", identity: target.identity });
       drain.disconnect();
@@ -334,7 +335,8 @@ export class EndpointManager {
       let replacement: ManagedAppServerEndpoint | undefined;
       try {
         replacement = await this.startCandidate(prepared);
-        const identity = await this.requireRuntimeIdentity(replacement);
+        // A daemonless endpoint has no runtime identity to prove after (re)start.
+        const identity = replacement.daemonless ? undefined : await this.requireRuntimeIdentity(replacement);
         checkpoint?.({ phase: "runtime_started", identity });
         this.publishAfterReopen(record, drain, replacement);
       } catch (error) {
@@ -354,11 +356,12 @@ export class EndpointManager {
       checkpoint?.({ phase: "draining", identity: target.identity });
       await this.requireManagedThreadsIdle(endpointId, target.endpoint);
       checkpoint?.({ phase: "idle_proven", identity: target.identity });
-      await target.endpoint.shutdownRuntime(target.identity);
+      await this.stopEndpointRuntime(target);
       runtimeStopped = true;
       checkpoint?.({ phase: "runtime_stopped", identity: target.identity });
       replacement = await this.startCandidate(preparedReplacement);
-      const replacementIdentity = await this.requireReplacementIdentity(replacement, target.identity);
+      // A daemonless replacement has no identity to prove distinct from the stopped one.
+      const replacementIdentity = target.identity ? await this.requireReplacementIdentity(replacement, target.identity) : undefined;
       checkpoint?.({ phase: "runtime_started", identity: replacementIdentity });
       this.publishAfterReopen(record, drain, replacement);
     } catch (error) {
@@ -565,6 +568,9 @@ export class EndpointManager {
   private async shutdownTarget(endpointId: string, record: EndpointRecord): Promise<ShutdownTarget> {
     const current = record.endpoint;
     if (current) {
+      // A daemonless endpoint (Claude) has no runtime identity to prove — it is always its
+      // own shutdown target, closed directly rather than drained by identity.
+      if (current.daemonless) return { endpoint: current, startedForProof: false };
       const identity = await current.runtimeIdentity().catch(() => undefined);
       if (identity) {
         const managed = await this.options.managedThreadIds(endpointId);
@@ -573,12 +579,19 @@ export class EndpointManager {
     }
     const candidate = current ? { endpoint: current } : await this.prepareCandidate(endpointId);
     const endpoint = await this.startCandidate(candidate);
+    if (endpoint.daemonless) return { endpoint, startedForProof: true };
     try {
       return { endpoint, identity: await this.requireRuntimeIdentity(endpoint), startedForProof: true };
     } catch (error) {
       await endpoint.closeConnection().catch(() => undefined);
       throw error;
     }
+  }
+
+  // Stop an endpoint's runtime: prove-and-shutdown a daemon, or just close a daemonless one.
+  private async stopEndpointRuntime(target: ShutdownTarget): Promise<void> {
+    if (target.identity) await target.endpoint.shutdownRuntime(target.identity);
+    else await target.endpoint.closeConnection();
   }
 
   private record(id: string): EndpointRecord {

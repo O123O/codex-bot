@@ -95,9 +95,13 @@ test("the exact production MCP map succeeds for every local and remote manager a
   await mkdir(qiyanHome, { recursive: true, mode: 0o700 });
   await copyFile(join(userHome, ".qiyan-bot", "data", "assistant-profile", "codex", "auth.json"), authTarget);
   await chmod(authTarget, 0o600);
+  const claudeRemoteAlias = process.env.QIYAN_ACCEPTANCE_CLAUDE_REMOTE; // e.g. dfw-claude
   await writeFile(join(qiyanHome, "endpoints.json"), `${JSON.stringify({
     version: 1,
-    endpoints: { "dfw-vscode": { type: "ssh", projects_root: "~/qiyan-projects" } },
+    endpoints: {
+      "dfw-vscode": { type: "ssh", projects_root: "~/qiyan-projects" },
+      ...(claudeRemoteAlias ? { [claudeRemoteAlias]: { type: "claude-code", projects_root: "~/qiyan-projects" } } : {}),
+    },
   }, null, 2)}\n`, { mode: 0o600 });
 
   const config: BotConfig = {
@@ -119,6 +123,10 @@ test("the exact production MCP map succeeds for every local and remote manager a
     attachmentMaxBytes: 1024 * 1024,
     attachmentStoreMaxBytes: 8 * 1024 * 1024,
     assistantSandboxMode: "read-only",
+    // Enable the local Claude endpoint so the Claude lifecycle runs through the same real
+    // manager/service/ownership stack as Codex (this coverage was the gap that let the
+    // local-Claude create/first-turn/delivery/archive bugs ship).
+    claudeCode: { endpointId: "claude-local", command: "claude", disallowedTools: [], appendSystemPrompt: "You are a managed QiYan worker; follow the user's instructions exactly." },
   };
   const adapter = new AcceptanceAdapter();
   let tools: Readonly<Record<AssistantToolName, ToolHandler>> | undefined;
@@ -165,12 +173,13 @@ test("the exact production MCP map succeeds for every local and remote manager a
     dbCleanup?.close();
     await app.stop().catch(() => undefined);
     for (const project of new Map(createdProjects.map((value) => [`${value.endpoint}\0${value.path}`, value])).values()) {
-      if (project.endpoint === "local") {
+      if (project.endpoint === "local" || project.endpoint === "claude-local") {
         if (project.path === join(userHome, "qiyan-projects", project.nickname)) {
           await rm(project.path, { recursive: true, force: true });
         }
       } else if (project.path.endsWith(`/qiyan-projects/${project.nickname}`) && project.path.startsWith("/")) {
-        spawnSync("ssh", [project.endpoint, "rm", "-rf", "--", project.path], { stdio: "ignore" });
+        const sshHost = project.endpoint === claudeRemoteAlias ? claudeRemoteAlias : project.endpoint;
+        spawnSync("ssh", [sshHost, "rm", "-rf", "--", project.path], { stdio: "ignore" });
       }
     }
     await rm(root, { recursive: true, force: true });
@@ -299,10 +308,13 @@ test("the exact production MCP map succeeds for every local and remote manager a
   };
 
   const suffix = `${process.pid.toString(36)}-${Date.now().toString(36)}`;
-  const fixtures = [
+  // Codex coverage is the default; a focused Claude run can skip it to keep a maintenance
+  // window short (QIYAN_ACCEPTANCE_SKIP_CODEX=1). The committed default exercises both.
+  const includeCodex = process.env.QIYAN_ACCEPTANCE_SKIP_CODEX !== "1";
+  const fixtures: ReadonlyArray<{ endpoint: string; nickname: string }> = includeCodex ? [
     { endpoint: "local", nickname: `mcp-local-${suffix}` },
     { endpoint: "dfw-vscode", nickname: `mcp-dfw-${suffix}` },
-  ] as const;
+  ] : [];
   const workerAttachmentSource = join(root, "acceptance-worker.txt");
   await writeFile(workerAttachmentSource, "worker attachment acceptance\n");
   const sessions = new Map<string, RegistryDocument["sessions"][string]>();
@@ -486,6 +498,68 @@ test("the exact production MCP map succeeds for every local and remote manager a
     assert.equal(archived.sessions.some((item: any) => item.id === session.thread_id && item.archived === false), false);
   }
 
+  // ---- Claude endpoint lifecycle: the coverage gap (local claude-local + optional remote) ----
+  // Drives the exact path that shipped bugs live: create (workspace routing) → send (unstarted
+  // first-turn dispatch) → deliver (ownership commits the Claude <id>.jsonl path) → collect →
+  // unadopt → adopt → archive, plus a never-materialized archive and a daemonless restart.
+  const claudeFixtures = [
+    { endpoint: "claude-local", nickname: `mcp-claude-local-${suffix}` },
+    ...(claudeRemoteAlias ? [{ endpoint: claudeRemoteAlias, nickname: `mcp-claude-remote-${suffix}` }] : []),
+  ] as const;
+  for (const fixture of claudeFixtures) {
+    const created = await call("create_session", { nickname: fixture.nickname, endpoint: fixture.endpoint }, fixture.endpoint);
+    assert.equal(created.nickname, fixture.nickname, `${fixture.endpoint} create`);
+    const session = (await registryDocument(config.sessionRegistryPath)).sessions[fixture.nickname];
+    assert.ok(session, `${fixture.nickname} was not committed`);
+    createdProjects.push({ endpoint: fixture.endpoint, nickname: fixture.nickname, path: session.project_dir });
+
+    const managed = await call("list_managed_sessions", {}, fixture.endpoint);
+    assert.equal(managed.sessions[fixture.nickname]?.provider, "claude", `${fixture.nickname} provider not claude`);
+
+    const marker = `QIYAN_CLAUDE_${fixture.endpoint === "claude-local" ? "LOCAL" : "REMOTE"}_OK`;
+    const content = `Reply with exactly ${marker} and nothing else.`;
+    const send = await call("send_to_session", { nickname: fixture.nickname, content, attachment_ids: [], mode: "start" }, fixture.endpoint, `/pass ${content}`);
+    const final = await waitForValue(() => db.prepare(`SELECT id FROM logical_final_messages
+      WHERE endpoint_id = ? AND thread_id = ? AND turn_id = ? ORDER BY item_order DESC LIMIT 1`)
+      .get(fixture.endpoint, session.thread_id, send.turnId) as { id: string } | undefined, workerTimeoutMs, `${fixture.nickname} first final delivered`);
+    await waitFor(() => (db.prepare(`SELECT native_status FROM session_runtime WHERE endpoint_id = ? AND thread_id = ? AND mapping_id = ?`)
+      .get(fixture.endpoint, session.thread_id, session.mapping_id) as { native_status: string } | undefined)?.native_status === "idle",
+      workerTimeoutMs, `${fixture.nickname} first turn idle`);
+    const read = await call("read_worker_message", { nickname: fixture.nickname, message_id: final.id }, fixture.endpoint);
+    assert.match(read.body, new RegExp(marker, "u"), `${fixture.nickname} reply not delivered`);
+    const collected = await call("collect_messages", { nickname: fixture.nickname, count: 1 }, fixture.endpoint);
+    assert.equal(collected.length, 1);
+    // the QiYan-driven turn must commit as OWNED (Claude <id>.jsonl path accepted, not external)
+    const ownRow = db.prepare(`SELECT external_turn_id FROM session_rollout_ownership WHERE endpoint_id = ? AND thread_id = ? AND mapping_id = ?`)
+      .get(fixture.endpoint, session.thread_id, session.mapping_id) as { external_turn_id: string | null } | undefined;
+    assert.ok(ownRow && !ownRow.external_turn_id, `${fixture.nickname} first turn was misclassified external`);
+    await call("get_session_status", { nickname: fixture.nickname }, fixture.endpoint);
+
+    // daemonless restart/disconnect with the session still managed: must not strand the
+    // endpoint "draining" and must restore the managed session (no runtime identity to prove).
+    await call("restart_endpoint", { endpoint: fixture.endpoint }, fixture.endpoint);
+    const afterRestart = await call("get_session_status", { nickname: fixture.nickname }, fixture.endpoint);
+    assert.equal(afterRestart.identity.thread_id, session.thread_id, `${fixture.endpoint} restart lost the session`);
+    await call("disconnect_endpoint", { endpoint: fixture.endpoint }, fixture.endpoint);
+    await call("restart_endpoint", { endpoint: fixture.endpoint }, fixture.endpoint);
+
+    await call("unadopt_session", { nickname: fixture.nickname }, fixture.endpoint);
+    assert.equal((await registryDocument(config.sessionRegistryPath)).sessions[fixture.nickname], undefined, `${fixture.nickname} unadopt`);
+    await call("adopt_session", { nickname: fixture.nickname, thread_id: session.thread_id, endpoint: fixture.endpoint }, fixture.endpoint);
+    assert.ok((await registryDocument(config.sessionRegistryPath)).sessions[fixture.nickname], `${fixture.nickname} re-adopt`);
+    await call("archive_session", { nickname: fixture.nickname }, fixture.endpoint);
+    assert.equal((await registryDocument(config.sessionRegistryPath)).sessions[fixture.nickname], undefined, `${fixture.nickname} archive`);
+
+    // never-materialized: create then archive with no turn (no transcript / no rollout).
+    const ephemeral = `${fixture.nickname}-empty`;
+    await call("create_session", { nickname: ephemeral, endpoint: fixture.endpoint }, fixture.endpoint);
+    const ephSession = (await registryDocument(config.sessionRegistryPath)).sessions[ephemeral];
+    assert.ok(ephSession, `${ephemeral} was not committed`);
+    createdProjects.push({ endpoint: fixture.endpoint, nickname: ephemeral, path: ephSession.project_dir });
+    await call("archive_session", { nickname: ephemeral }, fixture.endpoint);
+    assert.equal((await registryDocument(config.sessionRegistryPath)).sessions[ephemeral], undefined, `${ephemeral} never-materialized archive`);
+  }
+
   const messagesBefore = adapter.messages.length;
   await call("send_chat_message", { content: "QIYAN_CHAT_MCP_OK" });
   await waitFor(() => adapter.messages.length > messagesBefore, operationTimeoutMs, "chat delivery");
@@ -509,10 +583,16 @@ test("the exact production MCP map succeeds for every local and remote manager a
     "set_session_model", "set_reasoning_effort", "get_goal", "set_goal", "pause_goal", "resume_goal", "cancel_goal", "update_session_notes",
     "prepare_chat_attachment", "send_chat_attachment",
   ];
-  for (const name of endpointScoped) {
-    assert.deepEqual([...endpointCoverage.get(name) ?? []].sort(), ["dfw-vscode", "local"], `${name} lacks local/remote evidence`);
+  if (includeCodex) for (const name of endpointScoped) {
+    const covered = endpointCoverage.get(name) ?? new Set<string>();
+    for (const required of ["dfw-vscode", "local"]) assert.ok(covered.has(required), `${name} lacks ${required} evidence`);
   }
-  assert.deepEqual([...coverage].sort(), [...TOOL_NAMES].sort());
+  // The Claude lifecycle must have exercised the create/send/deliver/adopt/unadopt/archive/restart
+  // path on the local Claude endpoint (the coverage that was previously missing entirely).
+  for (const name of ["create_session", "send_to_session", "read_worker_message", "collect_messages", "unadopt_session", "adopt_session", "archive_session", "restart_endpoint"] as const) {
+    assert.ok((endpointCoverage.get(name) ?? new Set()).has("claude-local"), `${name} lacks Claude evidence`);
+  }
+  if (includeCodex) assert.deepEqual([...coverage].sort(), [...TOOL_NAMES].sort());
   assert.deepEqual(operationalFailures, []);
 });
 

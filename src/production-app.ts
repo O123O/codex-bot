@@ -3050,15 +3050,8 @@ export async function buildProductionApp(
       restart_endpoint: async (args, context) => {
         const endpointId = projectEndpoint(args.endpoint);
         assertEndpointLifecycleOrder(context.operationSequence, endpointId);
-        if (sessionProvider(endpointId) === "claude") {
-          // A Claude endpoint has no daemon to restart (turns are ephemeral `claude -p`
-          // subprocesses), so it has no runtime identity to prove a shutdown against. Reset it
-          // by disconnecting (daemonless-safe) and re-activating, instead of the Codex
-          // drain/shutdown/identity dance — which strands a Claude endpoint "draining".
-          await endpointManager.disconnect(endpointId);
-          await resumeManagedEndpoint(endpointId, true);
-          return { endpoint: endpointId, state: "ready" };
-        }
+        // Daemonless (Claude) endpoints go through the same restart flow; the manager skips the
+        // runtime-identity drain/shutdown for them (see EndpointManager.shutdownTarget).
         await endpointManager.restart(endpointId, (checkpoint) => context.checkpoint({ endpoint: endpointId, ...(checkpoint as object) }));
         await resumeManagedEndpoint(endpointId, true);
         return { endpoint: endpointId, state: "ready" };
@@ -3624,21 +3617,13 @@ export async function buildProductionApp(
           operations.succeed(operation.id, { endpoint: endpointId, state: "disconnected" });
         } else if (operation.kind === "restart_endpoint") {
           const endpointId = projectEndpoint(args.endpoint);
-          if (sessionProvider(endpointId) === "claude") {
-            // Daemonless: reset by disconnect + re-activate (see the live handler). Clears a
-            // Claude endpoint stranded "draining" by an earlier Codex-style restart attempt.
-            await endpointManager.disconnect(endpointId);
-            await resumeManagedEndpoint(endpointId, true);
-            operations.succeed(operation.id, { endpoint: endpointId, state: "ready" });
-          } else {
-            const saved = parseEndpointLifecycleCheckpoint(operation.receipt);
-            if (operation.receipt !== undefined && (!saved || saved.endpoint !== endpointId)) return;
-            if (saved) await endpointManager.recoverRestart(endpointId, saved.phase, saved.identity,
-              (checkpoint) => operations.checkpoint(operation.id, { endpoint: endpointId, ...(checkpoint as object) }));
-            else await endpointManager.restart(endpointId, (checkpoint) => operations.checkpoint(operation.id, { endpoint: endpointId, ...(checkpoint as object) }));
-            await resumeManagedEndpoint(endpointId, true);
-            operations.succeed(operation.id, { endpoint: endpointId, state: "ready" });
-          }
+          const saved = parseEndpointLifecycleCheckpoint(operation.receipt);
+          if (operation.receipt !== undefined && (!saved || saved.endpoint !== endpointId)) return;
+          if (saved) await endpointManager.recoverRestart(endpointId, saved.phase, saved.identity,
+            (checkpoint) => operations.checkpoint(operation.id, { endpoint: endpointId, ...(checkpoint as object) }));
+          else await endpointManager.restart(endpointId, (checkpoint) => operations.checkpoint(operation.id, { endpoint: endpointId, ...(checkpoint as object) }));
+          await resumeManagedEndpoint(endpointId, true);
+          operations.succeed(operation.id, { endpoint: endpointId, state: "ready" });
         } else if (operation.kind === "collect_messages") {
           const checkpoint = operation.receipt as { messageIds?: string[] } | undefined;
           const binding = assistantAttemptBinding(operation.attemptId);
