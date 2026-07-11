@@ -651,4 +651,14 @@ export const migrations: readonly Migration[] = [
     state TEXT NOT NULL,
     claimed_at INTEGER NOT NULL
   );`,
+  // Backstop counter for the Claude goal auto-drive: how many follow-up turns QiYan
+  // has driven since the objective was (re)set. Primary termination is the worker
+  // calling set_goal_status(complete|blocked); this cap only guards a model that
+  // never marks its goal done.
+  (db) => {
+    const columns = new Set((db.prepare("PRAGMA table_info(claude_session_goals)").all() as Array<{ name: string }>).map((row) => row.name));
+    if (!columns.has("driven_turns")) {
+      db.exec("ALTER TABLE claude_session_goals ADD COLUMN driven_turns INTEGER NOT NULL DEFAULT 0");
+    }
+  },
 ];
