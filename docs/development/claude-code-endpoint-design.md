@@ -137,6 +137,14 @@ tools any managed session (Codex or Claude) can call:
 - `monitor(check, prompt, {interval?, timeout?})` — QiYan runs `check` on the session's endpoint on an
   interval; on trigger it fires. Same shape as Claude's native Monitor, but **QiYan** evaluates it — this
   replaces warm mode.
+- `list_schedules()` — list this session's pending wakeups/crons/monitors (unified across all three types;
+  ↔ native `CronList` but not cron-only).
+- `cancel_schedule(id)` — cancel any pending wakeup/cron/monitor by id (↔ native `CronDelete`, all types).
+
+**Five tools total** (3 create + 2 manage). Unified `list`/`cancel` (rather than mirroring native's cron-only
+list/delete) because in QiYan's durable model every wakeup/cron/monitor is a persistent row the agent should
+see and cancel. No `update` (cancel+recreate). Optional: `schedule_wakeup`+`schedule_cron` could merge into one
+`schedule(when,…)`, but keeping them separate matches the native mental model so they read as true drop-ins.
 
 Firing (uniform, both providers): QiYan durably records `(session id, schedule/condition, prompt)`; when it
 fires it **resumes the session and drives one turn** with the prompt.
