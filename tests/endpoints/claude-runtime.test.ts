@@ -156,10 +156,14 @@ test("thread/goal get/set/status/clear are emulated via the goal store", async (
   assert.deepEqual(await rt.request("thread/goal/clear", { threadId: thread.id }), { goal: null });
 });
 
-test("goal ops on a runtime with no goal store fail loud, not silently", async () => {
-  const rt = makeRuntime(new FakeRunner()); // no goals configured
+test("with no goal store, goal read is empty but goal writes fail loud, not silently", async () => {
+  const rt = makeRuntime(new FakeRunner()); // no goals configured (e.g. a remote Claude endpoint)
   await rt.start();
-  await assert.rejects(rt.request("thread/goal/get", { threadId: "t" }), /goal store/u);
+  // Reading is graceful — no store means no goal — so get_session_status doesn't blow up.
+  assert.deepEqual(await rt.request("thread/goal/get", { threadId: "t" }), { goal: null });
+  // Writing a goal you can't persist must still fail loudly.
+  await assert.rejects(rt.request("thread/goal/set", { threadId: "t", objective: "x" }), /goal store/u);
+  await assert.rejects(rt.request("thread/goal/clear", { threadId: "t" }), /goal store/u);
 });
 
 test("turn/steer durably enqueues the message (never aborts the running turn)", async () => {
