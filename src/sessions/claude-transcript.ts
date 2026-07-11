@@ -212,7 +212,7 @@ function isTurnEnd(record: Record<string, unknown>): boolean {
 }
 
 // Extracts ONLY QiYan's own clientId marker; the message body is never returned.
-function extractClientMarker(message: unknown): string | undefined {
+export function extractClientMarker(message: unknown): string | undefined {
   if (!message || typeof message !== "object" || Array.isArray(message)) return undefined;
   const content = (message as Record<string, unknown>).content;
   let text = "";
