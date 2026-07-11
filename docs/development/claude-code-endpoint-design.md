@@ -64,6 +64,14 @@ speaks Codex's request surface (§4.3) — not a drop-in.
   RPC and tracks native goal state (`goalControlled`). **Claude Code has no native goal engine.** So goal for
   Claude is new app-layer work — most likely folded onto the §5 MCP mechanism (a standing "goal" prompt QiYan
   re-injects) or a synthesized system-prompt. Resolve in Phase 1; do not assume the Codex goal path applies.
+- **steer — DIVERGES from Codex (no mid-turn steer):** Codex allows a steer message injected *while a turn
+  runs*, incorporated at the next tool boundary (dispatcher `steer_submitting`). Claude `-p` has **no
+  mid-turn steer**: fire-and-resume is atomic (one msg → one turn → exit), and even warm stream-json queues
+  additional messages for the *next* turn (it offers a hard interrupt/abort, not a soft steer). So map QiYan's
+  "steer" to **turn-boundary queueing** — the steer message becomes the next turn's input (natural under
+  fire-and-resume) — with **interrupt (kill subprocess) + resume** as the abort escape hatch (lossy for
+  in-flight work; transcript up to the abort survives). Confirm the exact stream-json queue-vs-interrupt
+  behavior in the spike; the dispatcher's start/steer states need this explicit Claude mapping.
 
 ### 4.2 Event translation
 
