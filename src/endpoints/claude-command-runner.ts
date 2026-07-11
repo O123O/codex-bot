@@ -40,8 +40,10 @@ export interface ClaudeCommandRunner {
 
 // Builds the stable, deterministic `claude -p` argv for a turn. Exported for tests
 // and so the byte-identical-per-turn invariant is auditable in one place.
+// The prompt is delivered over stdin (see startTurn), NOT as a positional arg, so a
+// message beginning with "--" is never parsed as a flag and there is no ARG_MAX limit.
 export function buildClaudeArgs(request: ClaudeTurnRequest): string[] {
-  const args = ["-p", request.message, "--output-format", "stream-json", "--verbose"];
+  const args = ["-p", "--output-format", "stream-json", "--verbose"];
   args.push(request.resume ? "--resume" : "--session-id", request.threadId);
   const { flags } = request;
   if (flags.appendSystemPrompt !== undefined) args.push("--append-system-prompt", flags.appendSystemPrompt);
@@ -54,15 +56,26 @@ export function buildClaudeArgs(request: ClaudeTurnRequest): string[] {
 }
 
 export class LocalClaudeCommandRunner implements ClaudeCommandRunner {
+  private readonly pathCache = new Map<string, string>();
   constructor(private readonly options: { command?: string; home?: string } = {}) {}
 
   startTurn(request: ClaudeTurnRequest): ClaudeTurnHandle {
+    // stdin: prompt; stdout: stream-json; stderr IGNORED so a chatty child can never
+    // block on a full stderr pipe (which would deadlock and never emit `close`).
     const child = spawn(this.options.command ?? "claude", buildClaudeArgs(request), {
       cwd: request.cwd,
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: ["pipe", "pipe", "ignore"],
     });
     let isError = false;
     let buffer = "";
+    const consume = (line: string): void => {
+      const trimmed = line.trim();
+      if (!trimmed) return;
+      try {
+        const event = JSON.parse(trimmed) as Record<string, unknown>;
+        if (event.type === "result" && event.is_error === true) isError = true;
+      } catch { /* partial/non-json line — ignore */ }
+    };
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", (chunk: string) => {
       // Parse the stream-json only to learn the terminal `result` outcome; the
@@ -70,18 +83,16 @@ export class LocalClaudeCommandRunner implements ClaudeCommandRunner {
       buffer += chunk;
       let index: number;
       while ((index = buffer.indexOf("\n")) >= 0) {
-        const line = buffer.slice(0, index).trim();
+        consume(buffer.slice(0, index));
         buffer = buffer.slice(index + 1);
-        if (!line) continue;
-        try {
-          const event = JSON.parse(line) as Record<string, unknown>;
-          if (event.type === "result" && event.is_error === true) isError = true;
-        } catch { /* partial/non-json line — ignore */ }
       }
     });
+    // Deliver the prompt over stdin, then close it.
+    child.stdin.on("error", () => { /* child already gone */ });
+    child.stdin.end(request.message);
     const done = new Promise<ClaudeTurnStatus>((resolve) => {
       child.once("error", () => resolve("failed"));
-      child.once("close", (code) => resolve(code === 0 && !isError ? "completed" : "failed"));
+      child.once("close", (code) => { consume(buffer); resolve(code === 0 && !isError ? "completed" : "failed"); });
     });
     return { done, interrupt: () => { try { child.kill("SIGKILL"); } catch { /* already gone */ } } };
   }
@@ -105,6 +116,8 @@ export class LocalClaudeCommandRunner implements ClaudeCommandRunner {
   // A session's transcript is `<home>/.claude/projects/<cwd-hash>/<threadId>.jsonl`.
   // Rather than reproduce Claude's cwd-hashing, find the file by its unique session id.
   private async transcriptPath(threadId: string): Promise<string | undefined> {
+    const cached = this.pathCache.get(threadId);
+    if (cached) return cached;
     const projects = join(this.options.home ?? homedir(), ".claude", "projects");
     let dirs: string[];
     try { dirs = await readdir(projects); }
@@ -113,7 +126,7 @@ export class LocalClaudeCommandRunner implements ClaudeCommandRunner {
     for (const dir of dirs) {
       try {
         const entries = await readdir(join(projects, dir));
-        if (entries.includes(file)) return join(projects, dir, file);
+        if (entries.includes(file)) { const path = join(projects, dir, file); this.pathCache.set(threadId, path); return path; }
       } catch { /* race: dir vanished — keep looking */ }
     }
     return undefined;

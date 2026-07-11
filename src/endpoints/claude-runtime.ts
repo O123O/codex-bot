@@ -39,7 +39,7 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     launchFlags: ClaudeLaunchFlags;
   }) {
     this.id = options.id;
-    this.emitter.setMaxListeners(0);
+    this.emitter.setMaxListeners(100);
   }
 
   get state(): "starting" | "ready" | "unavailable" | "stopped" { return this.endpointState; }
@@ -89,7 +89,7 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
       case "thread/resume": return this.threadResume(args) as unknown as T;
       case "turn/start": return this.turnStart(args) as T;
       case "turn/interrupt": return this.turnInterrupt(args) as T;
-      case "thread/archive": return {} as T;
+      case "thread/archive": { const id = typeof args.threadId === "string" ? args.threadId : ""; this.threads.get(id)?.running?.handle.interrupt(); this.threads.delete(id); return {} as T; }
       case "thread/unsubscribe": return { status: "unsubscribed" } as T;
       case "thread/name/set": return {} as T;
       case "model/list": return { models: this.options.launchFlags.model ? [{ id: this.options.launchFlags.model }] : [] } as T;
@@ -126,12 +126,19 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
   }
 
   private async reconstruct(threadId: string): Promise<ClaudeThreadView> {
-    const state = this.threads.get(threadId);
-    // A thread QiYan started but not yet materialized reads as an empty idle thread
-    // (matches Codex's fresh-thread shape). A truly unknown thread reproduces the
-    // exact Codex `no rollout` error so recovery paths behave.
-    if (!state) throw noRollout(threadId);
-    const records = state.materialized ? await this.options.runner.readTranscript(threadId, state.cwd) : [];
+    let state = this.threads.get(threadId);
+    // Cold-start recovery: after a QiYan restart the in-memory map is empty, but the
+    // Claude transcript is durable on disk. Rehydrate an unknown-but-on-disk session
+    // (cwd read from the transcript itself) rather than falsely reporting it gone.
+    // A reserved-but-unmaterialized thread (state present, materialized false) reads
+    // as an empty idle thread. A truly unknown thread with no transcript reproduces
+    // the exact Codex `no rollout` error so recovery paths behave.
+    const records = state?.materialized === false ? [] : await this.options.runner.readTranscript(threadId, state?.cwd ?? "");
+    if (!state) {
+      if (records.length === 0) throw noRollout(threadId);
+      state = { cwd: cwdFromRecords(records), materialized: true, terminalTurns: new Set() };
+      this.threads.set(threadId, state);
+    }
     return reconstructClaudeThread({
       threadId, cwd: state.cwd, records,
       interruptedTurnIds: state.terminalTurns,
@@ -144,6 +151,9 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     const threadId = requireString(params.threadId, "threadId");
     const state = this.threads.get(threadId);
     if (!state) throw noRollout(threadId);
+    // Defense-in-depth: the pool/lifecycle serialize turns per thread, but never let
+    // a second turn/start silently orphan a running child (losing interrupt control).
+    if (state.running) throw new AppError("SESSION_BUSY", `claude turn already running: ${threadId}`);
     const clientId = requireString(params.clientUserMessageId, "clientUserMessageId");
     const message = `${inputToText(params.input)}\n\n${encodeClaudeClientMarker(clientId)}`;
 
@@ -155,9 +165,15 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     void handle.done.then((status) => {
       state.materialized = true;
       delete state.running;
+      // A failed turn is marked terminal so reconstruct synthesizes a findable
+      // terminal turn even if `claude` never wrote its user row (relay would else hang).
       if (status === "failed") state.terminalTurns.add(clientId);
       // The relay ignores this body and re-reads thread/read; {threadId, turn:{id}}
       // is the minimal trigger.
+      this.emitter.emit("notification", "turn/completed", { threadId, turn: { id: clientId } });
+    }).catch(() => {
+      delete state.running;
+      state.terminalTurns.add(clientId);
       this.emitter.emit("notification", "turn/completed", { threadId, turn: { id: clientId } });
     });
 
@@ -192,6 +208,18 @@ function inputToText(input: unknown): string {
     }
   }
   return parts.join("\n");
+}
+
+// Every transcript row carries the session cwd; used to rehydrate a cold-started
+// session whose in-memory state was lost on QiYan restart.
+function cwdFromRecords(records: readonly unknown[]): string {
+  for (const record of records) {
+    if (record && typeof record === "object" && !Array.isArray(record)) {
+      const cwd = (record as Record<string, unknown>).cwd;
+      if (typeof cwd === "string" && cwd.length > 0) return cwd;
+    }
+  }
+  return "";
 }
 
 function noRollout(threadId: string): JsonRpcResponseError {

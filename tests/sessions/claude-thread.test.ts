@@ -66,6 +66,17 @@ test("userMessage carries the QiYan clientId marker; phases split final vs comme
   assert.equal(items.find((i) => i.phase === "final_answer")?.text, "the answer");
 });
 
+test("a failed turn with no transcript row is synthesized as a findable interrupted turn", () => {
+  // claude died before writing its user row (e.g. spawn ENOENT); the relay must
+  // still find a terminal turn by id to release capacity instead of retrying forever.
+  const v = reconstructClaudeThread({ threadId: "s1", cwd: "/w", records: [], interruptedTurnIds: new Set(["ctx:x"]) });
+  assert.equal(v.turns.length, 1);
+  assert.equal(v.turns[0]?.id, "ctx:x");
+  assert.equal(v.turns[0]?.status, "interrupted");
+  assert.equal(v.turns[0]?.items[0]?.clientId, "ctx:x");
+  assert.equal(v.status.type, "idle");
+});
+
 test("a turn truncated by max_tokens still completes (not open forever)", () => {
   const recs = [
     { type: "user", promptSource: "sdk", promptId: "p1", uuid: "u1", message: { role: "user", content: "go" } },

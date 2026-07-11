@@ -113,11 +113,25 @@ export function reconstructClaudeThread(params: ReconstructClaudeThreadParams): 
   }
   finalize(current);
 
-  const openTurn = turns.length > 0 && (turns[turns.length - 1]!.status === "inProgress");
+  // A turn QiYan drove that failed/interrupted BEFORE `claude` persisted its
+  // turn-start user row (spawn ENOENT on a node without claude, a rejected flag,
+  // etc.) leaves no transcript turn — so synthesize a findable terminal turn for
+  // every known-terminal id that isn't already present. Otherwise the relay, which
+  // finds the turn by id in thread/read, retries forever and never releases the
+  // capacity claim.
+  if (params.interruptedTurnIds) {
+    const present = new Set(turns.map((turn) => turn.id));
+    for (const id of params.interruptedTurnIds) {
+      if (present.has(id)) continue;
+      turns.push({ id, status: "interrupted", itemsView: "full", items: [{ type: "userMessage", id: `${id}:user`, clientId: id }] });
+    }
+  }
+
+  const active = turns.some((turn) => turn.status === "inProgress");
   return {
     id: params.threadId,
     cwd: params.cwd,
-    status: { type: openTurn ? "active" : "idle" },
+    status: { type: active ? "active" : "idle" },
     itemsView: "full",
     turns,
     ...(params.threadSource === undefined ? {} : { threadSource: params.threadSource }),

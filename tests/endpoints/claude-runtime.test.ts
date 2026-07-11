@@ -108,7 +108,7 @@ test("turn/interrupt kills the running turn and marks it interrupted (terminal)"
   assert.equal(read.thread.turns[0].status, "interrupted");
 });
 
-test("reading an unknown thread reproduces the exact Codex no-rollout error", async () => {
+test("reading an unknown thread with no transcript reproduces the exact Codex no-rollout error", async () => {
   const rt = makeRuntime(new FakeRunner());
   await rt.start();
   await assert.rejects(
@@ -117,13 +117,32 @@ test("reading an unknown thread reproduces the exact Codex no-rollout error", as
   );
 });
 
+test("a cold-started session (on disk, not in memory) is rehydrated from the transcript, not reported gone", async () => {
+  // runtime A runs a turn, materializing a transcript in the shared runner.
+  const runner = new FakeRunner();
+  const a = makeRuntime(runner);
+  await a.start();
+  const { thread } = await a.request<{ thread: any }>("thread/start", { cwd: "/w" });
+  await a.request("turn/start", { threadId: thread.id, clientUserMessageId: "ctx:c1", input: [{ type: "text", text: "hi" }] });
+  runner.complete("completed");
+  await delay(5);
+
+  // runtime B (fresh in-memory state, e.g. after a QiYan restart) reads the same id.
+  const b = makeRuntime(runner);
+  await b.start();
+  const read = await b.request<{ thread: any }>("thread/read", { threadId: thread.id, includeTurns: true });
+  assert.equal(read.thread.turns.length, 1);
+  assert.equal(read.thread.turns[0].id, "ctx:c1");
+  assert.equal(read.thread.turns[0].status, "completed");
+});
+
 test("buildClaudeArgs emits stable, byte-identical flags", () => {
   const base: ClaudeTurnRequest = {
     threadId: "sid-1", cwd: "/w", message: "hi", resume: false,
     flags: { appendSystemPrompt: "SP", disallowedTools: ["Monitor", "ScheduleWakeup"], mcpConfig: ["/tmp/m.json"], model: "claude-opus-4-8" },
   };
   assert.deepEqual(buildClaudeArgs(base), [
-    "-p", "hi", "--output-format", "stream-json", "--verbose",
+    "-p", "--output-format", "stream-json", "--verbose",
     "--session-id", "sid-1",
     "--append-system-prompt", "SP",
     "--disallowedTools", "Monitor ScheduleWakeup",
@@ -131,4 +150,5 @@ test("buildClaudeArgs emits stable, byte-identical flags", () => {
     "--model", "claude-opus-4-8",
   ]);
   assert.equal(buildClaudeArgs({ ...base, resume: true }).includes("--resume"), true);
+  assert.equal(buildClaudeArgs(base).includes("hi"), false); // prompt goes over stdin, never argv
 });
