@@ -620,4 +620,35 @@ export const migrations: readonly Migration[] = [
     updated_at INTEGER NOT NULL,
     PRIMARY KEY (endpoint_id, thread_id)
   );`,
+  // Provider-agnostic durable schedules (Phase 2.1). Net-new additive table: on any
+  // trigger (wakeup timer / cron / monitor condition) the engine drives a turn via
+  // the unified send_to_session. Fire idempotency lives in the durable send enqueue
+  // (unique-constraint insert), not this row. Codex and Claude sessions share this.
+  `
+  CREATE TABLE IF NOT EXISTS session_schedules (
+    id TEXT PRIMARY KEY,
+    nickname TEXT NOT NULL,
+    endpoint_id TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    spec TEXT NOT NULL,
+    message TEXT NOT NULL,
+    state TEXT NOT NULL,
+    next_fire_at INTEGER,
+    interval_ms INTEGER,
+    created_at INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS session_schedules_due ON session_schedules(state, next_fire_at);`,
+  // Durable idempotent outbox for schedule fires (Phase 2.2 wiring). The single_fire_key
+  // PRIMARY KEY makes claiming a fire a true unique-constraint insert, so even two
+  // instances polling the same DB deliver at most once. state: sending -> sent; a
+  // crashed 'sending' row is reclaimed by age on recovery.
+  `
+  CREATE TABLE IF NOT EXISTS scheduled_sends (
+    single_fire_key TEXT PRIMARY KEY,
+    nickname TEXT NOT NULL,
+    message TEXT NOT NULL,
+    state TEXT NOT NULL,
+    claimed_at INTEGER NOT NULL
+  );`,
 ];

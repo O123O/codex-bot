@@ -1,4 +1,5 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { spawn } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { dirname, join, posix, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -115,6 +116,23 @@ import { ClaudeCodeRuntime } from "./endpoints/claude-runtime.ts";
 import { LocalClaudeCommandRunner } from "./endpoints/claude-command-runner.ts";
 import { scanLocalClaudeTranscript } from "./sessions/claude-transcript.ts";
 import { ClaudeGoalStore } from "./sessions/claude-goals.ts";
+import { SchedulingService } from "./scheduling/scheduling-service.ts";
+import type { ScheduleRow } from "./scheduling/schedule-store.ts";
+
+// Runs a monitor schedule's shell predicate on the QiYan host; true iff exit 0. Only
+// wired for LOCAL Claude sessions (host == QiYan host), so this is not a cross-host
+// escalation. When a REMOTE worker endpoint is added, its monitors MUST run over that
+// session's ssh channel, not here — gate on endpoint locality before that ships.
+// `bash -c` (not -l) so it does not source the operator's login profile.
+function runMonitorCheck(command: string, timeoutMs = 20_000): Promise<boolean> {
+  return new Promise((resolve) => {
+    const child = spawn("bash", ["-c", command], { stdio: "ignore" });
+    const timer = setTimeout(() => { try { child.kill("SIGKILL"); } catch { /* gone */ } resolve(false); }, timeoutMs);
+    timer.unref?.();
+    child.once("error", () => { clearTimeout(timer); resolve(false); });
+    child.once("close", (code) => { clearTimeout(timer); resolve(code === 0); });
+  });
+}
 
 const assistantAssetRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../assets/assistant");
 const remoteAssetRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../assets/remote");
@@ -1796,6 +1814,7 @@ export async function buildProductionApp(
   let endpoint!: ManagedAppServerEndpoint;
   let assistantEndpoint!: ManagedAppServerEndpoint;
   let claudeEndpoint: ClaudeCodeRuntime | undefined;
+  let scheduling: SchedulingService | undefined;
   let endpointCatalog!: EndpointCatalog;
   let endpointBindings!: EndpointBindingStore;
   let endpointManager!: EndpointManager;
@@ -2236,16 +2255,42 @@ export async function buildProductionApp(
         // Opt-in local Claude Code endpoint (Phase 1.4). Eager + always-ready like
         // "local" (no daemon); absent config.claudeCode it is never constructed and
         // the composition is unchanged.
-        claudeEndpoint = config.claudeCode === undefined ? undefined : new ClaudeCodeRuntime({
-          id: config.claudeCode.endpointId,
-          runner: new LocalClaudeCommandRunner({ command: config.claudeCode.command }),
+        const claudeCodeConfig = config.claudeCode;
+        scheduling = claudeCodeConfig === undefined ? undefined : new SchedulingService({
+          db,
+          now: () => Date.now(),
+          mcpConfigDir: join(dataDir, "claude-worker-mcp"),
+          // Fire drives a turn via the durable send_to_session (singleFireKey ==
+          // clientUserMessageId for idempotent delivery).
+          send: (nickname, message, key) => sessions.send(nickname, message, { mode: "auto", clientUserMessageId: key }).then(() => undefined),
+          runCheck: (row: ScheduleRow) => runMonitorCheck(row.spec),
+        });
+        claudeEndpoint = claudeCodeConfig === undefined ? undefined : new ClaudeCodeRuntime({
+          id: claudeCodeConfig.endpointId,
+          runner: new LocalClaudeCommandRunner({ command: claudeCodeConfig.command }),
           launchFlags: {
-            disallowedTools: config.claudeCode.disallowedTools,
-            appendSystemPrompt: config.claudeCode.appendSystemPrompt,
-            ...(config.claudeCode.model === undefined ? {} : { model: config.claudeCode.model }),
+            disallowedTools: claudeCodeConfig.disallowedTools,
+            appendSystemPrompt: claudeCodeConfig.appendSystemPrompt,
+            ...(claudeCodeConfig.model === undefined ? {} : { model: claudeCodeConfig.model }),
           },
           goals: new ClaudeGoalStore(db),
+          ...(scheduling ? {
+            workerMcpConfigPath: async (threadId: string) => {
+              const found = registry.getByIdentity(claudeCodeConfig.endpointId, threadId);
+              return found ? scheduling!.workerMcpConfigPath({ nickname: found.nickname, endpointId: claudeCodeConfig.endpointId, threadId }) : undefined;
+            },
+            steer: async (threadId: string, message: string) => {
+              const found = registry.getByIdentity(claudeCodeConfig.endpointId, threadId);
+              if (found) scheduling!.enqueueSteer({ nickname: found.nickname, endpointId: claudeCodeConfig.endpointId, threadId }, message);
+            },
+          } : {}),
         });
+        // A Claude endpoint id that collides with a configured remote (catalog) id
+        // would silently shadow that remote (builtins short-circuit before the
+        // catalog). Refuse the misconfiguration loudly.
+        if (claudeEndpoint && endpointCatalog.snapshot().endpoints[claudeEndpoint.id]) {
+          throw new AppError("CONFIGURATION_ERROR", `CLAUDE_CODE_ENDPOINT_ID collides with a catalog endpoint: ${claudeEndpoint.id}`);
+        }
         const sshRuntimeRoot = await prepareLocalSshRuntimeRoot(dataDir);
         const helperSource = await readFile(join(remoteAssetRoot, "qiyan-ssh-helper.mjs"));
         const planner = new SshGenerationPlanner({
@@ -2257,6 +2302,7 @@ export async function buildProductionApp(
         });
         endpointManager = new EndpointManager({
           localEndpoint: endpoint,
+          ...(claudeEndpoint ? { builtinEndpoints: [claudeEndpoint] } : {}),
           catalog: endpointCatalog,
           createRemote: async (definition) => {
             const generation = await planner.createGeneration(definition.id);
@@ -2283,9 +2329,10 @@ export async function buildProductionApp(
         pool = new AppServerPool([endpoint, assistantEndpoint, ...(claudeEndpoint ? [claudeEndpoint] : [])], {
           maxConcurrentTurns: config.maxConcurrentTurns,
           resolveEndpoint: (id) => endpointManager.ensureReady(id),
-          // The Claude endpoint is eager + always-ready (no daemon / no ssh work
-          // lease), so it runs the callback directly like assistant-local.
-          workLeaseProvider: (id, lease, run) => (id === assistantEndpoint.id || id === claudeEndpoint?.id) ? run(lease) : endpointManager.runWithReadyWorkLease(id, lease, run),
+          // The Claude endpoint is a manager built-in (like "local"), so it goes
+          // through the manager's ready-work-lease; only assistant-local (not
+          // manager-registered) runs the callback directly.
+          workLeaseProvider: (id, lease, run) => id === assistantEndpoint.id ? run(lease) : endpointManager.runWithReadyWorkLease(id, lease, run),
         });
         recoveredEndpointIds = new EndpointCapacityRecovery({
           runtime,
@@ -2635,9 +2682,13 @@ export async function buildProductionApp(
         schedulerAccepting = true;
         await enqueuePendingEvents();
         await dispatcher.enqueueInternal("startup");
+        // Provider-agnostic schedule engine + worker MCP surface (Phase 2). Recovery
+        // re-arms durable schedules on start; fires drive send_to_session.
+        if (scheduling) await scheduling.start();
       },
       stop: async () => {
         stopping = true;
+        if (scheduling) await scheduling.stop();
         assistantToolReadiness.stop();
         schedulerAccepting = false;
         const active = assistant.current();

@@ -40,6 +40,12 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     launchFlags: ClaudeLaunchFlags;
     goals?: ClaudeGoalStore;
     now?: () => number;
+    // Returns the stable per-session --mcp-config path exposing the worker scheduling
+    // tools, or undefined. Attached to every turn (byte-identical per session).
+    workerMcpConfigPath?: (threadId: string) => Promise<string | undefined>;
+    // Claude has no native mid-turn steer (spike 0.4). turn/steer durably enqueues the
+    // message; it is delivered as the next turn once the running one completes.
+    steer?: (threadId: string, message: string) => Promise<void>;
   }) {
     this.id = options.id;
     this.emitter.setMaxListeners(100);
@@ -90,7 +96,7 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
       case "thread/start": return this.threadStart(args) as T;
       case "thread/read": return this.threadRead(args) as unknown as T;
       case "thread/resume": return this.threadResume(args) as unknown as T;
-      case "turn/start": return this.turnStart(args) as T;
+      case "turn/start": return await this.turnStart(args) as T;
       case "turn/interrupt": return this.turnInterrupt(args) as T;
       case "thread/archive": { const id = typeof args.threadId === "string" ? args.threadId : ""; this.threads.get(id)?.running?.handle.interrupt(); this.threads.delete(id); return {} as T; }
       case "thread/unsubscribe": return { status: "unsubscribed" } as T;
@@ -99,7 +105,7 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
       case "thread/goal/get": return { goal: this.goals().get(this.id, requireString(args.threadId, "threadId")) } as T;
       case "thread/goal/set": return this.goalSet(args) as T;
       case "thread/goal/clear": { this.goals().clear(this.id, requireString(args.threadId, "threadId")); return { goal: null } as T; }
-      // turn/steer (Claude enqueue) is Phase 2.3.
+      case "turn/steer": return await this.turnSteer(args) as T;
       default: throw new AppError("UNSUPPORTED_CAPABILITY", `claude endpoint does not implement ${method}`);
     }
   }
@@ -162,7 +168,7 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     });
   }
 
-  private turnStart(params: Record<string, unknown>): { turn: { id: string; status: string } } {
+  private async turnStart(params: Record<string, unknown>): Promise<{ turn: { id: string; status: string } }> {
     const threadId = requireString(params.threadId, "threadId");
     const state = this.threads.get(threadId);
     if (!state) throw noRollout(threadId);
@@ -172,8 +178,13 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     const clientId = requireString(params.clientUserMessageId, "clientUserMessageId");
     const message = `${inputToText(params.input)}\n\n${encodeClaudeClientMarker(clientId)}`;
 
+    // Attach the worker scheduling tools (stable per session → cache-safe).
+    const workerConfig = await this.options.workerMcpConfigPath?.(threadId);
+    const flags: ClaudeLaunchFlags = workerConfig === undefined ? this.options.launchFlags
+      : { ...this.options.launchFlags, mcpConfig: [...(this.options.launchFlags.mcpConfig ?? []), workerConfig] };
+
     const handle = this.options.runner.startTurn({
-      threadId, cwd: state.cwd, message, resume: state.materialized, flags: this.options.launchFlags,
+      threadId, cwd: state.cwd, message, resume: state.materialized, flags,
     });
     state.running = { turnId: clientId, handle };
 
@@ -205,15 +216,28 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
   private goalSet(params: Record<string, unknown>): { goal: unknown } {
     const threadId = requireString(params.threadId, "threadId");
     const now = this.options.now?.() ?? Date.now();
+    const status = typeof params.status === "string" ? requireGoalStatus(params.status) : undefined;
     if (typeof params.objective === "string" && params.objective.length > 0) {
       return { goal: this.goals().set(this.id, threadId, {
         objective: params.objective,
-        ...(typeof params.status === "string" ? { status: params.status } : {}),
+        ...(status === undefined ? {} : { status }),
         ...(typeof params.tokenBudget === "number" ? { tokenBudget: params.tokenBudget } : {}),
       }, now) };
     }
-    if (typeof params.status === "string") return { goal: this.goals().setStatus(this.id, threadId, params.status, now) };
+    if (status !== undefined) return { goal: this.goals().setStatus(this.id, threadId, status, now) };
     throw new AppError("CONFIGURATION_ERROR", "thread/goal/set requires an objective or a status");
+  }
+
+  // Claude steer = durable enqueue (never abort the running turn). Delivered as the
+  // next turn once the running one completes (the schedule engine retries while the
+  // session is SESSION_BUSY).
+  private async turnSteer(params: Record<string, unknown>): Promise<{ turnId: string }> {
+    const threadId = requireString(params.threadId, "threadId");
+    if (!this.options.steer) throw new AppError("UNSUPPORTED_CAPABILITY", "claude endpoint has no steer queue configured");
+    const message = inputToText(params.input);
+    if (message.length === 0) throw new AppError("CONFIGURATION_ERROR", "turn/steer requires input text");
+    await this.options.steer(threadId, message);
+    return { turnId: typeof params.clientUserMessageId === "string" ? params.clientUserMessageId : randomUUID() };
   }
 
   private turnInterrupt(params: Record<string, unknown>): Record<string, never> {
@@ -229,6 +253,14 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
 function requireString(value: unknown, field: string): string {
   if (typeof value !== "string" || value.length === 0) throw new AppError("CONFIGURATION_ERROR", `claude endpoint: missing ${field}`);
   return value;
+}
+
+// The goal statuses QiYan's recovery/dashboard accept (production-app parseManagedGoal);
+// reject anything else at write time rather than letting recovery throw later.
+const CLAUDE_GOAL_STATUSES = new Set(["active", "paused", "blocked", "usageLimited", "budgetLimited", "complete"]);
+function requireGoalStatus(status: string): string {
+  if (!CLAUDE_GOAL_STATUSES.has(status)) throw new AppError("CONFIGURATION_ERROR", `invalid goal status: ${status}`);
+  return status;
 }
 
 // Concatenate the text of the Codex-shaped input items; non-text items (files) are

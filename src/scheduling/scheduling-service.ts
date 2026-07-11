@@ -1,0 +1,127 @@
+// Scheduling service (Phase 2 wiring) — ties the durable store, the idempotent send
+// outbox, the trigger engine, and the worker-facing MCP server together, and manages
+// per-session worker tokens + --mcp-config files. production-app constructs one and
+// injects `send` (→ send_to_session) and `runCheck` (→ shell on the session's host).
+import { randomUUID } from "node:crypto";
+import { mkdir, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { AppError } from "../core/errors.ts";
+import type { Database } from "../storage/database.ts";
+import { ScheduleStore, type ScheduleRow } from "./schedule-store.ts";
+import { ScheduledSendOutbox } from "./send-outbox.ts";
+import { TriggerEngine } from "./trigger-engine.ts";
+import { WorkerScheduleMcpServer, type WorkerScheduleSession } from "./worker-mcp.ts";
+
+export interface SchedulingServiceDeps {
+  db: Database;
+  // Drive a turn on the target session (production-app wires this to the durable
+  // send_to_session, passing singleFireKey as the clientUserMessageId).
+  send(nickname: string, message: string, singleFireKey: string): Promise<void>;
+  // Run a monitor's shell predicate on the session's endpoint; true iff exit 0.
+  runCheck(row: ScheduleRow): Promise<boolean>;
+  now(): number;
+  // Directory for per-session worker --mcp-config files (0700).
+  mcpConfigDir: string;
+  pollIntervalMs?: number;
+}
+
+export class SchedulingService {
+  readonly store: ScheduleStore;
+  private readonly outbox: ScheduledSendOutbox;
+  private readonly server: WorkerScheduleMcpServer;
+  private readonly engine: TriggerEngine;
+  private readonly tokenBySession = new Map<string, string>();   // `${endpointId}\0${threadId}` -> token
+  private readonly sessionByToken = new Map<string, WorkerScheduleSession>();
+
+  constructor(private readonly deps: SchedulingServiceDeps) {
+    this.store = new ScheduleStore(deps.db);
+    this.outbox = new ScheduledSendOutbox(deps.db);
+    this.server = new WorkerScheduleMcpServer({ store: this.store, now: deps.now, resolveToken: (token) => this.sessionByToken.get(token) });
+    this.engine = new TriggerEngine({
+      store: this.store,
+      now: deps.now,
+      fire: (row, key) => this.fire(row, key),
+      runCheck: deps.runCheck,
+      // Above pool.startTurn's ~30s reconciliation budget, so a slow-but-live send
+      // isn't spuriously orphaned by the engine's op timeout.
+      opTimeoutMs: 120_000,
+      ...(deps.pollIntervalMs === undefined ? {} : { pollIntervalMs: deps.pollIntervalMs }),
+    });
+  }
+
+  async start(): Promise<void> {
+    await mkdir(this.deps.mcpConfigDir, { recursive: true, mode: 0o700 });
+    await this.server.start();
+    // Recovery (2.5): the store is durable, so starting just resumes polling; armed
+    // rows (including any missed while down) fire on the first tick.
+    this.engine.start();
+  }
+
+  async stop(): Promise<void> {
+    this.engine.stop();
+    await this.server.stop();
+  }
+
+  // Drive one engine pass (tests / manual flush).
+  runDueOnce(): Promise<void> { return this.engine.tick(); }
+
+  // Idempotent fire. The outbox is the sole dedup ledger, so it must NOT drop the
+  // record on an ambiguous outcome (that would let a re-fire double-deliver on the
+  // shared-NFS deployment). Rules:
+  //   - claimed  → send. On success mark sent (advance). On a PROVEN-not-dispatched
+  //     error release + throw (re-fire cleanly). On any AMBIGUOUS error mark sent
+  //     anyway (the turn may have run — bias to no-double) and advance.
+  //   - delivered → someone already sent it; advance.
+  //   - in-flight → a live/crashed peer holds the claim; THROW so the schedule stays
+  //     armed (never advance) until it is proven sent or the claim goes stale and is
+  //     reclaimed. This closes the orphaned-send / lost-delivery hole.
+  private async fire(row: ScheduleRow, singleFireKey: string): Promise<void> {
+    const outcome = this.outbox.claim(singleFireKey, row.nickname, row.message, this.deps.now());
+    if (outcome === "delivered") return;
+    if (outcome === "in-flight") throw new AppError("OPERATION_UNCERTAIN", `schedule send in-flight: ${singleFireKey}`);
+    try {
+      await this.deps.send(row.nickname, row.message, singleFireKey);
+      this.outbox.markSent(singleFireKey);
+    } catch (error) {
+      if (isProvenNotDispatched(error)) { this.outbox.release(singleFireKey); throw error; }
+      // Ambiguous: the turn may already be running/done. Do NOT re-send (avoid the
+      // duplicate-delivery class this deployment is sensitive to); accept it.
+      this.outbox.markSent(singleFireKey);
+    }
+  }
+
+  // Claude steer: enqueue the message as an immediate one-shot so the engine delivers
+  // it as the next turn (retrying while the session is busy). Durable + recovers.
+  enqueueSteer(session: WorkerScheduleSession, message: string): void {
+    this.store.create({ nickname: session.nickname, endpointId: session.endpointId, threadId: session.threadId, kind: "wakeup", spec: "steer", message, nextFireAt: this.deps.now() }, this.deps.now());
+  }
+
+  // Register a worker session so it can reach the scheduling tools; returns the stable
+  // per-session --mcp-config path (byte-identical across the session's turns, so it
+  // doesn't break the prompt cache). Idempotent per session.
+  async workerMcpConfigPath(session: WorkerScheduleSession): Promise<string> {
+    const sessionKey = `${session.endpointId}\0${session.threadId}`;
+    let token = this.tokenBySession.get(sessionKey);
+    if (!token) {
+      token = randomUUID();
+      this.tokenBySession.set(sessionKey, token);
+      this.sessionByToken.set(token, session);
+    }
+    const path = join(this.deps.mcpConfigDir, `${session.threadId}.json`);
+    await writeFile(path, JSON.stringify({
+      mcpServers: { "qiyan-worker-scheduling": { type: "http", url: this.server.url, headers: { Authorization: `Bearer ${token}` } } },
+    }), { mode: 0o600 });
+    return path;
+  }
+}
+
+// Errors that PROVE the turn never dispatched — safe to release + re-fire. Anything
+// else (uncertain / failed) is treated as maybe-delivered to avoid double-sending.
+const PROVEN_NOT_DISPATCHED = new Set([
+  "SESSION_BUSY", "SESSION_DETACHED", "SESSION_IDLE", "UNKNOWN_SESSION", "AMBIGUOUS_SESSION",
+  "THREAD_NOT_FOUND", "ENDPOINT_UNAVAILABLE", "ENDPOINT_IDENTITY_CHANGED", "CWD_MISMATCH",
+  "CONFIGURATION_ERROR", "CAPACITY_EXCEEDED", "PERMISSION_BLOCKED", "UNSUPPORTED_CAPABILITY",
+]);
+function isProvenNotDispatched(error: unknown): boolean {
+  return error instanceof AppError && PROVEN_NOT_DISPATCHED.has(error.code);
+}
