@@ -614,6 +614,30 @@ test("a pathless created thread stays pending until its exact rollout path can b
   ) as { rollout_path: string }).rollout_path, resolvedPath);
 });
 
+test("a resolved Claude transcript path (<id>.jsonl) records and scans as owned, not rejected as invalid", async () => {
+  // Regression: once a Claude session's first turn writes its transcript, the guard resolves
+  // that path and records it. The path is `<id>.jsonl` (no Codex `rollout-` prefix), which the
+  // old validator rejected — throwing "managed rollout path is invalid", which surfaced as the
+  // repeating external_ownership_detection failure AND blocked the worker result's delivery.
+  const db = createTestDatabase();
+  const runtime = new RuntimeStore(db);
+  const identity = { endpoint: "claude-local", thread_id: "sess-claude", mapping_id: "map-claude" };
+  const resolvedPath = "/home/u/.claude/projects/-a-b/sess-claude.jsonl";
+  let scans = 0;
+  const guard = new SessionOwnershipGuard(db, runtime, new OperationStore(db), {
+    scan: async () => { throw new Error("materialized scan is not expected"); },
+    scanUnmaterialized: async (_endpoint, request) => { scans += 1; assert.equal(request.path, resolvedPath); return { state: "missing" }; },
+  }, async () => ({ state: "resolved", path: resolvedPath }));
+
+  guard.recordUnmaterialized(identity);
+  assert.deepEqual(await guard.inspect(identity), { state: "owned" });
+  assert.equal(scans, 1);
+  assert.equal((db.prepare(`SELECT rollout_path FROM session_rollout_ownership
+    WHERE endpoint_id = ? AND thread_id = ? AND mapping_id = ?`).get(
+    identity.endpoint, identity.thread_id, identity.mapping_id,
+  ) as { rollout_path: string }).rollout_path, resolvedPath);
+});
+
 test("an unstarted thread (no rollout until the first turn) dispatches its first turn as owned", async () => {
   // A Claude session's transcript is only written by the first `claude -p`, so its rollout
   // path is unresolvable until then. The resolver reports this as "unstarted" (vs the transient

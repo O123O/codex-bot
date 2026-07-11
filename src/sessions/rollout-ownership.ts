@@ -120,7 +120,7 @@ export class SessionOwnershipGuard {
   ) {}
 
   recordUnmaterialized(identity: MappingIdentity, path?: string): void {
-    if (path !== undefined && !validRolloutPath(path, identity.thread_id)) {
+    if (path !== undefined && !validManagedRolloutPath(path, identity.thread_id)) {
       throw new AppError("OPERATION_UNCERTAIN", "managed rollout path is invalid");
     }
     inTransaction(this.db, () => {
@@ -436,6 +436,19 @@ export async function scanLocalRollout(request: {
 function validRolloutPath(path: string, threadId: string): boolean {
   const name = basename(path);
   return isAbsolute(path) && safeThreadId(threadId) && name.startsWith("rollout-") && name.endsWith(`-${threadId}.jsonl`);
+}
+
+// The ownership guard is provider-neutral: it records paths for both Codex rollouts
+// (`rollout-*-<id>.jsonl`) and Claude transcripts (`<id>.jsonl`). recordUnmaterialized may
+// receive either, so it must accept both shapes — otherwise a Claude transcript path is
+// rejected as "invalid", the ownership scan throws, and the session's turns never commit as
+// owned (their result is never delivered). The Codex local scanner keeps the strict
+// `validRolloutPath`; a Claude path never reaches it (provider dispatch routes to the Claude
+// scanner, which enforces its own `<id>.jsonl` shape).
+function validManagedRolloutPath(path: string, threadId: string): boolean {
+  const name = basename(path);
+  if (!isAbsolute(path) || !safeThreadId(threadId)) return false;
+  return name === `${threadId}.jsonl` || (name.startsWith("rollout-") && name.endsWith(`-${threadId}.jsonl`));
 }
 
 function exactThreadPath(response: unknown, threadId: string): string | undefined {
