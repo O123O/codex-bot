@@ -40,6 +40,9 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     launchFlags: ClaudeLaunchFlags;
     goals?: ClaudeGoalStore;
     now?: () => number;
+    // Returns the stable per-session --mcp-config path exposing the worker scheduling
+    // tools, or undefined. Attached to every turn (byte-identical per session).
+    workerMcpConfigPath?: (threadId: string) => Promise<string | undefined>;
   }) {
     this.id = options.id;
     this.emitter.setMaxListeners(100);
@@ -90,7 +93,7 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
       case "thread/start": return this.threadStart(args) as T;
       case "thread/read": return this.threadRead(args) as unknown as T;
       case "thread/resume": return this.threadResume(args) as unknown as T;
-      case "turn/start": return this.turnStart(args) as T;
+      case "turn/start": return await this.turnStart(args) as T;
       case "turn/interrupt": return this.turnInterrupt(args) as T;
       case "thread/archive": { const id = typeof args.threadId === "string" ? args.threadId : ""; this.threads.get(id)?.running?.handle.interrupt(); this.threads.delete(id); return {} as T; }
       case "thread/unsubscribe": return { status: "unsubscribed" } as T;
@@ -162,7 +165,7 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     });
   }
 
-  private turnStart(params: Record<string, unknown>): { turn: { id: string; status: string } } {
+  private async turnStart(params: Record<string, unknown>): Promise<{ turn: { id: string; status: string } }> {
     const threadId = requireString(params.threadId, "threadId");
     const state = this.threads.get(threadId);
     if (!state) throw noRollout(threadId);
@@ -172,8 +175,13 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     const clientId = requireString(params.clientUserMessageId, "clientUserMessageId");
     const message = `${inputToText(params.input)}\n\n${encodeClaudeClientMarker(clientId)}`;
 
+    // Attach the worker scheduling tools (stable per session → cache-safe).
+    const workerConfig = await this.options.workerMcpConfigPath?.(threadId);
+    const flags: ClaudeLaunchFlags = workerConfig === undefined ? this.options.launchFlags
+      : { ...this.options.launchFlags, mcpConfig: [...(this.options.launchFlags.mcpConfig ?? []), workerConfig] };
+
     const handle = this.options.runner.startTurn({
-      threadId, cwd: state.cwd, message, resume: state.materialized, flags: this.options.launchFlags,
+      threadId, cwd: state.cwd, message, resume: state.materialized, flags,
     });
     state.running = { turnId: clientId, handle };
 

@@ -639,4 +639,16 @@ export const migrations: readonly Migration[] = [
     created_at INTEGER NOT NULL
   );
   CREATE INDEX IF NOT EXISTS session_schedules_due ON session_schedules(state, next_fire_at);`,
+  // Durable idempotent outbox for schedule fires (Phase 2.2 wiring). The single_fire_key
+  // PRIMARY KEY makes claiming a fire a true unique-constraint insert, so even two
+  // instances polling the same DB deliver at most once. state: sending -> sent; a
+  // crashed 'sending' row is reclaimed by age on recovery.
+  `
+  CREATE TABLE IF NOT EXISTS scheduled_sends (
+    single_fire_key TEXT PRIMARY KEY,
+    nickname TEXT NOT NULL,
+    message TEXT NOT NULL,
+    state TEXT NOT NULL,
+    claimed_at INTEGER NOT NULL
+  );`,
 ];
