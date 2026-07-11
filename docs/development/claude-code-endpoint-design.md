@@ -168,11 +168,11 @@ So the unified-tools requirement is satisfied *by construction* for everything e
 the reason to choose the adapter over a refactor. The cost is concentrated in the one transcript-reconstruction
 (§4.3/§6), reused everywhere.
 
-### 4.5 SDK vs headless
+### 4.5 Runtime: headless `claude -p` (decided)
 
-Start with the **headless `claude -p` subprocess** (mirrors QiYan's existing subprocess + jsonl patterns,
-keeps sessions out-of-process). Evaluate the **TS Agent SDK** (`@anthropic-ai/claude-agent-sdk`, typed
-events/resume/hooks) in the spike and pick one before building the adapter.
+Use the **headless `claude -p` subprocess** — it mirrors QiYan's existing subprocess + jsonl patterns
+(`LocalAppServerRuntime`) and keeps sessions out-of-process. The TS Agent SDK is **not** used (decision closed;
+no comparison). Each turn is one `claude -p --resume` invocation with stable flags.
 
 ## 5. Scheduling, monitoring, and steer — one provider-agnostic layer over `send_to_session`
 
@@ -334,15 +334,15 @@ in Phase 0 that the model genuinely cannot invoke each named native tool.
 ## 8. Plan & verifiable success criteria
 
 - **Phase 0 — Spike (before any abstraction).** Drive one session end-to-end from a script: start → capture
-  `session_id` → follow-up via `--resume` → stream response → confirm context retained. A/B the SDK vs
-  headless. Confirm A1/A2 (auth, `~/.claude` inheritance) and inspect a real transcript for the §6 per-turn
+  `session_id` → follow-up via `--resume` → stream response → confirm context retained (headless `claude -p`,
+  decided). Confirm A1/A2 (auth, `~/.claude` inheritance) and inspect a real transcript for the §6 per-turn
   user-message marker. Also assert the native schedulers are genuinely neutralized — spawn a session with
   `--disallowedTools "Monitor ScheduleWakeup CronCreate CronList CronDelete"` + the redirect prompt and confirm
   the model (a) **cannot invoke** each tool (a mismatched name silently no-ops the flag) **and** (b) has **no
   residual scheduling path** — asked "can you schedule?", it points to the `qiyan_*` MCP tools and does **not**
   reach for the surviving `/loop` skill or background-task/hook workarounds. **Verify:** two turns, second has
-  first-turn context; SDK-vs-headless decided; transcript schema documented; auth confirmed; native scheduling
-  provably neutralized (tools uninvokable AND no residual skill/workaround path).
+  first-turn context; transcript schema documented; auth confirmed; native scheduling provably neutralized
+  (tools uninvokable AND no residual skill/workaround path).
 - **Phase 1 — Codex-protocol `ClaudeCodeRuntime` (§4.3) + event translator + transcript scanner (§6) + goal
   decision (§4.1).** **Verify:** an integration test drives a real/faked session through the adapter: start →
   turn → `turn/completed` synthesized → delivery; a resumed turn carries context; the new scanner lets the
