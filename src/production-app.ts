@@ -2429,9 +2429,10 @@ export async function buildProductionApp(
             return context ? { remote: context.remote, helperPath: context.runtime.remoteHelperPath } : undefined;
           },
           validateLease: (id, lease) => endpointManager.validateWorkLease(lease, id),
-          // Provider dispatch: the Claude endpoint uses the transcript scanner; it is
-          // a local endpoint (its scans must not route to the ssh helper).
-          provider: (id) => id === claudeEndpointId ? "claude" : "codex",
+          // Provider dispatch (shared helper): Claude endpoints use the transcript
+          // scanner. Only the built-in local Claude endpoint is local; a catalog
+          // claude-code endpoint is remote (scans over ssh).
+          provider: (id) => sessionProvider(id),
           local: (id) => id === "local" || id === claudeEndpointId,
           scanLocalClaude: scanLocalClaudeTranscript,
         });
@@ -2812,7 +2813,16 @@ export async function buildProductionApp(
 
   function buildActions(): Partial<Record<AssistantToolName, (args: any, context: any) => Promise<any>>> {
     return {
-      list_managed_sessions: async () => registry.managedSnapshot(),
+      list_managed_sessions: async () => {
+        const snapshot = registry.managedSnapshot();
+        // Annotate each session with its provider (codex/claude) so the assistant can
+        // tell the runtime kind without knowing the endpoint-id convention.
+        return {
+          ...snapshot,
+          sessions: Object.fromEntries(Object.entries(snapshot.sessions).map(([nickname, session]) =>
+            [nickname, { ...session, provider: sessionProvider(session.endpoint) }])),
+        };
+      },
       discover_sessions: async (args) => discovery.list({ endpointId: projectEndpoint(args.endpoint), ...(args.search ? { search: args.search } : {}), ...(args.cwd ? { cwd: args.cwd } : {}), ...(args.limit ? { limit: args.limit } : {}), ...(args.cursor ? { cursor: args.cursor } : {}) }),
       get_session_status: async (args) => {
         const identity = dashboardIdentity(args.nickname);
@@ -3242,6 +3252,20 @@ export async function buildProductionApp(
     const endpointId = requested ?? endpoint.id;
     if (endpointId === assistantEndpoint.id) throw new AppError("UNSUPPORTED_CAPABILITY", "the assistant-only endpoint cannot host project sessions");
     return endpointId;
+  }
+
+  // The provider (runtime kind) of an endpoint. An endpoint is Codex or Claude, fixed
+  // at definition time: the local Claude endpoint is bound by config; a remote Claude
+  // endpoint is a catalog `type:"claude-code"` entry; everything else is Codex.
+  function sessionProvider(endpointId: string): "codex" | "claude" {
+    if (config.claudeCode !== undefined && endpointId === config.claudeCode.endpointId) return "claude";
+    if (endpointId !== "local" && endpointId !== assistantEndpoint.id) {
+      try {
+        const entry = endpointCatalog.snapshot().endpoints[endpointId] as { type?: string } | undefined;
+        if (entry?.type === "claude-code") return "claude";
+      } catch { /* catalog unavailable — treat as codex */ }
+    }
+    return "codex";
   }
 
   function operationTargetResolver(): OperationRecoveryTargetResolver {
