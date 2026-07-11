@@ -168,11 +168,23 @@ So the unified-tools requirement is satisfied *by construction* for everything e
 the reason to choose the adapter over a refactor. The cost is concentrated in the one transcript-reconstruction
 (§4.3/§6), reused everywhere.
 
-### 4.5 Runtime: headless `claude -p` (decided)
+### 4.5 Runtime: headless `claude -p` (decided) — and remote is trivial
 
 Use the **headless `claude -p` subprocess** — it mirrors QiYan's existing subprocess + jsonl patterns
 (`LocalAppServerRuntime`) and keeps sessions out-of-process. The TS Agent SDK is **not** used (decision closed;
 no comparison). Each turn is one `claude -p --resume` invocation with stable flags.
+
+**Remote (SSH) needs no server and no forwarding — a major simplification over remote Codex.** Remote Codex
+uses `SshAppServerRuntime`: launch a `codex app-server` *daemon* on the remote, forward its socket over SSH,
+speak JSON-RPC through the tunnel, manage the remote daemon lifecycle (a source of past incidents). Remote
+Claude is just **`ssh <host> claude -p --resume <id> …`** over the existing **ControlMaster** connection —
+stream-json over the SSH pipe, the subprocess exits after the turn. No remote daemon, no port forwarding, no
+tunnel. Local vs remote differ in exactly two already-solved places: (1) **spawn** — the runtime is
+parameterized by a *command runner* (direct vs `ssh`-wrapped, reusing QiYan's SSH channel + ControlMaster);
+(2) **transcript location** — local disk vs the remote `~/.claude/…`, read over the **same SSH command
+channel** (`RolloutAccess.scan` and the `monitor` `check` already "run on the session's endpoint"). Everything
+else (adapter, scheduling, steer, recovery) is identical. Confirmed: `dfw-vscode` has `claude` installed and
+ControlMaster is active. So remote support is a spawn parameter, not a subsystem.
 
 ## 5. Scheduling, monitoring, and steer — one provider-agnostic layer over `send_to_session`
 

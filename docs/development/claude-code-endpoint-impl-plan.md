@@ -29,6 +29,10 @@ Not merged; a scratch script + a findings note.
 - **0.4 Steer/queue behavior**: with `--input-format stream-json` held open, does a second message injected
   mid-turn queue-for-next or nothing? (Confirms the emulation is "queue," not a Claude feature.)
 - **0.5 Auth + config**: confirm API-key headless auth and `~/.claude` inheritance (non-`--bare`).
+- **0.6 Remote round-trip**: run `ssh <host> claude -p --resume <id> …` over ControlMaster (e.g. `dfw-vscode`,
+  which has `claude` installed) and confirm start + resume + stream work identically to local, and that the
+  remote transcript is readable over the same SSH command channel. (No remote server — confirms remote is just
+  ssh-wrapped spawn.)
 
 (Runtime is **headless `claude -p`** — decided; no SDK comparison.)
 
@@ -58,8 +62,13 @@ unchanged. Test each unit against the real lifecycle/relay with a **faked** runt
   *Verify:* drive it through the **real** `lifecycle`/`relay` with a scripted subprocess: start → turn →
   synthesized `turn/completed` → delivery; resumed turn carries context; phantom-gate drops a
   never-materialized session (uses 1.1).
-- **1.4 Wire into pool / EndpointManager / config**: an endpoint `type: "claude-code"` alongside Codex; launch
-  flags (system-prompt, `--mcp-config`, `--disallowedTools`, model) are **stable per session**.
+  Parameterize spawn by a **command runner**: local = direct `claude -p`; remote = `ssh <host> claude -p` over
+  the existing **ControlMaster** channel (no remote daemon, no forwarding). `RolloutAccess.scan` (1.1) and the
+  `monitor` `check` run over the same command channel (local or ssh). Remote is a spawn parameter, not a
+  subsystem — reuse QiYan's SSH infra.
+- **1.4 Wire into pool / EndpointManager / config**: an endpoint `type: "claude-code"` (local and ssh variants,
+  differing only in the command runner) alongside Codex; launch flags (system-prompt, `--mcp-config`,
+  `--disallowedTools`, model) are **stable per session**.
   *Verify:* a Claude session is created/adopted and appears in `list_managed_sessions`; the unified manager
   tools (`send_to_session`, `get_session_status`, `get_chat_history`, `adopt_session`, `interrupt_session`)
   work against it identically to Codex.
