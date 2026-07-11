@@ -196,11 +196,18 @@ vs Claude** — that divergence is entirely sealed *below* `send_to_session` (po
 - **Zero provider branching in the scheduling code.** The messy bits (subprocess vs daemon, steer emulation,
   transcript reconstruction) stay inside the adapter; the scheduler only ever calls `send_to_session`.
 
-**Four things collapse into ONE pattern** — a durable `(session, message)` + a **trigger** → on fire,
-`send_to_session` — differing only in the trigger: `schedule_wakeup` = absolute time; `schedule_cron` =
-recurring time; `monitor` = a `check` predicate polling true; **steer** (§4.1) = the session's turn completing.
-Steer is not special — it is the scheduling engine with a "turn-completed" trigger. So: **one durable store +
-one firing path (`send_to_session`) + four trigger sources.**
+**The three SCHEDULING triggers collapse into ONE provider-agnostic pattern** — a durable `(session, message)`
++ a **trigger** → on fire, `send_to_session` — differing only in the trigger: `schedule_wakeup` = absolute
+time; `schedule_cron` = recurring time; `monitor` = a `check` predicate polling true. These are fully
+provider-blind (firing = `send_to_session` → `turn/start`).
+
+**Steer is the one exception (provider-specific, below `send_to_session`).** `send_to_session(mode:"steer")` →
+`turn/steer`, whose *queueing* differs by provider and lives in the **adapter**, not the scheduling engine:
+**Codex keeps its native `turn/steer`** (the app-server queues into the running turn — unchanged, no
+regression); **Claude's adapter implements `turn/steer` as a durable enqueue** into the *same* store with a
+"turn-completed" trigger, so Claude steer *reuses* the store + firing while Codex steer stays native. So it's
+**one durable store + one firing path for scheduling (provider-blind) + a steer path whose provider difference
+is contained in the adapter** (Claude reuses the store; Codex is native).
 
 **Module boundaries (what prevents the mess):** (1) **schedule store** (durable DB: `session, trigger,
 message, single-fire key`; provider-agnostic); (2) **MCP tools** (the worker-facing registration surface,
@@ -255,8 +262,9 @@ a stdio launcher tunneling over the existing SSH channel) — see the worker-fac
   stripped (`production-app.ts:2218`). Exposing these tools to worker sessions needs a worker-facing MCP
   endpoint, a **worker auth model** (the current one authorizes the assistant PID), and **per-session identity
   injection** (the tool must know which worker called).
-- **Durable schedule storage.** None exists — `assistant/scheduler.ts` is in-memory only and doesn't survive
-  restart. Needs a new table + a firing loop.
+- **Durable schedule storage.** None exists — a **net-new additive** table + firing loop (NOT a replacement:
+  `assistant/scheduler.ts` is the assistant's conversation batching engine, unrelated — do not touch it).
+  Durable so it survives QiYan restart.
 - **Single-fire semantics** with **its own idempotency key** — a scheduler-initiated wakeup is self-originated,
   a different key than relay's per-observed-`turn/completed` delivery. Don't conflate the two.
 
@@ -324,8 +332,8 @@ in Phase 0 that the model genuinely cannot invoke each named native tool.
   apply (transcript = rollout). No new mechanism — the reconcileManaged + uncertain-delivery path you already
   hardened, working for Claude because the adapter presents Codex shapes.
 - **The new "pending → drive a turn" layer is NET-NEW durable state that must reload + re-arm:** goal, wakeup,
-  cron, monitor, and the steer queue must live in **durable DB tables, not in-memory** (replace the in-memory
-  `assistant/scheduler.ts`). Recovery re-arms each: wakeups (fire on recovery if the time passed, else
+  cron, monitor, and the steer queue must live in a **net-new durable DB table** (not in-memory; do not touch
+  `assistant/scheduler.ts` — the unrelated conversation batcher). Recovery re-arms each: wakeups (fire on recovery if the time passed, else
   reschedule), cron (recompute next fire; missed-occurrence policy), monitors (restart the poll loop), steer
   queue (reload FIFO, drain after the in-flight turn is reconciled), goal (reload + resume enforcement).
   **Single-fire idempotency key per fire/delivery** so recovery never double-fires or re-sends — reuse the

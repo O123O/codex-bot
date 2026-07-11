@@ -47,8 +47,11 @@ Build so the whole existing stack (lifecycle, relay, ownership, manager tools) d
 unchanged. Test each unit against the real lifecycle/relay with a **faked** runtime first (de-risk R1).
 
 - **1.1 Transcript parser + `RolloutAccess`** (`src/sessions/…` new module): parse the Phase-0 schema; implement
-  **both** `scan` and `scanUnmaterialized`; a Claude filename validator. Reuse the ownership DB tables +
-  `inspect`/`initialize` state machine unchanged.
+  **both** `scan` and `scanUnmaterialized`; a Claude filename validator (the existing `validRolloutPath`,
+  `rollout-ownership.ts:414`, hard-rejects non-`rollout-*.jsonl` paths, so the Claude scanner is separate).
+  **Name the dispatch seam:** `RolloutAccessRouter` (`endpoints/rollout-access.ts`) today routes local-vs-ssh
+  for the Codex scanner; add **provider dispatch** (Codex scanner vs Claude scanner) keyed by the
+  endpoint/session provider. Reuse the ownership DB tables + `inspect`/`initialize` state machine unchanged.
   *Verify:* unit tests over sample transcripts — materialized/unmaterialized/missing; owned-vs-external via the
   user-message marker.
 - **1.2 Event translator** (pure function): stream-json → Codex-shaped turn/item notifications; synthesize
@@ -58,7 +61,9 @@ unchanged. Test each unit against the real lifecycle/relay with a **faked** runt
   §4.3): `thread/start`, transcript-reconstructed `thread/read` (+`cwd`, `clientId` round-trip, `agentMessage`/
   `userMessage` item shapes), `thread/resume`, `turn/start` (spawn `claude -p --resume` with the **stable**
   flags → translate → push synthesized `turn/completed` via `onNotification`), `turn/interrupt` (kill
-  subprocess), `archive`/`unsubscribe` (local). Decide error-shape handling (reproduce vs. never-reached).
+  subprocess), `archive`/`unsubscribe` (local). The reconstructed `thread/read` must report
+  **`itemsView:"full"`** on every turn (`pool.readFullThread` requires it). Decide error-shape handling
+  (reproduce the exact `-32600` messages vs. structure so those branches are never reached).
   *Verify:* drive it through the **real** `lifecycle`/`relay` with a scripted subprocess: start → turn →
   synthesized `turn/completed` → delivery; resumed turn carries context; phantom-gate drops a
   never-materialized session (uses 1.1).
@@ -66,15 +71,24 @@ unchanged. Test each unit against the real lifecycle/relay with a **faked** runt
   the existing **ControlMaster** channel (no remote daemon, no forwarding). `RolloutAccess.scan` (1.1) and the
   `monitor` `check` run over the same command channel (local or ssh). Remote is a spawn parameter, not a
   subsystem — reuse QiYan's SSH infra.
-- **1.4 Wire into pool / EndpointManager / config**: an endpoint `type: "claude-code"` (local and ssh variants,
-  differing only in the command runner) alongside Codex; launch flags (system-prompt, `--mcp-config`,
+- **1.4 Wire into pool / EndpointManager / config** — endpoints model **hosts**, not providers, and are
+  currently hardcoded Codex (local = Codex `ManagedAppServerEndpoint`, `production-app.ts:2213-2218`; catalog
+  `type: z.literal("ssh")` → Codex runtime, `catalog.ts:10`). **Multiplexing model (state it):** a
+  `ClaudeCodeRuntime` is **one endpoint per host, multiplexing many sessions** (threadId = Claude
+  `session_id`), matching the pool's `(endpointId, threadId)` keying — NOT one-endpoint-per-session. Required
+  work: (i) extend the catalog schema (a `claude-code` local + ssh variant, differing only in the command
+  runner); (ii) a new construction path in `EndpointManager`/`production-app`; (iii) session-start endpoint
+  selection that can target it. The pool only needs the `AppServerEndpoint`/`ManagedAppServerEndpoint`
+  duck-typed surface (`pool.ts:4-8`), so it's feasible. Launch flags (system-prompt, `--mcp-config`,
   `--disallowedTools`, model) are **stable per session**.
   *Verify:* a Claude session is created/adopted and appears in `list_managed_sessions`; the unified manager
   tools (`send_to_session`, `get_session_status`, `get_chat_history`, `adopt_session`, `interrupt_session`)
-  work against it identically to Codex.
+  work against it identically to Codex; two Claude sessions multiplex on one endpoint concurrently.
 - **1.5 Goal emulation** (the one non-transparent manager family): implement `get/set/pause/resume/cancel_goal`
   for Claude via QiYan-tracked goal state + persistence (ownership already covered by the `clientId` marker).
-  *Verify:* the 5 goal tools operate on a Claude session; set-goal persists and is enforced by QiYan driving.
+  *Verify:* the 5 goal tools operate on a Claude session; set-goal **persists a goal row** that **causes a
+  QiYan-driven follow-up turn after the current turn completes** (the observable proof of enforcement), and
+  `cancel_goal` stops it.
 
 ⬛ *Review Phase 1 (adapter correctness + manager-tool parity + phantom-gate) before Phase 2.*
 
@@ -88,21 +102,35 @@ construction; goal works via emulation; recovery reconciles it via the transcrip
 One module, provider-blind, firing via `send_to_session`. Built once, tested against **both** Codex and Claude.
 
 - **2.1 Durable schedule store** (`src/…` new DB table + migration): `(id, session, trigger_kind, trigger_spec,
-  message, single_fire_key, state, next_fire_at)`. Replace the in-memory `assistant/scheduler.ts`.
+  message, single_fire_key, state, next_fire_at)`. **Net-new additive table** — there is no scheduler to
+  replace. (`assistant/scheduler.ts` is the assistant's conversation job/event-batching engine, wired into the
+  conversation-dispatcher — unrelated; **do not touch it**.)
   *Verify:* store/reload round-trips; survives process restart in a test.
 - **2.2 Trigger engine** (provider-blind): timers (wakeup/cron) + condition poller (`monitor`, runs `check` on
-  the session endpoint, floored interval) + turn-completion hook (steer). On fire → `send_to_session(session,
-  message)`; **single-fire idempotent** (reuse the hardened delivery-idempotency key).
-  *Verify:* a fake trigger fires exactly one `send_to_session`, never twice; mid-turn fire enqueues (steer rule).
-- **2.3 Steer queue = the store with a turn-completed trigger**: `send_to_session(mode:steer)` while mid-turn →
-  enqueue durably; drain FIFO on `turn/completed`; never interrupt.
-  *Verify:* two steers during a running turn deliver as the next two turns, in order, single-delivery, and
-  survive a simulated restart mid-turn.
+  the session endpoint, floored interval). On fire → enqueue a **durable `send_to_session` operation**
+  (`send_to_session` is a replayable durable operation, `production-app.ts:3433`) with **its OWN single-fire
+  key** — NOT the relay's per-observed-turn delivery idempotency (a fire is self-originated; different key, per
+  design §5). (Steer is 2.3, not here.)
+  *Verify:* a fake trigger enqueues exactly one `send_to_session` operation, never twice — including across a
+  simulated restart at the moment of firing.
+- **2.3 Steer — provider-specific, in the adapter (NOT a scheduling-engine trigger):** `send_to_session(mode:
+  steer)` → `turn/steer`. **Codex keeps its native `turn/steer`** (`service.ts:58`) — unchanged,
+  **regression-locked**, no behavior change. **Claude's adapter implements `turn/steer` as a durable enqueue**
+  into the 2.1 store (turn-completed trigger) — drain FIFO on `turn/completed`, never interrupt. So Claude steer
+  reuses the store/engine; Codex steer is native. The scheduling layer is NOT involved in the steer decision.
+  *Verify:* (Codex) existing steer behavior byte-identical (regression test); (Claude) two steers during a
+  running turn deliver as the next two turns, in order, single-delivery, surviving a simulated restart mid-turn.
 - **2.4 Worker-facing MCP surface** (`src/mcp/…` new): expose the 5 tools (`schedule_wakeup/cron/monitor/
-  list_schedules/cancel_schedule`) to **worker** sessions (not just the assistant) — worker auth model +
-  per-session identity injection; attach via per-invocation `--mcp-config`, additive, byte-identical per turn.
-  Tools are drop-in (provider-neutral descriptions); write to 2.1.
-  *Verify:* a worker session (Codex and Claude) calls each tool; it registers a row; `list`/`cancel` work.
+  list_schedules/cancel_schedule`) to **worker** sessions — today `LoopbackMcpServer` is assistant-only
+  (`mcp/server.ts` rejects non-assistant callers) and worker env is built by `buildWorkerChildEnvironment`
+  (`production-app.ts:2218`, MCP token stripped). Sub-parts: (a) **worker auth model** + **per-session
+  identity injection** (the tool must learn which worker called); (b) **remote reachability** — a remote
+  worker's `--mcp-config` needs a QiYan MCP surface reachable from that host (URL+token, or **stdio-over-SSH**
+  tunneling on the existing ControlMaster channel) — call this out as its own concern, it's the hard part;
+  (c) attach via per-invocation `--mcp-config`, additive, byte-identical per turn; drop-in descriptions;
+  writes to 2.1.
+  *Verify:* a worker session (Codex and Claude, **local and remote**) calls each tool; it registers a row;
+  `list`/`cancel` work.
 - **2.5 Recovery**: on QiYan restart, reload the store + re-arm (timers recompute next-fire / fire missed
   one-shots per policy; monitors restart poll loops; steer queues reload; goal reloads).
   *Verify:* a `schedule_wakeup` set before a QiYan restart fires **exactly one** resumed turn after restart —
@@ -118,8 +146,11 @@ One module, provider-blind, firing via `send_to_session`. Built once, tested aga
   integration tests. Keep Codex behavior byte-identical throughout (regression-lock).
 - **Security/logging:** never log message bodies, tokens, or transcript contents (repo rule). `monitor` `check`
   runs with the worker's own permissions (like the agent's own Bash).
-- **Sequencing:** Phase 0 gates 1; 1.1/1.2 gate 1.3; 1.3/1.4 gate the manager-tool parity; Phase 1 gates 2;
-  2.1/2.2 gate 2.3/2.4/2.5. Do not build 2 before 1's adapter exists (nothing to fire into).
+- **Sequencing:** Phase 0 gates 1; 1.1/1.2 gate 1.3; 1.3/1.4 gate the manager-tool parity; 2.1/2.2 gate
+  2.3/2.4/2.5. **Phase 2 can start in parallel with Phase 1 against Codex** — `send_to_session` works for Codex
+  today, so the store/engine/worker-MCP (2.1/2.2/2.4) can be built and validated end-to-end on Codex
+  independently of the Claude adapter (R2 is the biggest new build — start early). Only the "both providers"
+  exit (2.5) and Claude steer (2.3) truly need Phase 1.
 - **Not now (deferred):** detached-subprocess turn survival (start with child + re-drive); provider-agnostic
   pool/lifecycle refactor (only if a 3rd provider appears); warm mode (removed).
 
