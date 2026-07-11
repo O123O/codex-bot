@@ -12,7 +12,7 @@ import {
 import { runBoundedProcess, type BoundedProcessResult } from "./ssh-process.ts";
 import { parseRuntimeIdentity, type EndpointLossKind, type RuntimeIdentity } from "./types.ts";
 
-export const REMOTE_HELPER_SHA256 = "88c85fa042ff0966732df3a5ab286c5976f260d9f855fd241d244f8e92e28def";
+export const REMOTE_HELPER_SHA256 = "c8e6ac7c0cf8b20928eafb31f82add0fee8439888e5bfdf17a8b96ecb98a31a8";
 export const REMOTE_LAUNCHER_SHA256 = "db138ff3173f9b72d1fa8cc5fbc94c4958247691a401232d84edf0e3417bd334";
 
 const MAX_REMOTE_ARGUMENT_BYTES = 16 * 1024;
@@ -24,8 +24,6 @@ const preflightSchema = z.object({
   uid: z.number().int().positive(),
   home: z.string().startsWith("/"),
   shell: z.string().regex(/^\/[A-Za-z0-9_./+-]+$/u),
-  codexPath: z.string().regex(/^\/[A-Za-z0-9_./+-]+$/u),
-  tmuxPath: z.string().regex(/^\/[A-Za-z0-9_./+-]+$/u),
 }).strict();
 const inspectSchema = z.discriminatedUnion("status", [
   z.object({ status: z.literal("absent") }).strict(),
@@ -104,7 +102,17 @@ export interface SshRuntimeController {
   stop(expectedIdentity: RuntimeIdentity): Promise<void>;
 }
 
-export class SshRuntime implements SshRuntimeController {
+// The provider-neutral host facts a remote endpoint's consumers need (workspace router,
+// worker file bridge, ownership scan). A Codex remote satisfies this via SshRuntime; a
+// Claude remote (no app-server) builds a lean one over the same bootstrapped helper.
+export interface RemoteHost {
+  readonly remoteHome: string;
+  readonly remoteRuntimeDir: string;
+  readonly remoteHelperPath: string;
+  readonly remote: RemoteRuntimeClient;
+}
+
+export class SshRuntime implements SshRuntimeController, RemoteHost {
   private prepared?: { runtimeDir: string; helperPath: string; session: string; shell: string; home: string };
 
   constructor(private readonly options: { endpointId: string; remote: RemoteRuntimeClient; assetRoot?: string }) {
@@ -127,6 +135,7 @@ export class SshRuntime implements SshRuntimeController {
     if (!this.prepared) throw new AppError("ENDPOINT_UNAVAILABLE", "SSH runtime is not prepared");
     return this.prepared.home;
   }
+  get remote(): RemoteRuntimeClient { return this.options.remote; }
 
   async ensureStarted(): Promise<RuntimeIdentity> {
     const prepared = await this.prepare();

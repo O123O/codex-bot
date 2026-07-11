@@ -96,7 +96,7 @@ import { EndpointCatalog } from "./endpoints/catalog.ts";
 import { EndpointBindingStore } from "./endpoints/binding-store.ts";
 import { EndpointManager } from "./endpoints/manager.ts";
 import { SshGenerationPlanner } from "./endpoints/ssh-config.ts";
-import { attestUserControlMaster, SshRemoteClient, SshRuntime } from "./endpoints/ssh-runtime.ts";
+import { attestUserControlMaster, type RemoteHost, SshRemoteClient, SshRuntime } from "./endpoints/ssh-runtime.ts";
 import { SshAppServerRuntime } from "./endpoints/ssh-app-server-runtime.ts";
 import { prepareLocalSshEndpointSocketRoot, prepareLocalSshRuntimeRoot } from "./endpoints/local-runtime.ts";
 import { WebSocketWire } from "./app-server/websocket-wire.ts";
@@ -1856,7 +1856,7 @@ export async function buildProductionApp(
   const projectEndpointSubscriptions = new Map<string, Array<() => void>>();
   const projectEndpointRecoveries = new Map<string, Promise<void>>();
   const projectReadyRetryTimers = new Map<string, { generation: number; timer: ReturnType<typeof setTimeout> }>();
-  type RemoteContext = { runtime: SshRuntime; remote: SshRemoteClient; projectsRoot: string };
+  type RemoteContext = { host: RemoteHost; remote: SshRemoteClient; projectsRoot: string };
   const remoteContexts = new Map<string, RemoteContext>();
   const remoteCandidateContexts = new WeakMap<ManagedEndpointContract, RemoteContext>();
   const reconnectTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -2361,7 +2361,7 @@ export async function buildProductionApp(
               }),
               minimumVersion: MINIMUM_SUPPORTED_CODEX_VERSION,
             });
-            remoteCandidateContexts.set(remoteEndpoint, { runtime: remoteRuntime, remote, projectsRoot: definition.projectsRoot });
+            remoteCandidateContexts.set(remoteEndpoint, { host: remoteRuntime, remote, projectsRoot: definition.projectsRoot });
             return { endpoint: remoteEndpoint, pendingBinding: generation.pendingBinding };
           },
           hasIdentityReferences: (id) => hasEndpointIdentityReferences(id),
@@ -2388,16 +2388,16 @@ export async function buildProductionApp(
           await endpointManager.ensureReady(id);
           const context = remoteContexts.get(id);
           if (!context) throw new AppError("ENDPOINT_UNAVAILABLE", `SSH workspace host is unavailable: ${id}`);
-          const home = context.runtime.remoteHome;
+          const home = context.host.remoteHome;
           const projectsRoot = context.projectsRoot.startsWith("~/") ? posix.resolve(home, context.projectsRoot.slice(2)) : posix.resolve(context.projectsRoot);
           return new ProjectWorkspacePolicy({
             userHome: home,
-            qiyanHome: context.runtime.remoteRuntimeDir,
-            assistantWorkdir: context.runtime.remoteRuntimeDir,
-            dataDir: context.runtime.remoteRuntimeDir,
-            registryPath: posix.join(context.runtime.remoteRuntimeDir, "sessions.json"),
+            qiyanHome: context.host.remoteRuntimeDir,
+            assistantWorkdir: context.host.remoteRuntimeDir,
+            dataDir: context.host.remoteRuntimeDir,
+            registryPath: posix.join(context.host.remoteRuntimeDir, "sessions.json"),
             defaultProjectsRoot: projectsRoot,
-            host: new SshHost(id, context.remote, context.runtime.remoteHelperPath),
+            host: new SshHost(id, context.remote, context.host.remoteHelperPath),
           });
         }, (id, lease) => endpointManager.validateWorkLease(lease, id));
         workerFiles = new WorkerFileBridge({
@@ -2407,7 +2407,7 @@ export async function buildProductionApp(
           workspaces: workspaceRouter,
           remote: (id) => {
             const context = remoteContexts.get(id);
-            return context ? { remote: context.remote, helperPath: context.runtime.remoteHelperPath, runtimeDir: context.runtime.remoteRuntimeDir } : undefined;
+            return context ? { remote: context.remote, helperPath: context.host.remoteHelperPath, runtimeDir: context.host.remoteRuntimeDir } : undefined;
           },
           maxFileBytes: config.attachmentMaxBytes,
         });
@@ -2426,7 +2426,7 @@ export async function buildProductionApp(
         const rolloutAccess = new RolloutAccessRouter({
           remote: (id) => {
             const context = remoteContexts.get(id);
-            return context ? { remote: context.remote, helperPath: context.runtime.remoteHelperPath } : undefined;
+            return context ? { remote: context.remote, helperPath: context.host.remoteHelperPath } : undefined;
           },
           validateLease: (id, lease) => endpointManager.validateWorkLease(lease, id),
           // Provider dispatch (shared helper): Claude endpoints use the transcript
