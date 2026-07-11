@@ -147,9 +147,18 @@ request surface, these tools are **provider-blind and require no change**. Mappi
   reconstruction QiYan's own delivery uses — **one implementation serves both** the assistant's history reads
   and QiYan's final-message extraction.
 - `adopt_session` → `thread/resume`; `unadopt`/`archive` → local/no-op per §4.3.
+- `interrupt_session(nick, turn_id?)` (a real manager tool, `production-app.ts:2855`) → `turn/interrupt` →
+  adapter **kills the `claude -p` subprocess** (the transcript up to the kill survives). Works for both.
 
-So the unified-tools requirement is satisfied *by construction* — it is the reason to choose the adapter over
-a refactor. The cost is concentrated in the one transcript-reconstruction (§4.3/§6), reused everywhere.
+**The one exception — the goal tools.** `get_goal`/`set_goal`/`pause_goal`/`resume_goal`/`cancel_goal`
+(`production-app.ts:2880-2919`) map to Codex's **native `thread/goal/*`**, which Claude lacks. These are the
+*only* manager tools that do **not** reuse transparently; they need the §4.1 emulation (QiYan-tracked goal
+state + persistence via QiYan driving / an optional Stop hook; ownership already handled by the `clientId`
+marker). All other manager tools work by construction through the adapter.
+
+So the unified-tools requirement is satisfied *by construction* for everything except the goal family — it is
+the reason to choose the adapter over a refactor. The cost is concentrated in the one transcript-reconstruction
+(§4.3/§6), reused everywhere.
 
 ### 4.5 SDK vs headless
 
