@@ -172,14 +172,22 @@ Claude session is launched so it *cannot* reach the process-bound native schedul
 - `--mcp-config <qiyan-mcp.json>` (+ `--strict-mcp-config`) — provides the `qiyan_*` scheduling/monitor tools.
 - `--append-system-prompt "…scheduling/reminders/watching MUST use the qiyan_* MCP tools; the built-in
   Monitor/ScheduleWakeup/cron tools are disabled…"` — so the model reaches for the right ones and knows why.
-Disable + guide together — **the prompt redirect is REQUIRED, not optional** (tested 2026-07-11): the "when to
-use" guidance lives in the tool *descriptions*, so `--disallowedTools` removes the native scheduler tools
-cleanly (verified: init tool list had zero scheduling tools). **But skills ≠ tools** — the `/loop` skill
-survives the tool disable and the model still finds it (plus adjacent workarounds: background `Bash`, `Task*`,
-hooks). So the `--append-system-prompt` must explicitly forbid the survivors: *"do not use the /loop skill,
-background Bash tasks, or hooks for scheduling/reminders/watching — use ONLY the qiyan_* MCP tools."* Also
-investigate per-skill disabling of `/loop` in the spike. (Codex sessions get the same MCP tools; Codex has no
-native scheduler to disable.)
+**Design the MCP tools as drop-in replacements.** Give them clear, **QiYan-owned, provider-neutral**
+descriptions that capture the *same when/how* as the native `Monitor`/`ScheduleWakeup`/cron (informed by, but
+NOT verbatim copies of, Claude's — verbatim couples to version-specific wording and reads wrong for a tool
+Codex also calls), each noting it *replaces any built-in scheduler*. The model then reaches for them naturally.
+
+Three-part enforcement, in order of necessity (tested 2026-07-11 — the "when to use" guidance lives in tool
+*descriptions*, so `--disallowedTools` removes the native tools cleanly; but **skills ≠ tools**, so `/loop`
+survives the tool disable):
+1. **Disable the native tools** (`--disallowedTools "Monitor ScheduleWakeup CronCreate CronList CronDelete"`) —
+   REQUIRED: otherwise the model may pick a native version that silently fails in fire-and-resume.
+2. **Provide the drop-in MCP tools** — REQUIRED: gives one working, obvious choice.
+3. **One `--append-system-prompt` redirect line** ("for scheduled/recurring/watch work use the qiyan_* tools,
+   not /loop or background Bash/hooks") — REQUIRED and sufficient for the surviving `/loop` skill: with the
+   native tool disabled `/loop` is already broken (it calls the disabled `ScheduleWakeup`) and, given the
+   drop-in, unpreferred. **Per-skill disabling of `/loop` is therefore optional insurance, not needed.**
+(Codex sessions get the same MCP tools; Codex has no native scheduler to disable.)
 
 **Launch flags must be stable per session (a caching requirement, tested).** `--append-system-prompt` is a
 *per-invocation* parameter — it is not stored in the session/transcript, so it must be re-passed on **every**
