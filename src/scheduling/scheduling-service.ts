@@ -71,6 +71,12 @@ export class SchedulingService {
     }
   }
 
+  // Claude steer: enqueue the message as an immediate one-shot so the engine delivers
+  // it as the next turn (retrying while the session is busy). Durable + recovers.
+  enqueueSteer(session: WorkerScheduleSession, message: string): void {
+    this.store.create({ nickname: session.nickname, endpointId: session.endpointId, threadId: session.threadId, kind: "wakeup", spec: "steer", message, nextFireAt: this.deps.now() }, this.deps.now());
+  }
+
   // Register a worker session so it can reach the scheduling tools; returns the stable
   // per-session --mcp-config path (byte-identical across the session's turns, so it
   // doesn't break the prompt cache). Idempotent per session.

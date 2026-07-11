@@ -43,6 +43,9 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     // Returns the stable per-session --mcp-config path exposing the worker scheduling
     // tools, or undefined. Attached to every turn (byte-identical per session).
     workerMcpConfigPath?: (threadId: string) => Promise<string | undefined>;
+    // Claude has no native mid-turn steer (spike 0.4). turn/steer durably enqueues the
+    // message; it is delivered as the next turn once the running one completes.
+    steer?: (threadId: string, message: string) => Promise<void>;
   }) {
     this.id = options.id;
     this.emitter.setMaxListeners(100);
@@ -102,7 +105,7 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
       case "thread/goal/get": return { goal: this.goals().get(this.id, requireString(args.threadId, "threadId")) } as T;
       case "thread/goal/set": return this.goalSet(args) as T;
       case "thread/goal/clear": { this.goals().clear(this.id, requireString(args.threadId, "threadId")); return { goal: null } as T; }
-      // turn/steer (Claude enqueue) is Phase 2.3.
+      case "turn/steer": return await this.turnSteer(args) as T;
       default: throw new AppError("UNSUPPORTED_CAPABILITY", `claude endpoint does not implement ${method}`);
     }
   }
@@ -223,6 +226,18 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     }
     if (status !== undefined) return { goal: this.goals().setStatus(this.id, threadId, status, now) };
     throw new AppError("CONFIGURATION_ERROR", "thread/goal/set requires an objective or a status");
+  }
+
+  // Claude steer = durable enqueue (never abort the running turn). Delivered as the
+  // next turn once the running one completes (the schedule engine retries while the
+  // session is SESSION_BUSY).
+  private async turnSteer(params: Record<string, unknown>): Promise<{ turnId: string }> {
+    const threadId = requireString(params.threadId, "threadId");
+    if (!this.options.steer) throw new AppError("UNSUPPORTED_CAPABILITY", "claude endpoint has no steer queue configured");
+    const message = inputToText(params.input);
+    if (message.length === 0) throw new AppError("CONFIGURATION_ERROR", "turn/steer requires input text");
+    await this.options.steer(threadId, message);
+    return { turnId: typeof params.clientUserMessageId === "string" ? params.clientUserMessageId : randomUUID() };
   }
 
   private turnInterrupt(params: Record<string, unknown>): Record<string, never> {

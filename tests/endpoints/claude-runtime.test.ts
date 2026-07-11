@@ -162,6 +162,18 @@ test("goal ops on a runtime with no goal store fail loud, not silently", async (
   await assert.rejects(rt.request("thread/goal/get", { threadId: "t" }), /goal store/u);
 });
 
+test("turn/steer durably enqueues the message (never aborts the running turn)", async () => {
+  const steered: Array<{ threadId: string; message: string }> = [];
+  const rt = new ClaudeCodeRuntime({ id: "claude-local", runner: new FakeRunner(), launchFlags: {}, steer: async (threadId, message) => { steered.push({ threadId, message }); } });
+  await rt.start();
+  const { thread } = await rt.request<{ thread: any }>("thread/start", { cwd: "/w" });
+  // a turn is running
+  await rt.request("turn/start", { threadId: thread.id, clientUserMessageId: "ctx:c1", input: [{ type: "text", text: "long task" }] });
+  const res = await rt.request<{ turnId: string }>("turn/steer", { threadId: thread.id, clientUserMessageId: "ctx:steer1", input: [{ type: "text", text: "also do X" }], expectedTurnId: "ctx:c1" });
+  assert.equal(res.turnId, "ctx:steer1");
+  assert.deepEqual(steered, [{ threadId: thread.id, message: "also do X" }]);
+});
+
 test("buildClaudeArgs emits stable, byte-identical flags", () => {
   const base: ClaudeTurnRequest = {
     threadId: "sid-1", cwd: "/w", message: "hi", resume: false,

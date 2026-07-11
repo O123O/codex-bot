@@ -2271,10 +2271,16 @@ export async function buildProductionApp(
             ...(claudeCodeConfig.model === undefined ? {} : { model: claudeCodeConfig.model }),
           },
           goals: new ClaudeGoalStore(db),
-          ...(scheduling ? { workerMcpConfigPath: async (threadId: string) => {
-            const found = registry.getByIdentity(claudeCodeConfig.endpointId, threadId);
-            return found ? scheduling!.workerMcpConfigPath({ nickname: found.nickname, endpointId: claudeCodeConfig.endpointId, threadId }) : undefined;
-          } } : {}),
+          ...(scheduling ? {
+            workerMcpConfigPath: async (threadId: string) => {
+              const found = registry.getByIdentity(claudeCodeConfig.endpointId, threadId);
+              return found ? scheduling!.workerMcpConfigPath({ nickname: found.nickname, endpointId: claudeCodeConfig.endpointId, threadId }) : undefined;
+            },
+            steer: async (threadId: string, message: string) => {
+              const found = registry.getByIdentity(claudeCodeConfig.endpointId, threadId);
+              if (found) scheduling!.enqueueSteer({ nickname: found.nickname, endpointId: claudeCodeConfig.endpointId, threadId }, message);
+            },
+          } : {}),
         });
         // A Claude endpoint id that collides with a configured remote (catalog) id
         // would silently shadow that remote (builtins short-circuit before the
