@@ -281,6 +281,24 @@ in Phase 0 that the model genuinely cannot invoke each named native tool.
   a persistent sub-worker can be a continued subagent (parent holds the id) or a separate managed session.
 - **cwd/worktree:** sessions are cwd-scoped — matches `project_dir`; use worktrees for isolation.
 
+**QiYan-restart recovery — two halves:**
+- **Sessions/turns REUSE existing recovery** (via the adapter): reload managed sessions from the registry;
+  reconcile each through the adapter's transcript-reconstructed `thread/read` — the transcript says whether the
+  last turn *completed* (deliver a response QiYan may have missed) or was *interrupted*; phantom-gate/ownership
+  apply (transcript = rollout). No new mechanism — the reconcileManaged + uncertain-delivery path you already
+  hardened, working for Claude because the adapter presents Codex shapes.
+- **The new "pending → drive a turn" layer is NET-NEW durable state that must reload + re-arm:** goal, wakeup,
+  cron, monitor, and the steer queue must live in **durable DB tables, not in-memory** (replace the in-memory
+  `assistant/scheduler.ts`). Recovery re-arms each: wakeups (fire on recovery if the time passed, else
+  reschedule), cron (recompute next fire; missed-occurrence policy), monitors (restart the poll loop), steer
+  queue (reload FIFO, drain after the in-flight turn is reconciled), goal (reload + resume enforcement).
+  **Single-fire idempotency key per fire/delivery** so recovery never double-fires or re-sends — reuse the
+  hardened delivery-idempotency discipline, do not reinvent.
+- **In-flight turn on crash:** a `claude -p` child dies with QiYan → the turn is interrupted; reconcile from
+  the transcript (completed → deliver + drain queued steer; incomplete → resume/re-drive). Design choice:
+  **child + re-drive (MVP, simpler)** vs **detached subprocess** (turn survives QiYan restart and completes
+  independently — how Codex gets it free via its daemon — but manages orphans). Start with child + re-drive.
+
 ## 7. Non-goals
 
 - No changes to the shared session/delivery internals — the Codex-protocol **adapter** (§4.3) is precisely how
