@@ -614,15 +614,25 @@ test("the exact production MCP map succeeds for every local and remote manager a
     const monitorCount = (): number => (monitors.get(fixture.endpoint, session.thread_id, monitorSpec) as { count: number }).count;
     const sends = db.prepare(`SELECT COUNT(*) AS count FROM scheduled_sends WHERE nickname = ? AND state = 'sent'`);
     const sendCount = (): number => (sends.get(fixture.nickname) as { count: number }).count;
+    const finals = db.prepare(`SELECT COUNT(*) AS count FROM logical_final_messages WHERE endpoint_id = ? AND thread_id = ?`);
+    const finalCount = (): number => (finals.get(fixture.endpoint, session.thread_id) as { count: number }).count;
     const beforeFire = sendCount();
+    const beforeMonitorFinals = finalCount(); // session is idle here (prior step ended in waitForIdle)
     const monitorAsk = `Use your monitor tool with check ${JSON.stringify(monitorSpec)}, poll_seconds 2, and message MONITORFIRED. Then reply exactly MONITOROK.`;
     await call("send_to_session", { nickname: fixture.nickname, content: monitorAsk, attachment_ids: [], mode: "start" }, fixture.endpoint, `/pass ${monitorAsk}`);
     await waitFor(() => monitorCount() > 0, workerTimeoutMs, `${fixture.nickname} worker monitor did not persist (tool missing for this host?)`);
+    // The monitor polls its host-specific check; it fires ONLY if the check evaluated on the
+    // fixture's OWN host and saw the marker → a durable autonomous send (a new 'sent' row) that
+    // delivers MONITORFIRED as its own turn.
     await waitFor(() => sendCount() > beforeFire, workerTimeoutMs, `${fixture.nickname} monitor check never fired (did it run on ${fixture.endpoint}'s host?)`);
-    // Stop the recurring monitor before the marker is gone so it never re-polls (a remote check
-    // is an ssh round-trip every poll) during the remaining steps; then clean up the marker.
+    // Stop the recurring monitor and remove the marker so it never re-fires. Exactly two turns run
+    // in this step — the monitor-set turn (MONITOROK) and the one MONITORFIRED delivery — so wait
+    // for BOTH final messages (a durable, order-independent completion signal, unlike a bare idle
+    // check which could observe the brief pre-start idle and let a delivery collide with the next
+    // step's send).
     db.prepare(`UPDATE session_schedules SET state = 'cancelled' WHERE endpoint_id = ? AND thread_id = ? AND kind = 'monitor' AND state = 'armed'`).run(fixture.endpoint, session.thread_id);
     await removeMarker();
+    await waitFor(() => finalCount() >= beforeMonitorFinals + 2, workerTimeoutMs, `${fixture.nickname} monitor set + delivery turns did not both complete`);
     await waitForIdle(`${fixture.nickname} post-monitor idle`);
 
     // ---- Per-session model + effort must ACTUALLY reach `claude -p` (regressions: set_session_model
