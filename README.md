@@ -43,7 +43,8 @@ Read this before installing or launching:
 QiYan is distributed through GitHub Releases, not the npm registry. Install the latest release directly:
 
 ```bash
-npm install --global --prefix "$HOME/.local" https://github.com/O123O/qiyan-bot/releases/latest/download/qiyan-bot.tgz
+npm install --global --prefix "$HOME/.local" --allow-remote=all \
+  https://github.com/O123O/qiyan-bot/releases/latest/download/qiyan-bot.tgz
 export PATH="$HOME/.local/bin:$PATH"
 qiyan-bot --version
 ```

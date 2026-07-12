@@ -17,7 +17,7 @@ test("README links to all focused guides and every local guide target exists", a
   assert.doesNotMatch(readme, /upgrading-to-v0\.3|fresh v0\.3|versions? before v0\.3/iu);
   const firstInstall = readme.indexOf("npm install --global");
   assert.ok(firstInstall > 0);
-  assert.match(readme, /npm install --global --prefix "\$HOME\/\.local"[\s\\]+https:\/\/github\.com\/O123O\/qiyan-bot\/releases\/latest\/download\/qiyan-bot\.tgz/iu);
+  assert.match(readme, /npm install --global --prefix "\$HOME\/\.local" --allow-remote=all[\s\\]+https:\/\/github\.com\/O123O\/qiyan-bot\/releases\/latest\/download\/qiyan-bot\.tgz/iu);
   assert.doesNotMatch(readme, /workdir=\$\(mktemp|sha256sum --check/iu);
   assert.match(readme, /manual digest verification.*installation guide/iu);
   const links = [...readme.matchAll(/\]\((docs\/[^)#]+)(?:#[^)]+)?\)/gu)].map((match) => match[1]!);
@@ -80,7 +80,7 @@ test("installation guide covers Release install, no-Git source build, version, a
   const guide = await readFile(resolve("docs/installation.md"), "utf8");
   for (const required of [
     "releases/latest/download/qiyan-bot.tgz", "$HOME/.local", "main.tar.gz", "npm ci", "npm pack",
-    "qiyan-bot --version", "qiyan-bot --update", "Release must exist", "does not restart",
+    "qiyan-bot --version", "qiyan-bot --update", "--allow-remote=all", "Release must exist", "does not restart",
   ]) {
     assert.equal(guide.includes(required), true, `installation guide is missing: ${required}`);
   }

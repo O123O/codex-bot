@@ -359,6 +359,7 @@ writeFileSync(join(process.env.HOME, "update-record.json"), JSON.stringify({ arg
   };
   assert.deepEqual(updateRecord.argv, [
     "install", "--global", "--prefix", globalRoot, "--ignore-scripts", "--no-audit", "--no-fund",
+    "--allow-remote=all",
     "https://github.com/O123O/qiyan-bot/releases/latest/download/qiyan-bot.tgz",
   ]);
   assert.equal(updateRecord.env.HOME, fakeHome);

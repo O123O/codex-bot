@@ -75,6 +75,7 @@ export async function updateFromLatestRelease(options: UpdateOptions = {}): Prom
       "--ignore-scripts",
       "--no-audit",
       "--no-fund",
+      "--allow-remote=all",
       LATEST_RELEASE_URL,
     ], {
       env: buildUpdateEnvironment(options.env ?? process.env),

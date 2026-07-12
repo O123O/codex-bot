@@ -54,7 +54,7 @@ Do not install `main.tar.gz` globally. It is source without `dist/`; `npm ci` an
 qiyan-bot --update
 ```
 
-The updater locates the Linux global prefix that owns the running executable and installs the latest GitHub Release. It does not need bot/Codex secrets and does not restart a running process. Stop and restart QiYan yourself after success. The updater refuses source checkouts and unfamiliar package layouts.
+The updater locates the Linux global prefix that owns the running executable and installs the latest GitHub Release. It explicitly passes npm's per-command `--allow-remote=all` opt-in, which npm 12 requires for the reviewed GitHub Release URL. It does not need bot/Codex secrets and does not restart a running process. Stop and restart QiYan yourself after success. The updater refuses source checkouts and unfamiliar package layouts.
 
 ## Uninstall
 

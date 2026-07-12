@@ -65,7 +65,8 @@ test("updates the detected prefix with exact safe npm arguments and re-reads the
   assert.deepEqual(result, { prefix: resolve(prefix), version: "0.3.0" });
   assert.equal(observed?.command, "npm");
   assert.deepEqual(observed?.args, [
-    "install", "--global", "--prefix", resolve(prefix), "--ignore-scripts", "--no-audit", "--no-fund", LATEST_RELEASE_URL,
+    "install", "--global", "--prefix", resolve(prefix), "--ignore-scripts", "--no-audit", "--no-fund",
+    "--allow-remote=all", LATEST_RELEASE_URL,
   ]);
   assert.equal(observed?.options.stdio, "inherit");
   assert.equal(observed?.options.shell, false);
