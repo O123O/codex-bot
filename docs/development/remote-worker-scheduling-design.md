@@ -41,10 +41,21 @@ id). A remote `claude-code` endpoint has a different id, and its config lives in
    (`production-app.ts:2348`). A remote endpoint's `turn/completed` must ALSO reach the driver — subscribe on
    the remote `ClaudeCodeRuntime` in `createRemote` (or route all provider=claude completions to the driver).
 
-**Gating requirement:** goals need `config.claudeCode` to exist today (that's what constructs `claudeGoals`,
-`scheduling`, `claudeGoalDriver`). A remote Claude endpoint can exist with NO local `claudeCode` config. So
-construct `claudeGoals`/`scheduling`/`claudeGoalDriver` when **either** a local claude endpoint OR any catalog
-`claude-code` endpoint exists (catalog is readable at startup).
+**Gating requirement (review, BLOCKING):** the catalog is reloaded on every activation and the assistant adds a
+remote Claude endpoint at **runtime** by writing `endpoints.json` — so any startup-snapshot decision misses the
+primary use case (an endpoint added after boot would get no goal/scheduling stack). **Always construct**
+`claudeGoals`/`scheduling`/`claudeGoalDriver`, unconditionally (drop the `claudeCodeConfig === undefined ?
+undefined` gates). Cost is one idle loopback MCP + one poll loop; it removes all "does a claude endpoint exist
+yet" bookkeeping.
+
+**`resumeActive` (review, SHOULD-FIX) is an enumeration, not a predicate swap:** `listActive(id)` is per
+endpointId, so on startup enumerate `registry.snapshot().sessions`, keep `sessionProvider(endpoint)==="claude"`,
+group by `endpoint`, and `listActive` per id. (Recovery otherwise self-heals: a resumed drive fires →
+`send_to_session` → `createRemote` establishes the driver subscription → the turn completes back into the driver.)
+
+**Remote launch flags (review, NIT):** the remote runtime must take `model`/`disallowedTools` from the catalog
+`definition`, not the local `claudeLaunchFlags` (else goals drive turns on the wrong model). Catalog `claude-code`
+has no such fields today → default `{}`; sourcing them is a small follow-up, noted.
 
 ## 3. Tier B — worker self-scheduling over `ssh -R` (the networking piece)
 
@@ -76,22 +87,28 @@ establishment loudly and surface it — the worker MCP config for that endpoint 
 still runs, just without self-scheduling, same as a local endpoint whose scheduler is down). *Open question for
 review:* deterministic-with-fail vs. dynamic `-R 0` + parse the allocated port (unreliable under `-O forward`).
 
-### 3.4 Lifecycle
-- Establish the tunnel lazily, the first time `workerMcpConfigPath` is requested for a remote endpoint (i.e. the
-  first worker turn that would use scheduling), and cache it per endpoint. Re-establish if the ControlMaster
-  dropped (the tunnel dies with it) — `ssh -O check` before reuse, like the runner's attestation.
+### 3.4 Lifecycle (review, SHOULD-FIX: ownership + idempotency)
+- **The tunnel manager lives in the `createRemote` closure** (which holds the plan + `SshRemoteClient`), NOT in
+  `ClaudeCodeRuntime` (which holds only the runner). `closeConnection()` doesn't touch the master, and a
+  daemonless adapter reset does NOT exit the master (`ControlPersist=yes`), so the `-R` forward **survives** a
+  reset — reuse is fine, but re-arm must be **idempotent** (tolerate an already-live forward; `ssh -O check`
+  first). Teardown (`-O cancel -R` + optionally master exit) hooks to real endpoint disposal, not `closeConnection`,
+  or old loopback listeners accumulate on the remote across re-leases.
+- Establish lazily on the first `workerMcpConfigPath` for the endpoint; cache per endpoint; re-check the master
+  before reuse (mirrors the runner's per-turn `attestUserControlMaster`).
 - `workerMcpConfigPath` for a remote endpoint writes the config with `url: http://127.0.0.1:<rport>/mcp` (the
   remote-forwarded port), writes it to the **remote** runtime dir (the worker reads it there, via the file
   bridge / a `write-file` helper op), and returns the remote path for `--mcp-config`.
 - On endpoint disconnect/restart (daemonless lifecycle) the tunnel is torn down (`-O cancel -R`) and re-armed on
   next use.
 
-### 3.5 The monitor caveat
-`schedule_monitor` runs a `bash -c` check. Today that check runs on the QIYAN host (`runMonitorCheck`), not the
-worker's host. For a remote worker a monitor that greps a remote log would silently check QiYan's fs. Scope:
-`schedule_wakeup`/`schedule_cron`/`set_goal_status` are host-agnostic and fully supported remotely; **document
-that `schedule_monitor`'s check evaluates on the QiYan host** (or reject `schedule_monitor` for a remote worker
-until a remote-check op exists). Decide in review.
+### 3.5 The monitor caveat (review: REJECT for remote, do not document)
+`schedule_monitor` runs a `bash -c` check on the QIYAN host (`runMonitorCheck`, host-blind). Its tool
+description tells the worker the check runs "on your session's host" (`worker-mcp.ts:107`) — a lie for a remote
+worker, and a doc caveat never reaches the LLM worker, so it would write remote-path greps that silently
+evaluate against QiYan's fs. The in-code comment (`production-app.ts:125-127`) already mandates gating. So:
+**reject `schedule_monitor` (UNSUPPORTED) for a provider=claude remote session** until a remote-check op exists.
+`schedule_wakeup`/`schedule_cron`/`set_goal_status` are host-agnostic and fully supported remotely.
 
 ## 4. Plan
 1. **Tier A** (goals + steer for remote) — provider-based goal gates; construct the goal/scheduling stack when
@@ -114,7 +131,10 @@ until a remote-check op exists). Decide in review.
 - **Tier A gating change:** constructing the goal/scheduling stack for catalog-only Claude endpoints must not
   change behavior when only the local endpoint (or neither) exists.
 
-## 6. Open questions (for review)
-- §3.3 deterministic-port-with-fail vs. dynamic-port-parse.
-- §3.5 `schedule_monitor` remote semantics: document-QiYan-host vs. reject-for-remote vs. remote-check op.
-- Should Tier A ship first (no networking, high value) and Tier B follow, or land together?
+## 6. Open questions — RESOLVED by review
+- §3.3 → **deterministic-port-with-fail** (dynamic `-R 0` doesn't reliably surface the allocated port under
+  `-O forward` — the master prints it to its own stderr, not the control client). Note the same-host squat-DoS
+  (a co-tenant squatting the predictable port kills scheduling for that endpoint; not an escalation); optionally
+  a short deterministic retry sequence `base, base+1, …` instead of a single hard-fail.
+- §3.5 → **reject `schedule_monitor` for remote** (see §3.5).
+- Sequencing → **Tier A first** (no networking, no new attack surface), Tier B second.
