@@ -81,11 +81,17 @@ co-tenant process on the remote host could reach the port but not the token. Thi
 where any local process could reach `127.0.0.1:<port>` but needs the token.
 
 ### 3.3 Remote port allocation
-Deterministic per endpoint: `rport = 20000 + (sha256(endpointId) mod 20000)` (a stable high port). Establish the
-tunnel with `ExitOnForwardFailure=yes`; on a bind collision (port in use on the remote), fail the tunnel
-establishment loudly and surface it — the worker MCP config for that endpoint is then NOT written (the session
-still runs, just without self-scheduling, same as a local endpoint whose scheduler is down). *Open question for
-review:* deterministic-with-fail vs. dynamic `-R 0` + parse the allocated port (unreliable under `-O forward`).
+**Dynamic** (resolved during implementation — a deterministic port is unreclaimable): establish the tunnel with
+`-R 127.0.0.1:0:127.0.0.1:<localPort>` and read the sshd-allocated remote port back from `-O forward`'s stdout
+(empirically it prints just the port; the design's earlier worry that `-O forward` won't surface it was wrong).
+The worker learns the port from the URL in its per-session config, so it need not be fixed. `ExitOnForwardFailure=yes`
+still guards a real establishment failure (the config is then NOT written — the session runs without self-scheduling,
+same as a local endpoint whose scheduler is down). A deterministic `20000 + (sha256(endpointId) mod 20000)` port was
+rejected: an ssh forward is cancellable ONLY with its EXACT original spec (verified against OpenSSH — no listen-port-only
+cancel form matches), so once a prior QiYan instance's ephemeral `localPort` is forgotten, a stale forward squatting the
+fixed remote port can never be reclaimed and every re-establishment fails `ExitOnForwardFailure`. Dynamic allocation
+picks a fresh free port each establishment, so it never collides; a leaked forward from an unclean exit dies with the
+ControlMaster.
 
 ### 3.4 Lifecycle (review, SHOULD-FIX: ownership + idempotency)
 - **The tunnel manager lives in the `createRemote` closure** (which holds the plan + `SshRemoteClient`), NOT in
@@ -131,10 +137,11 @@ evaluate against QiYan's fs. The in-code comment (`production-app.ts:125-127`) a
 - **Tier A gating change:** constructing the goal/scheduling stack for catalog-only Claude endpoints must not
   change behavior when only the local endpoint (or neither) exists.
 
-## 6. Open questions — RESOLVED by review
-- §3.3 → **deterministic-port-with-fail** (dynamic `-R 0` doesn't reliably surface the allocated port under
-  `-O forward` — the master prints it to its own stderr, not the control client). Note the same-host squat-DoS
-  (a co-tenant squatting the predictable port kills scheduling for that endpoint; not an escalation); optionally
-  a short deterministic retry sequence `base, base+1, …` instead of a single hard-fail.
+## 6. Open questions — RESOLVED
+- §3.3 → **dynamic `-R 0` + read the allocated port from `-O forward` stdout** (revised during implementation).
+  The review had picked deterministic-with-fail on the belief that `-O forward` won't surface the allocated port;
+  that was tested false (it prints the port). Deterministic is worse: a stale forward on the fixed remote port is
+  unreclaimable (ssh cancels only by exact original spec) and permanently breaks re-establishment. Dynamic never
+  collides, so it also drops the same-host squat-DoS concern.
 - §3.5 → **reject `schedule_monitor` for remote** (see §3.5).
 - Sequencing → **Tier A first** (no networking, no new attack surface), Tier B second.

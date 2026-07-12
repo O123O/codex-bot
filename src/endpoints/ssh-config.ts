@@ -115,6 +115,10 @@ export function buildSshStreamForwardCancelArgs(plan: SshConnectionPlan, localSo
 // reach it. The remote listener binds to `127.0.0.1` (not `0.0.0.0`) — with the default
 // `GatewayPorts no` this is bind-not-relax: only processes ON the remote host can connect,
 // never the network. Auth is the per-session bearer token in the worker's --mcp-config.
+// A remotePort of 0 asks the remote sshd to allocate a free port (reported on stdout); this
+// avoids a fixed port that a stale forward from a prior instance could squat (a forward can
+// only be cancelled with its EXACT original spec, so a fixed remote port is unreclaimable
+// once the original local port is forgotten).
 export function buildSshReverseForwardArgs(plan: SshConnectionPlan, remotePort: number, localPort: number): string[] {
   return [
     ...baseArgs(plan, false),
@@ -130,7 +134,9 @@ export function buildSshReverseForwardCancelArgs(plan: SshConnectionPlan, remote
 }
 
 function reverseForwarding(remotePort: number, localPort: number): string {
-  if (![remotePort, localPort].every((port) => Number.isInteger(port) && port >= 1 && port <= 65_535)) {
+  // remotePort 0 = dynamic allocation (listen side); localPort must be a real bound port.
+  if (!Number.isInteger(remotePort) || remotePort < 0 || remotePort > 65_535
+    || !Number.isInteger(localPort) || localPort < 1 || localPort > 65_535) {
     throw new AppError("CONFIGURATION_ERROR", "invalid SSH reverse-forward port");
   }
   return `127.0.0.1:${remotePort}:127.0.0.1:${localPort}`;

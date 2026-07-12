@@ -1,35 +1,44 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { RemoteWorkerTunnel, remoteWorkerMcpPort } from "../../src/endpoints/remote-worker-tunnel.ts";
+import { RemoteWorkerTunnel } from "../../src/endpoints/remote-worker-tunnel.ts";
 import { parseSshConfig, planSshConnection } from "../../src/endpoints/ssh-config.ts";
 
 const plan = planSshConnection("dfw-claude", parseSshConfig(
   "hostname host.example\nuser xin\nport 22\ncontrolmaster auto\ncontrolpath /tmp/user-master\n",
 ), "/private/runtime");
 
-test("remoteWorkerMcpPort is deterministic and in the stable high range", () => {
-  const a = remoteWorkerMcpPort("dfw-claude");
-  assert.equal(a, remoteWorkerMcpPort("dfw-claude"), "not deterministic");
-  assert.notEqual(a, remoteWorkerMcpPort("other-claude"), "collides trivially");
-  assert.ok(a >= 20_000 && a < 40_000, `${a} out of range`);
+test("ensure() forwards a dynamic (0) remote port and adopts the sshd-allocated port", async () => {
+  const calls: Array<{ op: string; spec: string }> = [];
+  const run = async (_ssh: string, args: readonly string[]): Promise<{ stdout: Buffer; stderr: Buffer }> => {
+    calls.push({ op: args[args.indexOf("-O") + 1]!, spec: args[args.indexOf("-R") + 1]! });
+    return { stdout: Buffer.from("34567\n"), stderr: Buffer.alloc(0) };
+  };
+  const tunnel = new RemoteWorkerTunnel({ plan, localPort: 40001, run: run as never });
+  await tunnel.ensure();
+  assert.equal(calls[0]!.op, "forward");
+  assert.equal(calls[0]!.spec, "127.0.0.1:0:127.0.0.1:40001", "must request a dynamic remote port bound to the local MCP port");
+  assert.equal(tunnel.remotePort, 34567, "must adopt the port the remote sshd reported");
+  await tunnel.ensure(); // cached — no new ssh
+  assert.equal(calls.length, 1, "second ensure re-forwarded");
+  // cancel uses the EXACT allocated spec (only form ssh accepts to remove a forward)
+  await tunnel.cancel();
+  assert.deepEqual(calls.map((c) => c.op), ["forward", "cancel"]);
+  assert.equal(calls[1]!.spec, "127.0.0.1:34567:127.0.0.1:40001");
 });
 
-test("ensure() cancels any stale reverse forward then establishes a fresh one, once", async () => {
-  const calls: Array<{ op: string }> = [];
-  const run = async (_ssh: string, args: readonly string[]): Promise<{ stdout: Buffer; stderr: Buffer }> => {
-    calls.push({ op: args[args.indexOf("-O") + 1]! });
-    return { stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) };
-  };
-  const tunnel = new RemoteWorkerTunnel({ plan, remotePort: 34567, localPort: 40001, run: run as never });
-  await tunnel.ensure();
-  assert.deepEqual(calls.map((c) => c.op), ["cancel", "forward"], "must cancel-then-forward");
-  await tunnel.ensure(); // cached — no new ssh
-  assert.equal(calls.length, 2, "second ensure re-established the forward");
-  await tunnel.cancel();
-  assert.deepEqual(calls.map((c) => c.op), ["cancel", "forward", "cancel"]);
+test("remotePort before ensure() is an error, not a bogus value", () => {
+  const tunnel = new RemoteWorkerTunnel({ plan, localPort: 40001, run: (async () => ({ stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) })) as never });
+  assert.throws(() => tunnel.remotePort, /not established/u);
+});
+
+test("ensure() rejects a non-numeric or out-of-range allocated port", async () => {
+  for (const reported of ["", "notaport", "0", "70000"]) {
+    const tunnel = new RemoteWorkerTunnel({ plan, localPort: 40001, run: (async () => ({ stdout: Buffer.from(reported), stderr: Buffer.alloc(0) })) as never });
+    await assert.rejects(tunnel.ensure(), /allocated worker MCP port/u);
+  }
 });
 
 test("ensure() refuses to forward to an unavailable local MCP port", async () => {
-  const tunnel = new RemoteWorkerTunnel({ plan, remotePort: 34567, localPort: 0, run: (async () => ({ stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) })) as never });
+  const tunnel = new RemoteWorkerTunnel({ plan, localPort: 0, run: (async () => ({ stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) })) as never });
   await assert.rejects(tunnel.ensure(), /local port/u);
 });

@@ -98,7 +98,7 @@ import { EndpointManager } from "./endpoints/manager.ts";
 import { SshGenerationPlanner } from "./endpoints/ssh-config.ts";
 import { attestUserControlMaster, prepareRemoteHost, type RemoteHost, SshRemoteClient, SshRuntime } from "./endpoints/ssh-runtime.ts";
 import { SshClaudeCommandRunner } from "./endpoints/ssh-claude-command-runner.ts";
-import { RemoteWorkerTunnel, remoteWorkerMcpPort } from "./endpoints/remote-worker-tunnel.ts";
+import { RemoteWorkerTunnel } from "./endpoints/remote-worker-tunnel.ts";
 import { SshAppServerRuntime } from "./endpoints/ssh-app-server-runtime.ts";
 import { prepareLocalSshEndpointSocketRoot, prepareLocalSshRuntimeRoot } from "./endpoints/local-runtime.ts";
 import { WebSocketWire } from "./app-server/websocket-wire.ts";
@@ -2393,24 +2393,39 @@ export async function buildProductionApp(
               const host = await prepareRemoteHost({ endpointId: definition.id, remote, assetRoot: remoteAssetRoot });
               // Tier B: expose QiYan's worker-MCP on the remote host via an ssh -R reverse
               // tunnel over this endpoint's ControlMaster, so the remote worker can self-schedule.
+              // The remote listen port is allocated dynamically by the remote sshd (read back
+              // after ensure()); the worker learns it from the URL in its per-session config.
               const tunnel = new RemoteWorkerTunnel({
-                plan: generation.plan, remotePort: remoteWorkerMcpPort(definition.id), localPort: scheduling!.mcpPort,
+                plan: generation.plan, localPort: scheduling!.mcpPort,
               });
               const remoteWorkerMcpConfigPath = async (threadId: string): Promise<string | undefined> => {
                 const found = registry.getByIdentity(definition.id, threadId);
                 if (!found) return undefined;
-                await tunnel.ensure();
-                const content = scheduling!.workerMcpConfigContent(
-                  { nickname: found.nickname, endpointId: definition.id, threadId },
-                  `http://127.0.0.1:${tunnel.remotePort}/mcp`,
-                );
-                // Write the token-bearing config to the REMOTE runtime dir (content-addressed
-                // under files/<sha256>, mode 0600) so `claude -p --mcp-config` reads it there.
-                const buffer = Buffer.from(content, "utf8");
-                const result = await remote.invokeTransfer<{ path: string }>("write-file",
-                  [JSON.stringify({ runtimeDir: host.remoteRuntimeDir, size: buffer.byteLength, sha256: createHash("sha256").update(buffer).digest("hex") })],
-                  { input: (async function* () { yield buffer; })(), maxOutputBytes: 64 * 1024 }, host.remoteHelperPath);
-                return result.path;
+                // Self-scheduling is best-effort: the reverse tunnel must NOT be a single point of
+                // failure for basic remote messaging. If establishing it (or writing the config)
+                // fails, run the turn WITHOUT the scheduling tools rather than failing the whole
+                // turn. The degradation is surfaced as an operational warning (not silent), and the
+                // acceptance test's schedule-step assertion still fails loudly on a real regression.
+                try {
+                  await tunnel.ensure();
+                  const content = scheduling!.workerMcpConfigContent(
+                    { nickname: found.nickname, endpointId: definition.id, threadId },
+                    `http://127.0.0.1:${tunnel.remotePort}/mcp`,
+                  );
+                  // Write the token-bearing config to the REMOTE runtime dir (content-addressed
+                  // under files/<sha256>, mode 0600) so `claude -p --mcp-config` reads it there.
+                  const buffer = Buffer.from(content, "utf8");
+                  const result = await remote.invokeTransfer<{ path: string }>("write-file",
+                    [JSON.stringify({ runtimeDir: host.remoteRuntimeDir, size: buffer.byteLength, sha256: createHash("sha256").update(buffer).digest("hex") })],
+                    { input: (async function* () { yield buffer; })(), maxOutputBytes: 64 * 1024 }, host.remoteHelperPath);
+                  return result.path;
+                } catch (error) {
+                  reportOperationalSafely(report, {
+                    level: "warn", code: "worker_scheduling_unavailable", component: "remote_worker_tunnel",
+                    reason: error instanceof Error ? error.message : String(error),
+                  });
+                  return undefined;
+                }
               };
               const claudeRemoteEndpoint = new ClaudeCodeRuntime({
                 id: definition.id,
@@ -2811,12 +2826,11 @@ export async function buildProductionApp(
     {
       name: "scheduler",
       start: async () => {
-        if (options.testing?.holdAssistantScheduler) return;
-        schedulerAccepting = true;
-        await enqueuePendingEvents();
-        await dispatcher.enqueueInternal("startup");
-        // Provider-agnostic schedule engine + worker MCP surface (Phase 2). Recovery
-        // re-arms durable schedules on start; fires drive send_to_session.
+        // The provider-agnostic schedule engine + worker MCP surface (Phase 2) is an
+        // independent subsystem from the assistant's autonomous dispatcher, so it starts
+        // even when the latter is held (tests set holdAssistantScheduler to suppress the
+        // proactive assistant, NOT worker goal-drive / self-scheduling). Recovery re-arms
+        // durable schedules on start; fires drive send_to_session.
         if (scheduling) await scheduling.start();
         // Re-kick active Claude goals whose drive turn was in flight at restart (no
         // pending schedule, no live turn) so goal enforcement is restart-durable. listActive
@@ -2831,6 +2845,10 @@ export async function buildProductionApp(
             .map((found) => ({ nickname: found.nickname, endpointId, threadId: found.session.thread_id })));
           claudeGoalDriver.resumeActive(active);
         }
+        if (options.testing?.holdAssistantScheduler) return;
+        schedulerAccepting = true;
+        await enqueuePendingEvents();
+        await dispatcher.enqueueInternal("startup");
       },
       stop: async () => {
         stopping = true;
