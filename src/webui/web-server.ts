@@ -7,6 +7,7 @@ import type { OperationalEvent } from "../core/operational-log.ts";
 import type { WebBus } from "./web-bus.ts";
 import { assistantTranscript, listSessions, transcript, type WebReadsDeps } from "./web-reads.ts";
 import { browse, type WebFilesDeps } from "./web-files.ts";
+import { cleanupUploads, previewUpload, storeUpload, type WebUploadsConfig } from "./web-uploads.ts";
 
 const AUTH_COOKIE = "qiyan_web_token";
 const POLL_MS = 1_000;
@@ -24,6 +25,7 @@ export interface WebServerOptions {
   bus: WebBus;
   reads: WebReadsDeps;
   files: WebFilesDeps;
+  uploads?: WebUploadsConfig;
   submitInput(text: string, target: string | undefined): Promise<{ ok: boolean; error?: string }>;
   report(event: OperationalEvent): void;
 }
@@ -66,6 +68,7 @@ export function createWebServer(options: WebServerOptions): WebServer {
   const wss = new WebSocketServer({ noServer: true });
   let server: Server | undefined;
   let poll: ReturnType<typeof setInterval> | undefined;
+  let uploadSweep: ReturnType<typeof setInterval> | undefined;
   let lastSessions = "";
 
   const json = (response: ServerResponse, status: number, body: unknown): void => {
@@ -126,6 +129,22 @@ export function createWebServer(options: WebServerOptions): WebServer {
       json(response, "error" in result ? 400 : 200, result);
       return;
     }
+    // Send-file: store the uploaded bytes in the backend upload dir; the client appends the returned
+    // path to its message so the assistant/worker reads the file by path.
+    if (request.method === "POST" && url.pathname === "/api/upload") {
+      if (!options.uploads) { json(response, 501, { error: "uploads are disabled" }); return; }
+      const chunks: Buffer[] = []; let size = 0;
+      for await (const chunk of request) { size += chunk.length; if (size > options.uploads.maxBytes) { json(response, 413, { error: "file exceeds the size limit" }); return; } chunks.push(chunk as Buffer); }
+      const result = await storeUpload(options.uploads, url.searchParams.get("name") ?? "file", Buffer.concat(chunks), Date.now());
+      json(response, "error" in result ? 400 : 200, result);
+      return;
+    }
+    if (request.method === "GET" && url.pathname === "/api/upload/preview") {
+      if (!options.uploads) { json(response, 501, { error: "uploads are disabled" }); return; }
+      const result = await previewUpload(options.uploads, url.searchParams.get("path") ?? "");
+      json(response, "error" in result ? 400 : 200, result);
+      return;
+    }
     if (request.method === "POST" && url.pathname === "/api/input") {
       let raw = "";
       for await (const chunk of request) { raw += chunk; if (raw.length > 256 * 1024) { json(response, 413, { error: "too large" }); return; } }
@@ -167,6 +186,13 @@ export function createWebServer(options: WebServerOptions): WebServer {
         } catch (error) { options.report({ level: "warn", code: "background_task_failed", component: "web_ui", reason: error instanceof Error ? error.message : String(error) }); }
       }, POLL_MS);
       poll.unref?.();
+      // Expire uploaded files past their TTL: once now, then periodically.
+      if (options.uploads) {
+        const sweep = () => void cleanupUploads(options.uploads!, Date.now()).catch(() => {});
+        sweep();
+        uploadSweep = setInterval(sweep, 6 * 60 * 60 * 1000);
+        uploadSweep.unref?.();
+      }
       const address = server!.address();
       const boundPort = typeof address === "object" && address ? address.port : options.port;
       // Loud warning: a non-loopback bind exposes a danger-full-access surface on the LAN over
@@ -179,6 +205,7 @@ export function createWebServer(options: WebServerOptions): WebServer {
     },
     async stop() {
       if (poll) clearInterval(poll);
+      if (uploadSweep) clearInterval(uploadSweep);
       for (const ws of wss.clients) { try { ws.close(); } catch { /* closing */ } }
       wss.close();
       await new Promise<void>((resolve) => { if (!server) { resolve(); return; } server.close(() => resolve()); });

@@ -34,7 +34,7 @@ function normalizeMath(src: string): string {
 
 // Linkify file-path-like tokens in message text so they open a preview. Paths need a slash or a known
 // extension; code/links are skipped. Href scheme "qy-file:<encoded>" is intercepted by the <a> renderer.
-const PATH_RE = /((?:\.\.?\/)?(?:[A-Za-z0-9._-]+\/)+[A-Za-z0-9._-]+(?:\.[A-Za-z0-9]+)?|[A-Za-z0-9._-]+\.(?:ts|tsx|js|jsx|mjs|cjs|json|md|txt|py|rs|go|c|h|cc|cpp|hpp|css|scss|html|yaml|yml|toml|ini|cfg|sh|sql|log|env))(:\d+(?::\d+)?)?/g;
+const PATH_RE = /((?:\.{0,2}\/)?(?:[A-Za-z0-9._-]+\/)+[A-Za-z0-9._-]+(?:\.[A-Za-z0-9]+)?|[A-Za-z0-9._-]+\.(?:ts|tsx|js|jsx|mjs|cjs|json|md|txt|py|rs|go|c|h|cc|cpp|hpp|css|scss|html|yaml|yml|toml|ini|cfg|sh|sql|log|env|pdf|png|jpg|jpeg|gif|csv|zip|docx|xlsx))(:\d+(?::\d+)?)?/g;
 const SKIP = new Set(["code", "inlineCode", "link", "linkReference", "image"]);
 function remarkFilePaths() {
   const walk = (node: any) => {
@@ -189,6 +189,20 @@ export function App() {
     if (target) setTimeout(() => { if (selected === target) void loadFinals(target); }, 900);
   };
 
+  const fileInput = useRef<HTMLInputElement>(null);
+  const [uploading, setUploading] = useState(false);
+  // Send a file: the backend stores it and returns its path, which we append to the composer so the
+  // assistant/worker reads it by path (no download needed — the path is clickable to preview).
+  const uploadFile = async (f: File) => {
+    setUploading(true);
+    try {
+      const r = await fetch(`/api/upload?name=${encodeURIComponent(f.name)}`, { method: "POST", credentials: "same-origin", headers: { "content-type": "application/octet-stream" }, body: f });
+      const b = await r.json();
+      if (r.ok && b.path) setText((t) => (t ? t.replace(/\s*$/, " ") : "") + b.path + " ");
+      else push(key, { role: "assistant", body: `[upload failed: ${b.error ?? r.status}]`, at: Date.now() });
+    } catch { push(key, { role: "assistant", body: "[upload error]", at: Date.now() }); } finally { setUploading(false); }
+  };
+
   const onKey = (e: React.KeyboardEvent) => {
     if (suggest.length > 0) {
       if (e.key === "ArrowDown") { e.preventDefault(); setSugIdx((i) => (i + 1) % suggest.length); return; }
@@ -204,17 +218,24 @@ export function App() {
   const openFileAt = (nickname: string, relPath: string) =>
     void api<FileResult>(`/api/files/${nickname}?path=${encodeURIComponent(relPath)}`).then(setFile).catch(() => setFile({ error: "unavailable" }));
 
-  // Open a path mentioned in a worker's message, resolved against that worker's project dir.
+  const openUpload = (absPath: string) =>
+    void api<FileResult>(`/api/upload/preview?path=${encodeURIComponent(absPath)}`).then(setFile).catch(() => setFile({ error: "unavailable" }));
+
+  // Open a path mentioned in a message: an absolute path under the current worker's project opens as a
+  // project file; any other absolute path (e.g. an uploaded/sent file) opens from the upload store; a
+  // relative path opens against the current worker's project.
   const openMentioned = (raw: string) => {
-    if (!selected) return;
-    const clean = raw.replace(/^qy-file:/, "");
-    const decoded = decodeURIComponent(clean).replace(/:\d+(?::\d+)?$/, "").replace(/^\.\//, "");
-    const proj = selSession?.projectDir;
-    const rel = decoded.startsWith("/") ? (proj && decoded.startsWith(proj + "/") ? decoded.slice(proj.length + 1) : decoded.replace(/^\/+/, "")) : decoded;
-    openFileAt(selected, rel);
+    const decoded = decodeURIComponent(raw.replace(/^qy-file:/, "")).replace(/:\d+(?::\d+)?$/, "").replace(/^\.\//, "");
+    if (decoded.startsWith("/")) {
+      const proj = selSession?.projectDir;
+      if (selected && proj && decoded.startsWith(proj + "/")) openFileAt(selected, decoded.slice(proj.length + 1));
+      else openUpload(decoded);
+      return;
+    }
+    if (selected) openFileAt(selected, decoded);
   };
 
-  const remark = [remarkGfm, remarkMath, ...(selected ? [remarkFilePaths] : [])];
+  const remark = [remarkGfm, remarkMath, remarkFilePaths];
   const mdComponents = { a: (props: any) => typeof props.href === "string" && props.href.startsWith("qy-file:")
     ? <button className="file-link" onClick={() => openMentioned(props.href)}>{props.children}</button>
     : <a {...props} target="_blank" rel="noreferrer" /> };
@@ -272,6 +293,8 @@ export function App() {
           </div>
           <div className="composer">
             {suggest.length > 0 && <div className="suggest">{suggest.map((n, i) => <div key={n} className={`srow ${i === sugIdx ? "on" : ""}`} onMouseDown={(e) => { e.preventDefault(); pickSuggest(n); }}>@{n}</div>)}</div>}
+            <input ref={fileInput} type="file" hidden onChange={(e) => { const f = e.target.files?.[0]; if (f) void uploadFile(f); e.target.value = ""; }} />
+            <button className="ghost" title="Send a file (its path is appended)" disabled={uploading} onClick={() => fileInput.current?.click()}>{uploading ? "…" : "📎"}</button>
             <textarea value={text} onChange={(e) => onText(e.target.value)} onKeyDown={onKey} rows={2}
               placeholder={selected === null ? "Message QiYan… (@worker to direct-message a worker)" : `Message ${selected}…`} />
             <button onClick={() => void send()}>Send</button>

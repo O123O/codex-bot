@@ -3001,6 +3001,9 @@ export async function buildProductionApp(
         },
         maxFileBytes: config.attachmentMaxBytes,
       },
+      // Send-file store: uploads land here on the bot host and auto-expire after 30 days. The path is
+      // appended to the message so a LOCAL assistant/worker can read it (remote hosts can't — deferred).
+      uploads: { dir: join(dataDir, "web-uploads"), maxBytes: config.attachmentMaxBytes, ttlMs: 30 * 24 * 60 * 60 * 1000 },
       acceptChat, report,
       onStarted: (url) => { process.stdout.write(`QiYan web UI listening — open ${url}\n`); options.testing?.onWebUiStarted?.(url); },
     })] : []),
