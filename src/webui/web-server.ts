@@ -7,9 +7,10 @@ import { WebSocketServer } from "ws";
 import type { OperationalEvent } from "../core/operational-log.ts";
 import type { WebBus } from "./web-bus.ts";
 import { assistantTranscript, listSessions, transcript, type WebReadsDeps } from "./web-reads.ts";
-import { browse, createEntry, listFiles, resolvePath, type WebFilesDeps } from "./web-files.ts";
+import { browse, createEntry, resolvePath, type WebFilesDeps } from "./web-files.ts";
 import { cleanupUploads, storeUpload, type WebUploadsConfig } from "./web-uploads.ts";
 import { runCommand } from "./web-exec.ts";
+import { gitCommit, gitDiff, gitStage, gitStatus, gitUnstage } from "./web-git.ts";
 
 const AUTH_COOKIE = "qiyan_web_token";
 const POLL_MS = 1_000;
@@ -188,12 +189,6 @@ export function createWebServer(options: WebServerOptions): WebServer {
       await serveRaw(response, target, url.searchParams.get("download") === "1");
       return;
     }
-    // Flat file list for @-file autocomplete.
-    if (request.method === "GET" && url.pathname === "/api/filelist") {
-      const session = url.searchParams.get("session");
-      json(response, 200, { files: session ? await listFiles(options.files, session, 2000) : [] });
-      return;
-    }
     // Create a file/folder in a session's project (tree write ops).
     if (request.method === "POST" && url.pathname === "/api/fs") {
       const body = await readJson(request);
@@ -212,6 +207,30 @@ export function createWebServer(options: WebServerOptions): WebServer {
       if (!cwd) { json(response, 400, { error: "not a local session" }); return; }
       if (typeof command !== "string" || !command.trim()) { json(response, 400, { error: "command required" }); return; }
       json(response, 200, await runCommand(cwd, command, { maxBytes: 256 * 1024, timeoutMs: 30_000 }));
+      return;
+    }
+    // Git source control for a LOCAL session's project dir.
+    if (request.method === "GET" && (url.pathname === "/api/git/status" || url.pathname === "/api/git/diff")) {
+      const repo = options.files.projectDir(url.searchParams.get("session") ?? "");
+      if (!repo) { json(response, 400, { error: "not a local session" }); return; }
+      if (url.pathname === "/api/git/status") { json(response, 200, await gitStatus(repo)); return; }
+      const result = await gitDiff(repo, url.searchParams.get("path") ?? "", url.searchParams.get("staged") === "1");
+      json(response, "error" in result ? 400 : 200, result);
+      return;
+    }
+    const gitOp = /^\/api\/git\/(stage|unstage|commit)$/u.exec(url.pathname);
+    if (request.method === "POST" && gitOp) {
+      const body = await readJson(request);
+      if (!body) { json(response, 400, { error: "invalid json" }); return; }
+      const repo = options.files.projectDir(typeof body.session === "string" ? body.session : "");
+      if (!repo) { json(response, 400, { error: "not a local session" }); return; }
+      const op = gitOp[1];
+      const result = op === "commit"
+        ? await gitCommit(repo, typeof body.message === "string" ? body.message : "")
+        : typeof body.path === "string" && body.path
+          ? await (op === "stage" ? gitStage : gitUnstage)(repo, body.path)
+          : { error: "path required" };
+      json(response, "error" in result ? 400 : 200, result);
       return;
     }
     if (request.method === "POST" && url.pathname === "/api/input") {

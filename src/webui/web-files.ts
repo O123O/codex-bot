@@ -89,29 +89,6 @@ export async function createEntry(deps: WebFilesDeps, nickname: string, relPath:
   } catch (error) { return { error: error instanceof Error ? error.message : "create failed" }; }
 }
 
-// A flat list of file paths under a session's project (for @-file autocomplete), capped, skipping
-// dot-dirs and node_modules/.git so it stays cheap.
-export async function listFiles(deps: WebFilesDeps, nickname: string, limit: number): Promise<string[]> {
-  const root = deps.projectDir(nickname);
-  if (root === undefined) return [];
-  const realRoot = await realpath(root).catch(() => undefined);
-  if (realRoot === undefined) return [];
-  const out: string[] = [];
-  const skip = new Set([".git", "node_modules", ".venv", "__pycache__", "dist", "build"]);
-  const walk = async (dir: string, rel: string): Promise<void> => {
-    if (out.length >= limit) return;
-    const dirents = await readdir(dir, { withFileTypes: true }).catch(() => []);
-    for (const entry of dirents) {
-      if (out.length >= limit) return;
-      const childRel = rel ? `${rel}/${entry.name}` : entry.name;
-      if (entry.isFile()) out.push(childRel);
-      else if (entry.isDirectory() && !skip.has(entry.name) && !entry.name.startsWith(".")) await walk(join(dir, entry.name), childRel);
-    }
-  };
-  await walk(realRoot, "");
-  return out;
-}
-
 // List a directory or read a file, confined to the named session's project directory (the file tree).
 export async function browse(deps: WebFilesDeps, nickname: string, relPath: string): Promise<WebFilesResult> {
   const root = deps.projectDir(nickname);

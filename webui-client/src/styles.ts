@@ -26,6 +26,12 @@ body { margin:0; }
 .files { flex:0 0 auto; border-right:1px solid var(--line); background:var(--panel); display:flex; flex-direction:column; min-height:0; overflow:hidden; }
 .resizer { flex:0 0 5px; cursor:col-resize; background:transparent; } .resizer:hover { background:var(--accent); }
 .tw { display:inline-block; width:1.1em; color:var(--muted); }
+.tabs2 { display:flex; gap:4px; } .tabs2 button { background:transparent; border:0; color:var(--muted); cursor:pointer; padding:2px 8px; border-radius:6px; font-weight:600; } .tabs2 button.on { color:var(--text); background:var(--panel2); }
+.gbranch { padding:6px 10px; color:var(--muted); font-size:12px; border-bottom:1px solid var(--line); margin-bottom:6px; }
+.gsec-h { padding:4px 10px; font-size:11px; text-transform:uppercase; color:var(--muted); letter-spacing:.5px; }
+.commit { border-top:1px solid var(--line); margin-top:8px; padding:10px; display:flex; flex-direction:column; gap:6px; }
+.commit textarea { background:var(--bg); color:var(--text); border:1px solid var(--line); border-radius:8px; padding:6px 8px; resize:none; font:inherit; }
+.commit button { background:var(--accent); color:var(--accent-fg); border:0; border-radius:8px; padding:6px; cursor:pointer; font-weight:600; } .commit button:disabled { opacity:.45; cursor:default; }
 .files-head { padding:8px 14px; border-bottom:1px solid var(--line); font-weight:600; display:flex; align-items:center; justify-content:space-between; }
 .ghost.sm { padding:2px 8px; font-size:15px; line-height:1; }
 .older { text-align:center; color:var(--muted); font-size:12px; padding:6px 0 10px; }

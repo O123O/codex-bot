@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { browse, createEntry, listFiles, resolvePath, type WebFilesDeps } from "../../src/webui/web-files.ts";
+import { browse, createEntry, resolvePath, type WebFilesDeps } from "../../src/webui/web-files.ts";
 import { stat } from "node:fs/promises";
 
 async function fixture(): Promise<{ deps: WebFilesDeps; root: string; outside: string }> {
@@ -67,12 +67,6 @@ test("createEntry creates confined files/dirs and rejects escapes / duplicates",
   assert.ok("error" in (await createEntry(deps, "proj", "../evil.ts", "file"))); // traversal parent
   assert.ok("error" in (await createEntry(deps, "proj", "src/app.ts", "file"))); // already exists
   assert.ok("error" in (await createEntry(deps, "proj", "..", "dir")));          // bad name
-});
-
-test("listFiles returns a flat file list (heavy dirs skipped)", async () => {
-  const { deps } = await fixture();
-  const files = await listFiles(deps, "proj", 100);
-  assert.ok(files.includes("README.md") && files.includes("src/app.ts"));
 });
 
 test("resolvePath confines absolute paths to a known root and relative paths to the session root", async () => {

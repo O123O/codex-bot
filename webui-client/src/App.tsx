@@ -25,9 +25,10 @@ const TOP_PX = 120, BOTTOM_PX = 80;
 interface Session { nickname: string; endpoint: string; provider: string; projectDir: string; lifecycleState: string; nativeStatus: string | null; activeTurnId: string | null; model: string | null; goal: { objective: string; status: string } | null; }
 interface Msg { id?: string; body: string; completedAt?: number; terminalStatus?: string; role?: "you" | "assistant"; at?: number; }
 type FileResult = { kind: "dir"; path: string; entries: Array<{ name: string; type: "dir" | "file" | "other" }> } | { kind: "file"; path: string; content: string; truncated: boolean; encoding: string } | { error: string };
+interface GitStatus { branch: string; ahead: number; behind: number; staged: string[]; changes: string[]; untracked: string[] }
 type Preview =
   | { kind: "loading"; title: string }
-  | { kind: "text"; title: string; text: string; truncated: boolean }
+  | { kind: "text"; title: string; text: string; truncated: boolean; lang?: string }
   | { kind: "image"; title: string; url: string }
   | { kind: "error"; title: string; error: string };
 
@@ -99,10 +100,10 @@ function remarkFilePaths() {
 
 // A code/text file preview: syntax-highlighted (highlight.js) when the extension maps to a known
 // language, otherwise plain text. Same highlighter the chat's fenced code blocks use.
-function CodeView({ text, title }: { text: string; title: string }) {
+function CodeView({ text, title, lang: forced }: { text: string; title: string; lang?: string }) {
   const parts = title.split(".");
   const ext = parts.length > 1 ? parts.pop()!.toLowerCase() : "";
-  const lang = ext && hljs.getLanguage(ext) ? ext : "";
+  const lang = forced && hljs.getLanguage(forced) ? forced : ext && hljs.getLanguage(ext) ? ext : "";
   // Uniform structure: <code class="hljs"> gets the theme's block styling either way; hljs escapes source.
   return (
     <pre className="code-view">
@@ -132,9 +133,11 @@ export function App() {
   const [dirs, setDirs] = useState<Record<string, Array<{ name: string; type: string }> | { error: string }>>({}); // tree: entries by dir path ("" = root)
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [filesWidth, setFilesWidth] = useState<number>(() => Number(localStorage.getItem("qiyan-files-w")) || 300);
-  const [suggest, setSuggest] = useState<Array<{ type: "worker" | "file"; v: string }>>([]);
+  const [sidebarTab, setSidebarTab] = useState<"files" | "git">("files");
+  const [git, setGit] = useState<GitStatus | { error: string } | null>(null);
+  const [commitMsg, setCommitMsg] = useState("");
+  const [suggest, setSuggest] = useState<string[]>([]);
   const [sugIdx, setSugIdx] = useState(0);
-  const [fileList, setFileList] = useState<string[]>([]); // flat project files for @-file autocomplete
   const logRef = useRef<HTMLDivElement>(null);
   const preserveRef = useRef<number | null>(null); // scrollHeight snapshot to keep position on prepend
   const stickRef = useRef(true);                   // whether to stay pinned to the bottom
@@ -182,8 +185,7 @@ export function App() {
 
   // On tab switch: reset the render window, pin to bottom, and lazily load the transcript + file root.
   useEffect(() => { setVisible(RENDER_CAP); stickRef.current = true; preserveRef.current = null; if (selected) { setFinals([]); void loadFinals(selected); setDirs({}); setExpanded(new Set()); void loadDir(selected, ""); } }, [selected, loadFinals, loadDir]);
-  useEffect(() => { if (selected) void api<{ files: string[] }>(`/api/filelist?session=${selected}`).then((r) => setFileList(r.files)).catch(() => setFileList([])); else setFileList([]); }, [selected]);
-  // When a worker turn completes and you're pinned to the bottom, refresh to the latest page.
+  useEffect(() => { if (selected && sidebarTab === "git") loadGit(selected); else if (!selected) setGit(null); }, [selected, sidebarTab]); // eslint-disable-line  // When a worker turn completes and you're pinned to the bottom, refresh to the latest page.
   useEffect(() => { const s = sessions.find((x) => x.nickname === selected); if (s && !s.activeTurnId && selected && stickRef.current) void loadFinals(selected); }, [sessions]); // eslint-disable-line
 
   // The visible conversation: QiYan = loaded history + session activity; worker = its finals + your
@@ -235,16 +237,10 @@ export function App() {
 
   const onText = (v: string) => {
     setText(v); setSugIdx(0);
-    const at = /(?:^|\s)@([a-z0-9_./-]*)$/i.exec(v);
-    if (!at) { setSuggest([]); return; }
-    const q = at[1].toLowerCase();
-    const workers = sessions.map((s) => s.nickname).filter((n) => n.startsWith(q)).map((w) => ({ type: "worker" as const, v: w }));
-    const files = q ? fileList.filter((f) => f.toLowerCase().includes(q)).slice(0, 6).map((f) => ({ type: "file" as const, v: f })) : [];
-    setSuggest([...workers, ...files].slice(0, 8));
+    const at = /(?:^|\s)@([a-z0-9_-]*)$/i.exec(v); // @-autocomplete of worker nicknames
+    setSuggest(at ? sessions.map((s) => s.nickname).filter((n) => n.startsWith(at[1].toLowerCase())).slice(0, 6) : []);
   };
-  // A worker keeps the "@" (redirect); a file replaces the "@query" with its path (the worker reads it).
-  const pickSuggest = (s: { type: "worker" | "file"; v: string }) =>
-    { setText((t) => t.replace(/@[a-z0-9_./-]*$/i, s.type === "worker" ? `@${s.v} ` : `${s.v} `)); setSuggest([]); };
+  const pickSuggest = (nick: string) => { setText((t) => t.replace(/@[a-z0-9_-]*$/i, `@${nick} `)); setSuggest([]); };
 
   // `!cmd` in a worker tab runs a one-shot shell command in that worker's project dir; the output is an
   // ephemeral card (not persisted). Only local workers have a cwd.
@@ -352,6 +348,47 @@ export function App() {
     window.addEventListener("mouseup", onUp);
   };
 
+  // Git source control (per the selected worker's project).
+  const loadGit = (nickname: string) => void api<GitStatus | { error: string }>(`/api/git/status?session=${nickname}`).then(setGit).catch((e) => setGit({ error: (e as { error?: string })?.error ?? "unavailable" }));
+  const gitAct = async (op: "stage" | "unstage", path: string) => {
+    if (!selected) return;
+    try { await api(`/api/git/${op}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ session: selected, path }) }); loadGit(selected); }
+    catch (e) { alert((e as { error?: string })?.error ?? "failed"); }
+  };
+  const commit = async () => {
+    if (!selected || !commitMsg.trim()) return;
+    try { await api("/api/git/commit", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ session: selected, message: commitMsg }) }); setCommitMsg(""); loadGit(selected); }
+    catch (e) { alert((e as { error?: string })?.error ?? "commit failed"); }
+  };
+  const openDiff = (path: string, staged: boolean) => {
+    if (!selected) return;
+    setPreview({ kind: "loading", title: `diff · ${path}` });
+    void api<{ diff: string }>(`/api/git/diff?session=${selected}&path=${encodeURIComponent(path)}&staged=${staged ? "1" : "0"}`)
+      .then((r) => setPreview({ kind: "text", title: `${staged ? "staged " : ""}diff · ${path}`, text: r.diff, truncated: false, lang: "diff" }))
+      .catch((e) => setPreview({ kind: "error", title: path, error: (e as { error?: string })?.error ?? "diff failed" }));
+  };
+  const renderGit = (): React.ReactNode => {
+    if (!git) return <div className="hint">loading…</div>;
+    if ("error" in git) return <div className="hint">{git.error === "not a local session" ? "Not a local session." : git.error}</div>;
+    const section = (label: string, files: string[], staged: boolean) => files.length ? (
+      <div className="gsec" key={label}><div className="gsec-h">{label} · {files.length}</div>
+        {files.map((f) => <div key={label + f} className="frow"><span className="fname" title="View diff" onClick={() => openDiff(f, staged)}>{f}</span>
+          <span className="actions">{staged ? <button title="Unstage" onClick={() => void gitAct("unstage", f)}>−</button> : <button title="Stage" onClick={() => void gitAct("stage", f)}>＋</button>}</span></div>)}
+      </div>) : null;
+    const clean = !git.staged.length && !git.changes.length && !git.untracked.length;
+    return <div className="tree">
+      <div className="gbranch">⎇ {git.branch || "—"}{git.ahead ? ` ↑${git.ahead}` : ""}{git.behind ? ` ↓${git.behind}` : ""}</div>
+      {section("Staged", git.staged, true)}
+      {section("Changes", git.changes, false)}
+      {section("Untracked", git.untracked, false)}
+      {clean && <div className="hint">clean working tree</div>}
+      <div className="commit">
+        <textarea value={commitMsg} onChange={(e) => setCommitMsg(e.target.value)} rows={2} placeholder="Commit message (staged files)" />
+        <button disabled={!git.staged.length || !commitMsg.trim()} onClick={() => void commit()}>Commit · {git.staged.length}</button>
+      </div>
+    </div>;
+  };
+
   // Open a file in the popup. Text is STREAMED into the panel (not preloaded); images render inline;
   // pdf/html open in a new tab. The server resolves the path (any root for absolute, ?session=’s
   // project for relative), so the client never guesses which root a path lives in.
@@ -397,14 +434,20 @@ export function App() {
 
       <div className="body">
         <aside className="files" style={{ width: filesWidth }}>
-          <div className="files-head"><span>{selected ? `Files · ${selected}` : "Files"}</span>
+          <div className="files-head">
+            <span className="tabs2">
+              <button className={sidebarTab === "files" ? "on" : ""} onClick={() => setSidebarTab("files")}>Files</button>
+              <button className={sidebarTab === "git" ? "on" : ""} onClick={() => { setSidebarTab("git"); if (selected) loadGit(selected); }}>Git</button>
+            </span>
             {selected && <span className="head-actions">
-              <button className="ghost sm" title="New file at root" onClick={() => newEntry("mkfile", "")}>＋📄</button>
-              <button className="ghost sm" title="New folder at root" onClick={() => newEntry("mkdir", "")}>＋📁</button>
-              <button className="ghost sm" title="Refresh (no live watcher)" onClick={() => { [...new Set(["", ...Object.keys(dirs)])].forEach((p) => void loadDir(selected, p)); void loadSessions(); }}>⟳</button>
+              {sidebarTab === "files" && <>
+                <button className="ghost sm" title="New file at root" onClick={() => newEntry("mkfile", "")}>＋📄</button>
+                <button className="ghost sm" title="New folder at root" onClick={() => newEntry("mkdir", "")}>＋📁</button>
+              </>}
+              <button className="ghost sm" title="Refresh (no live watcher)" onClick={() => { if (sidebarTab === "git") loadGit(selected); else { [...new Set(["", ...Object.keys(dirs)])].forEach((p) => void loadDir(selected, p)); } void loadSessions(); }}>⟳</button>
             </span>}
           </div>
-          {selected === null ? <div className="hint">Select a worker to browse its project files.</div> : <div className="tree">{renderDir("", 0)}</div>}
+          {selected === null ? <div className="hint">Select a worker to browse its files / git.</div> : sidebarTab === "files" ? <div className="tree">{renderDir("", 0)}</div> : renderGit()}
         </aside>
         <div className="resizer" onMouseDown={startResize} title="Drag to resize" />
 
@@ -420,7 +463,7 @@ export function App() {
             ))}
           </div>
           <div className="composer">
-            {suggest.length > 0 && <div className="suggest">{suggest.map((s, i) => <div key={s.type + s.v} className={`srow ${i === sugIdx ? "on" : ""}`} onMouseDown={(e) => { e.preventDefault(); pickSuggest(s); }}>{s.type === "worker" ? `👤 @${s.v}` : `📄 ${s.v}`}</div>)}</div>}
+            {suggest.length > 0 && <div className="suggest">{suggest.map((n, i) => <div key={n} className={`srow ${i === sugIdx ? "on" : ""}`} onMouseDown={(e) => { e.preventDefault(); pickSuggest(n); }}>@{n}</div>)}</div>}
             <input ref={fileInput} type="file" hidden onChange={(e) => { const f = e.target.files?.[0]; if (f) void uploadFile(f); e.target.value = ""; }} />
             <button className="ghost" title="Send a file (its path is appended)" disabled={uploading} onClick={() => fileInput.current?.click()}>{uploading ? "…" : "📎"}</button>
             <textarea value={text} onChange={(e) => onText(e.target.value)} onKeyDown={onKey} rows={2}
@@ -446,7 +489,7 @@ export function App() {
                   : preview.kind === "loading" ? <div className="hint">loading…</div>
                   : preview.kind === "error" ? <div className="hint">{preview.error}</div>
                   : isMd && !srcMode ? <div className="md"><Markdown remarkPlugins={remark} rehypePlugins={[rehypeHighlight, rehypeKatex]} components={mdComponents}>{normalizeMath(preview.text)}</Markdown>{preview.truncated ? <div className="hint">… [truncated]</div> : null}</div>
-                  : <><CodeView text={preview.text} title={preview.title} />{preview.truncated ? <div className="hint">… [truncated]</div> : null}</>}
+                  : <><CodeView text={preview.text} title={preview.title} lang={preview.lang} />{preview.truncated ? <div className="hint">… [truncated]</div> : null}</>}
               </div>
             </div>
           </div>
