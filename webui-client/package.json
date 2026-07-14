@@ -3,7 +3,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "vite build"
+    "typecheck": "tsc --noEmit",
+    "build": "tsc --noEmit && vite build"
   },
   "dependencies": {
     "highlight.js": "^11.11.1",

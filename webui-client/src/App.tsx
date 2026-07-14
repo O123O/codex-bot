@@ -107,7 +107,7 @@ function CodeView({ text, title, lang: forced }: { text: string; title: string; 
   // Uniform structure: <code class="hljs"> gets the theme's block styling either way; hljs escapes source.
   return (
     <pre className="code-view">
-      {lang ? <code className="hljs" dangerouslySetInnerHTML={{ __html: hljs.highlight(text, { language: lang, ignoreIllegal: true }).value }} />
+      {lang ? <code className="hljs" dangerouslySetInnerHTML={{ __html: hljs.highlight(text, { language: lang, ignoreIllegals: true }).value }} />
         : <code className="hljs">{text}</code>}
     </pre>
   );
@@ -526,7 +526,7 @@ export function App() {
                 {preview.kind === "image" ? <img className="preview-img" src={preview.url} alt={preview.title} />
                   : preview.kind === "loading" ? <div className="hint">loading…</div>
                   : preview.kind === "error" ? <div className="hint">{preview.error}</div>
-                  : isMd && !srcMode ? <div className="md"><Markdown remarkPlugins={remark} rehypePlugins={[rehypeHighlight, rehypeKatex]} components={mdComponents}>{normalizeMath(preview.text)}</Markdown>{preview.truncated ? <div className="hint">… [truncated]</div> : null}</div>
+                  : isMd && !srcMode ? <div className="md"><Markdown remarkPlugins={remark} rehypePlugins={[rehypeHighlight, rehypeKatex]} components={mdComponentsFor(selected)}>{normalizeMath(preview.text)}</Markdown>{preview.truncated ? <div className="hint">… [truncated]</div> : null}</div>
                   : <><CodeView text={preview.text} title={preview.title} lang={preview.lang} />{preview.truncated ? <div className="hint">… [truncated]</div> : null}</>}
               </div>
             </div>
