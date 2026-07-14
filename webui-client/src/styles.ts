@@ -12,8 +12,9 @@ body { margin:0; }
 
 .topbar { display:flex; align-items:center; gap:14px; padding:8px 14px; background:var(--panel); border-bottom:1px solid var(--line); }
 .brand { font-weight:700; letter-spacing:.5px; color:var(--accent); }
-.tabs { display:flex; gap:6px; overflow-x:auto; flex:1; }
-.tab { display:flex; align-items:center; gap:6px; background:transparent; color:var(--muted); border:1px solid transparent; border-radius:999px; padding:5px 12px; cursor:pointer; white-space:nowrap; font-size:13px; }
+.tabs { display:flex; gap:6px; overflow-x:auto; overflow-y:hidden; flex:1; scrollbar-width:thin; }
+.tabs::-webkit-scrollbar { height:6px; } .tabs::-webkit-scrollbar-thumb { background:var(--line); border-radius:3px; }
+.tab { flex:0 0 auto; display:flex; align-items:center; gap:6px; background:transparent; color:var(--muted); border:1px solid transparent; border-radius:999px; padding:5px 12px; cursor:pointer; white-space:nowrap; font-size:13px; }
 .tab:hover { background:var(--panel2); }
 .tab.on { color:var(--text); background:var(--panel2); border-color:var(--line); }
 .dot { width:8px; height:8px; border-radius:50%; flex:0 0 auto; }

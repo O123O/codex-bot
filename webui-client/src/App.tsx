@@ -458,7 +458,7 @@ export function App() {
       <style>{STYLES}</style>
       <header className="topbar">
         <div className="brand">QiYan</div>
-        <nav className="tabs">
+        <nav className="tabs" onWheel={(e) => { if (e.deltaY !== 0) e.currentTarget.scrollLeft += e.deltaY; }}>
           <button className={`tab ${selected === null ? "on" : ""}`} onClick={() => setSelected(null)}><span className="dot other" />QiYan</button>
           {sessions.map((s) => (
             <button key={s.nickname} className={`tab ${selected === s.nickname ? "on" : ""}`} onClick={() => setSelected(s.nickname)} title={`${s.provider} · ${s.nativeStatus ?? "?"}${s.goal ? " · goal:" + s.goal.status : ""}`}>
