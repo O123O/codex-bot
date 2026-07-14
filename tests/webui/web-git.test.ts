@@ -48,19 +48,20 @@ test("gitDiff refuses paths outside the repo (no --no-index leak)", async () => 
   assert.ok("error" in (await gitDiff(dir, "../../etc/hostname", false))); // traversal
 });
 
-test("discoverRepos finds repos at the root and in subdirs", async () => {
-  const base = await mkdtemp(join(tmpdir(), "qiyan-discover-"));
-  await run("git", ["-C", base, "init", "-q"]);                 // root repo → ""
-  await mkdir(join(base, "sub"));
-  await run("git", ["-C", join(base, "sub"), "init", "-q"]);    // subdir repo → "sub"
-  await mkdir(join(base, "plain"));                             // not a repo
+test("discoverRepos finds multiple subdir repos when the root isn't a repo", async () => {
+  const base = await mkdtemp(join(tmpdir(), "qiyan-discover-")); // NOT a repo (the user's case)
+  await mkdir(join(base, "a")); await run("git", ["-C", join(base, "a"), "init", "-q"]);
+  await mkdir(join(base, "b")); await run("git", ["-C", join(base, "b"), "init", "-q"]);
+  await mkdir(join(base, "plain"));                              // not a repo
   const repos = await discoverRepos(base);
-  assert.ok(repos.includes(""), "root repo");
-  assert.ok(repos.includes("sub"), "subdir repo");
-  assert.ok(!repos.includes("plain"));
+  assert.deepEqual([...repos].sort(), ["a", "b"]);              // both subdir repos, not "plain", not ""
 
-  const noRepo = await discoverRepos(await mkdtemp(join(tmpdir(), "qiyan-norepo-")));
-  assert.deepEqual(noRepo, []);
+  // A repo at the root → just "" (we don't recurse into a found repo).
+  const rootRepo = await mkdtemp(join(tmpdir(), "qiyan-rootrepo-"));
+  await run("git", ["-C", rootRepo, "init", "-q"]);
+  assert.deepEqual(await discoverRepos(rootRepo), [""]);
+
+  assert.deepEqual(await discoverRepos(await mkdtemp(join(tmpdir(), "qiyan-norepo-"))), []);
 });
 
 test("reports non-repos and empty commit messages", async () => {
