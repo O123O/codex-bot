@@ -23,7 +23,9 @@ body { margin:0; }
 .ghost { background:transparent; color:var(--text); border:1px solid var(--line); border-radius:8px; padding:5px 9px; cursor:pointer; }
 
 .body { flex:1; display:flex; min-height:0; }
-.files { width:290px; flex:0 0 auto; border-right:1px solid var(--line); background:var(--panel); display:flex; flex-direction:column; min-height:0; }
+.files { flex:0 0 auto; border-right:1px solid var(--line); background:var(--panel); display:flex; flex-direction:column; min-height:0; overflow:hidden; }
+.resizer { flex:0 0 5px; cursor:col-resize; background:transparent; } .resizer:hover { background:var(--accent); }
+.tw { display:inline-block; width:1.1em; color:var(--muted); }
 .files-head { padding:8px 14px; border-bottom:1px solid var(--line); font-weight:600; display:flex; align-items:center; justify-content:space-between; }
 .ghost.sm { padding:2px 8px; font-size:15px; line-height:1; }
 .older { text-align:center; color:var(--muted); font-size:12px; padding:6px 0 10px; }

@@ -127,10 +127,11 @@ export function App() {
   const [visible, setVisible] = useState(RENDER_CAP);
   const [live, setLive] = useState(false);
   const [text, setText] = useState("");
-  const [filePath, setFilePath] = useState("");
   const [preview, setPreview] = useState<Preview | null>(null);
   const [srcMode, setSrcMode] = useState(false); // for markdown previews: rendered (false) vs raw source
-  const [tree, setTree] = useState<FileResult | null>(null);
+  const [dirs, setDirs] = useState<Record<string, Array<{ name: string; type: string }> | { error: string }>>({}); // tree: entries by dir path ("" = root)
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const [filesWidth, setFilesWidth] = useState<number>(() => Number(localStorage.getItem("qiyan-files-w")) || 300);
   const [suggest, setSuggest] = useState<string[]>([]);
   const [sugIdx, setSugIdx] = useState(0);
   const logRef = useRef<HTMLDivElement>(null);
@@ -151,10 +152,16 @@ export function App() {
     try { const p = await api<{ messages: Msg[]; hasOlder: boolean }>(`/api/sessions/${nickname}/messages?limit=${PAGE}`); setFinals(p.messages); setHasOlder((h) => ({ ...h, [nickname]: p.hasOlder })); }
     catch (e) { setFinals([{ body: `Error: ${(e as { error?: string }).error ?? e}`, completedAt: 0 }]); }
   }, []);
-  const loadTree = useCallback(async (nickname: string, path: string) => {
-    try { setTree(await api<FileResult>(`/api/files/${nickname}?path=${encodeURIComponent(path)}`)); }
-    catch (e) { setTree({ error: (e as { error?: string }).error ?? "unavailable" }); }
+  const loadDir = useCallback(async (nickname: string, path: string) => {
+    try { const r = await api<FileResult>(`/api/files/${nickname}?path=${encodeURIComponent(path)}`);
+      setDirs((d) => ({ ...d, [path]: "kind" in r && r.kind === "dir" ? r.entries : { error: "not a directory" } })); }
+    catch (e) { setDirs((d) => ({ ...d, [path]: { error: (e as { error?: string }).error ?? "unavailable" } })); }
   }, []);
+  const toggleDir = (nickname: string, path: string) => setExpanded((prev) => {
+    const next = new Set(prev);
+    if (next.has(path)) next.delete(path); else { next.add(path); if (!dirs[path]) void loadDir(nickname, path); }
+    return next;
+  });
 
   useEffect(() => { void loadSessions(); }, [loadSessions]);
   useEffect(() => { void loadHistory(); }, [loadHistory]);
@@ -172,9 +179,8 @@ export function App() {
     return () => { stop = true; try { ws.close(); } catch { /* closing */ } };
   }, []);
 
-  // On tab switch: reset the render window, pin to bottom, and lazily load that tab's latest page.
-  useEffect(() => { setVisible(RENDER_CAP); stickRef.current = true; preserveRef.current = null; if (selected) { setFinals([]); void loadFinals(selected); setFilePath(""); } }, [selected, loadFinals]);
-  useEffect(() => { if (selected) void loadTree(selected, filePath); }, [selected, filePath, loadTree]);
+  // On tab switch: reset the render window, pin to bottom, and lazily load the transcript + file root.
+  useEffect(() => { setVisible(RENDER_CAP); stickRef.current = true; preserveRef.current = null; if (selected) { setFinals([]); void loadFinals(selected); setDirs({}); setExpanded(new Set()); void loadDir(selected, ""); } }, [selected, loadFinals, loadDir]);
   // When a worker turn completes and you're pinned to the bottom, refresh to the latest page.
   useEffect(() => { const s = sessions.find((x) => x.nickname === selected); if (s && !s.activeTurnId && selected && stickRef.current) void loadFinals(selected); }, [sessions]); // eslint-disable-line
 
@@ -270,8 +276,34 @@ export function App() {
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); void send(); }
   };
 
-  const selSession = useMemo(() => sessions.find((s) => s.nickname === selected) ?? null, [sessions, selected]);
-  const crumbs = filePath ? filePath.split("/") : [];
+  // Recursive file tree: folders expand in place (lazy-loaded); files open the preview popup.
+  const renderDir = (path: string, depth: number): React.ReactNode => {
+    const node = dirs[path];
+    if (!node) return null;
+    if ("error" in node) return <div className="hint" style={{ paddingLeft: 8 + depth * 14 }}>{node.error === "unknown session" ? "Not browsable — a remote worker's files live on another host (deferred)." : node.error}</div>;
+    if (!node.length) return <div className="hint" style={{ paddingLeft: 8 + depth * 14 }}>empty</div>;
+    return node.map((e) => {
+      const full = path ? `${path}/${e.name}` : e.name;
+      if (e.type === "dir") {
+        const open = expanded.has(full);
+        return <div key={full}>
+          <div className="frow dir" style={{ paddingLeft: 6 + depth * 14 }} onClick={() => toggleDir(selected!, full)}><span className="tw">{open ? "▾" : "▸"}</span>📁 {e.name}</div>
+          {open && renderDir(full, depth + 1)}
+        </div>;
+      }
+      return <div key={full} className={`frow ${e.type}`} style={{ paddingLeft: 24 + depth * 14 }} onClick={() => e.type === "file" ? openPreview(full, selected) : undefined}>{e.type === "file" ? "📄" : "🔗"} {e.name}</div>;
+    });
+  };
+
+  // Drag the divider to resize the file panel (persisted).
+  const startResize = (e: React.MouseEvent) => {
+    e.preventDefault();
+    let w = filesWidth;
+    const onMove = (ev: MouseEvent) => { w = Math.max(180, Math.min(720, ev.clientX)); setFilesWidth(w); };
+    const onUp = () => { window.removeEventListener("mousemove", onMove); window.removeEventListener("mouseup", onUp); localStorage.setItem("qiyan-files-w", String(w)); };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  };
 
   // Open a file in the popup. Text is STREAMED into the panel (not preloaded); images render inline;
   // pdf/html open in a new tab. The server resolves the path (any root for absolute, ?session=’s
@@ -317,25 +349,13 @@ export function App() {
       </header>
 
       <div className="body">
-        <aside className="files">
+        <aside className="files" style={{ width: filesWidth }}>
           <div className="files-head"><span>{selected ? `Files · ${selected}` : "Files"}</span>
-            {selected && <button className="ghost sm" title="Refresh (no live watcher)" onClick={() => { void loadTree(selected, filePath); void loadSessions(); }}>⟳</button>}
+            {selected && <button className="ghost sm" title="Refresh (no live watcher)" onClick={() => { [...new Set(["", ...Object.keys(dirs)])].forEach((p) => void loadDir(selected, p)); void loadSessions(); }}>⟳</button>}
           </div>
-          {selected === null ? <div className="hint">Select a worker to browse its project files.</div> : (
-            <div className="tree">
-              <div className="crumbs">
-                <a onClick={() => setFilePath("")}>{selSession?.projectDir?.split("/").pop() || selected}</a>
-                {crumbs.map((p, i) => <span key={i}> / <a onClick={() => setFilePath(crumbs.slice(0, i + 1).join("/"))}>{p}</a></span>)}
-              </div>
-              {tree && "error" in tree && <div className="hint">{tree.error === "unknown session" ? "Not browsable — a remote worker's files live on another host (deferred)." : tree.error}</div>}
-              {tree && "kind" in tree && tree.kind === "dir" && (tree.entries.length ? tree.entries.map((e) => (
-                <div key={e.name} className={`frow ${e.type}`} onClick={() => e.type === "dir" ? setFilePath((filePath ? filePath + "/" : "") + e.name) : e.type === "file" ? openPreview((filePath ? filePath + "/" : "") + e.name, selected) : undefined}>
-                  {e.type === "dir" ? "📁" : e.type === "file" ? "📄" : "🔗"} {e.name}
-                </div>
-              )) : <div className="hint">empty</div>)}
-            </div>
-          )}
+          {selected === null ? <div className="hint">Select a worker to browse its project files.</div> : <div className="tree">{renderDir("", 0)}</div>}
         </aside>
+        <div className="resizer" onMouseDown={startResize} title="Drag to resize" />
 
         <main className="chat">
           <div className="log" ref={logRef} onScroll={onScroll}>
