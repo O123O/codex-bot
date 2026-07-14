@@ -4,19 +4,27 @@
   <img src="assets/brand/qiyan-logo.png" alt="QiYan logo" width="220">
 </p>
 
-QiYan Bot is a single-user, self-hosted, general-purpose personal assistant powered by Codex. It can answer and handle small filesystem tasks directly, or deliberately delegate sustained project work to ordinary, resumable Codex sessions. Telegram and Slack are implemented and live-tested. Personal WeChat is experimental: it is implemented with automated-test coverage but has not been successfully live-tested. Telegram, Slack, and WeChat can run together behind the same transport-neutral backend.
+QiYan Bot is a single-user, self-hosted, general-purpose personal assistant powered by Codex. It can answer and handle small filesystem tasks directly, or deliberately delegate sustained project work to ordinary, resumable coding-agent sessions — Codex or Claude Code, local or over SSH. Telegram and Slack are implemented and live-tested. Personal WeChat is experimental: it is implemented with automated-test coverage but has not been successfully live-tested. Telegram, Slack, and WeChat can run together behind the same transport-neutral backend.
 
 ## One assistant, many project sessions
 
-> **QiYan is both your everyday assistant and your Codex project manager.** It handles questions, files, and small tasks directly. For sustained or complex work, it starts or resumes the right Codex session, keeps it attached to its real project directory, and helps you steer and track the work from chat.
+> **QiYan is both your everyday assistant and your project session manager.** It handles questions, files, and small tasks directly. For sustained or complex work, it starts or resumes the right Codex or Claude Code session, keeps it attached to its real project directory, and helps you steer and track the work from chat.
 
 <p align="center">
-  <img src="assets/brand/qiyan-overview.svg" alt="QiYan handles everyday requests directly and manages resumable Codex sessions for complex projects" width="100%">
+  <img src="assets/brand/qiyan-overview.svg" alt="QiYan handles everyday requests directly and manages resumable Codex and Claude Code sessions for complex projects" width="100%">
 </p>
 
-Each managed project remains an ordinary, resumable Codex session in its own project directory. You can unadopt it from QiYan, continue it directly with Codex, and adopt it again later without creating a separate worker format.
+Each managed project remains an ordinary, resumable session — a Codex thread or a Claude Code session — in its own project directory. You can unadopt it from QiYan, continue it directly with the same CLI, and adopt it again later without creating a separate worker format.
 
-QiYan keeps the assistant and project workers distinct. The assistant has its own HOME, CODEX_HOME, authentication, instructions, and app-server. Workers use your normal HOME, CODEX_HOME, configuration, credentials, skills, and app-server. If another Codex client starts a turn in a managed thread, QiYan fences its own dispatch, warns you, and automatically unadopts the session once the external turn is idle. For a planned handoff, you can still call `unadopt_session` first to avoid the temporary release-pending window; adopt it again later if QiYan should resume management.
+QiYan keeps the assistant and project workers distinct. The assistant has its own HOME, CODEX_HOME, authentication, instructions, and app-server. Workers use your normal HOME, CODEX_HOME, configuration, credentials, skills, and app-server (or your normal `claude` configuration for a Claude worker). If another client starts a turn in a managed thread, QiYan fences its own dispatch, warns you, and automatically unadopts the session once the external turn is idle. For a planned handoff, you can still call `unadopt_session` first to avoid the temporary release-pending window; adopt it again later if QiYan should resume management.
+
+## Codex and Claude Code workers
+
+A worker can run either coding agent, chosen per endpoint. Codex workers run `codex app-server`; Claude workers run headless `claude -p`. Both are managed through the same lifecycle, nickname, and chat tools — create, adopt, send, steer, collect, unadopt, archive — so you pick a provider without learning a second workflow.
+
+Endpoints are declared in `<QIYAN_HOME>/endpoints.json`, each with a `provider` (`codex` or `claude`) and a `transport` (`local` or `ssh`); Claude entries may pin a `model` and `effort`. See the [worker endpoints guide](docs/ssh-workers.md) for the format.
+
+Claude has no built-in goal or scheduling engine, so QiYan supplies them: it drives a Claude worker toward a set goal turn by turn until the worker marks it complete or blocked, and gives the worker MCP tools to schedule its own wakeups, recurring runs, and condition monitors (locally, or over an SSH reverse tunnel for a remote worker). Because `claude -p` runs one turn at a time, a mid-turn "steer" is delivered as the worker's next turn rather than interrupting the running one, and archiving a Claude session tombstones it in QiYan while leaving its transcript on disk.
 
 ## Security model
 
@@ -34,8 +42,9 @@ Read this before installing or launching:
 
 - Linux
 - Node.js 24 or newer
-- `codex-cli 0.142.5` or newer
-- For remote workers: OpenSSH client; the remote Linux host needs Node.js 24+, tmux, Codex 0.142.5+, and its own authenticated Codex profile
+- `codex-cli 0.142.5` or newer (the assistant and Codex workers)
+- The Claude Code CLI (`claude`) — only if you configure Claude workers
+- For remote workers: OpenSSH client; the remote Linux host needs Node.js 24+ and, per endpoint provider, either Codex 0.142.5+ and tmux (Codex) or the `claude` CLI (Claude), plus its own authenticated CLI profile
 - At least one chat adapter: Telegram owner credentials, Slack owner/workspace credentials, a managed personal WeChat login, or any combination
 
 ## Install
@@ -123,11 +132,11 @@ For sustained coding or project work, QiYan creates or resumes a worker session.
 
 QiYan's own replies have no label prefix. Every eligible worker final is automatically delivered as `[nickname] …`, and backend warnings use `[system]`. The assistant receives metadata and reads the full worker body only when needed. `session-status.json`, `assistant-context.json`, and the registry are generated, read-only state; do not edit them.
 
-QiYan has one active QiYan conversation globally. A follow-up from the same conversation, including attachments, is appended to the active Codex turn with native `turn/steer`. Messages from another conversation wait in durable FIFO order, and every blocked message immediately receives exactly `[system] queued`. The active turn is never interrupted merely to switch conversations.
+QiYan has one active QiYan conversation globally. A follow-up from the same conversation, including attachments, is appended to the active turn via steer — native `turn/steer` for a Codex worker; a Claude worker, which runs one turn at a time, receives it as its next turn. Messages from another conversation wait in durable FIFO order, and every blocked message immediately receives exactly `[system] queued`. The active turn is never interrupted merely to switch conversations.
 
 The backend remembers which adapter and conversation owns the turn and routes replies there automatically. QiYan itself never chooses a chat platform or destination, and output is not broadcast to every configured adapter. `/pass` and `/collect` are ordinary messages that use the same start, `turn/steer`, queue, and recovery paths as any other input; their only special behavior is a backend exactness safeguard when the corresponding worker tool is called.
 
-`adopt_session` preserves an existing Codex thread's native cwd. `unadopt_session` removes it from QiYan without deleting or archiving the Codex thread; `archive_session` invokes Codex archive and then removes the QiYan mapping.
+`adopt_session` preserves an existing session's native cwd. `unadopt_session` removes it from QiYan without deleting or archiving the underlying thread; `archive_session` archives it — native Codex archive, or a durable QiYan tombstone for a Claude session that leaves the transcript on disk — and removes the QiYan mapping.
 
 Use the `/pass` exactness safeguard when wording must reach a worker unchanged:
 
