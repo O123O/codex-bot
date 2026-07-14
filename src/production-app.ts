@@ -29,6 +29,7 @@ import { composeApp, type AppPhase, type BotApp } from "./app.ts";
 import type { BotConfig } from "./config.ts";
 import { parseDirective } from "./directives/parser.ts";
 import { deliverDirectTo } from "./assistant/direct-to.ts";
+import { WebBus, createWebAdapter, createWebUiPhase } from "./webui/index.ts";
 import { claudeLaunchPolicy } from "./config.ts";
 import { AppError } from "./core/errors.ts";
 import { runBackground } from "./core/background.ts";
@@ -143,6 +144,7 @@ function runMonitorCheck(command: string, timeoutMs = 20_000): Promise<boolean> 
 
 const assistantAssetRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../assets/assistant");
 const remoteAssetRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../assets/remote");
+const webuiStaticRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../assets/webui");
 const fullAccessWarning = "QiYan assistant is running non-interactively with full filesystem access and approvals disabled.";
 const assistantMappingId = "assistant";
 const scheduledFailureThreshold = 3;
@@ -1796,6 +1798,7 @@ export async function buildProductionApp(
         tools: Readonly<Record<AssistantToolName, ToolHandler>>,
         activity: { registerTool(attemptId: string): number; finishTool(attemptId: string): void },
       ): void;
+      onWebUiStarted?(url: string): void;
     };
     storage?: {
       acquireDatabaseLease?: (path: string) => Promise<DatabaseLease>;
@@ -1978,6 +1981,11 @@ export async function buildProductionApp(
     report({ level: "info", code: "chat_input_accepted", adapter: source.binding.adapterId });
   };
 
+  // Web UI (opt-in). The bus + token are dependency-free, so create them here and share between
+  // the `web` ChatAdapter (chat-adapters phase) and the web server (web-ui phase). When WEB_UI is
+  // off, both are undefined and nothing is wired.
+  const webBus = config.webUi ? new WebBus() : undefined;
+  const webToken = config.webUi ? randomBytes(32).toString("base64url") : undefined;
   const phases: AppPhase[] = [
     {
       name: "assistant-workspace",
@@ -2213,10 +2221,16 @@ export async function buildProductionApp(
         } else if (options.chatAdapters) {
           weixin = configured.find((adapter) => adapter.delivery.id === "weixin") as WeixinChatAdapter | undefined;
         }
+        // The web UI participates as a `web` ChatAdapter (browser ⇄ assistant), so it must be in
+        // `chats` for outbound routing AND admitted into the boot guard's expected set. Added
+        // whenever WEB_UI is on (independent of the test adapter-injection path).
+        const webEnabled = Boolean(config.webUi) && Boolean(webBus);
+        if (webEnabled && webBus) configured.push(createWebAdapter(webBus));
         const expectedAdapters = [
           telegramConfig ? "telegram" : undefined,
           config.chat.slack ? "slack" : undefined,
           config.chat.weixin ? "weixin" : undefined,
+          webEnabled ? "web" : undefined,
         ].filter((id): id is string => Boolean(id)).sort();
         const actualAdapters = configured.map((adapter) => adapter.delivery.id).sort();
         if (!isDeepStrictEqual(actualAdapters, expectedAdapters)) throw new AppError("CONFIGURATION_ERROR", "configured chat adapters do not match chat credentials");
@@ -2963,6 +2977,20 @@ export async function buildProductionApp(
       },
       stop: async () => { await settleAll(chats.map((adapter) => adapter.stop())); },
     },
+    // The web UI server is last so it starts after every backend it reads is live, and (reverse
+    // order) stops first — before the delivery/chat teardown it depends on.
+    ...(config.webUi && webBus && webToken ? [createWebUiPhase({
+      host: config.webUi.host, port: config.webUi.port, allowLan: config.webUi.allowLan, token: webToken,
+      staticDir: webuiStaticRoot, bus: webBus,
+      reads: {
+        registrySnapshot: () => registry.snapshot(),
+        dashboardSnapshot: () => dashboard.snapshot(),
+        listFinals: (endpointId, threadId, count) => finals.list(endpointId, threadId, count),
+        provider: (id) => sessionProvider(id),
+      },
+      acceptChat, report,
+      onStarted: (url) => { process.stdout.write(`QiYan web UI listening — open ${url}\n`); options.testing?.onWebUiStarted?.(url); },
+    })] : []),
   ];
 
   function stopRecoveryOwners(): Promise<void> {
