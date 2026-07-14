@@ -41,16 +41,24 @@ test("remoteBrowse lists a confined dir and rejects escapes", async () => {
   assert.ok("error" in (await remoteBrowse(d, "testhost", root, "/etc")));        // absolute-ish (root//etc)
 });
 
-test("remoteReadStream streams a confined file and rejects escape + injection", async () => {
+test("remoteReadStream streams any readable file (unconfined preview) and keeps paths literal vs injection", async () => {
   const d = await deps();
   const root = await mkdtemp(join(tmpdir(), "qiyan-rread-"));
   await writeFile(join(root, "report.md"), "# hi\nbody\n");
   const ok = await collect(await remoteReadStream(d, "testhost", root, "report.md"));
   assert.equal(ok.text, "# hi\nbody\n");
 
-  // INJECTION: a path full of shell metacharacters must be a literal filename (no command runs).
+  // Owner-only preview is NOT confined to the root: an absolute path OUTSIDE it streams as-is (the
+  // remote OS's read permission is the boundary, unlike browse/git which stay confined).
+  const outside = await mkdtemp(join(tmpdir(), "qiyan-rout-"));
+  await writeFile(join(outside, "notes.txt"), "outside\n");
+  const out = await collect(await remoteReadStream(d, "testhost", root, join(outside, "notes.txt")));
+  assert.equal(out.text, "outside\n");
+
+  // INJECTION: a path full of shell metacharacters — INCLUDING a single quote, the char q() escapes as
+  // '\'' — must be a literal filename (no command runs).
   const marker = join(root, "PWNED");
-  const evil = await collect(await remoteReadStream(d, "testhost", root, "x\"; touch " + marker + " ; echo `touch " + marker + "` $(touch " + marker + ") #"));
+  const evil = await collect(await remoteReadStream(d, "testhost", root, "x'\"; touch " + marker + " ; echo `touch " + marker + "` $(touch " + marker + ") #"));
   assert.notEqual(evil.code, 0);                       // nonexistent literal file → error
   await assert.rejects(stat(marker));                  // nothing executed
 });

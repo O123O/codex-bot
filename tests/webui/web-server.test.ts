@@ -38,7 +38,7 @@ async function withServer(run: (base: string, calls: { inputs: Array<{ text: str
   const uploadsDir = await mkdtemp(join(tmpdir(), "qiyan-webui-up-"));
   const server = createWebServer({
     host: "127.0.0.1", port: 0, allowLan: false, token: TOKEN, staticDir, bus, reads,
-    files: { projectDir: () => undefined, allRoots: () => [uploadsDir], fileTarget: () => undefined, maxFileBytes: 1024 },
+    files: { projectDir: () => undefined, fileTarget: () => undefined, maxFileBytes: 1024 },
     uploads: { dir: uploadsDir, maxBytes: 1024, ttlMs: 1e9 },
     submitInput: async (text, target) => { calls.inputs.push({ text, ...(target ? { target } : {}) }); return { ok: true }; },
     report: () => {},
@@ -113,17 +113,28 @@ test("SPA fallback serves routes but 404s file-extension paths", async () => {
   });
 });
 
-test("streams a raw file with a browser Content-Type and blocks paths outside every root", async () => {
+test("streams any readable raw file with a browser Content-Type; 404s a nonexistent path; token-gated", async () => {
   await withServer(async (base, _calls, _bus, uploadsDir) => {
     await writeFile(join(uploadsDir, "page.html"), "<h1>hi</h1>");
-    const abs = encodeURIComponent(join(uploadsDir, "page.html")); // absolute path inside a known root
+    const abs = encodeURIComponent(join(uploadsDir, "page.html")); // any readable absolute path (owner-only preview)
     const r = await fetch(`${base}/api/raw?path=${abs}&token=${TOKEN}`);
     assert.equal(r.status, 200);
     assert.match(r.headers.get("content-type") ?? "", /text\/html/);
     assert.equal(r.headers.get("content-security-policy"), "sandbox"); // scripts neutered
     assert.equal(await r.text(), "<h1>hi</h1>");
-    // a path outside every accessible root → 404
-    assert.equal((await fetch(`${base}/api/raw?path=${encodeURIComponent("/etc/passwd")}&token=${TOKEN}`)).status, 404);
+    // existence + regular-file are still enforced: a nonexistent path → 404
+    assert.equal((await fetch(`${base}/api/raw?path=${encodeURIComponent(join(uploadsDir, "nope.txt"))}&token=${TOKEN}`)).status, 404);
+    // de-confinement: a readable file OUTSIDE every project/upload root streams 200 (owner-only preview)
+    const outsideDir = await mkdtemp(join(tmpdir(), "qiyan-outside-"));
+    await writeFile(join(outsideDir, "notes.txt"), "outside-local\n");
+    const o = await fetch(`${base}/api/raw?path=${encodeURIComponent(join(outsideDir, "notes.txt"))}&token=${TOKEN}`);
+    assert.equal(o.status, 200);
+    assert.equal(await o.text(), "outside-local\n");
+    // a CRLF-in-filename download must NOT crash locally (header injection guarded, like remote)
+    await writeFile(join(outsideDir, "e\r\nvil.txt"), "x");
+    const crlf = await fetch(`${base}/api/raw?path=${encodeURIComponent(join(outsideDir, "e\r\nvil.txt"))}&download=1&token=${TOKEN}`);
+    assert.equal(crlf.status, 200);
+    assert.doesNotMatch(crlf.headers.get("content-disposition") ?? "", /[\r\n]/);
     assert.equal((await fetch(`${base}/api/raw?path=${abs}`)).status, 401); // still token-gated
   });
 });
@@ -144,7 +155,7 @@ test("dispatches a remote session's files over ssh (browse + raw stream)", async
   await writeFile(join(staticDir, "index.html"), "ok");
   const server = createWebServer({
     host: "127.0.0.1", port: 0, allowLan: false, token: TOKEN, staticDir, bus, reads,
-    files: { projectDir: () => undefined, allRoots: () => [], maxFileBytes: 4096, fileTarget: (n) => (n === "rworker" ? { transport: "remote", projectDir: remoteRoot, host: "testhost" } : undefined) },
+    files: { projectDir: () => undefined, maxFileBytes: 4096, fileTarget: (n) => (n === "rworker" ? { transport: "remote", projectDir: remoteRoot, host: "testhost" } : undefined) },
     remote: () => ({ sshBinary: ssh, sshRuntimeRoot: sshRt }),
     submitInput: async () => ({ ok: true }), report: () => {},
   });
@@ -154,7 +165,12 @@ test("dispatches a remote session's files over ssh (browse + raw stream)", async
     const listing = await (await fetch(`${base}/api/files/rworker?token=${TOKEN}`)).json();
     assert.deepEqual(listing.entries?.map((e: { name: string }) => e.name), ["r.txt"]);
     assert.equal(await (await fetch(`${base}/api/raw?session=rworker&path=r.txt&token=${TOKEN}`)).text(), "remote-bytes\n");
-    assert.equal((await fetch(`${base}/api/raw?session=rworker&path=${encodeURIComponent("/etc/hostname")}&token=${TOKEN}`)).status, 404); // remote confinement
+    // Owner-only preview streams ANY readable file over ssh (NOT confined to the project root): an
+    // absolute path outside the root is served as-is.
+    const outside = join(dir, "outside.txt"); await writeFile(outside, "outside-bytes\n");
+    assert.equal(await (await fetch(`${base}/api/raw?session=rworker&path=${encodeURIComponent(outside)}&token=${TOKEN}`)).text(), "outside-bytes\n");
+    // a nonexistent path still 404s (regular-file guard)
+    assert.equal((await fetch(`${base}/api/raw?session=rworker&path=${encodeURIComponent(join(remoteRoot, "nope.txt"))}&token=${TOKEN}`)).status, 404);
     // a filename with CRLF + download=1 must NOT crash the server (header injection guarded)
     await writeFile(join(remoteRoot, "e\r\nvil.txt"), "x");
     const crlf = await fetch(`${base}/api/raw?session=rworker&path=${encodeURIComponent("e\r\nvil.txt")}&download=1&token=${TOKEN}`);

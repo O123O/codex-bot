@@ -11,8 +11,6 @@ export interface FileTarget { transport: "local" | "remote"; projectDir: string;
 export interface WebFilesDeps {
   // The managed LOCAL project directory for a session nickname (a root the browser may reach via fs).
   projectDir(nickname: string): string | undefined;
-  // Every LOCAL root a mentioned path may resolve against (all local project dirs + the upload store).
-  allRoots(): string[];
   // Transport + project dir + ssh host for a session (local or remote), or undefined if not browsable.
   fileTarget(nickname: string): FileTarget | undefined;
   maxFileBytes: number;
@@ -37,26 +35,15 @@ export async function confine(root: string, relPath: string): Promise<string | u
   return rel === "" || escapes(rel) ? undefined : realTarget;
 }
 
-// Prove an ABSOLUTE path lives inside one of `roots` (realpath containment). Lets a mentioned absolute
-// path (an upload, or any project file) be previewed from any tab without the client guessing the root.
-export async function confineAbsolute(roots: string[], absPath: string): Promise<string | undefined> {
-  const realTarget = await realpath(absPath).catch(() => undefined);
-  if (realTarget === undefined) return undefined;
-  for (const root of roots) {
-    const realRoot = await realpath(root).catch(() => undefined);
-    if (realRoot === undefined) continue;
-    if (realTarget === realRoot) return realTarget;
-    const rel = relative(realRoot, realTarget);
-    if (rel !== "" && !escapes(rel)) return realTarget;
-  }
-  return undefined;
-}
-
-// Resolve a mentioned path to a safe real path: absolute paths against any root; relative paths under
-// `sessionRoot` (the current worker's project). Undefined if it can't be confined.
-export async function resolvePath(roots: string[], sessionRoot: string | undefined, path: string): Promise<string | undefined> {
-  if (isAbsolute(path)) return confineAbsolute(roots, path);
-  return sessionRoot ? confine(sessionRoot, path === "" ? "." : path) : undefined;
+// Resolve a mentioned/preview path for streaming. The web UI is owner-only (token-gated) and the file
+// process runs as the user, so a PREVIEW may open ANY file the user can read — the OS's read permission
+// is the boundary (serveRaw still enforces regular-file + existence). Deliberately NOT confined to
+// project roots, unlike browse/git: a worker legitimately references files outside its project dir
+// (configs, logs, ~/.…), and the user asked to preview those. An absolute path is used as-is; a relative
+// path is joined under `sessionRoot` (the current worker's project). Undefined if relative with no root.
+export function resolvePath(sessionRoot: string | undefined, path: string): string | undefined {
+  if (isAbsolute(path)) return path;
+  return sessionRoot ? join(sessionRoot, path === "" ? "." : path) : undefined;
 }
 
 // Read a confined regular file (rejecting symlinks), capped at maxBytes. Binary → base64.

@@ -16,7 +16,7 @@ async function fixture(): Promise<{ deps: WebFilesDeps; root: string; outside: s
   await writeFile(join(root, "logo.bin"), Buffer.from([1, 2, 0, 3, 255]));
   await writeFile(outside, "TOP SECRET\n");
   await symlink(outside, join(root, "escape")); // symlink pointing OUTSIDE the project
-  return { deps: { projectDir: (n) => (n === "proj" ? root : undefined), allRoots: () => [root], fileTarget: (n) => (n === "proj" ? { transport: "local", projectDir: root } : undefined), maxFileBytes: 1024 }, root, outside };
+  return { deps: { projectDir: (n) => (n === "proj" ? root : undefined), fileTarget: (n) => (n === "proj" ? { transport: "local", projectDir: root } : undefined), maxFileBytes: 1024 }, root, outside };
 }
 
 test("lists a directory (dirs first) and reads a text file confined to the project", async () => {
@@ -55,8 +55,8 @@ test("reads a file whose name starts with .. (not treated as an escape)", async 
   const { deps, root } = await fixture();
   await writeFile(join(root, "..env"), "SECRET=1\n");
   assert.deepEqual(await browse(deps, "proj", "..env"), { kind: "file", path: "..env", content: "SECRET=1\n", truncated: false, encoding: "utf-8" });
-  assert.equal(await resolvePath([root], undefined, join(root, "..env")), join(root, "..env")); // absolute also accepted
-  assert.ok("error" in (await browse(deps, "proj", "../secret"))); // a real traversal is still rejected
+  assert.equal(resolvePath(undefined, join(root, "..env")), join(root, "..env")); // absolute returned as-is
+  assert.ok("error" in (await browse(deps, "proj", "../secret"))); // a real traversal is still rejected by BROWSE
 });
 
 test("createEntry creates confined files/dirs and rejects escapes / duplicates", async () => {
@@ -69,14 +69,15 @@ test("createEntry creates confined files/dirs and rejects escapes / duplicates",
   assert.ok("error" in (await createEntry(deps, "proj", "..", "dir")));          // bad name
 });
 
-test("resolvePath confines absolute paths to a known root and relative paths to the session root", async () => {
+test("resolvePath returns absolute paths as-is (owner-only preview) and relative paths under the session root", async () => {
   const { root, outside } = await fixture();
-  // absolute path inside a root resolves; outside every root does not
-  assert.equal(await resolvePath([root], undefined, join(root, "src/app.ts")), join(root, "src/app.ts"));
-  assert.equal(await resolvePath([root], undefined, outside), undefined);
-  assert.equal(await resolvePath([root], undefined, "/etc/passwd"), undefined);
-  // relative paths need a session root and stay inside it
-  assert.equal(await resolvePath([root], root, "src/app.ts"), join(root, "src/app.ts"));
-  assert.equal(await resolvePath([root], root, "../secret"), undefined);
-  assert.equal(await resolvePath([root], undefined, "src/app.ts"), undefined); // relative with no session → unresolved
+  // An absolute path is returned as-is, even OUTSIDE any project root — the OS's read permission,
+  // enforced when the file is streamed, is the boundary (not a path allowlist). This is the preview
+  // policy; browse/git stay confined (see the browse tests above).
+  assert.equal(resolvePath(undefined, join(root, "src/app.ts")), join(root, "src/app.ts"));
+  assert.equal(resolvePath(undefined, outside), outside);
+  assert.equal(resolvePath(undefined, "/etc/passwd"), "/etc/passwd");
+  // relative paths join under the session root
+  assert.equal(resolvePath(root, "src/app.ts"), join(root, "src/app.ts"));
+  assert.equal(resolvePath(undefined, "src/app.ts"), undefined); // relative with no session → unresolved
 });

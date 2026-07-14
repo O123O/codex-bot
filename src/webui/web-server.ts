@@ -31,7 +31,10 @@ async function serveRaw(response: ServerResponse, target: string | undefined, do
   const info = target ? await stat(target).catch(() => undefined) : undefined;
   if (!target || !info?.isFile()) { response.writeHead(404, { "content-type": "text/plain" }); response.end("not found"); return; }
   const contentType = RAW_CONTENT_TYPES[extname(target).toLowerCase()] ?? "application/octet-stream";
-  const disposition = download ? `attachment; filename="${(target.split("/").pop() || "download").replace(/["\\]/g, "_")}"` : "inline";
+  // Strip CR/LF (header injection) as well as quotes/backslash — a preview may now open any path, so a
+  // file whose name contains a newline must not reach writeHead (Node throws ERR_INVALID_CHAR). Matches
+  // serveRemoteRaw's sanitizer.
+  const disposition = download ? `attachment; filename="${(target.split("/").pop() || "download").replace(/[\r\n"\\]/g, "_")}"` : "inline";
   const headers: Record<string, string> = {
     "content-type": contentType, "content-length": String(info.size),
     "content-disposition": disposition, "x-content-type-options": "nosniff",
@@ -227,9 +230,9 @@ export function createWebServer(options: WebServerOptions): WebServer {
       json(response, "error" in result ? 400 : 200, result);
       return;
     }
-    // Unified streaming for any mentioned/browsed file: the server resolves the path against every
-    // accessible root (all project dirs + the upload store) for absolute paths, or under ?session=’s
-    // project for relative paths — so the client never guesses which root a path belongs to. The
+    // Unified streaming for any mentioned/browsed file. This owner-only preview opens ANY file the user
+    // can read (a worker legitimately references files outside its project dir); an absolute path is
+    // used as-is, a relative one resolves under ?session=’s project — local via fs, remote via ssh. The
     // client streams text into the panel, uses it as an <img> src, or opens pdf/html in a new tab.
     if (request.method === "GET" && url.pathname === "/api/raw") {
       const session = url.searchParams.get("session") || undefined;
@@ -240,7 +243,7 @@ export function createWebServer(options: WebServerOptions): WebServer {
         await serveRemoteRaw(response, remote, target.host, target.projectDir, path, download);
         return;
       }
-      const local = await resolvePath(options.files.allRoots(), session ? options.files.projectDir(session) : undefined, path);
+      const local = resolvePath(session ? options.files.projectDir(session) : undefined, path);
       await serveRaw(response, local, download);
       return;
     }

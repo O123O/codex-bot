@@ -1972,7 +1972,13 @@ export async function buildProductionApp(
       // internal awareness source; it does NOT run a normal assistant reply turn.
       await deliverDirectTo({
         alreadyDelivered: (sourceId) => conversations.hasInternalSource("direct_to", sourceId),
-        send: (nickname, text, sendOptions) => sessions.send(nickname, text, sendOptions),
+        send: (nickname, text, sendOptions) => {
+          // Record the client id for this direct relay BEFORE dispatch. A direct send carries no MCP
+          // operation and no scheduler outbox marker, so without this the ownership guard misreads the
+          // turn it starts as an external Codex turn and releases the session (see ownsDrivenTurn).
+          if (sendOptions.clientUserMessageId) ownership.recordDirectSendTurn(sendOptions.clientUserMessageId);
+          return sessions.send(nickname, text, sendOptions);
+        },
         recordAwareness: (input) => { conversations.createInternalSource(input); },
         pump: () => { void dispatcher.enqueueInternal("direct_to"); },
         commitCheckpoint: () => effects.commitNativeCheckpoint?.(),
@@ -3016,17 +3022,6 @@ export async function buildProductionApp(
         projectDir: (nickname) => {
           const session = registry.snapshot().sessions[nickname];
           return session && isLocalEndpointId(session.endpoint, localClaudeEndpointId) ? session.project_dir : undefined;
-        },
-        // Every root a mentioned absolute path may resolve against: each LOCAL project dir, QiYan's own
-        // workdir, and the upload store. Remote (ssh) project dirs are on another host — resolved on the
-        // remote instead (see fileTarget + web-remote).
-        allRoots: () => {
-          const snapshot = registry.snapshot();
-          const roots = Object.values(snapshot.sessions)
-            .filter((session) => isLocalEndpointId(session.endpoint, localClaudeEndpointId))
-            .map((session) => session.project_dir);
-          roots.push(snapshot.assistant.project_dir, webUploads().dir);
-          return roots;
         },
         // Transport for a session: local (fs) or remote (ssh host from the endpoint catalog).
         fileTarget: (nickname) => {

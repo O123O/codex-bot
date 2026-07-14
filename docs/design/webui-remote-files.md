@@ -73,9 +73,12 @@ case "$t/" in "$root"/*) ;; *) exit 4 ;; esac     # "$root" quoted ⇒ globs lit
 - TOCTOU between realpath and the op is accepted (same as local).
 
 ### Per-op remote scripts
-- **read/stream:** `[ -f "$t" ] || exit 5; cat -- "$t" & p=$!; while IFS= read -r _; do :; done; kill $p 2>/dev/null`
-  — the `[ -f ]` regular-file check (M6) rejects dirs/FIFOs; the `read` loop keeps bash alive on stdin so
-  when ssh dies (client disconnect) stdin EOFs and bash **kills the remote `cat`** (M5).
+- **read/stream (preview):** `t=<abs as-is | "$root/$rel">; [ -f "$t" ] || exit 5; exec cat -- "$t"`
+  — the `[ -f ]` regular-file check (M6) rejects dirs/FIFOs. **NOT confined** to the project root: the
+  owner-only preview streams ANY file the remote user can read (a worker legitimately references configs,
+  logs, `~/.…` outside its project dir). The remote OS's own read permission is the boundary — an
+  unreadable/absent path exits non-zero → 404. Only the preview read is unconfined; browse/git below
+  keep the confinement guard. On client disconnect the caller kills the ssh child (SIGPIPEs the `cat`).
 - **browse:** `ls` emitting **NUL-delimited** `type\tname` records (N3; newlines are legal in names).
 - **git:** `git -C "$t" -c core.quotePath=false <args>` with **all `--` separators preserved** and
   `-`-leading paths rejected (H4). Untracked diff replicates the local `--no-index` guard: reject
@@ -99,7 +102,11 @@ the body is NOT trusted as an origin. All hosts are within the token's trust and
 confined, so residual spoofing is UX-only.
 
 ## Security
-- Same token gate. Remote reads are **confined** to the worker's remote project dir.
+- Same token gate. **Browse/git** reads are **confined** to the worker's remote project dir. The
+  **preview** (`/api/raw`) is deliberately **unconfined** — it streams any file the remote user can read
+  (owner decision, 2026-07-14): a worker references files outside its project dir and the owner wants to
+  preview them. If the web token leaks, an attacker could read any user-readable file on that host — an
+  accepted tradeoff, since the token already grants worker-drive + local shell.
 - The ssh user is the account the worker already runs as, so this reveals nothing the worker couldn't
   already read; it is a read/exec primitive scoped to the web token (which already grants full local
   access + `!`-shell). Noted alongside the LAN warning.

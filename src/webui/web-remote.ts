@@ -76,13 +76,18 @@ export async function remoteBrowse(deps: RemoteDeps, host: string, root: string,
 }
 
 // --- Streaming read (for /api/raw) ---
-// `[ -f "$t" ]` guarantees a REGULAR file (not a dir/FIFO/device), so `cat` always makes progress and
-// never blocks idle — it streams then exits (ending the response), and on a client disconnect the
-// caller kills this ssh child, which SIGPIPEs the remote `cat` on its next write (no PTY needed). The
-// caller pipes `.stdout`, kills on response close, and enforces the byte cap.
+// The owner-only preview streams ANY file the remote user can read (a worker references files outside
+// its project dir) — so, unlike browse/git, this is NOT confined to the project root. The remote OS's
+// own read permission is the boundary: an absent/unreadable path exits non-zero → the caller returns
+// 404. An absolute path is used as-is; a relative one is joined under the project root. `[ -f "$t" ]`
+// guarantees a REGULAR file (not a dir/FIFO/device), so `cat` always makes progress and never blocks
+// idle — it streams then exits, and on a client disconnect the caller kills this ssh child, which
+// SIGPIPEs the remote `cat` on its next write. `q()` single-quotes the (untrusted) path so the remote
+// shell can't reparse it; `cat --` blocks option injection. Caller pipes `.stdout`, kills on close, caps.
 export async function remoteReadStream(deps: RemoteDeps, host: string, root: string, path: string): Promise<ChildProcessWithoutNullStreams> {
   const plan = await planFor(deps, host);
-  const script = `${guard(root, path, isAbsolute(path))}\n[ -f "$t" ] || exit 5\nexec cat -- "$t"`;
+  const target = isAbsolute(path) ? path : `${root}/${path}`;
+  const script = `t=${q(target)}\n[ -f "$t" ] || exit 5\nexec cat -- "$t"`;
   return spawn(deps.sshBinary, sshArgs(plan, script), { stdio: ["pipe", "pipe", "pipe"] });
 }
 
