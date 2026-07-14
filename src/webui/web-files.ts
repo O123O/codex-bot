@@ -1,4 +1,4 @@
-import { lstat, readdir, readFile, realpath, stat } from "node:fs/promises";
+import { lstat, open, readdir, realpath, stat } from "node:fs/promises";
 import { isAbsolute, relative, resolve } from "node:path";
 
 export interface WebFilesDeps {
@@ -51,7 +51,11 @@ export async function browse(deps: WebFilesDeps, nickname: string, relPath: stri
   const linkInfo = await lstat(target).catch(() => undefined);
   if (linkInfo?.isSymbolicLink()) return { error: "path not allowed" };
   const truncated = info.size > deps.maxFileBytes;
-  const bytes = (await readFile(target)).subarray(0, deps.maxFileBytes);
+  // Read at most maxFileBytes so a huge file in the project dir can't spike memory.
+  const buffer = Buffer.alloc(Math.min(info.size, deps.maxFileBytes));
+  const handle = await open(target, "r");
+  try { await handle.read(buffer, 0, buffer.length, 0); } finally { await handle.close(); }
+  const bytes = buffer;
   // A NUL byte marks the file as binary → base64; otherwise serve it as UTF-8 text.
   return bytes.includes(0)
     ? { kind: "file", path: relPath, content: bytes.toString("base64"), truncated, encoding: "base64" }
