@@ -111,6 +111,17 @@ export class ConversationStore {
     return this.db.prepare("SELECT 1 FROM source_contexts WHERE adapter_id IS NULL AND kind = ? AND source_id = ?").get(kind, sourceId) !== undefined;
   }
 
+  // The most recent real user chat messages (source_class='chat'), oldest → newest. Excludes internal
+  // submissions (delivery batches, /to awareness copies, etc.). Lease-free — for the web UI's
+  // two-sided QiYan history.
+  listRecentUserMessages(count: number): Array<{ body: string; at: number }> {
+    const clamped = Math.max(1, Math.min(20, count));
+    const rows = this.db.prepare(
+      "SELECT raw_text, created_at FROM source_contexts WHERE source_class = 'chat' ORDER BY created_at DESC, arrival_sequence DESC LIMIT ?",
+    ).all(clamped) as Array<{ raw_text: string; created_at: number }>;
+    return rows.reverse().map((row) => ({ body: String(row.raw_text), at: Number(row.created_at) }));
+  }
+
   createInternalSource(input: InternalSource): string {
     return inTransaction(this.db, () => {
       const existing = this.db.prepare("SELECT id FROM source_contexts WHERE adapter_id IS NULL AND kind = ? AND source_id = ?")

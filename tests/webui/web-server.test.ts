@@ -18,6 +18,7 @@ const reads: WebReadsDeps = {
     payments: { identity: { thread_id: "t1", endpoint: "local", project_dir: "/p" }, auto_session_info: { management_state: "managed", native_status: "idle", active_turn_id: null, last_sent: null, last_worker_event: null, model: { current: "gpt-5", pending: null }, reasoning_effort: { current: null, pending: null }, token_usage: null, goal: { objective: "ship it", status: "active", token_budget: null }, observed_at: null }, manager_notes: {} },
   } } as never),
   listFinals: (_e, _t, count) => Array.from({ length: Math.min(count, 2) }, (_, i) => ({ id: `f${i}`, endpointId: "local", threadId: "t1", turnId: `turn-${i}`, itemId: `it${i}`, completedAt: 1000 + i, itemOrder: 0, body: `final ${i}`, terminalStatus: "completed" })),
+  listUserMessages: () => [{ body: "hi there", at: 500 }],
   provider: () => "codex",
 };
 
@@ -59,11 +60,15 @@ test("serves the session list and a worker transcript", async () => {
   });
 });
 
-test("serves the assistant's persisted history", async () => {
+test("serves the assistant's persisted two-sided history, merged by time", async () => {
   await withServer(async (base) => {
     const h = await (await fetch(`${base}/api/assistant/messages?count=5&token=${TOKEN}`)).json();
-    assert.equal(h.messages.length, 2);
-    assert.equal(h.messages[0].body, "final 0");
+    // user prompt @500 sorts before the agent finals @1000/@1001
+    assert.deepEqual(h.messages, [
+      { role: "you", body: "hi there", at: 500 },
+      { role: "assistant", body: "final 0", at: 1000 },
+      { role: "assistant", body: "final 1", at: 1001 },
+    ]);
   });
 });
 

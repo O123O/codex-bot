@@ -6,7 +6,15 @@ export interface WebReadsDeps {
   registrySnapshot(): RegistryDocument;
   dashboardSnapshot(): SessionDashboardDocument;
   listFinals(endpointId: string, threadId: string, count: number): LogicalFinalMessage[];
+  // Recent real user chat messages (source_class='chat'), oldest → newest — excludes internal plumbing.
+  listUserMessages(count: number): Array<{ body: string; at: number }>;
   provider(endpointId: string): "codex" | "claude";
+}
+
+export interface WebConvoMessage {
+  role: "you" | "assistant";
+  body: string;
+  at: number;
 }
 
 export interface WebSessionSummary {
@@ -56,11 +64,17 @@ export function transcript(deps: WebReadsDeps, nickname: string, count: number):
   return finals(deps, session.endpoint, session.thread_id, count);
 }
 
-// The assistant's own final messages (its replies), lease-free, oldest → newest — a persisted
-// history for the QiYan tab that survives page reloads and restarts.
-export function assistantTranscript(deps: WebReadsDeps, count: number): WebMessage[] {
+// The QiYan conversation, lease-free, oldest → newest: the assistant's replies (final-message store)
+// merged with your real chat messages (source_class='chat') by time. Survives reloads/restarts.
+// The final-message store keeps only agent output, so the user side comes from the conversation store.
+export function assistantTranscript(deps: WebReadsDeps, count: number): WebConvoMessage[] {
   const assistant = deps.registrySnapshot().assistant;
-  return finals(deps, assistant.endpoint, assistant.thread_id, count);
+  const clamped = Math.max(1, Math.min(20, count));
+  const replies = deps.listFinals(assistant.endpoint, assistant.thread_id, clamped)
+    .map((m): WebConvoMessage => ({ role: "assistant", body: m.body, at: m.completedAt }));
+  const prompts = deps.listUserMessages(clamped)
+    .map((m): WebConvoMessage => ({ role: "you", body: m.body, at: m.at }));
+  return [...replies, ...prompts].filter((m) => m.body.trim()).sort((a, b) => a.at - b.at);
 }
 
 function finals(deps: WebReadsDeps, endpoint: string, threadId: string, count: number): WebMessage[] {
