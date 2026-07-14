@@ -80,6 +80,7 @@ export function App() {
   const preserveRef = useRef<number | null>(null); // scrollHeight snapshot to keep position on prepend
   const stickRef = useRef(true);                   // whether to stay pinned to the bottom
   const key = selected ?? ASSIST;
+  const selectedRef = useRef(selected); selectedRef.current = selected; // for the WS handler's stale closure
   const push = (k: string, m: Msg) => setLog((prev) => ({ ...prev, [k]: [...(prev[k] ?? []), m] }));
 
   useEffect(() => { document.documentElement.dataset.theme = theme; localStorage.setItem("qiyan-theme", theme); }, [theme]);
@@ -108,7 +109,7 @@ export function App() {
       ws.onclose = () => { setLive(false); if (!stop) setTimeout(connect, 2000); };
       ws.onmessage = (ev) => { let m; try { m = JSON.parse(ev.data); } catch { return; }
         if (m.type === "sessions") setSessions(m.sessions);
-        else if (m.type === "message") { push(ASSIST, { role: "assistant", body: m.body, at: m.at }); if (!stickRef.current) setVisible((v) => v + 1); } }; // grow the window so a live append while scrolled up doesn't slide/jump the view
+        else if (m.type === "message") { push(ASSIST, { role: "assistant", body: m.body, at: m.at }); if (selectedRef.current === null && !stickRef.current) setVisible((v) => v + 1); } }; // grow the window (only while viewing QiYan) so a live append while scrolled up doesn't slide/jump
     };
     connect();
     return () => { stop = true; try { ws.close(); } catch { /* closing */ } };
