@@ -28,6 +28,7 @@ async function withServer(run: (base: string, calls: { inputs: Array<{ text: str
   await writeFile(join(staticDir, "index.html"), "<!doctype html><title>ok</title>");
   const server = createWebServer({
     host: "127.0.0.1", port: 0, allowLan: false, token: TOKEN, staticDir, bus, reads,
+    files: { projectDir: () => undefined, maxFileBytes: 1024 },
     submitInput: async (text, target) => { calls.inputs.push({ text, ...(target ? { target } : {}) }); return { ok: true }; },
     report: () => {},
   });

@@ -3,6 +3,7 @@ export type OperationalEventCode =
   | "chat_input_accepted"
   | "direct_to_delivered"
   | "direct_to_failed"
+  | "web_ui_lan_exposure"
   | "chat_input_ignored"
   | "chat_ingress_failed"
   | "chat_ingress_recovered"

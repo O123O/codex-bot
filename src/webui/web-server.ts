@@ -6,6 +6,7 @@ import { WebSocketServer } from "ws";
 import type { OperationalEvent } from "../core/operational-log.ts";
 import type { WebBus } from "./web-bus.ts";
 import { listSessions, transcript, type WebReadsDeps } from "./web-reads.ts";
+import { browse, type WebFilesDeps } from "./web-files.ts";
 
 const AUTH_COOKIE = "qiyan_web_token";
 const POLL_MS = 1_000;
@@ -22,6 +23,7 @@ export interface WebServerOptions {
   staticDir: string;
   bus: WebBus;
   reads: WebReadsDeps;
+  files: WebFilesDeps;
   submitInput(text: string, target: string | undefined): Promise<{ ok: boolean; error?: string }>;
   report(event: OperationalEvent): void;
 }
@@ -103,12 +105,19 @@ export function createWebServer(options: WebServerOptions): WebServer {
       json(response, 200, { messages: result });
       return;
     }
+    // Local file browsing, confined to the named session's project directory (web-files.ts).
+    const files = /^\/api\/files\/([a-z0-9][a-z0-9_-]{0,63})$/u.exec(url.pathname);
+    if (request.method === "GET" && files) {
+      const result = await browse(options.files, files[1]!, url.searchParams.get("path") ?? "");
+      json(response, "error" in result ? 400 : 200, result);
+      return;
+    }
     if (request.method === "POST" && url.pathname === "/api/input") {
       let raw = "";
       for await (const chunk of request) { raw += chunk; if (raw.length > 256 * 1024) { json(response, 413, { error: "too large" }); return; } }
       let parsed: { text?: unknown; target?: unknown };
       try { parsed = JSON.parse(raw || "{}"); } catch { json(response, 400, { error: "invalid json" }); return; }
-      const text = typeof parsed.text === "string" ? parsed.text : "";
+      const text = typeof parsed.text === "string" ? parsed.text.trim() : "";
       const target = typeof parsed.target === "string" && parsed.target ? parsed.target : undefined;
       if (!text) { json(response, 400, { error: "text is required" }); return; }
       const result = await options.submitInput(text, target);
@@ -146,6 +155,12 @@ export function createWebServer(options: WebServerOptions): WebServer {
       poll.unref?.();
       const address = server!.address();
       const boundPort = typeof address === "object" && address ? address.port : options.port;
+      // Loud warning: a non-loopback bind exposes a danger-full-access surface on the LAN over
+      // plain HTTP — the access token travels in cleartext (URL + cookie) and grants a full shell.
+      if (host !== "127.0.0.1") {
+        options.report({ level: "warn", code: "web_ui_lan_exposure", component: "web_ui", reason: `bound ${host}:${boundPort} — full-access UI reachable on the LAN over plain HTTP` });
+        process.stderr.write(`\n*** SECURITY WARNING: QiYan web UI is bound to ${host}:${boundPort} (NOT loopback). This is a danger-full-access surface over plain HTTP; the access token is sniffable on the network. Prefer WEB_HOST=127.0.0.1 + an SSH tunnel. ***\n\n`);
+      }
       return { url: `http://${host}:${boundPort}/?token=${options.token}` };
     },
     async stop() {

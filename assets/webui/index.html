@@ -12,44 +12,44 @@
   #sidebar h1 { font-size:15px; margin:0; padding:14px 16px; border-bottom:1px solid var(--line); }
   #sessions { overflow-y:auto; flex:1; }
   .session { padding:10px 16px; border-bottom:1px solid var(--line); cursor:pointer; }
-  .session:hover { background:#1e2b36; }
-  .session.active { background:#22323e; border-left:3px solid var(--accent); }
-  .session .name { font-weight:600; }
-  .session .meta { color:var(--muted); font-size:12px; }
+  .session:hover { background:#1e2b36; } .session.active { background:#22323e; border-left:3px solid var(--accent); }
+  .session .name { font-weight:600; } .session .meta { color:var(--muted); font-size:12px; }
   .dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px; vertical-align:middle; }
   .idle { background:#3f7; } .active-turn { background:#fb3; } .other { background:#789; }
   #main { flex:1; display:flex; flex-direction:column; min-width:0; }
-  #header { padding:12px 18px; border-bottom:1px solid var(--line); font-weight:600; }
-  #transcript { flex:1; overflow-y:auto; padding:16px 18px; }
+  #header { padding:10px 18px; border-bottom:1px solid var(--line); display:flex; align-items:center; gap:14px; }
+  #header .title { font-weight:600; } .tab { color:var(--muted); cursor:pointer; padding:2px 4px; } .tab.on { color:var(--text); border-bottom:2px solid var(--accent); }
+  #content { flex:1; overflow-y:auto; padding:16px 18px; }
   .msg { border:1px solid var(--line); border-radius:8px; padding:10px 12px; margin-bottom:10px; white-space:pre-wrap; word-break:break-word; }
   .msg .when { color:var(--muted); font-size:11px; margin-bottom:4px; }
   #composer { border-top:1px solid var(--line); padding:12px 18px; display:flex; gap:8px; }
   #text { flex:1; background:var(--bg); color:var(--text); border:1px solid var(--line); border-radius:8px; padding:8px 10px; resize:none; }
   button { background:var(--accent); color:#fff; border:0; border-radius:8px; padding:8px 16px; cursor:pointer; font-weight:600; }
   #status { color:var(--muted); font-size:12px; padding:6px 18px; border-top:1px solid var(--line); }
+  .crumbs { margin-bottom:10px; color:var(--muted); } .crumbs a { color:var(--accent); cursor:pointer; }
+  .frow { padding:5px 8px; border-radius:6px; cursor:pointer; } .frow:hover { background:#1e2b36; }
+  .frow.dir { font-weight:600; } .frow.other { color:var(--muted); cursor:default; }
+  pre { white-space:pre-wrap; word-break:break-word; background:#0b1219; padding:12px; border-radius:8px; border:1px solid var(--line); }
 </style>
 </head>
 <body>
-<div id="sidebar">
-  <h1>QiYan · sessions</h1>
-  <div id="sessions"></div>
-</div>
+<div id="sidebar"><h1>QiYan · sessions</h1><div id="sessions"></div></div>
 <div id="main">
-  <div id="header">Select a session, or send to the assistant</div>
-  <div id="transcript"></div>
-  <div id="composer">
-    <textarea id="text" rows="2" placeholder="Message… (Enter to send, Shift+Enter for newline)"></textarea>
-    <button id="send">Send</button>
-  </div>
+  <div id="header"><span class="title" id="title">Assistant</span><span class="tab on" id="tab-chat" data-tab="chat">Chat</span><span class="tab" id="tab-files" data-tab="files" style="display:none">Files</span></div>
+  <div id="content"></div>
+  <div id="composer"><textarea id="text" rows="2" placeholder="Message… (Enter to send, Shift+Enter for newline)"></textarea><button id="send">Send</button></div>
   <div id="status">connecting…</div>
 </div>
 <script>
 const token = new URLSearchParams(location.search).get("token") || "";
-const api = (p, opts) => fetch(p, { credentials: "same-origin", ...opts }).then((r) => r.ok ? r.json() : r.json().then((e) => Promise.reject(e)));
-let sessions = [], selected = null; // null = the assistant
-
-const statusEl = document.getElementById("status");
-const setStatus = (s) => { statusEl.textContent = s; };
+const api = (p, opts) => fetch(p, { credentials: "same-origin", ...opts }).then((r) => r.json().then((b) => (r.ok ? b : Promise.reject(b))));
+const esc = (s) => String(s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+let sessions = [], selected = null, tab = "chat", filePath = "";
+const assistantLog = []; // in-memory assistant transcript (the assistant isn't a registry nickname)
+const setStatus = (s) => { document.getElementById("status").textContent = s; };
+const contentEl = document.getElementById("content");
+const sessionOf = (n) => sessions.find((s) => s.nickname === n);
+const isLocal = (s) => s && (s.endpoint === "local" || (s.provider === "claude" && !/ssh/.test(s.endpoint) && s.nativeStatus !== undefined));
 
 function renderSessions() {
   const el = document.getElementById("sessions");
@@ -59,76 +59,88 @@ function renderSessions() {
   for (const r of rows) {
     const d = document.createElement("div");
     d.className = "session" + (selected === r.nickname ? " active" : "");
-    const cls = r.nickname === null ? "other" : r.status === "idle" ? "idle" : r.status && r.status !== "idle" ? "active-turn" : "other";
-    d.innerHTML = `<div class="name"><span class="dot ${cls}"></span>${escapeHtml(r.label)}</div><div class="meta">${escapeHtml(r.meta || "")}</div>`;
+    const cls = r.nickname === null ? "other" : r.status === "idle" ? "idle" : r.status ? "active-turn" : "other";
+    d.innerHTML = `<div class="name"><span class="dot ${cls}"></span>${esc(r.label)}</div><div class="meta">${esc(r.meta || "")}</div>`;
     d.onclick = () => selectSession(r.nickname);
     el.appendChild(d);
   }
 }
-function escapeHtml(s) { return String(s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c])); }
 
 async function selectSession(nickname) {
-  selected = nickname;
-  document.getElementById("header").textContent = nickname === null ? "Assistant" : `Worker: ${nickname}`;
+  selected = nickname; tab = "chat"; filePath = "";
+  document.getElementById("title").textContent = nickname === null ? "Assistant" : `Worker: ${nickname}`;
+  // Files tab only for a LOCAL worker (a remote worker's files live on another host — not browsable yet).
+  document.getElementById("tab-files").style.display = nickname !== null ? "inline" : "none";
+  document.getElementById("tab-chat").className = "tab on"; document.getElementById("tab-files").className = "tab";
   renderSessions();
-  await refreshTranscript();
+  await render();
 }
 
-async function refreshTranscript() {
-  const t = document.getElementById("transcript");
-  if (selected === null) { t.innerHTML = `<div class="msg"><div class="when">assistant</div>Send a message to the assistant. Its replies stream in below.</div>`; return; }
+async function render() {
+  if (tab === "files") return renderFiles();
+  if (selected === null) {
+    contentEl.innerHTML = assistantLog.length ? "" : `<div class="msg"><div class="when">assistant</div>Message the assistant; replies appear here.</div>`;
+    for (const m of assistantLog) addMsg(m.role === "you" ? "you" : "assistant", m.body, m.at);
+    return;
+  }
   try {
     const { messages } = await api(`/api/sessions/${selected}/messages?count=20`);
-    t.innerHTML = messages.length ? "" : `<div class="msg">No final messages yet from ${escapeHtml(selected)}.</div>`;
-    for (const m of messages) {
-      const d = document.createElement("div"); d.className = "msg";
-      d.innerHTML = `<div class="when">${new Date(m.completedAt).toLocaleString()} · ${escapeHtml(m.terminalStatus)}</div>${escapeHtml(m.body)}`;
-      t.appendChild(d);
-    }
-    t.scrollTop = t.scrollHeight;
-  } catch (e) { t.innerHTML = `<div class="msg">Error: ${escapeHtml(e.error || e.message || e)}</div>`; }
+    contentEl.innerHTML = messages.length ? "" : `<div class="msg">No final messages yet from ${esc(selected)}.</div>`;
+    for (const m of messages) addMsg(`${new Date(m.completedAt).toLocaleString()} · ${esc(m.terminalStatus)}`, m.body);
+    contentEl.scrollTop = contentEl.scrollHeight;
+  } catch (e) { contentEl.innerHTML = `<div class="msg">Error: ${esc(e.error || e.message || e)}</div>`; }
+}
+function addMsg(when, body, at) {
+  const d = document.createElement("div"); d.className = "msg";
+  d.innerHTML = `<div class="when">${esc(when)}${at ? " · " + new Date(at).toLocaleTimeString() : ""}</div>${esc(body)}`;
+  contentEl.appendChild(d); contentEl.scrollTop = contentEl.scrollHeight;
 }
 
-function appendAssistantMessage(body) {
-  if (selected !== null) return; // assistant replies only shown on the assistant view
-  const t = document.getElementById("transcript");
-  const d = document.createElement("div"); d.className = "msg";
-  d.innerHTML = `<div class="when">assistant · ${new Date().toLocaleTimeString()}</div>${escapeHtml(body)}`;
-  t.appendChild(d); t.scrollTop = t.scrollHeight;
+async function renderFiles() {
+  try {
+    const r = await api(`/api/files/${selected}?path=${encodeURIComponent(filePath)}`);
+    const parts = filePath ? filePath.split("/") : [];
+    const crumbs = [`<a data-p="">${esc(selected)}</a>`].concat(parts.map((p, i) => `/ <a data-p="${esc(parts.slice(0, i + 1).join("/"))}">${esc(p)}</a>`)).join(" ");
+    if (r.kind === "dir") {
+      contentEl.innerHTML = `<div class="crumbs">${crumbs}</div>` + (r.entries.length ? "" : "<div class='msg'>empty</div>");
+      for (const e of r.entries) {
+        const row = document.createElement("div"); row.className = "frow " + e.type;
+        row.textContent = (e.type === "dir" ? "📁 " : e.type === "file" ? "📄 " : "🔗 ") + e.name;
+        if (e.type !== "other") row.onclick = () => { filePath = (filePath ? filePath + "/" : "") + e.name; renderFiles(); };
+        contentEl.appendChild(row);
+      }
+    } else {
+      const body = r.encoding === "base64" ? "[binary file — " + (r.truncated ? "truncated, " : "") + "not shown]" : r.content + (r.truncated ? "\n… [truncated]" : "");
+      contentEl.innerHTML = `<div class="crumbs">${crumbs}</div><pre>${esc(body)}</pre>`;
+    }
+    contentEl.querySelectorAll(".crumbs a").forEach((a) => a.onclick = () => { filePath = a.dataset.p; renderFiles(); });
+  } catch (e) { contentEl.innerHTML = `<div class="msg">Files unavailable: ${esc(e.error || e.message || e)} (remote sessions are not browsable yet)</div>`; }
 }
 
 async function send() {
-  const ta = document.getElementById("text");
-  const text = ta.value.trim();
-  if (!text) return;
-  ta.value = "";
-  if (selected === null) appendAssistantMessage("→ " + text);
+  const ta = document.getElementById("text"), text = ta.value.trim();
+  if (!text) return; ta.value = "";
+  if (selected === null) { assistantLog.push({ role: "you", body: text, at: Date.now() }); if (tab === "chat") render(); }
   try { const r = await api("/api/input", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text, target: selected || undefined }) });
-    if (!r.ok) setStatus("send failed: " + (r.error || "")); else setStatus("sent"); }
+    setStatus(r.ok ? "sent" : "send failed: " + (r.error || "")); }
   catch (e) { setStatus("send error: " + (e.error || e.message || e)); }
-  if (selected !== null) setTimeout(refreshTranscript, 800);
+  if (selected !== null && tab === "chat") setTimeout(render, 800);
 }
 
 document.getElementById("send").onclick = send;
 document.getElementById("text").addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } });
+document.querySelectorAll(".tab").forEach((t) => t.onclick = () => { tab = t.dataset.tab; document.querySelectorAll(".tab").forEach((x) => x.className = "tab" + (x === t ? " on" : "")); filePath = ""; render(); });
 
 async function loadSessions() { try { sessions = (await api("/api/sessions")).sessions; renderSessions(); } catch (e) { setStatus("load error: " + (e.error || e.message || e)); } }
-
 function connectWs() {
-  const proto = location.protocol === "https:" ? "wss" : "ws";
-  const ws = new WebSocket(`${proto}://${location.host}/ws?token=${encodeURIComponent(token)}`);
+  const ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws?token=${encodeURIComponent(token)}`);
   ws.onopen = () => setStatus("live");
   ws.onclose = () => { setStatus("disconnected — retrying…"); setTimeout(connectWs, 2000); };
-  ws.onmessage = (ev) => {
-    let m; try { m = JSON.parse(ev.data); } catch { return; }
-    if (m.type === "sessions") { sessions = m.sessions; renderSessions(); if (selected !== null) refreshTranscript(); }
-    else if (m.type === "message") appendAssistantMessage(m.body);
-  };
+  ws.onmessage = (ev) => { let m; try { m = JSON.parse(ev.data); } catch { return; }
+    if (m.type === "sessions") { sessions = m.sessions; renderSessions(); if (selected !== null && tab === "chat") render(); }
+    else if (m.type === "message") { assistantLog.push({ role: "assistant", body: m.body, at: m.at || Date.now() }); if (selected === null && tab === "chat") render(); } };
 }
-
-loadSessions();
-selectSession(null);
-connectWs();
+loadSessions(); selectSession(null); connectWs();
 </script>
 </body>
 </html>

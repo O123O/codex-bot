@@ -1829,6 +1829,7 @@ export async function buildProductionApp(
   let registry!: SessionRegistry;
   let dashboardStore!: SessionDashboardStore;
   let dashboard!: SessionDashboard;
+  let localClaudeEndpointId: string | undefined; // the local Claude endpoint id, if configured (for web file-browse locality)
   let observations!: SessionObservationProcessor;
   let attachments!: AttachmentStore;
   let attachmentCleanup!: AttachmentCleanup;
@@ -2318,6 +2319,7 @@ export async function buildProductionApp(
           throw new AppError("CONFIGURATION_ERROR", `at most one local Claude endpoint (provider:claude, transport:local) is allowed; found: ${localClaudeDefs.map((definition) => definition.id).join(", ")}`);
         }
         const localClaudeDef = localClaudeDefs[0];
+        localClaudeEndpointId = localClaudeDef?.id;
         // Goals + scheduling serve EVERY Claude endpoint (the local one and any remote
         // claude endpoint), keyed by (endpointId, threadId). Construct the stack
         // unconditionally: a remote Claude endpoint is added at runtime by writing
@@ -2987,6 +2989,16 @@ export async function buildProductionApp(
         dashboardSnapshot: () => dashboard.snapshot(),
         listFinals: (endpointId, threadId, count) => finals.list(endpointId, threadId, count),
         provider: (id) => sessionProvider(id),
+      },
+      // Local file browsing is confined to each session's managed project directory. Only LOCAL
+      // sessions expose files here; a remote (ssh) session's project dir is on another host, so it
+      // is intentionally not browsable yet (remote file browsing is a later phase).
+      files: {
+        projectDir: (nickname) => {
+          const session = registry.snapshot().sessions[nickname];
+          return session && isLocalEndpointId(session.endpoint, localClaudeEndpointId) ? session.project_dir : undefined;
+        },
+        maxFileBytes: config.attachmentMaxBytes,
       },
       acceptChat, report,
       onStarted: (url) => { process.stdout.write(`QiYan web UI listening — open ${url}\n`); options.testing?.onWebUiStarted?.(url); },
