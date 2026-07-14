@@ -9,7 +9,8 @@ import { STYLES } from "./styles";
 
 const TOKEN = new URLSearchParams(location.search).get("token") ?? "";
 const TOKEN_Q = TOKEN ? `&token=${encodeURIComponent(TOKEN)}` : "";
-const RAW_EXT = /\.(pdf|html?|png|jpe?g|gif|svg|webp)$/i; // browser-native → stream in a new tab
+const IMG_EXT = /\.(png|jpe?g|gif|svg|webp|bmp|ico)$/i; // shown inline in the preview panel
+const TAB_EXT = /\.(pdf|html?)$/i;                     // opened in a new tab as a streaming file
 // Preserve our internal file-mention scheme (react-markdown strips unknown protocols by default).
 const urlTransform = (u: string) => (u.startsWith("qy-file:") ? u : defaultUrlTransform(u));
 const ASSIST = " assistant"; // log key for the QiYan tab (selected === null)
@@ -80,6 +81,7 @@ export function App() {
   const [text, setText] = useState("");
   const [filePath, setFilePath] = useState("");
   const [file, setFile] = useState<FileResult | null>(null);
+  const [image, setImage] = useState<{ url: string; name: string } | null>(null);
   const [tree, setTree] = useState<FileResult | null>(null);
   const [suggest, setSuggest] = useState<string[]>([]);
   const [sugIdx, setSugIdx] = useState(0);
@@ -228,9 +230,11 @@ export function App() {
   const openUpload = (absPath: string) =>
     void api<FileResult>(`/api/upload/preview?path=${encodeURIComponent(absPath)}`).then(setFile).catch(() => setFile({ error: "unavailable" }));
 
-  // Open a mentioned path. Browser-native types (pdf/html/image) stream in a new tab; text opens in
-  // the side panel. Absolute paths under the worker's project resolve there; other absolute paths from
-  // the upload store; relative paths from the selected worker's project.
+  const closePreview = () => { setFile(null); setImage(null); };
+
+  // Open a mentioned path (like Codex-Web-UI): images show inline in the popup panel, pdf/html stream
+  // in a new tab, and text opens in the panel. Absolute paths under the worker's project resolve
+  // there; other absolute paths from the upload store; relative paths from the selected worker.
   const openMentioned = (mention: string) => {
     const decoded = decodeURIComponent(mention.replace(/^qy-file:/, "")).replace(/:\d+(?::\d+)?$/, "").replace(/^\.\//, "");
     const proj = selSession?.projectDir;
@@ -238,13 +242,11 @@ export function App() {
     const isUpload = decoded.startsWith("/") && !inProject;
     const rel = inProject ? decoded.slice(proj!.length + 1) : decoded;
     if (!isUpload && !selected) return; // a relative/project path needs a worker
-    if (RAW_EXT.test(decoded)) {
-      const url = isUpload
-        ? `/api/upload/raw?path=${encodeURIComponent(decoded)}${TOKEN_Q}`
-        : `/api/files/${selected}/raw?path=${encodeURIComponent(rel)}${TOKEN_Q}`;
-      window.open(url, "_blank", "noopener");
-      return;
-    }
+    const rawUrl = isUpload
+      ? `/api/upload/raw?path=${encodeURIComponent(decoded)}${TOKEN_Q}`
+      : `/api/files/${selected}/raw?path=${encodeURIComponent(rel)}${TOKEN_Q}`;
+    if (IMG_EXT.test(decoded)) { setImage({ url: rawUrl, name: decoded.split("/").pop() || decoded }); return; }
+    if (TAB_EXT.test(decoded)) { window.open(rawUrl, "_blank", "noopener"); return; }
     if (isUpload) openUpload(decoded); else openFileAt(selected!, rel);
   };
 
@@ -315,14 +317,15 @@ export function App() {
         </main>
       </div>
 
-      {file && (
-        <div className="modal" onClick={() => setFile(null)}>
+      {(file || image) && (
+        <div className="modal" onClick={closePreview}>
           <div className="sheet" onClick={(e) => e.stopPropagation()}>
-            <div className="sheet-head"><span>{"kind" in file && file.kind === "file" ? file.path : "file"}</span><button className="ghost" onClick={() => setFile(null)}>✕</button></div>
+            <div className="sheet-head"><span>{image?.name ?? (file && "kind" in file && file.kind === "file" ? file.path : "file")}</span><button className="ghost" onClick={closePreview}>✕</button></div>
             <div className="sheet-body">
-              {"error" in file ? <div className="hint">{file.error}</div>
-                : file.encoding === "base64" ? <div className="hint">[binary file{file.truncated ? ", truncated" : ""} — not shown]</div>
-                : <pre>{file.content}{file.truncated ? "\n… [truncated]" : ""}</pre>}
+              {image ? <img className="preview-img" src={image.url} alt={image.name} />
+                : file && "error" in file ? <div className="hint">{file.error}</div>
+                : file && file.encoding === "base64" ? <div className="hint">[binary file{file.truncated ? ", truncated" : ""} — not shown]</div>
+                : file ? <pre>{file.content}{file.truncated ? "\n… [truncated]" : ""}</pre> : null}
             </div>
           </div>
         </div>
