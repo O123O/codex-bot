@@ -4,7 +4,9 @@ import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import rehypeHighlight from "rehype-highlight";
 import rehypeKatex from "rehype-katex";
+import hljs from "highlight.js/lib/common";
 import "katex/dist/katex.min.css";
+import "highlight.js/styles/github-dark.css";
 import { STYLES } from "./styles";
 
 const TOKEN = new URLSearchParams(location.search).get("token") ?? "";
@@ -94,6 +96,21 @@ function remarkFilePaths() {
     node.children = out;
   };
   return (tree: any) => walk(tree);
+}
+
+// A code/text file preview: syntax-highlighted (highlight.js) when the extension maps to a known
+// language, otherwise plain text. Same highlighter the chat's fenced code blocks use.
+function CodeView({ text, title }: { text: string; title: string }) {
+  const parts = title.split(".");
+  const ext = parts.length > 1 ? parts.pop()!.toLowerCase() : "";
+  const lang = ext && hljs.getLanguage(ext) ? ext : "";
+  // Uniform structure: <code class="hljs"> gets the theme's block styling either way; hljs escapes source.
+  return (
+    <pre className="code-view">
+      {lang ? <code className="hljs" dangerouslySetInnerHTML={{ __html: hljs.highlight(text, { language: lang, ignoreIllegal: true }).value }} />
+        : <code className="hljs">{text}</code>}
+    </pre>
+  );
 }
 
 const when = (m: Msg) => m.completedAt ?? m.at ?? 0;
@@ -359,7 +376,7 @@ export function App() {
                   : preview.kind === "loading" ? <div className="hint">loading…</div>
                   : preview.kind === "error" ? <div className="hint">{preview.error}</div>
                   : isMd && !srcMode ? <div className="md"><Markdown remarkPlugins={remark} rehypePlugins={[rehypeHighlight, rehypeKatex]} components={mdComponents}>{normalizeMath(preview.text)}</Markdown>{preview.truncated ? <div className="hint">… [truncated]</div> : null}</div>
-                  : <pre>{preview.text}{preview.truncated ? "\n… [truncated]" : ""}</pre>}
+                  : <><CodeView text={preview.text} title={preview.title} />{preview.truncated ? <div className="hint">… [truncated]</div> : null}</>}
               </div>
             </div>
           </div>

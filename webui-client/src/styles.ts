@@ -39,8 +39,10 @@ body { margin:0; }
 .msg.you { background:var(--you); margin-left:15%; }
 .msg .when { color:var(--muted); font-size:11px; margin-bottom:4px; }
 .md { word-break:break-word; } .md > *:first-child { margin-top:0; } .md > *:last-child { margin-bottom:0; }
-.md p { margin:.4em 0; } .md pre { background:var(--code); padding:10px 12px; border-radius:8px; overflow-x:auto; border:1px solid var(--line); }
-.md code { background:var(--code); padding:.1em .35em; border-radius:5px; font-size:.92em; } .md pre code { padding:0; background:transparent; }
+.md p { margin:.4em 0; } .md pre { margin:.4em 0; border:1px solid var(--line); border-radius:8px; overflow:auto; }
+.md code:not(.hljs) { background:var(--code); padding:.1em .35em; border-radius:5px; font-size:.92em; } /* inline code only */
+.code-view, .md pre .hljs { margin:0; border-radius:8px; font:12.5px/1.5 monospace; }
+.code-view { border:1px solid var(--line); overflow:auto; }
 .md a { color:var(--accent); } .md table { border-collapse:collapse; } .md td, .md th { border:1px solid var(--line); padding:4px 8px; }
 .md blockquote { margin:.4em 0; padding-left:10px; border-left:3px solid var(--line); color:var(--muted); }
 
