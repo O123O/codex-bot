@@ -45,30 +45,39 @@ async function serveRaw(response: ServerResponse, target: string | undefined, do
 const MAX_REMOTE_STREAM = 64 * 1024 * 1024;
 // Stream a remote file (ssh) to the HTTP response with backpressure; kill the ssh child on client
 // disconnect (which SIGPIPEs the remote `cat`), cap the bytes, and 404 if the confinement guard fails.
+// All response writes happen inside child/stream event listeners, so they're guarded (headersSent +
+// try/catch) — an uncaught throw here would crash the whole process (handle().catch can't reach it).
 async function serveRemoteRaw(response: ServerResponse, remote: RemoteDeps, host: string, root: string, path: string, download: boolean): Promise<void> {
   const child = await remoteReadStream(remote, host, root, path);
   const contentType = RAW_CONTENT_TYPES[extname(path).toLowerCase()] ?? "application/octet-stream";
-  let started = false, size = 0;
+  let started = false, finished = false, size = 0;
   const killChild = (): void => { try { child.kill("SIGKILL"); } catch { /* gone */ } };
+  const safeHead = (status: number, headers: Record<string, string>): boolean => {
+    if (response.headersSent) return false;
+    try { response.writeHead(status, headers); return true; } catch { return false; }
+  };
+  const finish = (body?: string): void => { if (finished) return; finished = true; try { response.end(body); } catch { /* already ended */ } };
   response.on("close", killChild);
   child.stdout.on("data", (chunk: Buffer) => {
+    if (finished) return;
     if (!started) {
       started = true;
-      const disposition = download ? `attachment; filename="${(path.split("/").pop() || "download").replace(/["\\]/g, "_")}"` : "inline";
-      const headers: Record<string, string> = { "content-type": contentType, "content-disposition": disposition, "x-content-type-options": "nosniff" };
+      // Sanitize the download filename — strip CR/LF (header injection) and quotes/backslash.
+      const name = (path.split("/").pop() || "download").replace(/[\r\n"\\]/g, "_");
+      const headers: Record<string, string> = { "content-type": contentType, "content-disposition": download ? `attachment; filename="${name}"` : "inline", "x-content-type-options": "nosniff" };
       if (contentType.startsWith("text/html") || contentType === "image/svg+xml") headers["content-security-policy"] = "sandbox";
-      response.writeHead(200, headers);
+      if (!safeHead(200, headers)) { killChild(); finish(); return; }
     }
     size += chunk.length;
-    if (size > MAX_REMOTE_STREAM) { killChild(); response.end(); return; }
+    if (size > MAX_REMOTE_STREAM) { killChild(); finish(); return; }
     if (!response.write(chunk)) { child.stdout.pause(); response.once("drain", () => child.stdout.resume()); }
   });
   child.on("close", (code) => {
-    if (started) { response.end(); return; }
-    if (code === 0) { response.writeHead(200, { "content-type": contentType }); response.end(); } // empty file
-    else { response.writeHead(404, { "content-type": "text/plain" }); response.end("not found"); }
+    if (finished || started) { finish(); return; }
+    if (code === 0) { safeHead(200, { "content-type": contentType }); finish(); }        // empty file
+    else { finish(safeHead(404, { "content-type": "text/plain" }) ? "not found" : undefined); } // guard fail / ssh down
   });
-  child.on("error", () => { if (!started) { response.writeHead(502, { "content-type": "text/plain" }); response.end("remote error"); } else response.end(); });
+  child.on("error", () => { if (finished) return; if (!started) safeHead(502, { "content-type": "text/plain" }); finish(); });
 }
 const CONTENT_TYPES: Record<string, string> = {
   ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8",
@@ -85,7 +94,9 @@ export interface WebServerOptions {
   reads: WebReadsDeps;
   files: WebFilesDeps;
   uploads?: WebUploadsConfig;
-  remote?: RemoteDeps; // ssh access for remote-worker files (reuses the user's ControlMaster)
+  // ssh access for remote-worker files (reuses the user's ControlMaster). A PROVIDER, not a value: the
+  // ssh runtime root is only known after startup, so it must be resolved per request, not at wiring time.
+  remote?: () => RemoteDeps | undefined;
   submitInput(text: string, target: string | undefined): Promise<{ ok: boolean; error?: string }>;
   report(event: OperationalEvent): void;
 }
@@ -178,6 +189,7 @@ export function createWebServer(options: WebServerOptions): WebServer {
     if (url.searchParams.has("token")) {
       response.setHeader("set-cookie", `${AUTH_COOKIE}=${encodeURIComponent(options.token)}; HttpOnly; SameSite=Lax; Path=/`);
     }
+    const remote = options.remote?.(); // resolved per request (available after startup)
 
     if (request.method === "GET" && url.pathname === "/api/sessions") { json(response, 200, { sessions: listSessions(options.reads) }); return; }
     if (request.method === "GET" && url.pathname === "/api/assistant/messages") {
@@ -199,8 +211,8 @@ export function createWebServer(options: WebServerOptions): WebServer {
       const target = options.files.fileTarget(files[1]!);
       const path = url.searchParams.get("path") ?? "";
       if (!target) { json(response, 404, { error: "unknown session" }); return; }
-      const result = target.transport === "remote" && target.host && options.remote
-        ? await remoteBrowse(options.remote, target.host, target.projectDir, path)
+      const result = target.transport === "remote" && target.host && remote
+        ? await remoteBrowse(remote, target.host, target.projectDir, path)
         : await browse(options.files, files[1]!, path);
       json(response, "error" in result ? 400 : 200, result);
       return;
@@ -224,8 +236,8 @@ export function createWebServer(options: WebServerOptions): WebServer {
       const path = url.searchParams.get("path") ?? "";
       const download = url.searchParams.get("download") === "1";
       const target = session ? options.files.fileTarget(session) : undefined;
-      if (target?.transport === "remote" && target.host && options.remote) {
-        await serveRemoteRaw(response, options.remote, target.host, target.projectDir, path, download);
+      if (target?.transport === "remote" && target.host && remote) {
+        await serveRemoteRaw(response, remote, target.host, target.projectDir, path, download);
         return;
       }
       const local = await resolvePath(options.files.allRoots(), session ? options.files.projectDir(session) : undefined, path);
@@ -262,7 +274,7 @@ export function createWebServer(options: WebServerOptions): WebServer {
     };
     if (request.method === "GET" && url.pathname === "/api/git/discover") {
       const t = gitTarget(url.searchParams.get("session"));
-      const repos = !t ? [] : t.transport === "remote" && t.host && options.remote ? await remoteDiscover(options.remote, t.host, t.projectDir) : await discoverRepos(t.projectDir);
+      const repos = !t ? [] : t.transport === "remote" && t.host && remote ? await remoteDiscover(remote, t.host, t.projectDir) : await discoverRepos(t.projectDir);
       json(response, 200, { repos });
       return;
     }
@@ -270,14 +282,14 @@ export function createWebServer(options: WebServerOptions): WebServer {
       const t = gitTarget(url.searchParams.get("session"));
       if (!t) { json(response, 400, { error: "repo not found" }); return; }
       const repo = url.searchParams.get("repo") ?? "";
-      const remote = t.transport === "remote" && t.host && options.remote ? options.remote : undefined;
+      const gitRemote = t.transport === "remote" && t.host && remote ? remote : undefined;
       if (url.pathname === "/api/git/status") {
-        const result = remote ? await remoteGitStatus(remote, t.host!, t.projectDir, repo) : await withLocalRepo(t, repo, (dir) => gitStatus(dir));
+        const result = gitRemote ? await remoteGitStatus(gitRemote, t.host!, t.projectDir, repo) : await withLocalRepo(t, repo, (dir) => gitStatus(dir));
         json(response, "error" in result ? 400 : 200, result);
         return;
       }
       const path = url.searchParams.get("path") ?? "", staged = url.searchParams.get("staged") === "1";
-      const result = remote ? await remoteGitDiff(remote, t.host!, t.projectDir, repo, path, staged) : await withLocalRepo(t, repo, (dir) => gitDiff(dir, path, staged));
+      const result = gitRemote ? await remoteGitDiff(gitRemote, t.host!, t.projectDir, repo, path, staged) : await withLocalRepo(t, repo, (dir) => gitDiff(dir, path, staged));
       json(response, "error" in result ? 400 : 200, result);
       return;
     }
@@ -288,14 +300,14 @@ export function createWebServer(options: WebServerOptions): WebServer {
       const t = gitTarget(body.session);
       if (!t) { json(response, 400, { error: "repo not found" }); return; }
       const repo = typeof body.repo === "string" ? body.repo : "";
-      const remote = t.transport === "remote" && t.host && options.remote ? options.remote : undefined;
+      const gitRemote = t.transport === "remote" && t.host && remote ? remote : undefined;
       const op = gitOp[1];
       const path = typeof body.path === "string" ? body.path : "";
       const message = typeof body.message === "string" ? body.message : "";
       const result = op === "commit"
-        ? (remote ? await remoteGitCommit(remote, t.host!, t.projectDir, repo, message) : await withLocalRepo(t, repo, (dir) => gitCommit(dir, message)))
+        ? (gitRemote ? await remoteGitCommit(gitRemote, t.host!, t.projectDir, repo, message) : await withLocalRepo(t, repo, (dir) => gitCommit(dir, message)))
         : !path ? { error: "path required" }
-          : remote ? await (op === "stage" ? remoteGitStage : remoteGitUnstage)(remote, t.host!, t.projectDir, repo, path)
+          : gitRemote ? await (op === "stage" ? remoteGitStage : remoteGitUnstage)(gitRemote, t.host!, t.projectDir, repo, path)
             : await withLocalRepo(t, repo, (dir) => (op === "stage" ? gitStage : gitUnstage)(dir, path));
       json(response, "error" in result ? 400 : 200, result);
       return;

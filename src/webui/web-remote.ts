@@ -108,6 +108,7 @@ export async function remoteGitDiff(deps: RemoteDeps, host: string, root: string
   if (isAbsolute(path) || path.split(/[\\/]+/u).includes("..")) return { error: "path not allowed" };
   const primary = await gitRun(deps, host, root, repo, staged ? ["diff", "--cached", "--", q(path)] : ["diff", "--", q(path)]);
   if (primary.code === 4 || primary.code === 6) return { error: "repo not found" };
+  if (primary.code === 255 || primary.timedOut) return { error: remoteError(primary, "diff failed") }; // ssh down ≠ "(no changes)"
   if (primary.stdout.trim()) return { diff: primary.stdout };
   if (!staged) {
     // Untracked whole-file diff: confine the FILE to the repo on the remote (realpath catches symlinks),

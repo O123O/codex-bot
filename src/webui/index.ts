@@ -29,7 +29,7 @@ export interface WebUiPhaseDeps extends WebUiConfig {
   reads: WebReadsDeps;
   files: WebFilesDeps;
   uploads?: WebUploadsConfig;
-  remote?: RemoteDeps;
+  remote?: () => RemoteDeps | undefined; // provider — the ssh runtime root is only known after startup
   acceptChat(source: CanonicalChatSource, effects: ChatAcceptanceEffects): Promise<void>;
   report(event: OperationalEvent): void;
   onStarted(url: string): void;

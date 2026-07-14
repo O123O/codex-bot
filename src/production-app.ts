@@ -3038,8 +3038,9 @@ export async function buildProductionApp(
         },
         maxFileBytes: config.attachmentMaxBytes,
       },
-      // Remote-worker file access over ssh reuses the user's ControlMaster (never creates one).
-      ...(webSshRuntimeRoot ? { remote: { sshBinary: "ssh", sshRuntimeRoot: webSshRuntimeRoot } } : {}),
+      // Remote-worker file access over ssh reuses the user's ControlMaster (never creates one). A
+      // provider read per request: `webSshRuntimeRoot` is only assigned once endpoints start up.
+      remote: () => (webSshRuntimeRoot ? { sshBinary: "ssh", sshRuntimeRoot: webSshRuntimeRoot } : undefined),
       // Send-file store: uploads land here on the bot host and auto-expire after 30 days. The path is
       // appended to the message so a LOCAL assistant/worker can read it (remote hosts can't — deferred).
       uploads: webUploads(),

@@ -137,6 +137,7 @@ test("dispatches a remote session's files over ssh (browse + raw stream)", async
   await chmod(ssh, 0o755);
   const remoteRoot = await mkdtemp(join(tmpdir(), "qiyan-rroot-"));
   await writeFile(join(remoteRoot, "r.txt"), "remote-bytes\n");
+  const sshRt = await mkdtemp(join(tmpdir(), "qiyan-rrt-"));
 
   const bus = new WebBus();
   const staticDir = await mkdtemp(join(tmpdir(), "qiyan-rstatic-"));
@@ -144,7 +145,7 @@ test("dispatches a remote session's files over ssh (browse + raw stream)", async
   const server = createWebServer({
     host: "127.0.0.1", port: 0, allowLan: false, token: TOKEN, staticDir, bus, reads,
     files: { projectDir: () => undefined, allRoots: () => [], maxFileBytes: 4096, fileTarget: (n) => (n === "rworker" ? { transport: "remote", projectDir: remoteRoot, host: "testhost" } : undefined) },
-    remote: { sshBinary: ssh, sshRuntimeRoot: await mkdtemp(join(tmpdir(), "qiyan-rrt-")) },
+    remote: () => ({ sshBinary: ssh, sshRuntimeRoot: sshRt }),
     submitInput: async () => ({ ok: true }), report: () => {},
   });
   const { url } = await server.start();
@@ -154,6 +155,11 @@ test("dispatches a remote session's files over ssh (browse + raw stream)", async
     assert.deepEqual(listing.entries?.map((e: { name: string }) => e.name), ["r.txt"]);
     assert.equal(await (await fetch(`${base}/api/raw?session=rworker&path=r.txt&token=${TOKEN}`)).text(), "remote-bytes\n");
     assert.equal((await fetch(`${base}/api/raw?session=rworker&path=${encodeURIComponent("/etc/hostname")}&token=${TOKEN}`)).status, 404); // remote confinement
+    // a filename with CRLF + download=1 must NOT crash the server (header injection guarded)
+    await writeFile(join(remoteRoot, "e\r\nvil.txt"), "x");
+    const crlf = await fetch(`${base}/api/raw?session=rworker&path=${encodeURIComponent("e\r\nvil.txt")}&download=1&token=${TOKEN}`);
+    assert.equal(crlf.status, 200);
+    assert.doesNotMatch(crlf.headers.get("content-disposition") ?? "", /[\r\n]/);
   } finally { await server.stop(); }
 });
 
