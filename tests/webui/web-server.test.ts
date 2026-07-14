@@ -19,12 +19,12 @@ const reads: WebReadsDeps = {
   } } as never),
   listFinals: (_e, _t, count, before) => {
     const all = Array.from({ length: 2 }, (_, i) => ({ id: `f${i}`, endpointId: "local", threadId: "t1", turnId: `turn-${i}`, itemId: `it${i}`, completedAt: 1000 + i, itemOrder: 0, body: `final ${i}`, terminalStatus: "completed" }));
-    const older = all.filter((m) => before === undefined || m.completedAt < before);
+    const older = all.filter((m) => before === undefined || m.completedAt <= before); // inclusive cursor
     return older.slice(Math.max(0, older.length - count));
   },
   listOwnerConversation: (_e, _t, before, limit) => {
-    const convo = [{ role: "you" as const, body: "hi there", at: 500 }, { role: "assistant" as const, body: "final 0", at: 1000 }, { role: "assistant" as const, body: "final 1", at: 1001 }];
-    const older = convo.filter((m) => before === undefined || m.at < before);
+    const convo = [{ id: "s1", role: "you" as const, body: "hi there", at: 500 }, { id: "f0", role: "assistant" as const, body: "final 0", at: 1000 }, { id: "f1", role: "assistant" as const, body: "final 1", at: 1001 }];
+    const older = convo.filter((m) => before === undefined || m.at <= before); // inclusive cursor
     return older.slice(Math.max(0, older.length - limit));
   },
   provider: () => "codex",
@@ -73,23 +73,25 @@ test("serves the assistant's persisted two-sided history, merged by time", async
     const h = await (await fetch(`${base}/api/assistant/messages?limit=5&token=${TOKEN}`)).json();
     // user prompt @500 sorts before the agent finals @1000/@1001
     assert.deepEqual(h.messages, [
-      { role: "you", body: "hi there", at: 500 },
-      { role: "assistant", body: "final 0", at: 1000 },
-      { role: "assistant", body: "final 1", at: 1001 },
+      { id: "s1", role: "you", body: "hi there", at: 500 },
+      { id: "f0", role: "assistant", body: "final 0", at: 1000 },
+      { id: "f1", role: "assistant", body: "final 1", at: 1001 },
     ]);
     assert.equal(h.hasOlder, false);
   });
 });
 
-test("paginates older messages with the before cursor", async () => {
+test("paginates older messages with an inclusive before cursor (no same-ms skip)", async () => {
   await withServer(async (base) => {
     const page1 = await (await fetch(`${base}/api/assistant/messages?limit=2&token=${TOKEN}`)).json();
     assert.deepEqual(page1.messages.map((m: { body: string }) => m.body), ["final 0", "final 1"]);
     assert.equal(page1.hasOlder, true); // a full page came back ⇒ maybe older
     const oldest = page1.messages[0].at; // 1000
+    // Inclusive cursor re-returns the boundary row "final 0" (the client dedups it by id) so nothing
+    // sharing the boundary millisecond is skipped; the older "hi there" is reachable.
     const page2 = await (await fetch(`${base}/api/assistant/messages?limit=2&before=${oldest}&token=${TOKEN}`)).json();
-    assert.deepEqual(page2.messages.map((m: { body: string }) => m.body), ["hi there"]);
-    assert.equal(page2.hasOlder, false);
+    assert.deepEqual(page2.messages.map((m: { body: string }) => m.body), ["hi there", "final 0"]);
+    assert.deepEqual(page2.messages.map((m: { id: string }) => m.id), ["s1", "f0"]);
   });
 });
 

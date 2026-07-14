@@ -12,6 +12,7 @@ export interface WebReadsDeps {
 }
 
 export interface WebConvoMessage {
+  id: string;
   role: "you" | "assistant";
   body: string;
   at: number;
@@ -36,6 +37,7 @@ export interface WebSessionSummary {
 }
 
 export interface WebMessage {
+  id: string;
   turnId: string;
   body: string;
   completedAt: number;
@@ -70,15 +72,16 @@ export function transcript(deps: WebReadsDeps, nickname: string, limit: number, 
   if (!session) return undefined;
   const clamped = Math.max(1, Math.min(50, limit));
   const messages = deps.listFinals(session.endpoint, session.thread_id, clamped, before)
-    .map((m): WebMessage => ({ turnId: m.turnId, body: m.body, completedAt: m.completedAt, terminalStatus: m.terminalStatus }));
+    .map((m): WebMessage => ({ id: m.id, turnId: m.turnId, body: m.body, completedAt: m.completedAt, terminalStatus: m.terminalStatus }));
   return { messages, hasOlder: messages.length === clamped };
 }
 
 // The QiYan conversation (your chat + the assistant's replies), lease-free, oldest → newest, one
-// page. `before` pages older. Survives reloads/restarts. Whitespace-only finals are dropped.
+// page. `before` pages older. Survives reloads/restarts. Rows are returned raw (whitespace included)
+// so `hasOlder` and the client's `before` cursor stay consistent; the client hides blank bodies.
 export function assistantTranscript(deps: WebReadsDeps, limit: number, before?: number): WebPage<WebConvoMessage> {
   const assistant = deps.registrySnapshot().assistant;
   const clamped = Math.max(1, Math.min(50, limit));
-  const raw = deps.listOwnerConversation(assistant.endpoint, assistant.thread_id, before, clamped);
-  return { messages: raw.filter((m) => m.body.trim()), hasOlder: raw.length === clamped };
+  const messages = deps.listOwnerConversation(assistant.endpoint, assistant.thread_id, before, clamped);
+  return { messages, hasOlder: messages.length === clamped };
 }

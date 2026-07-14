@@ -39,11 +39,12 @@ export class FinalMessageStore {
   }
 
   // Newest `count` messages, oldest → newest. With `before` (a completed_at cursor) returns the page
-  // strictly older than that instant — for scroll-up pagination.
+  // at-or-older than that instant — INCLUSIVE, so rows sharing the boundary millisecond are re-returned
+  // rather than skipped (the caller dedups by id). completed_at alone is not unique.
   list(endpointId: string, threadId: string, count: number, before?: number): LogicalFinalMessage[] {
     if (!Number.isSafeInteger(count) || count < 1 || count > 50) throw new RangeError("count must be between 1 and 50");
     const cursor = before !== undefined && Number.isFinite(before);
-    const clause = cursor ? " AND completed_at < ?" : "";
+    const clause = cursor ? " AND completed_at <= ?" : "";
     const params = cursor ? [endpointId, threadId, before as number, count] : [endpointId, threadId, count];
     const rows = this.db.prepare(`SELECT * FROM (
       SELECT * FROM logical_final_messages WHERE endpoint_id = ? AND thread_id = ?${clause}

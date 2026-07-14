@@ -15,7 +15,7 @@ const REVEAL_STEP = 20;      // reveal step when scrolling into in-memory histor
 const TOP_PX = 120, BOTTOM_PX = 80;
 
 interface Session { nickname: string; endpoint: string; provider: string; projectDir: string; lifecycleState: string; nativeStatus: string | null; activeTurnId: string | null; model: string | null; goal: { objective: string; status: string } | null; }
-interface Msg { body: string; completedAt?: number; terminalStatus?: string; role?: "you" | "assistant"; at?: number; }
+interface Msg { id?: string; body: string; completedAt?: number; terminalStatus?: string; role?: "you" | "assistant"; at?: number; }
 type FileResult = { kind: "dir"; path: string; entries: Array<{ name: string; type: "dir" | "file" | "other" }> } | { kind: "file"; path: string; content: string; truncated: boolean; encoding: string } | { error: string };
 
 async function api<T>(path: string, opts?: RequestInit): Promise<T> {
@@ -108,22 +108,23 @@ export function App() {
       ws.onclose = () => { setLive(false); if (!stop) setTimeout(connect, 2000); };
       ws.onmessage = (ev) => { let m; try { m = JSON.parse(ev.data); } catch { return; }
         if (m.type === "sessions") setSessions(m.sessions);
-        else if (m.type === "message") push(ASSIST, { role: "assistant", body: m.body, at: m.at }); };
+        else if (m.type === "message") { push(ASSIST, { role: "assistant", body: m.body, at: m.at }); if (!stickRef.current) setVisible((v) => v + 1); } }; // grow the window so a live append while scrolled up doesn't slide/jump the view
     };
     connect();
     return () => { stop = true; try { ws.close(); } catch { /* closing */ } };
   }, []);
 
   // On tab switch: reset the render window, pin to bottom, and lazily load that tab's latest page.
-  useEffect(() => { setVisible(RENDER_CAP); stickRef.current = true; if (selected) { setFinals([]); void loadFinals(selected); setFilePath(""); } }, [selected, loadFinals]);
+  useEffect(() => { setVisible(RENDER_CAP); stickRef.current = true; preserveRef.current = null; if (selected) { setFinals([]); void loadFinals(selected); setFilePath(""); } }, [selected, loadFinals]);
   useEffect(() => { if (selected) void loadTree(selected, filePath); }, [selected, filePath, loadTree]);
   // When a worker turn completes and you're pinned to the bottom, refresh to the latest page.
   useEffect(() => { const s = sessions.find((x) => x.nickname === selected); if (s && !s.activeTurnId && selected && stickRef.current) void loadFinals(selected); }, [sessions]); // eslint-disable-line
 
-  // The visible conversation: QiYan = loaded history + session activity; worker = its finals + your echoes.
+  // The visible conversation: QiYan = loaded history + session activity; worker = its finals + your
+  // echoes. Blank bodies are hidden here (kept in the loaded pages so the `before` cursor stays valid).
   const shown: Msg[] = useMemo(() => {
-    if (selected === null) return [...history, ...(log[ASSIST] ?? [])];
-    return [...finals, ...(log[selected] ?? [])].sort((a, b) => when(a) - when(b));
+    const base = selected === null ? [...history, ...(log[ASSIST] ?? [])] : [...finals, ...(log[selected] ?? [])].sort((a, b) => when(a) - when(b));
+    return base.filter((m) => m.body.trim());
   }, [selected, finals, log, history]);
   const rendered = shown.slice(Math.max(0, shown.length - visible));
 
@@ -144,11 +145,16 @@ export function App() {
     try {
       const path = selected === null ? `/api/assistant/messages?limit=${PAGE}&before=${cursor}` : `/api/sessions/${selected}/messages?limit=${PAGE}&before=${cursor}`;
       const p = await api<{ messages: Msg[]; hasOlder: boolean }>(path);
-      if (p.messages.length) {
-        if (selected === null) setHistory((cur) => [...p.messages, ...cur]); else setFinals((cur) => [...p.messages, ...cur]);
-        setVisible((v) => v + p.messages.length);
+      // The `before` cursor is INCLUSIVE, so dedup the boundary rows we already have (by id).
+      const existing = new Set((selected === null ? history : finals).map((m) => m.id).filter(Boolean));
+      const fresh = p.messages.filter((m) => !m.id || !existing.has(m.id));
+      if (fresh.length) {
+        if (selected === null) setHistory((cur) => [...fresh, ...cur]); else setFinals((cur) => [...fresh, ...cur]);
+        setVisible((v) => v + fresh.length);
       } else preserveRef.current = null;
-      setHasOlder((h) => ({ ...h, [key]: p.hasOlder }));
+      // Stop paging if the server has no more OR this fetch made no progress (avoids re-fetching the
+      // same boundary page forever when >limit rows share one millisecond).
+      setHasOlder((h) => ({ ...h, [key]: p.hasOlder && fresh.length > 0 }));
     } catch { preserveRef.current = null; } finally { setLoadingOlder(false); }
   }, [loadingOlder, selected, history, finals, key]);
 
@@ -257,7 +263,7 @@ export function App() {
             {(hasOlder[key] || visible < shown.length) && <div className="older">{loadingOlder ? "loading…" : "scroll up for older messages"}</div>}
             {shown.length === 0 && <div className="empty">{selected === null ? "Message QiYan — replies appear here." : `Message ${selected} — its replies appear here.`}</div>}
             {rendered.map((m, i) => (
-              <div key={i} className={`msg ${m.role === "you" ? "you" : ""}`}>
+              <div key={m.id ?? `${m.at ?? m.completedAt}-${i}`} className={`msg ${m.role === "you" ? "you" : ""}`}>
                 <div className="when">{m.role === "you" ? "you" : m.role === "assistant" ? "QiYan" : `${m.completedAt ? new Date(m.completedAt).toLocaleString() : ""} · ${m.terminalStatus ?? ""}`}</div>
                 <div className="md"><Markdown remarkPlugins={remark} rehypePlugins={[rehypeHighlight, rehypeKatex]} components={mdComponents}>{normalizeMath(m.body)}</Markdown></div>
               </div>
