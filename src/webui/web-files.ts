@@ -1,5 +1,5 @@
-import { lstat, open, readdir, realpath, stat } from "node:fs/promises";
-import { isAbsolute, relative, resolve, sep } from "node:path";
+import { lstat, mkdir, open, readdir, realpath, stat } from "node:fs/promises";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 // A `path.relative()` result escapes its root only when it is exactly ".." or begins with "../" — NOT
 // when a legitimate child name merely starts with ".." (e.g. "..env", "...").
@@ -68,6 +68,48 @@ export async function readConfinedFile(target: string, displayPath: string, maxB
   return buffer.includes(0)
     ? { kind: "file", path: displayPath, content: buffer.toString("base64"), truncated, encoding: "base64" }
     : { kind: "file", path: displayPath, content: buffer.toString("utf-8"), truncated, encoding: "utf-8" };
+}
+
+// Create an empty file or a directory under a session's project, confined. The PARENT must already
+// exist inside the root (confine requires existence); the new leaf name must be a plain name.
+export async function createEntry(deps: WebFilesDeps, nickname: string, relPath: string, kind: "file" | "dir"): Promise<{ ok: true; path: string } | { error: string }> {
+  const root = deps.projectDir(nickname);
+  if (root === undefined) return { error: "unknown session" };
+  const name = basename(relPath);
+  if (!name || name === "." || name === ".." || name.includes("/") || name.includes("\\")) return { error: "invalid name" };
+  const parentRel = dirname(relPath);
+  const parent = await confine(root, parentRel === "." || parentRel === "" ? "." : parentRel);
+  if (parent === undefined) return { error: "path not allowed" };
+  const target = join(parent, name);
+  if (await stat(target).catch(() => undefined)) return { error: "already exists" };
+  try {
+    if (kind === "dir") await mkdir(target);
+    else { const handle = await open(target, "wx"); await handle.close(); }
+    return { ok: true, path: relPath };
+  } catch (error) { return { error: error instanceof Error ? error.message : "create failed" }; }
+}
+
+// A flat list of file paths under a session's project (for @-file autocomplete), capped, skipping
+// dot-dirs and node_modules/.git so it stays cheap.
+export async function listFiles(deps: WebFilesDeps, nickname: string, limit: number): Promise<string[]> {
+  const root = deps.projectDir(nickname);
+  if (root === undefined) return [];
+  const realRoot = await realpath(root).catch(() => undefined);
+  if (realRoot === undefined) return [];
+  const out: string[] = [];
+  const skip = new Set([".git", "node_modules", ".venv", "__pycache__", "dist", "build"]);
+  const walk = async (dir: string, rel: string): Promise<void> => {
+    if (out.length >= limit) return;
+    const dirents = await readdir(dir, { withFileTypes: true }).catch(() => []);
+    for (const entry of dirents) {
+      if (out.length >= limit) return;
+      const childRel = rel ? `${rel}/${entry.name}` : entry.name;
+      if (entry.isFile()) out.push(childRel);
+      else if (entry.isDirectory() && !skip.has(entry.name) && !entry.name.startsWith(".")) await walk(join(dir, entry.name), childRel);
+    }
+  };
+  await walk(realRoot, "");
+  return out;
 }
 
 // List a directory or read a file, confined to the named session's project directory (the file tree).

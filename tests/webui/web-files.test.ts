@@ -3,7 +3,8 @@ import { mkdir, mkdtemp, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { browse, resolvePath, type WebFilesDeps } from "../../src/webui/web-files.ts";
+import { browse, createEntry, listFiles, resolvePath, type WebFilesDeps } from "../../src/webui/web-files.ts";
+import { stat } from "node:fs/promises";
 
 async function fixture(): Promise<{ deps: WebFilesDeps; root: string; outside: string }> {
   const base = await mkdtemp(join(tmpdir(), "qiyan-webfiles-"));
@@ -56,6 +57,22 @@ test("reads a file whose name starts with .. (not treated as an escape)", async 
   assert.deepEqual(await browse(deps, "proj", "..env"), { kind: "file", path: "..env", content: "SECRET=1\n", truncated: false, encoding: "utf-8" });
   assert.equal(await resolvePath([root], undefined, join(root, "..env")), join(root, "..env")); // absolute also accepted
   assert.ok("error" in (await browse(deps, "proj", "../secret"))); // a real traversal is still rejected
+});
+
+test("createEntry creates confined files/dirs and rejects escapes / duplicates", async () => {
+  const { deps, root } = await fixture();
+  assert.deepEqual(await createEntry(deps, "proj", "src/new.ts", "file"), { ok: true, path: "src/new.ts" });
+  assert.ok(await stat(join(root, "src/new.ts")).then(() => true));
+  assert.deepEqual(await createEntry(deps, "proj", "newdir", "dir"), { ok: true, path: "newdir" });
+  assert.ok("error" in (await createEntry(deps, "proj", "../evil.ts", "file"))); // traversal parent
+  assert.ok("error" in (await createEntry(deps, "proj", "src/app.ts", "file"))); // already exists
+  assert.ok("error" in (await createEntry(deps, "proj", "..", "dir")));          // bad name
+});
+
+test("listFiles returns a flat file list (heavy dirs skipped)", async () => {
+  const { deps } = await fixture();
+  const files = await listFiles(deps, "proj", 100);
+  assert.ok(files.includes("README.md") && files.includes("src/app.ts"));
 });
 
 test("resolvePath confines absolute paths to a known root and relative paths to the session root", async () => {

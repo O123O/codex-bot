@@ -132,8 +132,9 @@ export function App() {
   const [dirs, setDirs] = useState<Record<string, Array<{ name: string; type: string }> | { error: string }>>({}); // tree: entries by dir path ("" = root)
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [filesWidth, setFilesWidth] = useState<number>(() => Number(localStorage.getItem("qiyan-files-w")) || 300);
-  const [suggest, setSuggest] = useState<string[]>([]);
+  const [suggest, setSuggest] = useState<Array<{ type: "worker" | "file"; v: string }>>([]);
   const [sugIdx, setSugIdx] = useState(0);
+  const [fileList, setFileList] = useState<string[]>([]); // flat project files for @-file autocomplete
   const logRef = useRef<HTMLDivElement>(null);
   const preserveRef = useRef<number | null>(null); // scrollHeight snapshot to keep position on prepend
   const stickRef = useRef(true);                   // whether to stay pinned to the bottom
@@ -181,6 +182,7 @@ export function App() {
 
   // On tab switch: reset the render window, pin to bottom, and lazily load the transcript + file root.
   useEffect(() => { setVisible(RENDER_CAP); stickRef.current = true; preserveRef.current = null; if (selected) { setFinals([]); void loadFinals(selected); setDirs({}); setExpanded(new Set()); void loadDir(selected, ""); } }, [selected, loadFinals, loadDir]);
+  useEffect(() => { if (selected) void api<{ files: string[] }>(`/api/filelist?session=${selected}`).then((r) => setFileList(r.files)).catch(() => setFileList([])); else setFileList([]); }, [selected]);
   // When a worker turn completes and you're pinned to the bottom, refresh to the latest page.
   useEffect(() => { const s = sessions.find((x) => x.nickname === selected); if (s && !s.activeTurnId && selected && stickRef.current) void loadFinals(selected); }, [sessions]); // eslint-disable-line
 
@@ -233,13 +235,34 @@ export function App() {
 
   const onText = (v: string) => {
     setText(v); setSugIdx(0);
-    const at = /(?:^|\s)@([a-z0-9_-]*)$/i.exec(v);
-    setSuggest(at ? sessions.map((s) => s.nickname).filter((n) => n.startsWith(at[1].toLowerCase())).slice(0, 6) : []);
+    const at = /(?:^|\s)@([a-z0-9_./-]*)$/i.exec(v);
+    if (!at) { setSuggest([]); return; }
+    const q = at[1].toLowerCase();
+    const workers = sessions.map((s) => s.nickname).filter((n) => n.startsWith(q)).map((w) => ({ type: "worker" as const, v: w }));
+    const files = q ? fileList.filter((f) => f.toLowerCase().includes(q)).slice(0, 6).map((f) => ({ type: "file" as const, v: f })) : [];
+    setSuggest([...workers, ...files].slice(0, 8));
   };
-  const pickSuggest = (nick: string) => { setText((t) => t.replace(/@[a-z0-9_-]*$/i, `@${nick} `)); setSuggest([]); };
+  // A worker keeps the "@" (redirect); a file replaces the "@query" with its path (the worker reads it).
+  const pickSuggest = (s: { type: "worker" | "file"; v: string }) =>
+    { setText((t) => t.replace(/@[a-z0-9_./-]*$/i, s.type === "worker" ? `@${s.v} ` : `${s.v} `)); setSuggest([]); };
+
+  // `!cmd` in a worker tab runs a one-shot shell command in that worker's project dir; the output is an
+  // ephemeral card (not persisted). Only local workers have a cwd.
+  const runExec = async (cmd: string) => {
+    if (!cmd || !selected) return;
+    stickRef.current = true;
+    push(selected, { role: "you", body: "$ " + cmd, at: Date.now() });
+    try {
+      const r = await api<{ stdout: string; stderr: string; exitCode: number | null; timedOut: boolean; truncated: boolean; error?: string }>("/api/exec", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ session: selected, command: cmd }) });
+      const out = [r.stdout, r.stderr].filter(Boolean).join("\n") || "(no output)";
+      const status = r.error ? `error: ${r.error}` : r.timedOut ? "timed out" : `exit ${r.exitCode}`;
+      push(selected, { role: "assistant", body: "```\n" + out + (r.truncated ? "\n… [truncated]" : "") + "\n```\n`" + status + "`", at: Date.now() });
+    } catch (e) { push(selected, { role: "assistant", body: `[exec failed: ${(e as { error?: string })?.error ?? e}]`, at: Date.now() }); }
+  };
 
   const send = async () => {
     const t = text.trim(); if (!t) return;
+    if (selected && t.startsWith("!")) { setText(""); setSuggest([]); void runExec(t.slice(1).trim()); return; }
     const m = /^@([a-z0-9][a-z0-9_-]*)\s+([\s\S]+)$/.exec(t);
     const redirect = m && sessions.some((s) => s.nickname === m[1]) ? m[1] : null;
     const target = redirect ?? selected ?? undefined;
@@ -276,7 +299,19 @@ export function App() {
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); void send(); }
   };
 
-  // Recursive file tree: folders expand in place (lazy-loaded); files open the preview popup.
+  // Tree write ops (backend-agnostic quick wins).
+  const newEntry = (op: "mkfile" | "mkdir", parent: string) => {
+    const name = window.prompt(op === "mkdir" ? "New folder name" : "New file name")?.trim();
+    if (!name || !selected) return;
+    void api("/api/fs", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ op, session: selected, path: parent ? `${parent}/${name}` : name }) })
+      .then(() => { setExpanded((s) => new Set(s).add(parent)); void loadDir(selected, parent); })
+      .catch((e) => alert((e as { error?: string })?.error ?? "create failed"));
+  };
+  const download = (path: string) => window.open(`${rawUrl(path, selected)}&download=1`, "_blank");
+  const insertPath = (path: string) => { const proj = sessions.find((s) => s.nickname === selected)?.projectDir; setText((t) => `${t ? t.replace(/\s*$/, " ") : ""}${proj ? `${proj}/${path}` : path} `); };
+
+  // Recursive file tree: folders expand in place (lazy-loaded); files open the preview popup; hover
+  // reveals per-row actions (new file/folder in a dir; download / insert-path for a file).
   const renderDir = (path: string, depth: number): React.ReactNode => {
     const node = dirs[path];
     if (!node) return null;
@@ -287,11 +322,23 @@ export function App() {
       if (e.type === "dir") {
         const open = expanded.has(full);
         return <div key={full}>
-          <div className="frow dir" style={{ paddingLeft: 6 + depth * 14 }} onClick={() => toggleDir(selected!, full)}><span className="tw">{open ? "▾" : "▸"}</span>📁 {e.name}</div>
+          <div className="frow dir" style={{ paddingLeft: 6 + depth * 14 }} onClick={() => toggleDir(selected!, full)}>
+            <span className="tw">{open ? "▾" : "▸"}</span>📁 <span className="fname">{e.name}</span>
+            <span className="actions" onClick={(ev) => ev.stopPropagation()}>
+              <button title="New file" onClick={() => newEntry("mkfile", full)}>＋📄</button>
+              <button title="New folder" onClick={() => newEntry("mkdir", full)}>＋📁</button>
+            </span>
+          </div>
           {open && renderDir(full, depth + 1)}
         </div>;
       }
-      return <div key={full} className={`frow ${e.type}`} style={{ paddingLeft: 24 + depth * 14 }} onClick={() => e.type === "file" ? openPreview(full, selected) : undefined}>{e.type === "file" ? "📄" : "🔗"} {e.name}</div>;
+      return <div key={full} className={`frow ${e.type}`} style={{ paddingLeft: 24 + depth * 14 }} onClick={() => e.type === "file" ? openPreview(full, selected) : undefined}>
+        {e.type === "file" ? "📄" : "🔗"} <span className="fname">{e.name}</span>
+        {e.type === "file" && <span className="actions" onClick={(ev) => ev.stopPropagation()}>
+          <button title="Download" onClick={() => download(full)}>⬇</button>
+          <button title="Insert path into message" onClick={() => insertPath(full)}>↳</button>
+        </span>}
+      </div>;
     });
   };
 
@@ -351,7 +398,11 @@ export function App() {
       <div className="body">
         <aside className="files" style={{ width: filesWidth }}>
           <div className="files-head"><span>{selected ? `Files · ${selected}` : "Files"}</span>
-            {selected && <button className="ghost sm" title="Refresh (no live watcher)" onClick={() => { [...new Set(["", ...Object.keys(dirs)])].forEach((p) => void loadDir(selected, p)); void loadSessions(); }}>⟳</button>}
+            {selected && <span className="head-actions">
+              <button className="ghost sm" title="New file at root" onClick={() => newEntry("mkfile", "")}>＋📄</button>
+              <button className="ghost sm" title="New folder at root" onClick={() => newEntry("mkdir", "")}>＋📁</button>
+              <button className="ghost sm" title="Refresh (no live watcher)" onClick={() => { [...new Set(["", ...Object.keys(dirs)])].forEach((p) => void loadDir(selected, p)); void loadSessions(); }}>⟳</button>
+            </span>}
           </div>
           {selected === null ? <div className="hint">Select a worker to browse its project files.</div> : <div className="tree">{renderDir("", 0)}</div>}
         </aside>
@@ -369,7 +420,7 @@ export function App() {
             ))}
           </div>
           <div className="composer">
-            {suggest.length > 0 && <div className="suggest">{suggest.map((n, i) => <div key={n} className={`srow ${i === sugIdx ? "on" : ""}`} onMouseDown={(e) => { e.preventDefault(); pickSuggest(n); }}>@{n}</div>)}</div>}
+            {suggest.length > 0 && <div className="suggest">{suggest.map((s, i) => <div key={s.type + s.v} className={`srow ${i === sugIdx ? "on" : ""}`} onMouseDown={(e) => { e.preventDefault(); pickSuggest(s); }}>{s.type === "worker" ? `👤 @${s.v}` : `📄 ${s.v}`}</div>)}</div>}
             <input ref={fileInput} type="file" hidden onChange={(e) => { const f = e.target.files?.[0]; if (f) void uploadFile(f); e.target.value = ""; }} />
             <button className="ghost" title="Send a file (its path is appended)" disabled={uploading} onClick={() => fileInput.current?.click()}>{uploading ? "…" : "📎"}</button>
             <textarea value={text} onChange={(e) => onText(e.target.value)} onKeyDown={onKey} rows={2}

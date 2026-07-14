@@ -32,8 +32,11 @@ body { margin:0; }
 .file-link { background:transparent; border:0; padding:0; color:var(--accent); cursor:pointer; font:inherit; text-decoration:underline; }
 .tree { overflow-y:auto; padding:8px; }
 .crumbs { color:var(--muted); font-size:12px; margin-bottom:8px; word-break:break-all; } .crumbs a { color:var(--accent); cursor:pointer; }
-.frow { padding:5px 8px; border-radius:6px; cursor:pointer; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.frow { display:flex; align-items:center; gap:2px; padding:5px 8px 5px 0; border-radius:6px; cursor:pointer; white-space:nowrap; }
 .frow:hover { background:var(--panel2); } .frow.dir { font-weight:600; } .frow.other { color:var(--muted); cursor:default; }
+.fname { flex:1; overflow:hidden; text-overflow:ellipsis; }
+.actions { display:none; gap:2px; flex:0 0 auto; padding-right:4px; } .frow:hover .actions { display:flex; }
+.actions button { background:transparent; border:0; cursor:pointer; font-size:12px; padding:0 3px; opacity:.8; } .actions button:hover { opacity:1; }
 .hint { color:var(--muted); padding:10px 8px; font-size:13px; }
 
 .chat { flex:1; display:flex; flex-direction:column; min-width:0; }

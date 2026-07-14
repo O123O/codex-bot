@@ -7,8 +7,9 @@ import { WebSocketServer } from "ws";
 import type { OperationalEvent } from "../core/operational-log.ts";
 import type { WebBus } from "./web-bus.ts";
 import { assistantTranscript, listSessions, transcript, type WebReadsDeps } from "./web-reads.ts";
-import { browse, resolvePath, type WebFilesDeps } from "./web-files.ts";
+import { browse, createEntry, listFiles, resolvePath, type WebFilesDeps } from "./web-files.ts";
 import { cleanupUploads, storeUpload, type WebUploadsConfig } from "./web-uploads.ts";
+import { runCommand } from "./web-exec.ts";
 
 const AUTH_COOKIE = "qiyan_web_token";
 const POLL_MS = 1_000;
@@ -22,14 +23,16 @@ const RAW_CONTENT_TYPES: Record<string, string> = {
   ".json": "application/json; charset=utf-8", ".csv": "text/csv; charset=utf-8",
 };
 
-// Stream a resolved file with a best-effort Content-Type so the browser can render/read it inline.
-async function serveRaw(response: ServerResponse, target: string | undefined): Promise<void> {
+// Stream a resolved file with a best-effort Content-Type so the browser can render/read it inline
+// (or download it, when `download` is set).
+async function serveRaw(response: ServerResponse, target: string | undefined, download = false): Promise<void> {
   const info = target ? await stat(target).catch(() => undefined) : undefined;
   if (!target || !info?.isFile()) { response.writeHead(404, { "content-type": "text/plain" }); response.end("not found"); return; }
   const contentType = RAW_CONTENT_TYPES[extname(target).toLowerCase()] ?? "application/octet-stream";
+  const disposition = download ? `attachment; filename="${(target.split("/").pop() || "download").replace(/["\\]/g, "_")}"` : "inline";
   const headers: Record<string, string> = {
     "content-type": contentType, "content-length": String(info.size),
-    "content-disposition": "inline", "x-content-type-options": "nosniff",
+    "content-disposition": disposition, "x-content-type-options": "nosniff",
   };
   // Neuter scripts/callbacks in previewed HTML/SVG opened as a document (unique, isolated origin).
   if (contentType.startsWith("text/html") || contentType === "image/svg+xml") headers["content-security-policy"] = "sandbox";
@@ -67,6 +70,13 @@ function pageParams(url: URL): { limit: number; before: number | undefined } {
   const rawBefore = url.searchParams.get("before");
   const before = rawBefore !== null && Number.isFinite(Number(rawBefore)) ? Number(rawBefore) : undefined;
   return { limit, before };
+}
+
+// Read a small JSON request body (capped); undefined on invalid JSON or overflow.
+async function readJson(request: IncomingMessage): Promise<Record<string, unknown> | undefined> {
+  let raw = "";
+  for await (const chunk of request) { raw += chunk; if (raw.length > 256 * 1024) return undefined; }
+  try { return raw ? JSON.parse(raw) : {}; } catch { return undefined; }
 }
 
 function tokenValid(expected: string, actual: string | undefined): boolean {
@@ -175,7 +185,33 @@ export function createWebServer(options: WebServerOptions): WebServer {
     if (request.method === "GET" && url.pathname === "/api/raw") {
       const session = url.searchParams.get("session") || undefined;
       const target = await resolvePath(options.files.allRoots(), session ? options.files.projectDir(session) : undefined, url.searchParams.get("path") ?? "");
-      await serveRaw(response, target);
+      await serveRaw(response, target, url.searchParams.get("download") === "1");
+      return;
+    }
+    // Flat file list for @-file autocomplete.
+    if (request.method === "GET" && url.pathname === "/api/filelist") {
+      const session = url.searchParams.get("session");
+      json(response, 200, { files: session ? await listFiles(options.files, session, 2000) : [] });
+      return;
+    }
+    // Create a file/folder in a session's project (tree write ops).
+    if (request.method === "POST" && url.pathname === "/api/fs") {
+      const body = await readJson(request);
+      if (!body) { json(response, 400, { error: "invalid json" }); return; }
+      const { op, session, path } = body as { op?: string; session?: string; path?: string };
+      if ((op !== "mkfile" && op !== "mkdir") || typeof session !== "string" || typeof path !== "string" || !path) { json(response, 400, { error: "op, session, path required" }); return; }
+      json(response, 200, await createEntry(options.files, session, path, op === "mkdir" ? "dir" : "file"));
+      return;
+    }
+    // Run a one-shot shell command in a LOCAL session's project dir (the `!` command).
+    if (request.method === "POST" && url.pathname === "/api/exec") {
+      const body = await readJson(request);
+      if (!body) { json(response, 400, { error: "invalid json" }); return; }
+      const { session, command } = body as { session?: string; command?: string };
+      const cwd = typeof session === "string" ? options.files.projectDir(session) : undefined;
+      if (!cwd) { json(response, 400, { error: "not a local session" }); return; }
+      if (typeof command !== "string" || !command.trim()) { json(response, 400, { error: "command required" }); return; }
+      json(response, 200, await runCommand(cwd, command, { maxBytes: 256 * 1024, timeoutMs: 30_000 }));
       return;
     }
     if (request.method === "POST" && url.pathname === "/api/input") {
