@@ -13,7 +13,8 @@ test("sendDocument stores the file in the web store and broadcasts its path", as
   const events: Array<{ type: string; body: string }> = [];
   bus.add(fakeSocket(events) as never);
   const dir = await mkdtemp(join(tmpdir(), "qiyan-out-"));
-  const adapter = createWebAdapter(bus, { dir, maxBytes: 1024, ttlMs: 1e9 });
+  const annotations: Array<{ id: string; text: string }> = [];
+  const adapter = createWebAdapter(bus, { dir, maxBytes: 1024, ttlMs: 1e9 }, (id, text) => annotations.push({ id, text }));
   async function* stream() { yield Buffer.from("report bytes"); }
   const result = await adapter.delivery.sendDocument!({ surface: "web" }, { stream: stream(), size: 12, displayName: "report.txt", mediaType: "text/plain", deliveryId: "d1", caption: "here you go" });
 
@@ -25,6 +26,10 @@ test("sendDocument stores the file in the web store and broadcasts its path", as
   assert.equal(events[0]!.type, "message");
   assert.match(events[0]!.body, /here you go/);       // caption preserved
   assert.ok(events[0]!.body.includes(join(dir, files[0]!))); // clickable stored path
+  // path persisted into the durable delivery body (survives reload), keyed by deliveryId
+  assert.equal(annotations.length, 1);
+  assert.equal(annotations[0]!.id, "d1");
+  assert.ok(annotations[0]!.text.includes(join(dir, files[0]!)));
 });
 
 test("sendDocument rejects a stream exceeding the size limit", async () => {

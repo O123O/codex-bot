@@ -2229,7 +2229,7 @@ export async function buildProductionApp(
         // `chats` for outbound routing AND admitted into the boot guard's expected set. Added
         // whenever WEB_UI is on (independent of the test adapter-injection path).
         const webEnabled = Boolean(config.webUi) && Boolean(webBus);
-        if (webEnabled && webBus) configured.push(createWebAdapter(webBus, webUploads()));
+        if (webEnabled && webBus) configured.push(createWebAdapter(webBus, webUploads(), (id, appended) => deliveries.appendToBody(id, appended)));
         const expectedAdapters = [
           telegramConfig ? "telegram" : undefined,
           config.chat.slack ? "slack" : undefined,

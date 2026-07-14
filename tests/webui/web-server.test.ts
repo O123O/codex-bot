@@ -30,20 +30,22 @@ const reads: WebReadsDeps = {
   provider: () => "codex",
 };
 
-async function withServer(run: (base: string, calls: { inputs: Array<{ text: string; target?: string }> }, bus: WebBus) => Promise<void>): Promise<void> {
+async function withServer(run: (base: string, calls: { inputs: Array<{ text: string; target?: string }> }, bus: WebBus, uploadsDir: string) => Promise<void>): Promise<void> {
   const bus = new WebBus();
   const calls = { inputs: [] as Array<{ text: string; target?: string }> };
   const staticDir = await mkdtemp(join(tmpdir(), "qiyan-webui-"));
   await writeFile(join(staticDir, "index.html"), "<!doctype html><title>ok</title>");
+  const uploadsDir = await mkdtemp(join(tmpdir(), "qiyan-webui-up-"));
   const server = createWebServer({
     host: "127.0.0.1", port: 0, allowLan: false, token: TOKEN, staticDir, bus, reads,
     files: { projectDir: () => undefined, maxFileBytes: 1024 },
+    uploads: { dir: uploadsDir, maxBytes: 1024, ttlMs: 1e9 },
     submitInput: async (text, target) => { calls.inputs.push({ text, ...(target ? { target } : {}) }); return { ok: true }; },
     report: () => {},
   });
   const { url } = await server.start();
   const base = url.slice(0, url.indexOf("/?"));
-  try { await run(base, calls, bus); } finally { await server.stop(); }
+  try { await run(base, calls, bus, uploadsDir); } finally { await server.stop(); }
 }
 
 test("requires the token on every route", async () => {
@@ -101,6 +103,20 @@ test("POST /api/input forwards text and target to submitInput", async () => {
     await fetch(`${base}/api/input?token=${TOKEN}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text: "hi assistant" }) });
     assert.deepEqual(calls.inputs, [{ text: "hello", target: "payments" }, { text: "hi assistant" }]);
     assert.equal((await fetch(`${base}/api/input?token=${TOKEN}`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" })).status, 400);
+  });
+});
+
+test("streams a raw upload with a browser Content-Type and blocks traversal", async () => {
+  await withServer(async (base, _calls, _bus, uploadsDir) => {
+    await writeFile(join(uploadsDir, "page.html"), "<h1>hi</h1>");
+    const r = await fetch(`${base}/api/upload/raw?path=page.html&token=${TOKEN}`);
+    assert.equal(r.status, 200);
+    assert.match(r.headers.get("content-type") ?? "", /text\/html/);
+    assert.equal(r.headers.get("content-security-policy"), "sandbox"); // scripts neutered
+    assert.equal(await r.text(), "<h1>hi</h1>");
+    // basename() collapses traversal → not found in the store
+    assert.equal((await fetch(`${base}/api/upload/raw?path=../../etc/passwd&token=${TOKEN}`)).status, 404);
+    assert.equal((await fetch(`${base}/api/upload/raw?path=page.html`)).status, 401); // still token-gated
   });
 });
 

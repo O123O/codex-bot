@@ -15,7 +15,7 @@ export type WebFilesResult =
 // Resolve `relPath` under `root` and PROVE (via realpath) the result stays inside the real root —
 // so no `..`, absolute path, or symlink can escape the session's project directory. There is no OS
 // sandbox on this process, so this confinement is the whole security boundary for file browsing.
-async function confine(root: string, relPath: string): Promise<string | undefined> {
+export async function confine(root: string, relPath: string): Promise<string | undefined> {
   if (isAbsolute(relPath) || relPath.split(/[\\/]+/u).includes("..")) return undefined;
   const realRoot = await realpath(root).catch(() => undefined);
   if (realRoot === undefined) return undefined;

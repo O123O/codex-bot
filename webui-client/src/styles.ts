@@ -50,8 +50,8 @@ body { margin:0; }
 .suggest { position:absolute; bottom:calc(100% + 4px); left:14px; background:var(--panel); border:1px solid var(--line); border-radius:8px; overflow:hidden; box-shadow:0 6px 20px rgba(0,0,0,.3); }
 .srow { padding:6px 14px; cursor:pointer; } .srow:hover, .srow.on { background:var(--panel2); }
 
-.modal { position:fixed; inset:0; background:rgba(0,0,0,.5); display:flex; align-items:center; justify-content:center; padding:5vh 5vw; }
-.sheet { background:var(--panel); border:1px solid var(--line); border-radius:12px; width:min(900px,100%); max-height:100%; display:flex; flex-direction:column; }
+.modal { position:fixed; inset:0; background:rgba(0,0,0,.45); display:flex; align-items:stretch; justify-content:flex-end; }
+.sheet { background:var(--panel); border-left:1px solid var(--line); width:min(820px,94vw); height:100%; display:flex; flex-direction:column; box-shadow:-8px 0 30px rgba(0,0,0,.3); }
 .sheet-head { display:flex; justify-content:space-between; align-items:center; padding:10px 14px; border-bottom:1px solid var(--line); font-family:monospace; word-break:break-all; }
 .sheet-body { overflow:auto; padding:14px; } .sheet-body pre { margin:0; white-space:pre-wrap; word-break:break-word; font:12.5px/1.5 monospace; }
 `;

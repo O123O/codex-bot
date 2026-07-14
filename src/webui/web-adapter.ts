@@ -17,7 +17,9 @@ export const WEB_BINDING: ConversationBinding = {
 // The `web` ChatAdapter. Inbound (browser → assistant) is driven by the HTTP server calling
 // `acceptChat` with a WEB_BINDING source (not this object). Outbound (assistant reply → browser)
 // arrives here via the DeliveryWorker → `sendMessage`/`sendDocument`, fanned out to connected sockets.
-export function createWebAdapter(bus: WebBus, uploads: WebUploadsConfig): ChatAdapter {
+// `annotateDelivery` persists the stored path into the delivery's durable body so an outbound file
+// survives a browser reload (the live broadcast alone is not persisted).
+export function createWebAdapter(bus: WebBus, uploads: WebUploadsConfig, annotateDelivery?: (deliveryId: string, appended: string) => void): ChatAdapter {
   return {
     primaryBinding: WEB_BINDING,
     delivery: {
@@ -40,7 +42,10 @@ export function createWebAdapter(bus: WebBus, uploads: WebUploadsConfig): ChatAd
         }
         const stored = await storeUpload(uploads, file.displayName, Buffer.concat(chunks), Date.now());
         if ("error" in stored) throw new AppError("ATTACHMENT_INVALID", stored.error);
-        bus.broadcast({ type: "message", body: `${file.caption ? file.caption + "\n\n" : ""}📎 ${stored.path}`, at: Date.now() });
+        const suffix = `\n\n📎 ${stored.path}`;
+        // Persist the path into the outbox so it survives reload, then broadcast the full message live.
+        annotateDelivery?.(file.deliveryId, suffix);
+        bus.broadcast({ type: "message", body: `${file.caption ?? ""}${suffix}`, at: Date.now() });
         return { delivered: true, path: stored.path };
       },
       isSafeToRetry: () => false, // storing to disk is deterministic; don't re-copy on failure

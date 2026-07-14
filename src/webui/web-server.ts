@@ -1,16 +1,42 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { createReadStream } from "node:fs";
 import { timingSafeEqual } from "node:crypto";
 import { readFile, stat } from "node:fs/promises";
-import { extname, join, normalize } from "node:path";
+import { basename, extname, join, normalize } from "node:path";
 import { WebSocketServer } from "ws";
 import type { OperationalEvent } from "../core/operational-log.ts";
 import type { WebBus } from "./web-bus.ts";
 import { assistantTranscript, listSessions, transcript, type WebReadsDeps } from "./web-reads.ts";
-import { browse, type WebFilesDeps } from "./web-files.ts";
+import { browse, confine, type WebFilesDeps } from "./web-files.ts";
 import { cleanupUploads, previewUpload, storeUpload, type WebUploadsConfig } from "./web-uploads.ts";
 
 const AUTH_COOKIE = "qiyan_web_token";
 const POLL_MS = 1_000;
+// Browser-native types are streamed raw (Content-Type set) so a new tab renders them; everything
+// else is served as JSON text via the preview endpoints. Unknown types download as octet-stream.
+const RAW_CONTENT_TYPES: Record<string, string> = {
+  ".pdf": "application/pdf", ".html": "text/html; charset=utf-8", ".htm": "text/html; charset=utf-8",
+  ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
+  ".svg": "image/svg+xml", ".webp": "image/webp", ".txt": "text/plain; charset=utf-8",
+  ".md": "text/plain; charset=utf-8", ".log": "text/plain; charset=utf-8",
+  ".json": "application/json; charset=utf-8", ".csv": "text/csv; charset=utf-8",
+};
+
+// Stream a file confined to `root` with a best-effort Content-Type so the browser can render it inline.
+async function serveRaw(response: ServerResponse, root: string, relPath: string): Promise<void> {
+  const target = await confine(root, relPath === "" ? "." : relPath);
+  const info = target ? await stat(target).catch(() => undefined) : undefined;
+  if (!target || !info?.isFile()) { response.writeHead(404, { "content-type": "text/plain" }); response.end("not found"); return; }
+  const contentType = RAW_CONTENT_TYPES[extname(target).toLowerCase()] ?? "application/octet-stream";
+  const headers: Record<string, string> = {
+    "content-type": contentType, "content-length": String(info.size),
+    "content-disposition": "inline", "x-content-type-options": "nosniff",
+  };
+  // Neuter scripts/callbacks in previewed HTML (it renders as a unique, isolated origin).
+  if (contentType.startsWith("text/html")) headers["content-security-policy"] = "sandbox";
+  response.writeHead(200, headers);
+  createReadStream(target).pipe(response);
+}
 const CONTENT_TYPES: Record<string, string> = {
   ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8",
   ".json": "application/json; charset=utf-8", ".svg": "image/svg+xml", ".ico": "image/x-icon", ".png": "image/png",
@@ -143,6 +169,19 @@ export function createWebServer(options: WebServerOptions): WebServer {
       if (!options.uploads) { json(response, 501, { error: "uploads are disabled" }); return; }
       const result = await previewUpload(options.uploads, url.searchParams.get("path") ?? "");
       json(response, "error" in result ? 400 : 200, result);
+      return;
+    }
+    // Raw streaming for browser-native types (pdf/html/image → open in a new tab).
+    if (request.method === "GET" && url.pathname === "/api/upload/raw") {
+      if (!options.uploads) { json(response, 501, { error: "uploads are disabled" }); return; }
+      await serveRaw(response, options.uploads.dir, basename(url.searchParams.get("path") ?? ""));
+      return;
+    }
+    const rawFile = /^\/api\/files\/([a-z0-9][a-z0-9_-]{0,63})\/raw$/u.exec(url.pathname);
+    if (request.method === "GET" && rawFile) {
+      const root = options.files.projectDir(rawFile[1]!);
+      if (!root) { json(response, 404, { error: "unknown session" }); return; }
+      await serveRaw(response, root, url.searchParams.get("path") ?? "");
       return;
     }
     if (request.method === "POST" && url.pathname === "/api/input") {

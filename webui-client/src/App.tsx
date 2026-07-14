@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import Markdown from "react-markdown";
+import Markdown, { defaultUrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import rehypeHighlight from "rehype-highlight";
@@ -8,6 +8,10 @@ import "katex/dist/katex.min.css";
 import { STYLES } from "./styles";
 
 const TOKEN = new URLSearchParams(location.search).get("token") ?? "";
+const TOKEN_Q = TOKEN ? `&token=${encodeURIComponent(TOKEN)}` : "";
+const RAW_EXT = /\.(pdf|html?|png|jpe?g|gif|svg|webp)$/i; // browser-native → stream in a new tab
+// Preserve our internal file-mention scheme (react-markdown strips unknown protocols by default).
+const urlTransform = (u: string) => (u.startsWith("qy-file:") ? u : defaultUrlTransform(u));
 const ASSIST = " assistant"; // log key for the QiYan tab (selected === null)
 const PAGE = 20;             // messages fetched per page
 const RENDER_CAP = 30;       // messages rendered initially per tab
@@ -224,18 +228,24 @@ export function App() {
   const openUpload = (absPath: string) =>
     void api<FileResult>(`/api/upload/preview?path=${encodeURIComponent(absPath)}`).then(setFile).catch(() => setFile({ error: "unavailable" }));
 
-  // Open a path mentioned in a message: an absolute path under the current worker's project opens as a
-  // project file; any other absolute path (e.g. an uploaded/sent file) opens from the upload store; a
-  // relative path opens against the current worker's project.
-  const openMentioned = (raw: string) => {
-    const decoded = decodeURIComponent(raw.replace(/^qy-file:/, "")).replace(/:\d+(?::\d+)?$/, "").replace(/^\.\//, "");
-    if (decoded.startsWith("/")) {
-      const proj = selSession?.projectDir;
-      if (selected && proj && decoded.startsWith(proj + "/")) openFileAt(selected, decoded.slice(proj.length + 1));
-      else openUpload(decoded);
+  // Open a mentioned path. Browser-native types (pdf/html/image) stream in a new tab; text opens in
+  // the side panel. Absolute paths under the worker's project resolve there; other absolute paths from
+  // the upload store; relative paths from the selected worker's project.
+  const openMentioned = (mention: string) => {
+    const decoded = decodeURIComponent(mention.replace(/^qy-file:/, "")).replace(/:\d+(?::\d+)?$/, "").replace(/^\.\//, "");
+    const proj = selSession?.projectDir;
+    const inProject = Boolean(selected && proj && decoded.startsWith(proj + "/"));
+    const isUpload = decoded.startsWith("/") && !inProject;
+    const rel = inProject ? decoded.slice(proj!.length + 1) : decoded;
+    if (!isUpload && !selected) return; // a relative/project path needs a worker
+    if (RAW_EXT.test(decoded)) {
+      const url = isUpload
+        ? `/api/upload/raw?path=${encodeURIComponent(decoded)}${TOKEN_Q}`
+        : `/api/files/${selected}/raw?path=${encodeURIComponent(rel)}${TOKEN_Q}`;
+      window.open(url, "_blank", "noopener");
       return;
     }
-    if (selected) openFileAt(selected, decoded);
+    if (isUpload) openUpload(decoded); else openFileAt(selected!, rel);
   };
 
   const remark = [remarkGfm, remarkMath, remarkFilePaths];
@@ -290,7 +300,7 @@ export function App() {
             {rendered.map((m, i) => (
               <div key={m.id ?? `${m.at ?? m.completedAt}-${i}`} className={`msg ${m.role === "you" ? "you" : ""}`}>
                 <div className="when">{m.role === "you" ? "you" : m.role === "assistant" ? "QiYan" : `${m.completedAt ? new Date(m.completedAt).toLocaleString() : ""} · ${m.terminalStatus ?? ""}`}</div>
-                <div className="md"><Markdown remarkPlugins={remark} rehypePlugins={[rehypeHighlight, rehypeKatex]} components={mdComponents}>{normalizeMath(m.body)}</Markdown></div>
+                <div className="md"><Markdown remarkPlugins={remark} rehypePlugins={[rehypeHighlight, rehypeKatex]} components={mdComponents} urlTransform={urlTransform}>{normalizeMath(m.body)}</Markdown></div>
               </div>
             ))}
           </div>
