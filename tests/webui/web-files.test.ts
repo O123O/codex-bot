@@ -50,6 +50,14 @@ test("REJECTS every escape from the project root", async () => {
   assert.deepEqual(await browse(deps, "other", ""), { error: "unknown session" });                // unknown root
 });
 
+test("reads a file whose name starts with .. (not treated as an escape)", async () => {
+  const { deps, root } = await fixture();
+  await writeFile(join(root, "..env"), "SECRET=1\n");
+  assert.deepEqual(await browse(deps, "proj", "..env"), { kind: "file", path: "..env", content: "SECRET=1\n", truncated: false, encoding: "utf-8" });
+  assert.equal(await resolvePath([root], undefined, join(root, "..env")), join(root, "..env")); // absolute also accepted
+  assert.ok("error" in (await browse(deps, "proj", "../secret"))); // a real traversal is still rejected
+});
+
 test("resolvePath confines absolute paths to a known root and relative paths to the session root", async () => {
   const { root, outside } = await fixture();
   // absolute path inside a root resolves; outside every root does not

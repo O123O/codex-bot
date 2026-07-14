@@ -31,8 +31,8 @@ async function serveRaw(response: ServerResponse, target: string | undefined): P
     "content-type": contentType, "content-length": String(info.size),
     "content-disposition": "inline", "x-content-type-options": "nosniff",
   };
-  // Neuter scripts/callbacks in previewed HTML (it renders as a unique, isolated origin).
-  if (contentType.startsWith("text/html")) headers["content-security-policy"] = "sandbox";
+  // Neuter scripts/callbacks in previewed HTML/SVG opened as a document (unique, isolated origin).
+  if (contentType.startsWith("text/html") || contentType === "image/svg+xml") headers["content-security-policy"] = "sandbox";
   response.writeHead(200, headers);
   createReadStream(target).pipe(response);
 }

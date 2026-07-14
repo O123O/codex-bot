@@ -1,5 +1,9 @@
 import { lstat, open, readdir, realpath, stat } from "node:fs/promises";
-import { isAbsolute, relative, resolve } from "node:path";
+import { isAbsolute, relative, resolve, sep } from "node:path";
+
+// A `path.relative()` result escapes its root only when it is exactly ".." or begins with "../" — NOT
+// when a legitimate child name merely starts with ".." (e.g. "..env", "...").
+const escapes = (rel: string): boolean => rel === ".." || rel.startsWith(".." + sep) || isAbsolute(rel);
 
 export interface WebFilesDeps {
   // The managed project directory for a session nickname (a root the browser may reach).
@@ -25,7 +29,7 @@ export async function confine(root: string, relPath: string): Promise<string | u
   if (realTarget === undefined) return undefined;
   if (realTarget === realRoot) return realRoot;
   const rel = relative(realRoot, realTarget);
-  return rel === "" || rel.startsWith("..") || isAbsolute(rel) ? undefined : realTarget;
+  return rel === "" || escapes(rel) ? undefined : realTarget;
 }
 
 // Prove an ABSOLUTE path lives inside one of `roots` (realpath containment). Lets a mentioned absolute
@@ -38,7 +42,7 @@ export async function confineAbsolute(roots: string[], absPath: string): Promise
     if (realRoot === undefined) continue;
     if (realTarget === realRoot) return realTarget;
     const rel = relative(realRoot, realTarget);
-    if (rel !== "" && !rel.startsWith("..") && !isAbsolute(rel)) return realTarget;
+    if (rel !== "" && !escapes(rel)) return realTarget;
   }
   return undefined;
 }
