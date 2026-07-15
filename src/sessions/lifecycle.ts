@@ -563,6 +563,12 @@ export class SessionLifecycle {
   }
 
   private async verifyCwd(endpointId: string, actual: string, expected: string, lease?: EndpointWorkLease): Promise<void> {
+    // The thread's reported cwd almost always already equals the canonical project path the caller
+    // resolved (`expected`). When the strings are identical there is nothing to canonicalize — the
+    // path was already resolved and validated by the caller — so skip the remote resolution
+    // (multiple ssh round-trips over a recovery). Only a genuine drift or a non-canonical cwd string
+    // (`actual !== expected`) needs canonicalization to compare fairly.
+    if (actual === expected) return;
     let canonicalActual: string;
     try { canonicalActual = (await this.prepareExisting(endpointId, actual, lease)).path; }
     catch (error) {
