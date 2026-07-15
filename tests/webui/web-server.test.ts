@@ -42,7 +42,7 @@ async function withServer(run: (base: string, calls: { inputs: Array<{ text: str
   await writeFile(join(staticDir, "index.html"), "<!doctype html><title>ok</title>");
   const uploadsDir = await mkdtemp(join(tmpdir(), "qiyan-webui-up-"));
   const server = createWebServer({
-    host: "127.0.0.1", port: 0, allowLan: false, token: TOKEN, staticDir, bus, reads,
+    host: "127.0.0.1", port: 0, token: TOKEN, staticDir, bus, reads,
     files: { projectDir: () => undefined, fileTarget: () => undefined, maxFileBytes: 1024 },
     uploads: { dir: uploadsDir, maxBytes: 1024, ttlMs: 1e9 },
     submitInput: async (text, target) => { calls.inputs.push({ text, ...(target ? { target } : {}) }); return { ok: true }; },
@@ -58,7 +58,7 @@ test("the server handle is restartable: start → stop → start re-listens and 
   const staticDir = await mkdtemp(join(tmpdir(), "qiyan-webui-"));
   await writeFile(join(staticDir, "index.html"), "<!doctype html><title>ok</title>");
   const server = createWebServer({
-    host: "127.0.0.1", port: 0, allowLan: false, token: TOKEN, staticDir, bus, reads,
+    host: "127.0.0.1", port: 0, token: TOKEN, staticDir, bus, reads,
     files: { projectDir: () => undefined, fileTarget: () => undefined, maxFileBytes: 1024 },
     submitInput: async () => ({ ok: true }), report: () => {},
   });
@@ -186,7 +186,7 @@ test("dispatches a remote session's files over ssh (browse + raw stream)", async
   const staticDir = await mkdtemp(join(tmpdir(), "qiyan-rstatic-"));
   await writeFile(join(staticDir, "index.html"), "ok");
   const server = createWebServer({
-    host: "127.0.0.1", port: 0, allowLan: false, token: TOKEN, staticDir, bus, reads,
+    host: "127.0.0.1", port: 0, token: TOKEN, staticDir, bus, reads,
     files: { projectDir: () => undefined, maxFileBytes: 4096, fileTarget: (n) => (n === "rworker" ? { transport: "remote", projectDir: remoteRoot, host: "testhost" } : undefined) },
     remote: () => ({ sshBinary: ssh, sshRuntimeRoot: sshRt }),
     submitInput: async () => ({ ok: true }), report: () => {},

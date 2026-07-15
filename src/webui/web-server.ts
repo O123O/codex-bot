@@ -90,7 +90,6 @@ const CONTENT_TYPES: Record<string, string> = {
 export interface WebServerOptions {
   host: string;
   port: number;
-  allowLan: boolean;
   token: string;
   staticDir: string;
   bus: WebBus;
@@ -145,7 +144,7 @@ function tokenFromRequest(request: IncomingMessage, url: URL): string | undefine
 }
 
 export function createWebServer(options: WebServerOptions): WebServer {
-  const host = options.allowLan ? options.host : "127.0.0.1";
+  const host = options.host; // WEB_HOST/--host directly; a non-loopback bind prints the warning below
   // Recreated on each start() (and closed+cleared on stop()) so the handle is re-startable for the
   // manual web-UI toggle — a closed ws.Server rejects later handleUpgrade calls.
   let wss: WebSocketServer | undefined;
@@ -381,7 +380,13 @@ export function createWebServer(options: WebServerOptions): WebServer {
       if (poll) clearInterval(poll);
       if (uploadSweep) clearInterval(uploadSweep);
       if (wss) { for (const ws of wss.clients) { try { ws.close(); } catch { /* closing */ } } wss.close(); wss = undefined; }
-      await new Promise<void>((resolve) => { if (!server) { resolve(); return; } server.close(() => resolve()); });
+      await new Promise<void>((resolve) => {
+        if (!server) { resolve(); return; }
+        server.close(() => resolve());
+        // Force-close lingering HTTP keep-alive sockets (a polling browser) so a `web-ui start --port`
+        // rebind or shutdown completes promptly instead of waiting out keepAliveTimeout.
+        server.closeAllConnections?.();
+      });
     },
   };
 }

@@ -11,7 +11,7 @@ export type CliCommand =
   | { command: "weixin-login"; qiyanHome?: string }
   | { command: "config-check"; qiyanHome?: string }
   | { command: "service"; action: ServiceAction; qiyanHome?: string }
-  | { command: "web-ui"; action: WebUiAction; qiyanHome?: string }
+  | { command: "web-ui"; action: WebUiAction; qiyanHome?: string; host?: string; port?: number }
   | { command: "help"; topic: CliHelpTopic }
   | { command: "update" }
   | { command: "version" };
@@ -49,12 +49,12 @@ export function formatCliHelp(topic: CliHelpTopic): string {
     return "QiYan systemd user service\n\nUsage:\n  qiyan-bot service <install|start|stop|restart|status|logs|uninstall>\n  qiyan-bot service install [--home <path>]\n\nThe service runs the foreground bot under systemd; tmux is not required.\nInstallation captures the invoking terminal's PATH; reinstall the service after PATH changes.\nUse `qiyan-bot service logs` to read the latest 100 journal entries.\n";
   }
   if (topic === "web-ui") {
-    return "QiYan web UI (live start/stop)\n\nUsage:\n  qiyan-bot web-ui <start|stop|status> [--home <path>]\n\nToggles the opt-in web UI on the running bot without restarting it (workers and in-flight\nturns keep running); the setting persists across restarts. Requires WEB_UI to be configured.\nUnder systemd only; a foreground bot persists the setting but applies it on next start.\n";
+    return "QiYan web UI (live start/stop)\n\nUsage:\n  qiyan-bot web-ui start [--host <host>] [--port <port>] [--home <path>]\n  qiyan-bot web-ui stop [--home <path>]\n  qiyan-bot web-ui status [--home <path>]\n\nStarts/stops the web UI on the running bot WITHOUT restarting it (workers and in-flight turns\nkeep running); the setting persists across restarts. `start` binds WEB_HOST:WEB_PORT by default\n(127.0.0.1:9520); --host/--port override and are remembered. A non-loopback host is reachable on\nthe LAN over plain HTTP (token still required) and prints a security warning.\n\nLive toggle needs the bot under systemd; a foreground bot persists the setting for its next start.\n";
   }
   if (topic !== "root") {
     return `QiYan ${topic}\n\nUsage:\n  qiyan-bot ${topic} [--home <path>]\n\nOptions:\n  -h, --help     Show help\n  --home <path>  QiYan home directory\n`;
   }
-  return `QiYan personal assistant bot\n\nUsage:\n  qiyan-bot [--home <path>] [--workdir <path>]\n  qiyan-bot assistant-login [--home <path>]\n  qiyan-bot weixin-login [--home <path>]\n  qiyan-bot config-check [--home <path>]\n  qiyan-bot service <action>\n  qiyan-bot web-ui <start|stop|status>\n  qiyan-bot --update\n  qiyan-bot --version\n\nRunning without a command starts the long-lived bot in the foreground.\n\nOptions:\n  -h, --help       Show help\n  --home <path>    QiYan home directory\n  --workdir <path> Assistant working directory (run only)\n  --update         Install the latest GitHub Release\n  --version        Print version\n\nRequires Node.js 24 or newer.\n`;
+  return `QiYan personal assistant bot\n\nUsage:\n  qiyan-bot [--home <path>] [--workdir <path>]\n  qiyan-bot assistant-login [--home <path>]\n  qiyan-bot weixin-login [--home <path>]\n  qiyan-bot config-check [--home <path>]\n  qiyan-bot service <action>\n  qiyan-bot web-ui start [--host <host>] [--port <port>]\n  qiyan-bot web-ui <stop|status>\n  qiyan-bot --update\n  qiyan-bot --version\n\nRunning without a command starts the long-lived bot in the foreground.\n\nOptions:\n  -h, --help       Show help\n  --home <path>    QiYan home directory\n  --workdir <path> Assistant working directory (run only)\n  --update         Install the latest GitHub Release\n  --version        Print version\n\nRequires Node.js 24 or newer.\n`;
 }
 
 const serviceActions = new Set<ServiceAction>(["install", "start", "stop", "restart", "status", "logs", "uninstall"]);
@@ -95,11 +95,42 @@ function parseWebUiArgs(argv: readonly string[]): CliCommand {
     if (argv.length !== 2) throw new AppError("CONFIGURATION_ERROR", "unknown argument");
     return { command: "help", topic: "web-ui" };
   }
-  // --home is valid for every web-ui action (unlike `service`, where only install takes options).
-  const options = parsePathOptions(argv.slice(1), false);
-  return options.qiyanHome === undefined
-    ? { command: "web-ui", action: action as WebUiAction }
-    : { command: "web-ui", action: action as WebUiAction, qiyanHome: options.qiyanHome };
+  // --home is valid for every web-ui action; --host/--port only for `start`.
+  const options = parseWebUiOptions(argv.slice(1), action as WebUiAction);
+  return { command: "web-ui", action: action as WebUiAction, ...options };
+}
+
+function parseWebUiOptions(argv: readonly string[], action: WebUiAction): { qiyanHome?: string; host?: string; port?: number } {
+  let qiyanHome: string | undefined;
+  let host: string | undefined;
+  let port: number | undefined;
+  const requireValue = (flag: string, value: string | undefined): string => {
+    if (!value || value.startsWith("--")) throw new AppError("CONFIGURATION_ERROR", `${flag} requires a value`);
+    return value;
+  };
+  for (let index = 0; index < argv.length; index += 1) {
+    const argument = argv[index]!;
+    if (argument === "--home") {
+      if (qiyanHome !== undefined) throw new AppError("CONFIGURATION_ERROR", "--home may be specified only once");
+      qiyanHome = requireValue("--home", argv[index + 1]); index += 1;
+    } else if (argument === "--host" && action === "start") {
+      if (host !== undefined) throw new AppError("CONFIGURATION_ERROR", "--host may be specified only once");
+      host = requireValue("--host", argv[index + 1]); index += 1;
+    } else if (argument === "--port" && action === "start") {
+      if (port !== undefined) throw new AppError("CONFIGURATION_ERROR", "--port may be specified only once");
+      const raw = requireValue("--port", argv[index + 1]);
+      const parsed = Number(raw);
+      if (!Number.isInteger(parsed) || parsed < 0 || parsed > 65_535) throw new AppError("CONFIGURATION_ERROR", "--port must be an integer between 0 and 65535");
+      port = parsed; index += 1;
+    } else {
+      throw new AppError("CONFIGURATION_ERROR", "unknown argument");
+    }
+  }
+  return {
+    ...(qiyanHome === undefined ? {} : { qiyanHome }),
+    ...(host === undefined ? {} : { host }),
+    ...(port === undefined ? {} : { port }),
+  };
 }
 
 function parsePathOptions(argv: readonly string[], allowWorkdir: boolean): { assistantWorkdir?: string; qiyanHome?: string } {

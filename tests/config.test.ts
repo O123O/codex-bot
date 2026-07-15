@@ -206,9 +206,9 @@ test("claudeLaunchPolicy disables Claude's built-in scheduling and appends the r
   assert.equal(claudeLaunchPolicy(undefined, "low").effort, "low");
 });
 
-test("WEB_UI is off by default and opt-in via env (host/port/allow-lan)", () => {
-  assert.equal(loadConfig(baseEnv(), { qiyanHome }).webUi, undefined);
-  assert.deepEqual(loadConfig(baseEnv({ WEB_UI: "1" }), { qiyanHome }).webUi, { host: "127.0.0.1", port: 4180, allowLan: false });
-  assert.deepEqual(loadConfig(baseEnv({ WEB_UI: "true", WEB_HOST: "0.0.0.0", WEB_PORT: "8080", WEB_ALLOW_LAN: "1" }), { qiyanHome }).webUi, { host: "0.0.0.0", port: 8080, allowLan: true });
-  assert.equal(loadConfig(baseEnv({ WEB_UI: "0" }), { qiyanHome }).webUi, undefined);
+test("web UI default host/port comes from WEB_HOST/WEB_PORT (default 127.0.0.1:9520)", () => {
+  // The web UI is always available (toggled by `web-ui start|stop` + state, not a config flag);
+  // WEB_HOST/WEB_PORT only set the default bind address.
+  assert.deepEqual(loadConfig(baseEnv(), { qiyanHome }).webUi, { host: "127.0.0.1", port: 9520 });
+  assert.deepEqual(loadConfig(baseEnv({ WEB_HOST: "0.0.0.0", WEB_PORT: "8080" }), { qiyanHome }).webUi, { host: "0.0.0.0", port: 8080 });
 });

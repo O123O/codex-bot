@@ -1993,15 +1993,15 @@ export async function buildProductionApp(
   };
 
   // Web UI (opt-in). The bus + token are dependency-free, so create them here and share between
-  // the `web` ChatAdapter (chat-adapters phase) and the web server (web-ui phase). When WEB_UI is
-  // off, both are undefined and nothing is wired.
-  const webBus = config.webUi ? new WebBus() : undefined;
+  // the `web` ChatAdapter (chat-adapters phase) and the web server (web-ui phase). The machinery is
+  // always built; the web server listens only when the persisted state says enabled (off by default,
+  // toggled by `qiyan-bot web-ui start|stop`).
+  const webBus = new WebBus();
   // The access token is PERSISTED under the data dir so it survives restarts — otherwise every restart
   // rotates it and open browser tabs (and their auth cookie) 401 with a stale token. Read lazily so
   // `dataDir` is the finalized root.
   let webTokenCache: string | undefined;
-  const webToken = (): string | undefined => {
-    if (!config.webUi) return undefined;
+  const webToken = (): string => {
     if (webTokenCache) return webTokenCache;
     const path = join(dataDir, "web-token");
     try { const existing = readFileSync(path, "utf8").trim(); if (existing) return (webTokenCache = existing); } catch { /* create below */ }
@@ -2248,15 +2248,14 @@ export async function buildProductionApp(
           weixin = configured.find((adapter) => adapter.delivery.id === "weixin") as WeixinChatAdapter | undefined;
         }
         // The web UI participates as a `web` ChatAdapter (browser ⇄ assistant), so it must be in
-        // `chats` for outbound routing AND admitted into the boot guard's expected set. Added
-        // whenever WEB_UI is on (independent of the test adapter-injection path).
-        const webEnabled = Boolean(config.webUi) && Boolean(webBus);
-        if (webEnabled && webBus) configured.push(createWebAdapter(webBus, webUploads(), (id, appended) => deliveries.appendToBody(id, appended)));
+        // `chats` for outbound routing AND admitted into the boot guard's expected set. Always
+        // registered (the machinery is always built); it only carries traffic when the server listens.
+        configured.push(createWebAdapter(webBus, webUploads(), (id, appended) => deliveries.appendToBody(id, appended)));
         const expectedAdapters = [
           telegramConfig ? "telegram" : undefined,
           config.chat.slack ? "slack" : undefined,
           config.chat.weixin ? "weixin" : undefined,
-          webEnabled ? "web" : undefined,
+          "web", // always registered — the web machinery is always built
         ].filter((id): id is string => Boolean(id)).sort();
         const actualAdapters = configured.map((adapter) => adapter.delivery.id).sort();
         if (!isDeepStrictEqual(actualAdapters, expectedAdapters)) throw new AppError("CONFIGURATION_ERROR", "configured chat adapters do not match chat credentials");
@@ -3011,8 +3010,8 @@ export async function buildProductionApp(
     },
     // The web UI server is last so it starts after every backend it reads is live, and (reverse
     // order) stops first — before the delivery/chat teardown it depends on.
-    ...(config.webUi && webBus ? [createWebUiPhase({
-      host: config.webUi.host, port: config.webUi.port, allowLan: config.webUi.allowLan, token: webToken()!,
+    createWebUiPhase({
+      defaultHost: config.webUi.host, defaultPort: config.webUi.port, token: webToken(),
       staticDir: webuiStaticRoot, bus: webBus,
       reads: {
         registrySnapshot: () => registry.snapshot(),
@@ -3058,7 +3057,7 @@ export async function buildProductionApp(
       acceptChat, report,
       onStarted: (url) => { process.stdout.write(`QiYan web UI listening — open ${url}\n`); options.testing?.onWebUiStarted?.(url); },
       statePath: webUiStatePath(config.qiyanHome),
-    })] : []),
+    }),
   ];
 
   function stopRecoveryOwners(): Promise<void> {

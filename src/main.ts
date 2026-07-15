@@ -12,7 +12,7 @@ import { createNodeWeixinLoginTerminal, runWeixinLogin } from "./chat-apps/weixi
 import { bootstrapWeixin } from "./chat-apps/weixin/bootstrap.ts";
 import { buildServiceEffectiveEnvironment, readServiceMainPid, SystemdUserService } from "./service/systemd-user.ts";
 import { installWebUiSignalHandler } from "./webui/webui-signal.ts";
-import { readWebUiEnabled, webUiStatePath, writeWebUiEnabled } from "./webui/webui-state.ts";
+import { readWebUiState, webUiStatePath, writeWebUiState, type WebUiState } from "./webui/webui-state.ts";
 import { AppError } from "./core/errors.ts";
 import { createOperationalLogSink } from "./core/operational-log.ts";
 import { readFileSync } from "node:fs";
@@ -101,8 +101,10 @@ export async function main(
     const config = loadConfig(loaded.values, { qiyanHome: loaded.qiyanHome, weixinConfigured: weixin.configured });
     await runWebUiCommand(command.action, {
       qiyanHome: loaded.qiyanHome,
-      ...(config.webUi ? { webUi: { host: config.webUi.host, port: config.webUi.port } } : {}),
+      defaults: { host: config.webUi.host, port: config.webUi.port },
       dataDir: config.dataDir,
+      ...(command.host === undefined ? {} : { host: command.host }),
+      ...(command.port === undefined ? {} : { port: command.port }),
       mainPid: () => readServiceMainPid(env),
       signal: (pid) => { try { process.kill(pid, "SIGUSR2"); return true; } catch { return false; } },
       readToken: (dataDir) => { try { return readFileSync(join(dataDir, "web-token"), "utf8").trim() || undefined; } catch { return undefined; } },
@@ -125,48 +127,64 @@ export async function main(
 
 export interface WebUiCommandDeps {
   qiyanHome: string;
-  webUi?: { host: string; port: number }; // undefined ⇒ WEB_UI not configured
+  defaults: { host: string; port: number }; // env WEB_HOST/WEB_PORT — fallback when state has no override
   dataDir: string;
+  host?: string; // --host override (start only)
+  port?: number; // --port override (start only)
   mainPid(): Promise<number | undefined>; // the running bot's main PID, or undefined
   signal(pid: number): boolean; // deliver SIGUSR2; false on ESRCH (PID died)
   readToken(dataDir: string): string | undefined; // best-effort persisted web token
   write(text: string): void;
 }
 
-// `qiyan-bot web-ui start|stop|status`. start/stop persist the desired state atomically and, when
-// the bot is running, signal it to reconcile live (no restart). Signalling is safe regardless of
-// config because the running bot always installs a SIGUSR2 handler (see installWebUiSignalHandler);
-// the config guard here is UX only.
+// `qiyan-bot web-ui start|stop|status`. start/stop persist the control state atomically (merging any
+// --host/--port over the saved value) and, when the bot is running, signal it to reconcile live (no
+// restart). Signalling is always safe — the running bot installs its SIGUSR2 handler unconditionally
+// (see installWebUiSignalHandler).
 export async function runWebUiCommand(action: WebUiAction, deps: WebUiCommandDeps): Promise<void> {
   const statePath = webUiStatePath(deps.qiyanHome);
+  const effective = (state: WebUiState | undefined): { host: string; port: number } => ({
+    host: state?.host ?? deps.defaults.host,
+    port: state?.port ?? deps.defaults.port,
+  });
+
   if (action === "status") {
-    let desired: string;
-    try { desired = readWebUiEnabled(statePath) ? "enabled" : "disabled"; }
-    catch { desired = "unreadable (kept as-is)"; }
+    let state: WebUiState | undefined;
+    let unreadable = false;
+    try { state = readWebUiState(statePath); } catch { unreadable = true; }
+    const { host, port } = effective(state);
     const pid = await deps.mainPid();
-    const lines = [
-      `Web UI: ${deps.webUi ? "configured" : "not configured (set WEB_UI=1 and restart)"}`,
-      `Desired: ${desired}`,
+    const token = deps.readToken(deps.dataDir);
+    const base = `http://${host}:${port}`;
+    deps.write([
+      `Enabled: ${unreadable ? "unreadable (kept as-is)" : state!.enabled ? "yes" : "no"}`,
+      `Host/port: ${host}:${port}${state?.host === undefined && state?.port === undefined ? " (env/default)" : ""}`,
       `Bot service: ${pid === undefined ? "not running" : `running (pid ${pid})`}`,
-    ];
-    if (deps.webUi) {
-      const base = `http://${deps.webUi.host}:${deps.webUi.port}`;
-      const token = deps.readToken(deps.dataDir);
-      lines.push(`URL: ${token ? `${base}/?token=${token}` : `${base} (token shown by: qiyan-bot service logs)`}`);
-    }
-    deps.write(`${lines.join("\n")}\n`);
+      `URL: ${token ? `${base}/?token=${token}` : `${base} (token shown by: qiyan-bot service logs)`}`,
+    ].join("\n") + "\n");
     return;
   }
-  if (!deps.webUi) {
-    deps.write("Web UI is not configured; set WEB_UI=1 (and WEB_HOST/WEB_PORT) in <qiyanHome>/.env and restart.\n");
-    return;
+
+  // start | stop: merge over the existing state (recover from a corrupt file by starting fresh).
+  let existing: WebUiState;
+  try { existing = readWebUiState(statePath); } catch { existing = { enabled: false }; }
+  const next: WebUiState = { ...existing, enabled: action === "start" };
+  if (action === "start") {
+    if (deps.host !== undefined) next.host = deps.host;
+    if (deps.port !== undefined) next.port = deps.port;
   }
-  writeWebUiEnabled(statePath, action === "start");
+  writeWebUiState(statePath, next);
+
+  const { host, port } = effective(next);
+  const where = action === "start" ? ` on ${host}:${port}` : "";
   const pid = await deps.mainPid();
   const signalled = pid !== undefined && deps.signal(pid);
   deps.write(signalled
-    ? `Web UI ${action === "start" ? "started" : "stopped"}.\n`
-    : "Saved; the bot is not running — it will apply on next start.\n");
+    ? `Web UI ${action === "start" ? "started" : "stopped"}${where}.\n`
+    : `Saved${where}; the bot is not running — it will apply on next start.\n`);
+  if (action === "start" && host !== "127.0.0.1") {
+    deps.write(`Warning: ${host} is non-loopback — the web UI is reachable on the LAN over plain HTTP (token required). Prefer 127.0.0.1 + an ssh tunnel.\n`);
+  }
 }
 
 interface ServiceProcessControl {

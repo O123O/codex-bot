@@ -6,62 +6,54 @@ import { join } from "node:path";
 import test from "node:test";
 import type { BotApp } from "../src/app.ts";
 import { requestServiceRestart, runForegroundApp, runWebUiCommand, type WebUiCommandDeps } from "../src/main.ts";
-import { readWebUiEnabled, webUiStatePath } from "../src/webui/webui-state.ts";
+import { readWebUiState, webUiStatePath } from "../src/webui/webui-state.ts";
 
-test("web-ui start persists the state and signals a running bot", async () => {
+const webUiDeps = (dir: string, over: Partial<WebUiCommandDeps> = {}): WebUiCommandDeps => ({
+  qiyanHome: dir, defaults: { host: "127.0.0.1", port: 9520 }, dataDir: dir,
+  mainPid: async () => 999, signal: () => true, readToken: () => "tok", write: () => {},
+  ...over,
+});
+
+test("web-ui start enables + signals the running bot, defaulting host/port to env", async () => {
   const dir = await mkdtemp(join(tmpdir(), "qiyan-webui-cmd-"));
   const writes: string[] = [];
   let signalled: number | undefined;
-  const deps: WebUiCommandDeps = {
-    qiyanHome: dir, webUi: { host: "127.0.0.1", port: 4180 }, dataDir: dir,
-    mainPid: async () => 999, signal: (pid) => { signalled = pid; return true; },
-    readToken: () => "tok", write: (t) => writes.push(t),
-  };
-  await runWebUiCommand("start", deps);
+  await runWebUiCommand("start", webUiDeps(dir, { signal: (pid) => { signalled = pid; return true; }, write: (t) => writes.push(t) }));
   assert.equal(signalled, 999);
-  assert.equal(readWebUiEnabled(webUiStatePath(dir)), true);
-  assert.match(writes.join(""), /Web UI started/u);
+  assert.deepEqual(readWebUiState(webUiStatePath(dir)), { enabled: true }, "no host/port override persisted");
+  assert.match(writes.join(""), /Web UI started on 127\.0\.0\.1:9520/u);
 });
 
-test("web-ui does not signal when the web UI is not configured", async () => {
+test("web-ui start --host --port overrides env, persists, and warns on non-loopback", async () => {
   const dir = await mkdtemp(join(tmpdir(), "qiyan-webui-cmd-"));
   const writes: string[] = [];
-  let signalled = false;
-  await runWebUiCommand("stop", {
-    qiyanHome: dir, dataDir: dir, // webUi omitted ⇒ not configured
-    mainPid: async () => 999, signal: () => { signalled = true; return true; },
-    readToken: () => undefined, write: (t) => writes.push(t),
-  });
-  assert.equal(signalled, false, "must not signal a bot that has no web-ui machinery");
-  assert.match(writes.join(""), /not configured/u);
+  await runWebUiCommand("start", webUiDeps(dir, { host: "0.0.0.0", port: 8420, write: (t) => writes.push(t) }));
+  assert.deepEqual(readWebUiState(webUiStatePath(dir)), { enabled: true, host: "0.0.0.0", port: 8420 });
+  const out = writes.join("");
+  assert.match(out, /Web UI started on 0\.0\.0\.0:8420/u);
+  assert.match(out, /non-loopback/u);
 });
 
-test("web-ui stop persists but does not signal when the bot is not running", async () => {
+test("web-ui stop keeps the saved host/port but does not signal when the bot is not running", async () => {
   const dir = await mkdtemp(join(tmpdir(), "qiyan-webui-cmd-"));
+  await runWebUiCommand("start", webUiDeps(dir, { host: "0.0.0.0", port: 8420 })); // seed an override
   const writes: string[] = [];
   let signalled = false;
-  await runWebUiCommand("stop", {
-    qiyanHome: dir, webUi: { host: "h", port: 1 }, dataDir: dir,
-    mainPid: async () => undefined, signal: () => { signalled = true; return true; },
-    readToken: () => undefined, write: (t) => writes.push(t),
-  });
+  await runWebUiCommand("stop", webUiDeps(dir, { mainPid: async () => undefined, signal: () => { signalled = true; return true; }, write: (t) => writes.push(t) }));
   assert.equal(signalled, false);
-  assert.equal(readWebUiEnabled(webUiStatePath(dir)), false, "state persisted for next start");
+  assert.deepEqual(readWebUiState(webUiStatePath(dir)), { enabled: false, host: "0.0.0.0", port: 8420 }, "override preserved for next start");
   assert.match(writes.join(""), /apply on next start/u);
 });
 
-test("web-ui status reports configured/desired/running and the URL", async () => {
+test("web-ui status reports enabled/host-port/running/URL", async () => {
   const dir = await mkdtemp(join(tmpdir(), "qiyan-webui-cmd-"));
   const writes: string[] = [];
-  await runWebUiCommand("status", {
-    qiyanHome: dir, webUi: { host: "127.0.0.1", port: 4180 }, dataDir: dir,
-    mainPid: async () => 777, signal: () => true, readToken: () => "tok", write: (t) => writes.push(t),
-  });
+  await runWebUiCommand("status", webUiDeps(dir, { mainPid: async () => 777, readToken: () => "tok", write: (t) => writes.push(t) }));
   const out = writes.join("");
-  assert.match(out, /Web UI: configured/u);
-  assert.match(out, /Desired: enabled/u); // absent state file ⇒ enabled
+  assert.match(out, /Enabled: no/u); // absent state ⇒ off by default
+  assert.match(out, /Host\/port: 127\.0\.0\.1:9520 \(env\/default\)/u);
   assert.match(out, /running \(pid 777\)/u);
-  assert.match(out, /http:\/\/127\.0\.0\.1:4180\/\?token=tok/u);
+  assert.match(out, /http:\/\/127\.0\.0\.1:9520\/\?token=tok/u);
 });
 
 test("service restart requests a nonzero graceful SIGTERM", () => {

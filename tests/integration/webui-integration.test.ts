@@ -6,9 +6,11 @@ import test from "node:test";
 import type { BotConfig } from "../../src/config.ts";
 import type { ChatAdapter } from "../../src/chat-apps/shared/contracts.ts";
 import { buildProductionApp } from "../../src/production-app.ts";
+import { webUiStatePath, writeWebUiState } from "../../src/webui/webui-state.ts";
 
-// Real end-to-end: builds the full production app (real codex assistant app-server) with WEB_UI on,
-// and drives the web HTTP/WS surface. RUN_WEBUI_INTEGRATION=1 (needs codex auth on the host).
+// Real end-to-end: builds the full production app (real codex assistant app-server) with the web UI
+// enabled via saved state, and drives the web HTTP/WS surface. RUN_WEBUI_INTEGRATION=1 (needs codex
+// auth on the host).
 const enabled = process.env.RUN_WEBUI_INTEGRATION === "1";
 
 function fakeSlackAdapter(): ChatAdapter {
@@ -28,6 +30,7 @@ test("the web UI serves live bot state and enforces the token", { skip: !enabled
   await copyFile(join(userHome, ".qiyan-bot", "data", "assistant-profile", "codex", "auth.json"), authTarget);
   await chmod(authTarget, 0o600);
   await mkdir(join(root, "qiyan-home"), { recursive: true, mode: 0o700 });
+  writeWebUiState(webUiStatePath(join(root, "qiyan-home")), { enabled: true }); // web UI is off by default; turn it on
 
   const config: BotConfig = {
     qiyanHome: join(root, "qiyan-home"),
@@ -36,7 +39,7 @@ test("the web UI serves live bot state and enforces the token", { skip: !enabled
     sessionRegistryPath: join(dataDir, "sessions.json"), endpointCatalogPath: join(root, "qiyan-home", "endpoints.json"),
     codexBinary: "codex", maxConcurrentTurns: 4, maxCollectCount: 20, mcpHost: "127.0.0.1", mcpPort: 0,
     attachmentMaxBytes: 1024 * 1024, attachmentStoreMaxBytes: 8 * 1024 * 1024, assistantSandboxMode: "read-only",
-    webUi: { host: "127.0.0.1", port: 0, allowLan: false },
+    webUi: { host: "127.0.0.1", port: 0 },
   };
 
   let webUrl = "";
