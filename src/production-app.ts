@@ -2920,9 +2920,13 @@ export async function buildProductionApp(
         await reconcileOperations();
         conversations.repairQueueNotices();
         await reconcileStartupLifecycleState();
-        await resumeStartupManagedSessions();
+        const backgroundedRecovery = await resumeStartupManagedSessions();
         for (const endpointId of [...new Set(recoveredEndpointIds)]) {
+          // Endpoints whose managed recovery was backgrounded own their per-endpoint reconcile
+          // (ownership + relay + claims) inside that background task — skip them here so this
+          // synchronous loop can't race/redo it or block on a still-recovering endpoint.
           if (endpointId === assistantEndpoint.id || activation.unavailable.includes(endpointId)
+            || backgroundedRecovery.has(endpointId)
             || lifecycleOwnedEndpointIds().has(endpointId) || endpointManager.desiredState(endpointId) !== "automatic") continue;
           await reconcileOwnershipBeforeRelayWithLease(endpointManager, ownershipWatcher, relay, endpointId, async (lease) => {
             await pool.reconcileEndpointClaims(
@@ -4138,11 +4142,43 @@ export async function buildProductionApp(
     for (const endpointId of endpointIds) await reconcileLifecycleState({ endpointId });
   }
 
-  async function resumeStartupManagedSessions(): Promise<void> {
+  async function resumeStartupManagedSessions(): Promise<Set<string>> {
     const excluded = lifecycleOwnedEndpointIds();
     const endpointIds = [...new Set(Object.values(registry.managedSnapshot().sessions).map((session) => session.endpoint))]
       .filter((endpointId) => !excluded.has(endpointId) && endpointManager.desiredState(endpointId) === "automatic");
-    for (const endpointId of endpointIds) await resumeManagedEndpoint(endpointId);
+    const managedEndpoints = new Set(endpointIds);
+    // SYNCHRONOUS gate-close (the linchpin): flip every managed session to "unavailable" (DB-only, no
+    // network) BEFORE returning. dispatch (SESSION_DETACHED), delivery (non-deliverable), the ownership
+    // watcher, and the scheduler all treat "unavailable" as hands-off, so nothing drives/delivers/
+    // releases a session before its recovery re-verifies native liveness + re-scans ownership for an
+    // external turn. Leaving sessions "managed" while recovery is backgrounded would reopen the
+    // duplicate-delivery window — so this flip MUST stay synchronous.
+    for (const session of Object.values(registry.managedSnapshot().sessions)) {
+      if (!managedEndpoints.has(session.endpoint)) continue;
+      const state = runtime.getSession(session.endpoint, session.thread_id, session.mapping_id);
+      if (state?.managementState === "managed") {
+        runtime.setSession(session.endpoint, session.thread_id, session.mapping_id, "unavailable", state.nativeStatus);
+      }
+    }
+    // Recover each endpoint in the BACKGROUND — startup must not wait for session recovery, which
+    // re-verifies each session over the app-server (ssh for remote, minutes when the cluster is slow).
+    // Each session stays "unavailable" (hands-off) until its endpoint's background recovery re-opens
+    // it; failures are surfaced (background_task_failed) and the endpoint's managedRecoveryOwner keeps
+    // retrying. On-demand callers (a send to an unrecovered session) get SESSION_DETACHED and, for
+    // scheduled drives, a proven-not-dispatched retry — never a lost or duplicated delivery.
+    for (const endpointId of endpointIds) {
+      runBackground(() => resumeManagedEndpoint(endpointId), (error) => reportOperationalSafely(report, {
+        level: "warn", code: "background_task_failed", component: "managed_recovery",
+        reason: `background managed recovery of ${endpointId} failed: ${error instanceof Error ? error.message : String(error)}`,
+      }));
+      // Claim this endpoint's recovery for the background task: remove it from the ready buffer's
+      // pending set so the synchronous acceptAndDrain() below doesn't kick a second, concurrent
+      // recoverProjectEndpoint for it. Failures are still retried by managedRecoveryOwner, and a later
+      // endpoint-ready event re-arms the buffer normally. (resumeManagedEndpoint also acknowledges at
+      // the end — idempotent.)
+      endpointReadyBuffer?.acknowledge(endpointId);
+    }
+    return managedEndpoints;
   }
 
   async function resumeManagedEndpoint(endpointId: string, requireAcknowledged = false): Promise<void> {
