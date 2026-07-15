@@ -2582,14 +2582,21 @@ export async function buildProductionApp(
         // Bind the shared locality predicate to this deployment's local Claude endpoint id,
         // then inject it into the workspace router, rollout-access, and worker file bridge.
         const isLocalEndpoint = (id: string): boolean => isLocalEndpointId(id, localClaudeDef?.id);
+        // Reuse the ProjectWorkspacePolicy (and its SshHost + resolved-constant cache) while the
+        // endpoint's remote context is unchanged. A new generation installs a fresh RemoteContext
+        // (bindProjectEndpoint), so the `=== context` check rebuilds — never handing back a policy
+        // bound to a torn-down transport. ensureReady() still gates every lookup onto a ready generation.
+        const remotePolicyCache = new Map<string, { context: RemoteContext; policy: ProjectWorkspacePolicy }>();
         workspaceRouter = new WorkspaceRouter(async (id) => {
           if (isLocalEndpoint(id)) return projectWorkspaces;
           await endpointManager.ensureReady(id);
           const context = remoteContexts.get(id);
           if (!context) throw new AppError("ENDPOINT_UNAVAILABLE", `SSH workspace host is unavailable: ${id}`);
+          const cached = remotePolicyCache.get(id);
+          if (cached && cached.context === context) return cached.policy;
           const home = context.host.remoteHome;
           const projectsRoot = context.projectsRoot.startsWith("~/") ? posix.resolve(home, context.projectsRoot.slice(2)) : posix.resolve(context.projectsRoot);
-          return new ProjectWorkspacePolicy({
+          const policy = new ProjectWorkspacePolicy({
             userHome: home,
             qiyanHome: context.host.remoteRuntimeDir,
             assistantWorkdir: context.host.remoteRuntimeDir,
@@ -2598,6 +2605,8 @@ export async function buildProductionApp(
             defaultProjectsRoot: projectsRoot,
             host: new SshHost(id, context.remote, context.host.remoteHelperPath),
           });
+          remotePolicyCache.set(id, { context, policy });
+          return policy;
         }, (id, lease) => endpointManager.validateWorkLease(lease, id));
         workerFiles = new WorkerFileBridge({
           attachments,
