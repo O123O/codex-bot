@@ -7,6 +7,7 @@ import rehypeKatex from "rehype-katex";
 import hljs from "highlight.js/lib/common";
 import "katex/dist/katex.min.css";
 import { formatGoalStatus, selectedWorkerGoal, type WorkerGoal } from "./goal-presentation";
+import { createBrowserUuid } from "./browser-uuid";
 import { STYLES } from "./styles";
 import { workerStatus } from "./worker-status";
 import {
@@ -260,11 +261,11 @@ export function App() {
     if (!socket || socket.readyState !== WebSocket.OPEN) return;
     if (!nickname) {
       replaceWorker(null);
-      socket.send(JSON.stringify({ type: "worker/unsubscribe", requestId: crypto.randomUUID() }));
+      socket.send(JSON.stringify({ type: "worker/unsubscribe", requestId: createBrowserUuid() }));
       return;
     }
     const session = sessionsRef.current.find((candidate) => candidate.nickname === nickname);
-    const requestId = crypto.randomUUID();
+    const requestId = createBrowserUuid();
     const previous = workerRef.current;
     const next = beginWorkerSubscription(nickname, session?.provider ?? "codex", requestId);
     replaceWorker(previous?.nickname === nickname ? { ...next, messages: previous.messages.filter((message) => message.optimistic) } : next);
@@ -414,11 +415,11 @@ export function App() {
     const target = redirect ?? selected ?? undefined;
     const body = redirect ? m![2] : t;
     setText(""); setSuggest([]); stickRef.current = true;
-    const clientInputId = target ? crypto.randomUUID() : undefined;
+    const clientInputId = target ? createBrowserUuid() : undefined;
     const active = workerRef.current;
     if (target && target === selected && clientInputId) {
       const session = sessions.find((candidate) => candidate.nickname === target);
-      const timeline = active?.nickname === target ? active : beginWorkerSubscription(target, session?.provider ?? "codex", crypto.randomUUID());
+      const timeline = active?.nickname === target ? active : beginWorkerSubscription(target, session?.provider ?? "codex", createBrowserUuid());
       replaceWorker(addOptimisticWorkerMessage(timeline, `to:web:${clientInputId}`, body, Date.now()));
     } else {
       push(key, { role: "you", body: redirect && redirect !== selected ? `→ @${redirect}  ${body}` : body, at: Date.now() });
