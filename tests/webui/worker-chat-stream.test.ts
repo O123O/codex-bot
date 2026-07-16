@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 import {
   acknowledgeWorkerSubscription,
@@ -11,6 +12,9 @@ import {
   failWorkerHistory,
   requeueWorkerRecovery,
   receiveWorkerEvent,
+  retainWorkerDraftMessages,
+  storeWorkerDraftMessages,
+  takeWorkerDraftMessages,
   type WorkerEventEnvelope,
 } from "../../webui-client/src/worker-chat-stream.ts";
 
@@ -33,6 +37,107 @@ test("agent deltas accumulate into one draft and item completion replaces it aut
   assert.deepEqual(state.messages.map((message) => [message.id, message.body, message.streaming, message.phase]), [["a:turn:a1", "complete", false, "final_answer"]]);
   state = receiveWorkerEvent(state, envelope({ kind: "agent-message-delta", turnId: "turn", itemId: "a1", delta: "duplicate" }));
   assert.equal(state.messages[0]!.body, "complete");
+});
+
+test("switching away and back retains only the running turn transcript", () => {
+  let state = acknowledgeWorkerSubscription(beginWorkerSubscription("worker", "codex", ids.requestId), ids.subscriptionId);
+  state = applyWorkerSnapshot(state, {
+    messages: [{ id: "a:done:a1", turnId: "done", body: "old", completedAt: 1, terminalStatus: "completed", turnOrder: 0, itemOrder: 0 }],
+    hasOlder: false, terminalTurnIds: ["done"], openTurnIds: [],
+  });
+  state = receiveWorkerEvent(state, envelope({ kind: "item-completed", turnId: "running", item: { type: "user-message", id: "u1", text: "question" } }));
+  state = receiveWorkerEvent(state, envelope({ kind: "agent-message-delta", turnId: "running", itemId: "a2", delta: "working" }));
+
+  const retained = retainWorkerDraftMessages(state);
+  const restored = beginWorkerSubscription("worker", "codex", crypto.randomUUID(), retained);
+
+  assert.deepEqual(restored.messages.map((message) => [message.body, message.streaming]), [
+    ["question", false],
+    ["working", true],
+  ]);
+});
+
+test("a fresh snapshot prunes retained rows that belong to a replaced worker", () => {
+  let old = acknowledgeWorkerSubscription(beginWorkerSubscription("worker", "codex", ids.requestId), ids.subscriptionId);
+  old = receiveWorkerEvent(old, envelope({ kind: "item-completed", turnId: "old-turn", item: { type: "user-message", id: "u1", text: "old question" } }));
+  const retained = retainWorkerDraftMessages(old);
+  let replacement = beginWorkerSubscription("worker", "codex", crypto.randomUUID(), retained);
+  replacement = applyWorkerSnapshot(replacement, { messages: [], hasOlder: false, terminalTurnIds: [], openTurnIds: [] });
+  assert.deepEqual(replacement.messages, []);
+  assert.deepEqual(replacement.retainedMessageIds, []);
+});
+
+test("a replacement mapping cannot inherit an optimistic row", () => {
+  let old = beginWorkerSubscription("worker", "codex", ids.requestId, [], "mapping-old");
+  old = addOptimisticWorkerMessage(old, "to:web:old", "old question", 1);
+  const cache = new Map();
+  storeWorkerDraftMessages(cache, old);
+  assert.deepEqual(takeWorkerDraftMessages(cache, "worker", "mapping-new"), []);
+
+  let restored = beginWorkerSubscription("worker", "codex", crypto.randomUUID(), retainWorkerDraftMessages(old), "mapping-old");
+  restored = addOptimisticWorkerMessage(restored, "to:web:fresh", "new question", 2);
+  const rebound = acknowledgeWorkerSubscription(restored, crypto.randomUUID(), "mapping-new");
+  assert.deepEqual(rebound.messages.map((message) => [message.clientId, message.body]), [["to:web:fresh", "new question"]]);
+  assert.deepEqual(rebound.retainedMessageIds, []);
+});
+
+test("the selected panel resubscribes when its mapping identity changes", async () => {
+  const source = await readFile(new URL("../../webui-client/src/App.tsx", import.meta.url), "utf8");
+  assert.match(source, /const selectedMappingId = selected === null \? null : sessions\.find\([^;]+\?\.mappingId \?\? null;/u);
+  assert.match(source, /\}, \[selected, selectedMappingId, subscribeWorker, loadDir\]\);/u);
+  assert.match(source, /active\?\.nickname === target && active\.mappingId === mappingId/u);
+});
+
+test("terminal proof drops a retained partial item omitted from the bounded page", () => {
+  const retained = [{
+    id: "a:turn:a", turnId: "turn", body: "partial", completedAt: 1,
+    terminalStatus: "", role: "worker" as const, streaming: true, optimistic: false,
+  }];
+  let state = beginWorkerSubscription("worker", "codex", ids.requestId, retained);
+  state = applyWorkerSnapshot(state, { messages: [], hasOlder: true, terminalTurnIds: ["turn"], openTurnIds: [] });
+  assert.deepEqual(state.messages, []);
+});
+
+test("inactive worker drafts use a byte-bounded four-worker LRU", () => {
+  const cache = new Map();
+  for (let index = 0; index < 5; index += 1) {
+    const state = {
+      ...beginWorkerSubscription(`worker-${index}`, "codex", crypto.randomUUID()),
+      messages: [{
+        id: `a:turn-${index}:a`, turnId: `turn-${index}`, body: "draft", completedAt: index,
+        terminalStatus: "", role: "worker" as const, streaming: true, optimistic: false,
+      }],
+    };
+    storeWorkerDraftMessages(cache, state);
+  }
+  assert.equal(cache.size, 4);
+  assert.deepEqual(takeWorkerDraftMessages(cache, "worker-0", ""), []);
+  assert.deepEqual(takeWorkerDraftMessages(cache, "worker-4", "").map((message) => message.body), ["draft"]);
+  assert.equal(cache.size, 3);
+
+  const oversized = {
+    ...beginWorkerSubscription("huge", "codex", crypto.randomUUID()),
+    messages: [{
+      id: "a:huge:a", turnId: "huge", body: "x".repeat(512 * 1024), completedAt: 1,
+      terminalStatus: "", role: "worker" as const, streaming: true, optimistic: false,
+    }],
+  };
+  storeWorkerDraftMessages(cache, oversized);
+  assert.deepEqual(takeWorkerDraftMessages(cache, "huge", ""), []);
+
+  cache.clear();
+  for (let index = 0; index < 3; index += 1) {
+    const state = {
+      ...beginWorkerSubscription(`large-${index}`, "codex", crypto.randomUUID()),
+      messages: [{
+        id: `a:large-${index}:a`, turnId: `large-${index}`, body: "x".repeat(400 * 1024), completedAt: index,
+        terminalStatus: "", role: "worker" as const, streaming: true, optimistic: false,
+      }],
+    };
+    storeWorkerDraftMessages(cache, state);
+  }
+  assert.equal(cache.size, 2);
+  assert.deepEqual(takeWorkerDraftMessages(cache, "large-0", ""), []);
 });
 
 test("snapshot merge trusts terminal items and recovers only a true mid-turn join", () => {

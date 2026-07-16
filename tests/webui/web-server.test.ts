@@ -89,6 +89,7 @@ test("serves the session list but never reads worker history without an active s
   await withServer(async (base) => {
     const list = await (await fetch(`${base}/api/sessions?token=${TOKEN}`)).json();
     assert.deepEqual(list.sessions.map((s: { nickname: string }) => s.nickname), ["payments"]);
+    assert.equal(list.sessions[0].mappingId, "m1");
     assert.equal(list.sessions[0].provider, "codex");
     assert.deepEqual(list.sessions[0].goal, { objective: "ship it", status: "active" });
 
@@ -237,6 +238,7 @@ test("worker history requires the exact active WS subscription and tab switching
     const subscribed = await ack;
     assert.equal(subscribed.requestId, requestId);
     assert.match(subscribed.subscriptionId, /^[0-9a-f-]{36}$/u);
+    assert.equal(subscribed.mappingId, "m1");
 
     assert.equal((await fetch(`${base}/api/sessions/payments/messages?token=${TOKEN}`)).status, 409);
     const page = await (await fetch(`${base}/api/sessions/payments/messages?subscriptionId=${subscribed.subscriptionId}&token=${TOKEN}`)).json();

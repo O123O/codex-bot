@@ -47,8 +47,11 @@ does not copy those items into its own persistence.
 - Selecting a worker subscribes before requesting its history snapshot. Live
   events received while that snapshot is in flight are buffered by the client,
   then merged after the snapshot using stable turn/item IDs and terminal state.
-- Switching workers discards the old panel's transient state and subscription.
-  Returning later performs a fresh lazy snapshot.
+- Switching workers discards the old subscription and retains only a small,
+  globally byte-bounded LRU of nonterminal display rows in browser memory.
+  Entries are bound to the immutable registry mapping ID. Returning later
+  validates those rows against a fresh lazy snapshot; inactive workers receive
+  no events or history reads.
 - A WebSocket reconnect re-subscribes to the current foreground worker and takes
   a fresh snapshot. No server-side event ring is required for the first version.
 - Worker events are inspected and sent only when at least one Web UI socket is
@@ -136,7 +139,10 @@ The snapshot response identifies terminal turn IDs and any open turn IDs:
   already-finalized item are ignored.
 - Rows from an open snapshot turn are not installed. Buffered events for that
   turn build the forward stream from subscription time; `item/completed`
-  eventually supplies the authoritative full item text.
+  eventually supplies the authoritative full item text. A tab switch retains
+  only the foreground reducer's bounded nonterminal display rows in browser
+  memory, so already-rendered user and agent text does not blink away when the
+  user returns; the inactive worker still receives no events or history reads.
 - Opening midway through a turn can omit items that completed before the
   subscription. For each open snapshot turn, the client first checks its buffered
   events: a matching `turn-started` proves the turn was fully observed after the

@@ -22,6 +22,10 @@ import {
   finishWorkerHistory,
   receiveWorkerEvent,
   requeueWorkerRecovery,
+  retainWorkerDraftMessages,
+  storeWorkerDraftMessages,
+  takeWorkerDraftMessages,
+  type WorkerDraftCache,
   type WorkerEventEnvelope,
   type WorkerSnapshot,
   type WorkerStreamState,
@@ -42,7 +46,7 @@ const REVEAL_STEP = 20;      // reveal step when scrolling into in-memory histor
 const TOP_PX = 120, BOTTOM_PX = 80;
 const RECOVERY_RETRY_MS = [500, 1_500, 4_000] as const;
 
-interface Session { nickname: string; endpoint: string; provider: string; projectDir: string; lifecycleState: string; nativeStatus: string | null; activeTurnId: string | null; model: string | null; goal: WorkerGoal | null; }
+interface Session { nickname: string; mappingId: string; endpoint: string; provider: string; projectDir: string; lifecycleState: string; nativeStatus: string | null; activeTurnId: string | null; model: string | null; goal: WorkerGoal | null; }
 interface Msg { id?: string; body: string; completedAt?: number; terminalStatus?: string; role?: "you" | "assistant" | "worker"; at?: number; origin?: string; phase?: string; streaming?: boolean; turnOrder?: number; itemOrder?: number; }
 type FileResult = { kind: "dir"; path: string; entries: Array<{ name: string; type: "dir" | "file" | "other" }> } | { kind: "file"; path: string; content: string; truncated: boolean; encoding: string } | { error: string };
 interface GitStatus { branch: string; ahead: number; behind: number; staged: string[]; changes: string[]; untracked: string[] }
@@ -164,9 +168,11 @@ export function App() {
   const stickRef = useRef(true);                   // whether to stay pinned to the bottom
   const key = selected ?? ASSIST;
   const goal = selectedWorkerGoal(sessions, selected);
+  const selectedMappingId = selected === null ? null : sessions.find((session) => session.nickname === selected)?.mappingId ?? null;
   const selectedRef = useRef(selected); selectedRef.current = selected; // for the WS handler's stale closure
   const sessionsRef = useRef(sessions); sessionsRef.current = sessions;
   const workerRef = useRef<WorkerStreamState | null>(workerChat); workerRef.current = workerChat;
+  const workerDraftsRef = useRef<WorkerDraftCache>(new Map());
   const wsRef = useRef<WebSocket | null>(null);
   const workerPageLoaderRef = useRef<((nickname: string, subscriptionId: string, snapshotPending: boolean, before?: string, recoveredTurnId?: string) => Promise<void>) | null>(null);
   const recoveryRetriesRef = useRef(new Map<string, { attempt: number; timer: number }>());
@@ -259,16 +265,24 @@ export function App() {
   const subscribeWorker = useCallback((socket: WebSocket | null, nickname: string | null) => {
     clearRecoveryRetries();
     if (!socket || socket.readyState !== WebSocket.OPEN) return;
+    const previous = workerRef.current;
+    const session = nickname ? sessionsRef.current.find((candidate) => candidate.nickname === nickname) : undefined;
+    const mappingId = session?.mappingId ?? "";
+    const sameWorker = previous?.nickname === nickname && previous.mappingId === mappingId;
+    if (previous && !sameWorker) {
+      storeWorkerDraftMessages(workerDraftsRef.current, previous);
+    }
     if (!nickname) {
       replaceWorker(null);
       socket.send(JSON.stringify({ type: "worker/unsubscribe", requestId: createBrowserUuid() }));
       return;
     }
-    const session = sessionsRef.current.find((candidate) => candidate.nickname === nickname);
     const requestId = createBrowserUuid();
-    const previous = workerRef.current;
-    const next = beginWorkerSubscription(nickname, session?.provider ?? "codex", requestId);
-    replaceWorker(previous?.nickname === nickname ? { ...next, messages: previous.messages.filter((message) => message.optimistic) } : next);
+    const retained = sameWorker && previous
+      ? retainWorkerDraftMessages(previous)
+      : takeWorkerDraftMessages(workerDraftsRef.current, nickname, mappingId);
+    const next = beginWorkerSubscription(nickname, session?.provider ?? "codex", requestId, retained, mappingId);
+    replaceWorker(next);
     socket.send(JSON.stringify({ type: "worker/subscribe", nickname, requestId }));
   }, [clearRecoveryRetries, replaceWorker]);
 
@@ -288,7 +302,7 @@ export function App() {
         else if (m.type === "worker/subscribed") {
           const current = workerRef.current;
           if (!current || current.nickname !== m.nickname || current.requestId !== m.requestId || typeof m.subscriptionId !== "string") return;
-          const acknowledged = acknowledgeWorkerSubscription(current, m.subscriptionId);
+          const acknowledged = acknowledgeWorkerSubscription(current, m.subscriptionId, typeof m.mappingId === "string" ? m.mappingId : "");
           replaceWorker(acknowledged);
           void workerPageLoaderRef.current?.(m.nickname, m.subscriptionId, true);
         } else if (m.type === "worker/event") {
@@ -318,7 +332,7 @@ export function App() {
     setVisible(RENDER_CAP); stickRef.current = true; preserveRef.current = null;
     subscribeWorker(wsRef.current, selected);
     if (selected) { setDirs({}); setExpanded(new Set()); void loadDir(selected, ""); }
-  }, [selected, subscribeWorker, loadDir]);
+  }, [selected, selectedMappingId, subscribeWorker, loadDir]);
   useEffect(() => {
     if (selected && sidebarTab === "git") {
       const saved = JSON.parse(localStorage.getItem(`qiyan-git:${selected}`) || "[]") as string[];
@@ -419,7 +433,10 @@ export function App() {
     const active = workerRef.current;
     if (target && target === selected && clientInputId) {
       const session = sessions.find((candidate) => candidate.nickname === target);
-      const timeline = active?.nickname === target ? active : beginWorkerSubscription(target, session?.provider ?? "codex", createBrowserUuid());
+      const mappingId = session?.mappingId ?? "";
+      const timeline = active?.nickname === target && active.mappingId === mappingId
+        ? active
+        : beginWorkerSubscription(target, session?.provider ?? "codex", createBrowserUuid(), [], mappingId);
       replaceWorker(addOptimisticWorkerMessage(timeline, `to:web:${clientInputId}`, body, Date.now()));
     } else {
       push(key, { role: "you", body: redirect && redirect !== selected ? `→ @${redirect}  ${body}` : body, at: Date.now() });

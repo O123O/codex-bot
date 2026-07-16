@@ -54,10 +54,12 @@ export interface WorkerSnapshot {
 
 export interface WorkerStreamState {
   nickname: string;
+  mappingId: string;
   provider: WorkerProvider;
   requestId: string;
   subscriptionId?: string;
   messages: WorkerChatMessage[];
+  retainedMessageIds: string[];
   bufferedEvents: WorkerEventEnvelope[];
   bufferedBytes: number;
   snapshotPending: boolean;
@@ -74,18 +76,76 @@ export interface WorkerStreamState {
 
 const MAX_BUFFER_EVENTS = 2_048;
 const MAX_BUFFER_BYTES = 1024 * 1024;
+const MAX_RETAINED_DRAFT_MESSAGES = 30;
+const MAX_RETAINED_DRAFT_BYTES = 512 * 1024;
+const MAX_RETAINED_WORKERS = 4;
+const MAX_RETAINED_TOTAL_BYTES = 1024 * 1024;
 const utf8Bytes = (value: unknown): number => new TextEncoder().encode(JSON.stringify(value)).byteLength;
 
-export function beginWorkerSubscription(nickname: string, provider: WorkerProvider, requestId: string): WorkerStreamState {
+export type WorkerDraftCache = Map<string, WorkerChatMessage[]>;
+
+export function beginWorkerSubscription(
+  nickname: string,
+  provider: WorkerProvider,
+  requestId: string,
+  retainedMessages: WorkerChatMessage[] = [],
+  mappingId = "",
+): WorkerStreamState {
   return {
-    nickname, provider, requestId, messages: [], bufferedEvents: [], bufferedBytes: 0,
+    nickname, mappingId, provider, requestId, messages: [...retainedMessages], retainedMessageIds: retainedMessages.map((message) => message.id),
+    bufferedEvents: [], bufferedBytes: 0,
     snapshotPending: false, overflow: false, recoveryTurnIds: [], pendingRecoveryTurnIds: [],
     recoveredTurnIds: [], observedTurnIds: [], historyInFlight: false, historyLoaded: false, hasOlder: false, olderCursor: undefined,
   };
 }
 
-export function acknowledgeWorkerSubscription(state: WorkerStreamState, subscriptionId: string): WorkerStreamState {
-  return { ...state, subscriptionId };
+export function retainWorkerDraftMessages(state: WorkerStreamState): WorkerChatMessage[] {
+  const candidates = state.messages.filter((message) => message.optimistic || message.terminalStatus === "");
+  const retained: WorkerChatMessage[] = [];
+  let bytes = 0;
+  for (let index = candidates.length - 1; index >= 0 && retained.length < MAX_RETAINED_DRAFT_MESSAGES; index -= 1) {
+    const message = candidates[index]!;
+    const nextBytes = utf8Bytes(message);
+    if (bytes + nextBytes > MAX_RETAINED_DRAFT_BYTES) break;
+    retained.unshift(message);
+    bytes += nextBytes;
+  }
+  return retained;
+}
+
+const retainedBytes = (messages: WorkerChatMessage[]): number => messages.reduce((total, message) => total + utf8Bytes(message), 0);
+
+const workerDraftKey = (nickname: string, mappingId: string): string => `${nickname}\0${mappingId}`;
+
+export function storeWorkerDraftMessages(cache: WorkerDraftCache, state: WorkerStreamState): void {
+  const retained = retainWorkerDraftMessages(state);
+  const key = workerDraftKey(state.nickname, state.mappingId);
+  cache.delete(key);
+  if (retained.length > 0) cache.set(key, retained);
+  let totalBytes = [...cache.values()].reduce((total, messages) => total + retainedBytes(messages), 0);
+  while (cache.size > MAX_RETAINED_WORKERS || totalBytes > MAX_RETAINED_TOTAL_BYTES) {
+    const oldest = cache.entries().next().value as [string, WorkerChatMessage[]] | undefined;
+    if (!oldest) break;
+    cache.delete(oldest[0]);
+    totalBytes -= retainedBytes(oldest[1]);
+  }
+}
+
+export function takeWorkerDraftMessages(cache: WorkerDraftCache, nickname: string, mappingId: string): WorkerChatMessage[] {
+  const key = workerDraftKey(nickname, mappingId);
+  const retained = cache.get(key) ?? [];
+  cache.delete(key);
+  return retained;
+}
+
+export function acknowledgeWorkerSubscription(state: WorkerStreamState, subscriptionId: string, mappingId = state.mappingId): WorkerStreamState {
+  if (mappingId === state.mappingId) return { ...state, subscriptionId };
+  const retainedIds = new Set(state.retainedMessageIds);
+  return {
+    ...state, mappingId, subscriptionId,
+    messages: state.messages.filter((message) => !retainedIds.has(message.id)),
+    retainedMessageIds: [],
+  };
 }
 
 export function beginWorkerHistory(state: WorkerStreamState, snapshotPending: boolean): { state: WorkerStreamState; started: boolean } {
@@ -182,7 +242,16 @@ export function applyWorkerSnapshot(state: WorkerStreamState, snapshot: WorkerSn
   const terminalMessages = snapshot.messages.filter((message) => !open.has(message.turnId)).map((message): WorkerChatMessage => ({
     ...message, role: message.role === "you" ? "you" : "worker", streaming: false, optimistic: false,
   }));
-  let messages = state.messages;
+  const currentOpenTurnIds = new Set([
+    ...snapshot.openTurnIds,
+    ...state.bufferedEvents.map((envelope) => envelope.event.turnId),
+  ]);
+  const snapshotMessageIds = new Set(snapshot.messages.map((message) => message.id));
+  const retainedIds = new Set(state.retainedMessageIds);
+  let messages = state.messages.filter((message) => !retainedIds.has(message.id)
+    || message.optimistic
+    || currentOpenTurnIds.has(message.turnId)
+    || snapshotMessageIds.has(message.id));
   for (const message of terminalMessages) {
     if (message.clientId) messages = messages.filter((candidate) => !(candidate.optimistic && candidate.clientId === message.clientId));
     messages = upsert(messages, message);
@@ -206,7 +275,7 @@ export function applyWorkerSnapshot(state: WorkerStreamState, snapshot: WorkerSn
     }
   }
   let next: WorkerStreamState = {
-    ...state, messages, bufferedEvents: [], bufferedBytes: 0, snapshotPending: false,
+    ...state, messages, retainedMessageIds: [], bufferedEvents: [], bufferedBytes: 0, snapshotPending: false,
     historyInFlight: false, recoveryTurnIds: [...recovery], pendingRecoveryTurnIds, recoveredTurnIds,
     historyLoaded: true, hasOlder: snapshot.hasOlder, olderCursor: snapshot.nextCursor,
   };

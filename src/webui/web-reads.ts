@@ -29,6 +29,7 @@ export interface WebPage<T> {
 
 export interface WebSessionSummary {
   nickname: string;
+  mappingId: string;
   endpoint: string;
   provider: "codex" | "claude";
   projectDir: string;
@@ -61,6 +62,7 @@ export function listSessions(deps: WebReadsDeps): WebSessionSummary[] {
     const goal = info?.goal ?? null;
     return {
       nickname,
+      mappingId: session.mapping_id,
       endpoint: session.endpoint,
       provider: deps.provider(session.endpoint),
       projectDir: session.project_dir,

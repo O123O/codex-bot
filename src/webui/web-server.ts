@@ -443,6 +443,9 @@ export function createWebServer(options: WebServerOptions): WebServer {
     const subscription = options.bus.subscribe(socket, {
       nickname, endpointId: session.endpoint, threadId: session.thread_id, mappingId: session.mapping_id, requestId,
     });
-    options.bus.send(socket, { type: "worker/subscribed", nickname, requestId, subscriptionId: subscription.subscriptionId });
+    options.bus.send(socket, {
+      type: "worker/subscribed", nickname, requestId,
+      subscriptionId: subscription.subscriptionId, mappingId: subscription.mappingId,
+    });
   }
 }
