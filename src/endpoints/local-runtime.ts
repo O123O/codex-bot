@@ -6,7 +6,6 @@ import { isAbsolute, join } from "node:path";
 import { AppError } from "../core/errors.ts";
 
 const privateDirectoryMode = 0o700;
-const maxUnixSocketPathBytes = 103;
 
 interface LocalRuntimeOptions {
   runtimeBase?: string;
@@ -31,39 +30,6 @@ export async function prepareLocalSshRuntimeRoot(
   const namespaceRoot = join(productRoot, namespace);
   await ensurePrivateOwnerDirectory(namespaceRoot, expectedUid, true);
   return namespaceRoot;
-}
-
-export function localSshEndpointSocketRoot(runtimeRoot: string, endpointId: string): string {
-  if (!isAbsolute(runtimeRoot) || !/^[a-z0-9][a-z0-9_-]{0,63}$/u.test(endpointId)) throw runtimeDirectoryError();
-  const endpointNamespace = createHash("sha256").update(endpointId).digest("hex").slice(0, 16);
-  const socketRoot = join(runtimeRoot, "s", endpointNamespace);
-  const socketPath = join(socketRoot, "00000000");
-  if (Buffer.byteLength(socketPath) > maxUnixSocketPathBytes) {
-    throw new AppError("CONFIGURATION_ERROR", "local SSH Unix socket path is too long");
-  }
-  return socketRoot;
-}
-
-export function localSshForwardSocketPath(socketRoot: string, generation: string): string {
-  if (!isAbsolute(socketRoot) || !/^[a-f0-9]{8}$/u.test(generation)) throw runtimeDirectoryError("local SSH forward socket path is invalid");
-  const socketPath = join(socketRoot, generation);
-  if (Buffer.byteLength(socketPath) > maxUnixSocketPathBytes) {
-    throw new AppError("CONFIGURATION_ERROR", "local SSH Unix socket path is too long");
-  }
-  return socketPath;
-}
-
-export async function prepareLocalSshEndpointSocketRoot(
-  runtimeRoot: string,
-  endpointId: string,
-  expectedUid = process.geteuid?.() ?? process.getuid?.(),
-): Promise<string> {
-  const socketRoot = localSshEndpointSocketRoot(runtimeRoot, endpointId);
-  await ensurePrivateOwnerDirectory(runtimeRoot, expectedUid, false);
-  const socketsRoot = join(runtimeRoot, "s");
-  await ensurePrivateOwnerDirectory(socketsRoot, expectedUid, true);
-  await ensurePrivateOwnerDirectory(socketRoot, expectedUid, true);
-  return socketRoot;
 }
 
 function defaultRuntimeBase(uid: number | undefined, options: LocalRuntimeOptions): string {

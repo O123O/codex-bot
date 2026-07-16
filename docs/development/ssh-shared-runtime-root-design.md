@@ -27,7 +27,7 @@ Before choosing the new App Server runtime directory, a Codex endpoint probes it
 
 Stopping an exact legacy runtime clears the cached legacy selection. A later start re-probes and selects the shared runtime after proving the legacy runtime absent. Likewise, an unexpectedly absent cached legacy runtime is not resurrected; the next start re-prepares against the shared base. Remote host services such as workspace operations and file transfer always use the shared helper/runtime directory, even while a pre-upgrade App Server is temporarily reused from the legacy directory.
 
-This changes no SSH authentication or endpoint naming. Helper commands and forward control commands continue to pin and reuse the existing authenticated ControlMaster.
+This changes no SSH authentication or endpoint naming. Helper and user-space proxy commands continue to pin and reuse the existing authenticated ControlMaster.
 
 The configured prenyx ControlMaster lives in a canonical owner-only directory on NFS. QiYan previously rejected it solely by filesystem type, fell back to an unauthenticated BatchMode master, and exited 255. User-owned masters now retain exact canonical-path, UID, mode, and socket-type attestation regardless of filesystem type, followed by the authoritative `ssh -O check` and operation. QiYan-owned master sockets and remote App Server sockets still prefer local runtime storage.
 
@@ -53,7 +53,7 @@ The configured prenyx ControlMaster lives in a canonical owner-only directory on
 
 - Two prenyx SSH channels see the same selected runtime directory.
 - Helper bootstrap in one channel is usable by the next channel.
-- Inspect/start and stream-local forwarding use the same shared per-endpoint runtime state.
+- Inspect/start and the user-space App Server proxy use the same shared per-endpoint runtime state.
 - A healthy legacy runtime is reused without starting a duplicate; after exact stop, the next start selects the shared runtime.
 - Existing hosts without a valid standard XDG runtime directory continue using `/tmp/qiyan-<uid>`.
 - Unsafe, aliased, broadly accessible, wrong-owner, or NFS XDG directories are never selected.

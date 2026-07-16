@@ -1,8 +1,147 @@
 import { spawn } from "node:child_process";
 import { once } from "node:events";
+import { PassThrough, type Readable, type Writable } from "node:stream";
 import { AppError } from "../core/errors.ts";
 
 export interface BoundedProcessResult { stdout: Buffer; stderr: Buffer }
+
+export interface ReadyProcessStream {
+  readonly input: Writable;
+  readonly output: Readable;
+  onClose(listener: (error?: Error) => void): () => void;
+  close(): Promise<void>;
+}
+
+export function openReadyProcessStream(
+  command: string,
+  args: readonly string[],
+  options: { readyMarker: Uint8Array; timeoutMs: number; maxPreludeBytes: number },
+): Promise<ReadyProcessStream> {
+  if (options.readyMarker.byteLength < 1 || options.readyMarker.byteLength > 256
+    || options.maxPreludeBytes < options.readyMarker.byteLength) {
+    return Promise.reject(new AppError("CONFIGURATION_ERROR", "invalid process readiness marker"));
+  }
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, [...args], { stdio: ["pipe", "pipe", "pipe"], shell: false });
+    const marker = Buffer.from(options.readyMarker);
+    const output = new PassThrough();
+    const closeListeners = new Set<(error?: Error) => void>();
+    let prelude = Buffer.alloc(0);
+    let stderrBytes = 0;
+    let ready = false;
+    let startupSettled = false;
+    let intentional = false;
+    let terminal = false;
+    let processExited = false;
+    let terminalError: Error | undefined;
+    let exitResolve!: () => void;
+    const exited = new Promise<void>((done) => { exitResolve = done; });
+    let escalation: ReturnType<typeof setTimeout> | undefined;
+    const terminate = (): void => {
+      if (processExited) return;
+      child.kill("SIGTERM");
+      if (!escalation) {
+        escalation = setTimeout(() => child.kill("SIGKILL"), 250);
+        escalation.unref?.();
+      }
+    };
+    const notifyClose = (error?: Error): void => {
+      if (terminal) return;
+      terminal = true;
+      terminalError = error;
+      output.end();
+      for (const listener of closeListeners) listener(error);
+    };
+    const failStartup = (error: Error): void => {
+      if (startupSettled) {
+        if (!intentional) notifyClose(error);
+        terminate();
+        return;
+      }
+      startupSettled = true;
+      clearTimeout(timeout);
+      terminate();
+      child.stdin.destroy();
+      child.stdout.destroy();
+      child.stderr.destroy();
+      output.destroy();
+      reject(error);
+    };
+    const forwardOutput = (chunk: Uint8Array): void => {
+      if (terminal || intentional || output.writableEnded || output.destroyed) return;
+      if (!output.write(chunk)) child.stdout.pause();
+    };
+    output.on("drain", () => {
+      if (!terminal && !intentional) child.stdout.resume();
+    });
+    const handle: ReadyProcessStream = {
+      input: child.stdin,
+      output,
+      onClose(listener) {
+        if (terminal) {
+          const error = terminalError;
+          queueMicrotask(() => listener(error));
+          return () => undefined;
+        }
+        closeListeners.add(listener);
+        return () => closeListeners.delete(listener);
+      },
+      async close() {
+        if (intentional) { await exited; return; }
+        intentional = true;
+        child.stdin.destroy();
+        output.end();
+        terminate();
+        await exited;
+      },
+    };
+    child.stdout.on("data", (chunk: Buffer) => {
+      if (terminal) return;
+      if (ready) { forwardOutput(chunk); return; }
+      prelude = Buffer.concat([prelude, Buffer.from(chunk)]);
+      if (prelude.byteLength > options.maxPreludeBytes) {
+        failStartup(new AppError("ENDPOINT_UNAVAILABLE", "SSH process exceeded its readiness output limit"));
+        return;
+      }
+      const boundary = prelude.indexOf(marker);
+      if (boundary < 0) return;
+      const following = prelude.subarray(boundary + marker.byteLength);
+      prelude = Buffer.alloc(0);
+      ready = true;
+      startupSettled = true;
+      clearTimeout(timeout);
+      resolve(handle);
+      if (following.byteLength > 0) forwardOutput(following);
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderrBytes += chunk.byteLength;
+      if (stderrBytes > options.maxPreludeBytes) {
+        failStartup(new AppError("ENDPOINT_UNAVAILABLE", ready
+          ? "SSH process exceeded its diagnostic output limit"
+          : "SSH process exceeded its readiness output limit"));
+      }
+    });
+    child.stdin.on("error", () => {
+      if (!intentional && ready) notifyClose(new AppError("ENDPOINT_UNAVAILABLE", "SSH process input closed"));
+    });
+    child.once("error", () => failStartup(new AppError("ENDPOINT_UNAVAILABLE", ready
+      ? "SSH process stream failed"
+      : "SSH process stream failed before readiness")));
+    child.once("exit", (code, signal) => {
+      processExited = true;
+      if (escalation) clearTimeout(escalation);
+      exitResolve();
+      const error = code === 0 && !signal ? undefined : new AppError("ENDPOINT_UNAVAILABLE", ready
+        ? "SSH process stream failed"
+        : "SSH process stream failed before readiness");
+      if (!startupSettled) failStartup(error ?? new AppError("ENDPOINT_UNAVAILABLE", "SSH process stream closed before readiness"));
+      else if (!intentional) notifyClose(error);
+    });
+    child.stdout.once("close", () => { if (ready) output.end(); });
+    const timeout = setTimeout(() => failStartup(new AppError("ENDPOINT_UNAVAILABLE", "SSH process readiness timed out")), options.timeoutMs);
+    timeout.unref?.();
+  });
+}
 
 export function runBoundedProcess(
   command: string,

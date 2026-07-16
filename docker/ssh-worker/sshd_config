@@ -10,7 +10,7 @@ PermitEmptyPasswords no
 AllowUsers codex
 DisableForwarding no
 AllowTcpForwarding no
-AllowStreamLocalForwarding local
+AllowStreamLocalForwarding no
 AllowAgentForwarding no
 X11Forwarding no
 PermitTunnel no

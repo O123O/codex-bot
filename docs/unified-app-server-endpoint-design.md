@@ -4,6 +4,9 @@
 
 Revision 5, updated for local-filesystem ControlMaster-backed forwarding.
 
+The stream-local forwarding details in this historical design were superseded by the
+[SSH user-space App Server proxy design](development/ssh-user-app-server-proxy-design.md).
+
 ## Problem
 
 QiYan currently has two classes that both implement the Codex App Server lifecycle:

@@ -110,23 +110,6 @@ export function buildSshStreamArgs(plan: SshConnectionPlan, remoteCommand: strin
   return [...baseArgs(plan, false), plan.alias, remoteCommand];
 }
 
-export function buildSshStreamForwardArgs(plan: SshConnectionPlan, localSocket: string, remoteSocket: string): string[] {
-  const forwarding = streamForwarding(localSocket, remoteSocket);
-  return [
-    ...baseArgs(plan, false),
-    "-o", "ExitOnForwardFailure=yes",
-    "-o", "StreamLocalBindUnlink=no",
-    "-o", "StreamLocalBindMask=0177",
-    "-O", "forward",
-    "-L", forwarding,
-    plan.alias,
-  ];
-}
-
-export function buildSshStreamForwardCancelArgs(plan: SshConnectionPlan, localSocket: string, remoteSocket: string): string[] {
-  return [...baseArgs(plan, false), "-O", "cancel", "-L", streamForwarding(localSocket, remoteSocket), plan.alias];
-}
-
 // Reverse-forward (`-R`) a REMOTE loopback TCP port to a LOCAL port over the ControlMaster —
 // exposes QiYan's loopback worker-MCP on the remote host so a remote `claude -p` worker can
 // reach it. The remote listener binds to `127.0.0.1` (not `0.0.0.0`) — with the default
@@ -217,13 +200,6 @@ function baseArgs(plan: SshConnectionPlan, establishOwnedMaster: boolean): strin
     ? ["-o", "ControlMaster=auto", "-o", "ControlPersist=yes"]
     : !plan.ownsControlMaster ? ["-o", "ControlMaster=no"] : [])];
   return [...plan.commonArgs, ...pinned, ...control];
-}
-
-function streamForwarding(localSocket: string, remoteSocket: string): string {
-  if (![localSocket, remoteSocket].every((value) => isAbsolute(value) && /^[A-Za-z0-9_./-]+$/u.test(value))) {
-    throw new AppError("CONFIGURATION_ERROR", "unsafe SSH stream-local forwarding path");
-  }
-  return `${localSocket}:${remoteSocket}`;
 }
 
 function usableControlPath(value: string): boolean {

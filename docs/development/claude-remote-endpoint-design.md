@@ -186,8 +186,8 @@ buildable/leasable but whose ownership scan still throws `UNSUPPORTED_CAPABILITY
 1. **`RemoteHost` refactor** (§3.2) — introduce `RemoteHost`; `SshRuntime` composes one internally (getters
    delegate); consumers read `context.host`. `SshRuntime.prepare()` builds/caches the `RemoteHost` (host-preflight
    + bootstrap) and **keeps holding `shell`/`session` alongside it** — the host owns
-   `home`/`uid`-derived-dirs/`helperPath`/`remote`; `SshRuntime` layers `session`/`shell`/`remoteSocketPath`
-   (`= ${host.remoteRuntimeDir}/app-server.sock`, still Codex-only, consumed by `SshAppServerRuntime`) on top.
+   `home`/`uid`-derived-dirs/`helperPath`/`remote`; `SshRuntime` layers `session`/`shell` and the Codex-only
+   `openAppServerStream` operation consumed by `SshAppServerRuntime` on top.
    *Verify (GATE):* the **full existing Codex remote test suite stays green** (this is a behavior-preserving
    refactor of the incident-sensitive path).
 2. **Catalog + createRemote + ownership scan (atomic)** — §3.1 union; §3.3 claude-code branch +

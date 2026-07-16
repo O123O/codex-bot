@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
+import { once } from "node:events";
+import { unlinkSync } from "node:fs";
 import { appendFile, chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { createServer, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Readable } from "node:stream";
@@ -8,13 +12,14 @@ import test from "node:test";
 import {
   REMOTE_HELPER_SHA256,
   REMOTE_LAUNCHER_SHA256,
+  REMOTE_APP_SERVER_PROXY_READY,
   SshRemoteClient,
   encodeRemoteBootstrapArgument,
   encodeRemoteArgument,
   parseRemoteHelperResponse,
   validateInstalledHelperPath,
 } from "../../src/endpoints/ssh-runtime.ts";
-import { runBoundedProcess } from "../../src/endpoints/ssh-process.ts";
+import { openReadyProcessStream, runBoundedProcess } from "../../src/endpoints/ssh-process.ts";
 
 const helperPath = new URL("../../assets/remote/qiyan-ssh-helper.mjs", import.meta.url);
 const launcherPath = new URL("../../assets/remote/qiyan-app-server-launcher.sh", import.meta.url);
@@ -226,6 +231,47 @@ test("the helper establishes a frame boundary after output without a trailing ne
   assert.doesNotThrow(() => parseRemoteHelperResponse(result.stdout, "workspace"));
 });
 
+test("the helper proxies App Server bytes without response framing", async (t) => {
+  const fixture = await proxyFixture(t);
+  const stream = await openReadyProcessStream(process.execPath, [
+    helperPath.pathname,
+    "proxy-app-server",
+    encodeRemoteArgument(JSON.stringify(fixture.request)),
+  ], { readyMarker: REMOTE_APP_SERVER_PROXY_READY, timeoutMs: 2_000, maxPreludeBytes: 64 * 1024 });
+  const received = once(stream.output, "data");
+
+  stream.input.write("websocket-upgrade-bytes");
+
+  assert.equal(String((await received)[0]), "websocket-upgrade-bytes");
+  await stream.close();
+});
+
+test("the helper rejects an App Server socket replacement before readiness or byte copying", async (t) => {
+  let accepted: Socket | undefined;
+  let receivedBytes = 0;
+  const replacement = createServer();
+  const fixture = await proxyFixture(t, (socket, socketPath) => {
+    accepted = socket;
+    socket.on("data", (chunk) => { receivedBytes += Buffer.byteLength(chunk); });
+    unlinkSync(socketPath);
+    replacement.listen(socketPath);
+  });
+  t.after(async () => {
+    accepted?.destroy();
+    if (replacement.listening) await closeNetServer(replacement);
+  });
+
+  await assert.rejects(
+    openReadyProcessStream(process.execPath, [
+      helperPath.pathname,
+      "proxy-app-server",
+      encodeRemoteArgument(JSON.stringify(fixture.request)),
+    ], { readyMarker: REMOTE_APP_SERVER_PROXY_READY, timeoutMs: 2_000, maxPreludeBytes: 64 * 1024 }),
+    /before readiness|closed before readiness/u,
+  );
+  assert.equal(receivedBytes, 0);
+});
+
 test("helper response parsing fails closed without exposing output", () => {
   const invalid = /SSH inspect helper returned an invalid response/u;
   assert.throws(() => parseRemoteHelperResponse(Buffer.from("remote output only"), "inspect"), invalid);
@@ -238,6 +284,75 @@ test("helper response parsing fails closed without exposing output", () => {
     assert.equal(String(error).includes("secret"), false);
   }
 });
+
+async function proxyFixture(
+  t: test.TestContext,
+  onConnection: (socket: Socket, socketPath: string) => void = (socket) => socket.pipe(socket),
+): Promise<{ request: Record<string, unknown> }> {
+  const uid = process.getuid?.();
+  assert.ok(uid);
+  const base = `/tmp/qiyan-${uid}`;
+  const runtimeDir = `${base}/${randomBytes(12).toString("hex")}`;
+  await mkdir(base, { mode: 0o700 }).catch((error: NodeJS.ErrnoException) => { if (error.code !== "EEXIST") throw error; });
+  await chmod(base, 0o700);
+  await mkdir(runtimeDir, { mode: 0o700 });
+  const token = randomBytes(16).toString("hex");
+  const holder = spawn(process.execPath, ["-e", "setInterval(() => {}, 10000)"], {
+    detached: true,
+    env: { ...process.env, QIYAN_RUNTIME_TOKEN: token },
+    stdio: "ignore",
+  });
+  assert.ok(holder.pid);
+  let processState: { processGroupId: number; linuxStartTime: string } | undefined;
+  for (let attempt = 0; attempt < 100 && !processState; attempt += 1) {
+    processState = await readLinuxProcessState(holder.pid);
+    if (!processState) await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.ok(processState);
+  const expected = {
+    kind: "ssh",
+    token,
+    pid: holder.pid,
+    linuxStartTime: processState.linuxStartTime,
+    processGroupId: processState.processGroupId,
+  };
+  await writeFile(`${runtimeDir}/identity.json`, `${JSON.stringify(expected)}\n`, { mode: 0o600 });
+  const socketPath = `${runtimeDir}/app-server.sock`;
+  const server = createServer((socket) => onConnection(socket, socketPath));
+  await new Promise<void>((resolve, reject) => server.once("error", reject).listen(socketPath, resolve));
+  await chmod(socketPath, 0o600);
+  t.after(async () => {
+    try { process.kill(-holder.pid!, "SIGKILL"); } catch { /* already stopped */ }
+    await once(holder, "exit").catch(() => undefined);
+    if (server.listening) await closeNetServer(server);
+    await rm(runtimeDir, { recursive: true, force: true });
+  });
+  return {
+    request: {
+      runtimeDir,
+      session: `qiyan-${runtimeDir.slice(-24)}`,
+      tmuxMode: "explicit",
+      expected,
+    },
+  };
+}
+
+async function readLinuxProcessState(pid: number): Promise<{ processGroupId: number; linuxStartTime: string } | undefined> {
+  let raw: string;
+  try { raw = await readFile(`/proc/${pid}/stat`, "utf8"); } catch { return undefined; }
+  const close = raw.lastIndexOf(")");
+  if (close < 0) return undefined;
+  const fields = raw.slice(close + 2).trim().split(/\s+/u);
+  const processGroupId = Number(fields[2]);
+  const linuxStartTime = fields[19];
+  return Number.isSafeInteger(processGroupId) && processGroupId > 1 && /^\d+$/u.test(linuxStartTime ?? "")
+    ? { processGroupId, linuxStartTime: linuxStartTime! }
+    : undefined;
+}
+
+async function closeNetServer(server: Server): Promise<void> {
+  await new Promise<void>((resolve) => server.close(() => resolve()));
+}
 
 test("the packaged helper bootstraps owner-only assets and inspects an absent isolated session", async (t) => {
   const uid = process.getuid?.();

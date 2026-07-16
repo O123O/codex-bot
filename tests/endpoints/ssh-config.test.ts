@@ -2,11 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   SshGenerationPlanner,
-  buildControlMasterCheckArgs,
   buildControlMasterExitArgs,
   buildSshArgs,
-  buildSshStreamForwardCancelArgs,
-  buildSshStreamForwardArgs,
   buildSshReverseForwardArgs,
   buildSshReverseForwardCancelArgs,
   parseSshConfig,
@@ -41,26 +38,6 @@ test("honors a usable user ControlMaster without taking ownership", () => {
   assert.ok(args.includes("ControlMaster=no"));
   assert.doesNotMatch(args.join(" "), /ControlPersist/u);
   assert.throws(() => buildControlMasterExitArgs(plan), /user-owned/u);
-});
-
-test("stream-local forwarding is registered and cancelled on the authenticated ControlMaster", () => {
-  const plan = planSshConnection("devbox", parseSshConfig(`${parsed}controlmaster auto\ncontrolpath /tmp/user-master\n`), "/private/runtime");
-  const local = "/private/qiyan/f-01234567.sock";
-  const remote = "/tmp/qiyan-1000/abcdef/app-server.sock";
-  const check = buildControlMasterCheckArgs(plan);
-  const forward = buildSshStreamForwardArgs(plan, local, remote);
-  const cancel = buildSshStreamForwardCancelArgs(plan, local, remote);
-  for (const [args, command] of [[check, "check"], [forward, "forward"], [cancel, "cancel"]] as const) {
-    assert.deepEqual(args.slice(args.indexOf("-S"), args.indexOf("-S") + 2), ["-S", "/tmp/user-master"]);
-    assert.deepEqual(args.slice(args.indexOf("-O"), args.indexOf("-O") + 2), ["-O", command]);
-    assert.equal(args.at(-1), "devbox");
-    assert.doesNotMatch(args.join(" "), /ControlPath=none|ControlPersist=60|-N|-T|-n/u);
-  }
-  for (const option of ["ExitOnForwardFailure=yes", "StreamLocalBindUnlink=no", "StreamLocalBindMask=0177"]) {
-    assert.ok(forward.includes(option), option);
-  }
-  assert.ok(forward.includes(`${local}:${remote}`));
-  assert.ok(cancel.includes(`${local}:${remote}`));
 });
 
 test("reverse forwarding binds a REMOTE loopback port (bind-not-relax) on the ControlMaster", () => {

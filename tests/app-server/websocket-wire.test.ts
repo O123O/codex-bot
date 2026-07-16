@@ -1,12 +1,16 @@
 import assert from "node:assert/strict";
+import { once } from "node:events";
 import { chmod, mkdtemp, rm, symlink } from "node:fs/promises";
-import { createServer } from "node:http";
+import { createServer, request } from "node:http";
+import { connect } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PassThrough } from "node:stream";
 import test from "node:test";
 import { WebSocketServer } from "ws";
 import { RpcClient } from "../../src/app-server/rpc-client.ts";
-import { WebSocketWire } from "../../src/app-server/websocket-wire.ts";
+import { OneShotStreamAgent, WebSocketWire, createSocketCompatibleDuplex } from "../../src/app-server/websocket-wire.ts";
+import type { ReadyProcessStream } from "../../src/endpoints/ssh-process.ts";
 
 test("WebSocket wire exchanges App Server frames over a Unix socket", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "qiyan-ws-"));
@@ -108,4 +112,57 @@ test("redirects and stalled handshakes fail within the bound", async (t) => {
       await rm(root, { recursive: true, force: true });
     });
   }
+});
+
+test("WebSocket wire performs a real handshake over a non-Socket byte stream", async (t) => {
+  const server = createServer();
+  const websocket = new WebSocketServer({ server });
+  websocket.on("connection", (peer) => peer.on("message", (value) => {
+    const rpc = JSON.parse(value.toString()) as { id: number };
+    peer.send(JSON.stringify({ id: rpc.id, result: { stream: true } }));
+  }));
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  const transport = connect(address.port, "127.0.0.1");
+  await once(transport, "connect");
+  const input = new PassThrough();
+  const output = new PassThrough();
+  input.pipe(transport);
+  transport.pipe(output);
+  let closeCalls = 0;
+  const stream: ReadyProcessStream = {
+    input,
+    output,
+    onClose: () => () => undefined,
+    close: async () => { closeCalls += 1; transport.destroy(); input.destroy(); output.destroy(); },
+  };
+  t.after(async () => {
+    for (const peer of websocket.clients) peer.terminate();
+    websocket.close();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+
+  const client = new RpcClient(await WebSocketWire.connectStream(stream, { timeoutMs: 500 }), { requestTimeoutMs: 500 });
+  assert.deepEqual(await client.request("initialize", {}), { stream: true });
+  client.close();
+  for (let attempt = 0; attempt < 20 && closeCalls === 0; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(closeCalls, 1);
+});
+
+test("the stream HTTP agent rejects a concurrent second request instead of queueing", async () => {
+  const input = new PassThrough();
+  const output = new PassThrough();
+  const stream: ReadyProcessStream = {
+    input, output, onClose: () => () => undefined,
+    close: async () => { input.destroy(); output.destroy(); },
+  };
+  const socket = createSocketCompatibleDuplex(stream);
+  const agent = new OneShotStreamAgent(socket);
+  const first = request({ host: "stream.invalid", agent });
+  first.on("error", () => undefined);
+  first.end();
+  assert.throws(() => request({ host: "stream.invalid", agent }), /already admitted|one-shot/u);
+  first.destroy();
+  agent.destroy();
 });

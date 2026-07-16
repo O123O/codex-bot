@@ -2,8 +2,11 @@ import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { once } from "node:events";
 import test from "node:test";
-import { runBoundedProcess } from "../../src/endpoints/ssh-process.ts";
+import { openReadyProcessStream, runBoundedProcess } from "../../src/endpoints/ssh-process.ts";
+
+const readyMarker = Buffer.from("qiyan-app-server-proxy-v1-ready\n");
 
 test("runs an argv-only process and bounds captured output", async () => {
   const result = await runBoundedProcess(process.execPath, ["-e", "process.stdout.write('ok')"], { timeoutMs: 1_000, maxOutputBytes: 16 });
@@ -82,4 +85,101 @@ test("rejects pre-aborted work without spawning and handles an early stdin close
     }),
     /input|stdin|closed/u,
   );
+});
+
+test("a ready process stream consumes bounded preamble and exposes only post-marker bytes", async () => {
+  const program = [
+    "process.stdout.write('remote shell banner\\n');",
+    `process.stdout.write(${JSON.stringify(readyMarker.subarray(0, 11).toString())});`,
+    `setTimeout(() => process.stdout.write(${JSON.stringify(readyMarker.subarray(11).toString())}), 10);`,
+    "process.stdin.on('data', (chunk) => process.stdout.write(chunk));",
+  ].join("\n");
+  const stream = await openReadyProcessStream(process.execPath, ["-e", program], {
+    readyMarker, timeoutMs: 1_000, maxPreludeBytes: 1024,
+  });
+  const received = once(stream.output, "data");
+
+  stream.input.write("websocket bytes");
+
+  assert.equal(String((await received)[0]), "websocket bytes");
+  await stream.close();
+});
+
+test("a ready process stream backpressures and resumes its producer", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "qiyan-ssh-backpressure-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const completed = join(root, "producer-completed");
+  const program = [
+    "const fs = require('node:fs');",
+    `process.stdout.write(${JSON.stringify(readyMarker.toString())});`,
+    `process.stdout.write(Buffer.alloc(16 * 1024 * 1024), () => fs.writeFileSync(${JSON.stringify(completed)}, 'yes'));`,
+    "process.stdin.resume();",
+  ].join("\n");
+  const stream = await openReadyProcessStream(process.execPath, ["-e", program], {
+    readyMarker, timeoutMs: 1_000, maxPreludeBytes: 1024,
+  });
+
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  await assert.rejects(readFile(completed), /ENOENT/u);
+
+  stream.output.resume();
+  for (let attempt = 0; attempt < 80; attempt += 1) {
+    try { assert.equal(await readFile(completed, "utf8"), "yes"); break; }
+    catch {
+      if (attempt === 79) assert.fail("the producer did not resume after output drained");
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  }
+  await stream.close();
+});
+
+test("a ready process stream ignores final stdout during intentional shutdown", async () => {
+  const program = [
+    "process.on('SIGTERM', () => process.stdout.write('late', () => process.exit(0)));",
+    `process.stdout.write(${JSON.stringify(readyMarker.toString())});`,
+    "setInterval(() => {}, 10000);",
+  ].join("\n");
+  const stream = await openReadyProcessStream(process.execPath, ["-e", program], {
+    readyMarker, timeoutMs: 1_000, maxPreludeBytes: 1024,
+  });
+
+  await stream.close();
+});
+
+test("a ready process stream fails generically before its marker and cleans up", async () => {
+  const secret = "REMOTE_CREDENTIAL_OUTPUT";
+  const program = `process.stderr.write(${JSON.stringify(secret)}); process.stdout.write('banner'); process.exit(23)`;
+
+  await assert.rejects(
+    openReadyProcessStream(process.execPath, ["-e", program], {
+      readyMarker, timeoutMs: 1_000, maxPreludeBytes: 1024,
+    }),
+    (error: unknown) => error instanceof Error
+      && /stream failed before readiness/u.test(error.message)
+      && !error.message.includes(secret),
+  );
+});
+
+test("a ready process stream rejects unbounded output before its marker", async () => {
+  await assert.rejects(
+    openReadyProcessStream(process.execPath, ["-e", "process.stdout.write('x'.repeat(2048)); setTimeout(() => {}, 10000)"], {
+      readyMarker, timeoutMs: 1_000, maxPreludeBytes: 1024,
+    }),
+    /readiness output limit/u,
+  );
+});
+
+test("a ready process stream terminates after bounded diagnostic output is exceeded", async () => {
+  const program = [
+    `process.stdout.write(${JSON.stringify(readyMarker.toString())});`,
+    "setTimeout(() => process.stderr.write('x'.repeat(2048)), 10);",
+    "setInterval(() => {}, 10000);",
+  ].join("\n");
+  const stream = await openReadyProcessStream(process.execPath, ["-e", program], {
+    readyMarker, timeoutMs: 1_000, maxPreludeBytes: 1024,
+  });
+  const closed = new Promise<Error | undefined>((resolve) => stream.onClose(resolve));
+
+  assert.match(String(await closed), /diagnostic output limit/u);
+  await stream.close();
 });

@@ -10,11 +10,17 @@ import {
   buildSshRemoteNodeProgramArgs,
   type SshConnectionPlan,
 } from "./ssh-config.ts";
-import { runBoundedProcess, type BoundedProcessResult } from "./ssh-process.ts";
+import {
+  openReadyProcessStream,
+  runBoundedProcess,
+  type BoundedProcessResult,
+  type ReadyProcessStream,
+} from "./ssh-process.ts";
 import { parseRuntimeIdentity, type EndpointLossKind, type RuntimeIdentity } from "./types.ts";
 
-export const REMOTE_HELPER_SHA256 = "a331b76f1e336f04c71b745ee7766055a124ab0452b8f116b5511c4d9a77cc99";
+export const REMOTE_HELPER_SHA256 = "d69342b241add2190df27b67849672886252d04e6b45a9b4b560c5d85217ba9b";
 export const REMOTE_LAUNCHER_SHA256 = "643dd9424f3d7fb5cca8d9f7cbd835fb40a57e8a7e728ed1529259e92fa793c5";
+export const REMOTE_APP_SERVER_PROXY_READY = Buffer.from("qiyan-app-server-proxy-v1-ready\n");
 
 const MAX_REMOTE_ARGUMENT_BYTES = 16 * 1024;
 const MAX_UNIX_SOCKET_PATH_BYTES = 107;
@@ -42,7 +48,15 @@ export interface RemoteAssets {
 export interface RemoteRuntimeClient {
   bootstrap(payload: RemoteBootstrapPayload): Promise<void>;
   invoke<T>(operation: string, args: readonly string[], installedHelperPath?: string): Promise<T>;
+  openAppServerStream?(request: RemoteAppServerProxyRequest, installedHelperPath: string): Promise<ReadyProcessStream>;
   closeControlMaster?(): Promise<void>;
+}
+
+export interface RemoteAppServerProxyRequest {
+  runtimeDir: string;
+  session: string;
+  tmuxMode: "explicit" | "legacy";
+  expected: RuntimeIdentity;
 }
 
 export interface RemoteTransferClient {
@@ -96,8 +110,8 @@ export async function attestUserControlMaster(
 }
 
 export interface SshRuntimeController {
-  readonly remoteSocketPath: string;
   ensureStarted(): Promise<RuntimeIdentity>;
+  openAppServerStream(expected: RuntimeIdentity): Promise<ReadyProcessStream>;
   runtimeIdentity(): Promise<RuntimeIdentity | undefined>;
   classifyLoss?(): Promise<EndpointLossKind>;
   closeTransport?(): Promise<void>;
@@ -154,10 +168,6 @@ export class SshRuntime implements SshRuntimeController, RemoteHost {
     if (!/^[a-z0-9][a-z0-9_-]{0,63}$/u.test(options.endpointId)) throw new AppError("CONFIGURATION_ERROR", "invalid SSH endpoint ID");
   }
 
-  get remoteSocketPath(): string {
-    if (!this.prepared) throw new AppError("ENDPOINT_UNAVAILABLE", "SSH runtime is not prepared");
-    return `${this.prepared.runtimeDir}/app-server.sock`;
-  }
   get remoteHelperPath(): string {
     if (!this.prepared) throw new AppError("ENDPOINT_UNAVAILABLE", "SSH runtime is not prepared");
     return this.prepared.host.remoteHelperPath;
@@ -201,6 +211,19 @@ export class SshRuntime implements SshRuntimeController, RemoteHost {
     if (current.status === "healthy" || (current.status === "unhealthy" && current.identity)) return current.identity;
     if (current.status === "unhealthy") throw new AppError("OPERATION_UNCERTAIN", `SSH runtime identity is unavailable: ${this.options.endpointId}`);
     return undefined;
+  }
+
+  async openAppServerStream(expected: RuntimeIdentity): Promise<ReadyProcessStream> {
+    const prepared = await this.prepare();
+    if (expected.kind !== "ssh" || !this.options.remote.openAppServerStream) {
+      throw new AppError("CONFIGURATION_ERROR", "SSH App Server proxy is unavailable");
+    }
+    return this.options.remote.openAppServerStream({
+      runtimeDir: prepared.runtimeDir,
+      session: prepared.session,
+      tmuxMode: prepared.tmuxMode,
+      expected,
+    }, prepared.host.remoteHelperPath);
   }
 
   async classifyLoss(): Promise<EndpointLossKind> {
@@ -273,6 +296,7 @@ export class SshRemoteClient implements RemoteRuntimeClient {
     sshBinary?: string;
     helperSource: Buffer;
     run?: typeof runBoundedProcess;
+    openStream?: typeof openReadyProcessStream;
   }) {
     requireDigest(options.helperSource, REMOTE_HELPER_SHA256);
     this.helperProgram = gzipSync(options.helperSource).toString("base64url");
@@ -313,6 +337,25 @@ export class SshRemoteClient implements RemoteRuntimeClient {
     return parseRemoteHelperResponse<T>(result.stdout, operation);
   }
 
+  async openAppServerStream(
+    request: RemoteAppServerProxyRequest,
+    installedHelperPath: string,
+  ): Promise<ReadyProcessStream> {
+    validateInstalledHelperPath(installedHelperPath);
+    parseRuntimeIdentity(request.expected);
+    await this.prepareConnection();
+    const args = buildSshRemoteNodeProgramArgs(
+      this.options.plan,
+      this.helperProgram,
+      ["proxy-app-server", encodeRemoteArgument(JSON.stringify(request))],
+    );
+    return (this.options.openStream ?? openReadyProcessStream)(this.options.sshBinary ?? "ssh", args, {
+      readyMarker: REMOTE_APP_SERVER_PROXY_READY,
+      timeoutMs: 10_000,
+      maxPreludeBytes: 64 * 1024,
+    });
+  }
+
   async closeControlMaster(): Promise<void> {
     if (!this.options.plan.ownsControlMaster) return;
     const run = this.options.run ?? runBoundedProcess;
@@ -328,17 +371,8 @@ export class SshRemoteClient implements RemoteRuntimeClient {
     maxOutputBytes = 1024 * 1024,
     timeoutMs = REMOTE_HELPER_TIMEOUT_MS,
   ): Promise<BoundedProcessResult> {
-    if (this.options.plan.ownsControlMaster) {
-      const directory = dirname(this.options.plan.controlPath!);
-      await mkdir(directory, { recursive: true, mode: 0o700 });
-      const state = await lstat(directory);
-      const uid = process.getuid?.();
-      if (!state.isDirectory() || state.isSymbolicLink() || (state.mode & 0o077) !== 0 || (uid !== undefined && state.uid !== uid)) {
-        throw new AppError("CONFIGURATION_ERROR", "unsafe SSH ControlMaster directory");
-      }
-    }
+    await this.prepareConnection();
     const run = this.options.run ?? runBoundedProcess;
-    if (!this.options.plan.ownsControlMaster) await attestUserControlMaster(this.options.plan);
     const args = buildSshRemoteNodeProgramArgs(
       this.options.plan,
       this.helperProgram,
@@ -349,6 +383,19 @@ export class SshRemoteClient implements RemoteRuntimeClient {
       maxOutputBytes,
       ...(input ? { input } : {}),
     });
+  }
+
+  private async prepareConnection(): Promise<void> {
+    if (this.options.plan.ownsControlMaster) {
+      const directory = dirname(this.options.plan.controlPath!);
+      await mkdir(directory, { recursive: true, mode: 0o700 });
+      const state = await lstat(directory);
+      const uid = process.getuid?.();
+      if (!state.isDirectory() || state.isSymbolicLink() || (state.mode & 0o077) !== 0 || (uid !== undefined && state.uid !== uid)) {
+        throw new AppError("CONFIGURATION_ERROR", "unsafe SSH ControlMaster directory");
+      }
+    }
+    if (!this.options.plan.ownsControlMaster) await attestUserControlMaster(this.options.plan);
   }
 }
 

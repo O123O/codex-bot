@@ -4,6 +4,7 @@ import { chmod, lstat, mkdir, open, readFile, realpath, rm, stat, unlink } from 
 import { userInfo } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
+import { connect } from "node:net";
 
 const SAFE_PATH = /^\/[A-Za-z0-9_./+-]+$/u;
 const SAFE_NAME = /^[a-z0-9][a-z0-9_-]{0,63}$/u;
@@ -16,26 +17,31 @@ const MAX_ARGUMENT_BYTES = 64 * 1024;
 const MAX_UNIX_SOCKET_PATH_BYTES = 107;
 const NFS_SUPER_MAGIC = 0x6969;
 const RESPONSE_PREFIX = "qiyan-helper-v1:";
+const APP_SERVER_PROXY_READY = "qiyan-app-server-proxy-v1-ready\n";
 
 const operation = process.argv[2];
 const encoded = process.argv.slice(3);
 
 try {
-  let result;
-  switch (operation) {
-    case "preflight": result = preflight(); break;
-    case "bootstrap": result = await bootstrap(decodeJson(encoded, 1)); break;
-    case "inspect": result = await inspect(decodeJson(encoded, 1)); break;
-    case "start": result = await start(decodeJson(encoded, 1)); break;
-    case "stop": result = await stop(decodeJson(encoded, 1)); break;
-    case "read-file": result = await readFileDescriptor(decodeJson(encoded, 1)); break;
-    case "write-file": result = await writeFileDescriptor(decodeJson(encoded, 1)); break;
-    case "rollout-scan": result = await scanRollouts(decodeJson(encoded, 1)); break;
-    case "claude-rollout-scan": result = await scanClaudeTranscripts(decodeJson(encoded, 1)); break;
-    case "workspace": result = await workspace(decodeJson(encoded, 1)); break;
-    default: throw new Error("unsupported helper operation");
+  if (operation === "proxy-app-server") {
+    await proxyAppServer(decodeJson(encoded, 1));
+  } else {
+    let result;
+    switch (operation) {
+      case "preflight": result = preflight(); break;
+      case "bootstrap": result = await bootstrap(decodeJson(encoded, 1)); break;
+      case "inspect": result = await inspect(decodeJson(encoded, 1)); break;
+      case "start": result = await start(decodeJson(encoded, 1)); break;
+      case "stop": result = await stop(decodeJson(encoded, 1)); break;
+      case "read-file": result = await readFileDescriptor(decodeJson(encoded, 1)); break;
+      case "write-file": result = await writeFileDescriptor(decodeJson(encoded, 1)); break;
+      case "rollout-scan": result = await scanRollouts(decodeJson(encoded, 1)); break;
+      case "claude-rollout-scan": result = await scanClaudeTranscripts(decodeJson(encoded, 1)); break;
+      case "workspace": result = await workspace(decodeJson(encoded, 1)); break;
+      default: throw new Error("unsupported helper operation");
+    }
+    process.stdout.write(`\n${RESPONSE_PREFIX}${JSON.stringify(result)}\n`);
   }
-  process.stdout.write(`\n${RESPONSE_PREFIX}${JSON.stringify(result)}\n`);
 } catch {
   process.stderr.write("qiyan remote helper failed\n");
   process.exitCode = 1;
@@ -148,6 +154,55 @@ async function stop(value) {
   await rm(paths.socketPath, { force: true });
   await rm(paths.identityPath, { force: true });
   return { stopped: true };
+}
+
+async function proxyAppServer(value) {
+  const paths = runtimePaths(value);
+  const expected = validIdentity(value?.expected);
+  if (!expected) throw new Error("invalid expected runtime identity");
+  const beforeIdentity = await readIdentity(paths.identityPath);
+  if (!beforeIdentity || !sameIdentity(beforeIdentity, expected) || !identityMatches(beforeIdentity)) {
+    throw new Error("runtime identity changed");
+  }
+  const beforeSocket = await privateSocketIdentity(paths.socketPath);
+  const socket = connect(paths.socketPath);
+  try {
+    await new Promise((resolveConnection, rejectConnection) => {
+      const connected = () => { cleanup(); resolveConnection(); };
+      const failed = () => { cleanup(); rejectConnection(new Error("app-server socket connection failed")); };
+      const cleanup = () => { socket.off("connect", connected); socket.off("error", failed); };
+      socket.once("connect", connected);
+      socket.once("error", failed);
+    });
+    const [afterSocket, afterIdentity] = await Promise.all([
+      privateSocketIdentity(paths.socketPath),
+      readIdentity(paths.identityPath),
+    ]);
+    if (afterSocket.device !== beforeSocket.device || afterSocket.inode !== beforeSocket.inode
+      || !afterIdentity || !sameIdentity(afterIdentity, expected) || !identityMatches(afterIdentity)) {
+      throw new Error("runtime changed during connection");
+    }
+    await new Promise((resolveReady, rejectReady) => {
+      process.stdout.write(APP_SERVER_PROXY_READY, (error) => error ? rejectReady(error) : resolveReady());
+    });
+    await new Promise((resolveProxy, rejectProxy) => {
+      const failed = () => rejectProxy(new Error("app-server proxy failed"));
+      process.stdin.once("error", failed);
+      process.stdout.once("error", failed);
+      socket.once("error", failed);
+      socket.once("close", resolveProxy);
+      process.stdin.pipe(socket);
+      socket.pipe(process.stdout, { end: false });
+    });
+  } finally { socket.destroy(); }
+}
+
+async function privateSocketIdentity(path) {
+  const state = await lstat(path, { bigint: true });
+  const uid = process.getuid?.();
+  if (!state.isSocket() || state.isSymbolicLink() || (state.mode & 0o077n) !== 0n
+    || (uid !== undefined && state.uid !== BigInt(uid))) throw new Error("invalid app-server socket");
+  return { device: state.dev.toString(10), inode: state.ino.toString(10) };
 }
 
 async function scanRollouts(value) {

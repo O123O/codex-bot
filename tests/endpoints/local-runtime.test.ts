@@ -1,15 +1,9 @@
 import assert from "node:assert/strict";
 import { symlink, lstat, mkdtemp, mkdir, rm } from "node:fs/promises";
-import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import {
-  localSshEndpointSocketRoot,
-  localSshForwardSocketPath,
-  prepareLocalSshEndpointSocketRoot,
-  prepareLocalSshRuntimeRoot,
-} from "../../src/endpoints/local-runtime.ts";
+import { prepareLocalSshRuntimeRoot } from "../../src/endpoints/local-runtime.ts";
 import { parseSshConfig, planSshConnection } from "../../src/endpoints/ssh-config.ts";
 
 test("places transient SSH sockets in the host runtime instead of the durable data directory", async (t) => {
@@ -27,52 +21,22 @@ test("places transient SSH sockets in the host runtime instead of the durable da
   assert.equal((await lstat(first)).mode & 0o777, 0o700);
 });
 
-test("the production socket path binds under XDG-style and fallback runtime bases", async (t) => {
-  const uid = process.geteuid?.() ?? process.getuid?.() ?? 104284;
-  const fixture = await mkdtemp(join(tmpdir(), "qiyan-local-socket-"));
-  t.after(() => rm(fixture, { recursive: true, force: true }));
-  const selections = [
-    {
-      base: join(fixture, "run", "user", String(uid)),
-      options: { xdgRuntimeDir: join(fixture, "run", "user", String(uid)) },
-    },
-    {
-      base: join(fixture, "tmp", `qiyan-${uid}`),
-      options: { xdgRuntimeDir: null, temporaryDirectory: join(fixture, "tmp") },
-    },
-  ];
-
-  for (const { base, options } of selections) {
-    await mkdir(base, { recursive: true, mode: 0o700 });
-    const runtimeRoot = await prepareLocalSshRuntimeRoot("/nfs/home/user/.qiyan-bot/data", { expectedUid: uid, ...options });
-    assert.ok(runtimeRoot.startsWith(`${base}/`));
-    const socketRoot = await prepareLocalSshEndpointSocketRoot(runtimeRoot, "dfw-vscode");
-    const socketPath = localSshForwardSocketPath(socketRoot, "01234567");
-    assert.ok(Buffer.byteLength(socketPath) <= 103);
-    const server = createServer();
-    await new Promise<void>((resolve, reject) => server.once("error", reject).listen(socketPath, resolve));
-    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
-  }
-});
-
-test("keeps representative Linux runtime sockets within the portable path bound", () => {
+test("keeps representative ControlMaster sockets within the portable path bound", () => {
   for (const runtimeRoot of [
     "/run/user/104284/qiyan/0123456789abcdef",
     "/tmp/qiyan-104284/qiyan/0123456789abcdef",
   ]) {
-    const socketRoot = localSshEndpointSocketRoot(runtimeRoot, "dfw-vscode");
-    const socketPath = localSshForwardSocketPath(socketRoot, "01234567");
-    assert.ok(Buffer.byteLength(socketPath) <= 103);
     const owned = planSshConnection("dfw-vscode", parseSshConfig(
       "hostname host.example\nuser xin\nport 22\ncontrolmaster no\ncontrolpath none\n",
     ), runtimeRoot);
     assert.ok(Buffer.byteLength(owned.controlPath!) <= 100);
   }
   assert.throws(
-    () => localSshEndpointSocketRoot(`/${"x".repeat(100)}`, "dfw-vscode"),
-    /Unix socket path is too long/u,
+    () => planSshConnection("dfw-vscode", parseSshConfig(
+      "hostname host.example\nuser xin\nport 22\ncontrolmaster no\ncontrolpath none\n",
+    ), `/${"x".repeat(100)}`),
+    /control path is too long/u,
   );
-  assert.throws(() => localSshForwardSocketPath("/private/runtime", "unsafe"), /socket path/u);
 });
 
 test("rejects a symlink in the private SSH runtime path", async (t) => {

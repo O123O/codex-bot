@@ -107,7 +107,7 @@ import { attestUserControlMaster, prepareRemoteHost, type RemoteHost, SshRemoteC
 import { SshClaudeCommandRunner } from "./endpoints/ssh-claude-command-runner.ts";
 import { RemoteWorkerTunnel } from "./endpoints/remote-worker-tunnel.ts";
 import { SshAppServerRuntime } from "./endpoints/ssh-app-server-runtime.ts";
-import { prepareLocalSshEndpointSocketRoot, prepareLocalSshRuntimeRoot } from "./endpoints/local-runtime.ts";
+import { prepareLocalSshRuntimeRoot } from "./endpoints/local-runtime.ts";
 import { WebSocketWire } from "./app-server/websocket-wire.ts";
 import { SshHost } from "./endpoints/ssh-host.ts";
 import { WorkspaceRouter } from "./endpoints/workspace-router.ts";
@@ -2591,14 +2591,11 @@ export async function buildProductionApp(
               return { endpoint: claudeRemoteEndpoint, pendingBinding: generation.pendingBinding };
             }
             const remoteRuntime = new SshRuntime({ endpointId: definition.id, remote, assetRoot: remoteAssetRoot });
-            const socketRoot = await prepareLocalSshEndpointSocketRoot(sshRuntimeRoot, definition.id);
             const remoteEndpoint = new ManagedAppServerEndpoint({
               id: definition.id,
               runtime: new SshAppServerRuntime({
                 runtime: remoteRuntime,
-                plan: generation.plan,
-                socketRoot,
-                connectWire: (socketPath) => WebSocketWire.connect(socketPath, { timeoutMs: 10_000, trustedRoot: socketRoot }),
+                connectWire: (stream) => WebSocketWire.connectStream(stream, { timeoutMs: 10_000 }),
               }),
               minimumVersion: MINIMUM_SUPPORTED_CODEX_VERSION,
             });

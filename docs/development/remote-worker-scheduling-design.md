@@ -66,7 +66,7 @@ the remote host. Expose it via an `ssh -R` reverse tunnel over the endpoint's ex
 ### 3.1 Transport: remote loopback TCP → QiYan's MCP port
 `ssh -O forward -R 127.0.0.1:<rport>:127.0.0.1:<mcpPort>` over the ControlMaster (one tunnel **per endpoint/host**,
 shared by all its sessions — the per-session bearer token already distinguishes them). Mirror the existing
-`buildSshStreamForwardArgs` (which does `-L` for the Codex app-server socket) with a new `buildSshReverseForwardArgs`
+the former Codex app-server `-L` forwarding path with a new `buildSshReverseForwardArgs`
 using `-R`. The remote listener binds to `127.0.0.1` (NOT `0.0.0.0`) — with the default `GatewayPorts no` this is
 **bind-not-relax**: only processes ON the remote host can connect, never the network.
 

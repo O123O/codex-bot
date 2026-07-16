@@ -92,7 +92,7 @@ test("SSH daemon accepts only the codex user's public key", async () => {
     "AllowUsers codex",
     "DisableForwarding no",
     "AllowTcpForwarding no",
-    "AllowStreamLocalForwarding local",
+    "AllowStreamLocalForwarding no",
     "AllowAgentForwarding no",
     "X11Forwarding no",
     "PermitTunnel no",
@@ -103,7 +103,7 @@ test("SSH daemon accepts only the codex user's public key", async () => {
   }
 });
 
-test("effective SSH policy enables only local stream-local forwarding", async (t) => {
+test("effective SSH policy disables forwarding", async (t) => {
   const sshd = "/usr/sbin/sshd";
   const sshKeygen = "/usr/bin/ssh-keygen";
   try { await Promise.all([access(sshd), access(sshKeygen)]); }
@@ -121,7 +121,7 @@ test("effective SSH policy enables only local stream-local forwarding", async (t
 
   // OpenSSH 10.4 may preserve keyword casing in `sshd -T` output. Keywords are
   // case-insensitive, so validate the effective values without pinning casing.
-  assert.match(stdout, /^allowstreamlocalforwarding local$/imu);
+  assert.match(stdout, /^allowstreamlocalforwarding no$/imu);
   assert.match(stdout, /^allowtcpforwarding no$/imu);
   assert.match(stdout, /^allowagentforwarding no$/imu);
   assert.match(stdout, /^x11forwarding no$/imu);

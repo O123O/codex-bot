@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdir, readFile, mkdtemp, rm } from "node:fs/promises";
+import { readFile, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { Readable } from "node:stream";
@@ -14,7 +14,7 @@ import { SshHost } from "../../src/endpoints/ssh-host.ts";
 
 const enabled = process.env.QIYAN_SSH_ENDPOINT_INTEGRATION === "1";
 
-test("Docker SSH endpoint uses a ControlMaster stream-local forward and reconnects to the same detached App Server", { skip: !enabled }, async () => {
+test("Docker SSH endpoint uses a user-owned proxy and reconnects to the same detached App Server", { skip: !enabled }, async () => {
   const config = resolve(".tmp/ssh-worker/config");
   await readFile(config).catch(() => { throw new Error("SSH fixture is unavailable; run npm run ssh-worker:up first"); });
   const root = await mkdtemp(join(tmpdir(), "qiyan-ssh-integration-"));
@@ -27,15 +27,11 @@ test("Docker SSH endpoint uses a ControlMaster stream-local forward and reconnec
   };
   const remote = new SshRemoteClient({ plan, helperSource: await readFile("assets/remote/qiyan-ssh-helper.mjs") });
   const runtime = new SshRuntime({ endpointId: "fixture", remote });
-  const socketRoot = join(root, "socket");
-  await mkdir(socketRoot, { mode: 0o700 });
   const endpoint = new ManagedAppServerEndpoint({
     id: "fixture",
     runtime: new SshAppServerRuntime({
       runtime,
-      plan,
-      socketRoot,
-      connectWire: (socketPath) => WebSocketWire.connect(socketPath, { timeoutMs: 10_000, trustedRoot: socketRoot }),
+      connectWire: (stream) => WebSocketWire.connectStream(stream, { timeoutMs: 10_000 }),
     }),
     minimumVersion: MINIMUM_SUPPORTED_CODEX_VERSION,
   });

@@ -3,8 +3,10 @@ import { chmod, mkdtemp, readFile, rm, symlink } from "node:fs/promises";
 import { createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PassThrough } from "node:stream";
 import test from "node:test";
 import {
+  REMOTE_APP_SERVER_PROXY_READY,
   SshRemoteClient,
   SshRuntime,
   attestUserControlMaster,
@@ -16,6 +18,7 @@ import {
 } from "../../src/endpoints/ssh-runtime.ts";
 import { AppError } from "../../src/core/errors.ts";
 import type { SshConnectionPlan } from "../../src/endpoints/ssh-config.ts";
+import type { ReadyProcessStream } from "../../src/endpoints/ssh-process.ts";
 
 const userMasterPlan: SshConnectionPlan = {
   alias: "devbox",
@@ -142,6 +145,43 @@ test("user-owned helper and transfer calls rely on their authoritative SSH opera
   assert.equal(calls.some(({ args }) => args.includes("exit")), false);
 });
 
+test("the SSH client opens an identity-bound helper stream over the authenticated master", async (t) => {
+  const { plan } = await privateUserMaster(t);
+  const input = new PassThrough();
+  const output = new PassThrough();
+  const stream: ReadyProcessStream = { input, output, onClose: () => () => undefined, close: async () => undefined };
+  let observed: { command: string; args: string[]; marker: Buffer } | undefined;
+  const remote = new SshRemoteClient({
+    plan,
+    helperSource,
+    openStream: async (command, args, options) => {
+      observed = { command, args: [...args], marker: Buffer.from(options.readyMarker) };
+      return stream;
+    },
+  });
+  const expected = { kind: "ssh" as const, token: "d".repeat(32), pid: 901, linuxStartTime: "902", processGroupId: 901 };
+
+  assert.equal(await remote.openAppServerStream({
+    runtimeDir: "/tmp/qiyan-1000/abcdef0123456789abcdef01",
+    session: "qiyan-abcdef0123456789abcdef01",
+    tmuxMode: "explicit",
+    expected,
+  }, helperPath), stream);
+
+  assert.ok(observed);
+  assert.equal(observed.command, "ssh");
+  assert.deepEqual(observed.marker, REMOTE_APP_SERVER_PROXY_READY);
+  assert.deepEqual(observed.args.slice(observed.args.indexOf("-S"), observed.args.indexOf("-S") + 2), ["-S", plan.controlPath]);
+  const operation = observed.args.indexOf("proxy-app-server");
+  assert.notEqual(operation, -1);
+  assert.deepEqual(JSON.parse(decodeRemoteArgument(observed.args[operation + 1]!)), {
+    runtimeDir: "/tmp/qiyan-1000/abcdef0123456789abcdef01",
+    session: "qiyan-abcdef0123456789abcdef01",
+    tmuxMode: "explicit",
+    expected,
+  });
+});
+
 test("helper response framing ignores unrelated remote shell stdout", async (t) => {
   const { plan } = await privateUserMaster(t);
   const framed = 'qiyan-helper-v1:{"ok":true}\n';
@@ -264,8 +304,6 @@ test("reuses a healthy detached runtime and changes identity only after replacem
   const first = await runtime.ensureStarted();
   assert.deepEqual(first, remote.identity);
   assert.equal(remote.calls.filter((call) => call.operation === "start").length, 0);
-  assert.match(runtime.remoteSocketPath, /^\/tmp\/qiyan-1000\/[a-f0-9]{24}\/app-server\.sock$/u);
-
   assert.deepEqual(await runtime.runtimeIdentity(), first);
   assert.equal(remote.calls.filter((call) => call.operation === "preflight").length, 1);
   assert.equal(remote.calls.filter((call) => call.operation === "bootstrap").length, 1);
@@ -282,7 +320,6 @@ test("reuses a healthy legacy runtime without duplication and moves to shared XD
   assert.equal(remote.calls.filter((call) => call.operation === "start").length, 0);
   assert.equal(runtime.remoteRuntimeDir, "/run/user/1000/qiyan-bot/2ff8ddd61f5e0a0c72ad9390");
   assert.equal(runtime.remoteHelperPath, `${runtime.remoteRuntimeDir}/qiyan-ssh-helper.mjs`);
-  assert.equal(runtime.remoteSocketPath, "/tmp/qiyan-1000/2ff8ddd61f5e0a0c72ad9390/app-server.sock");
   assert.equal(remote.calls.some((call) => call.operation === "inspect" && call.value?.tmuxMode === "legacy"), true);
 
   await runtime.stop(remote.identity);
@@ -291,7 +328,6 @@ test("reuses a healthy legacy runtime without duplication and moves to shared XD
   assert.equal(starts.length, 1);
   assert.equal(starts[0]!.value?.runtimeDir, runtime.remoteRuntimeDir);
   assert.equal(starts[0]!.value?.tmuxMode, "explicit");
-  assert.equal(runtime.remoteSocketPath, `${runtime.remoteRuntimeDir}/app-server.sock`);
 });
 
 test("an unhealthy legacy runtime is never shadowed by a duplicate shared runtime", async () => {
@@ -312,7 +348,6 @@ test("fallback paths probe both tmux namespaces before classifying overlapping l
 
   assert.deepEqual(await runtime.ensureStarted(), remote.identity);
   assert.equal(remote.calls.some((call) => call.operation === "start"), false);
-  assert.equal(runtime.remoteSocketPath, "/tmp/qiyan-1000/2ff8ddd61f5e0a0c72ad9390/app-server.sock");
 });
 
 test("remote host preparation rejects an unvalidated runtime base before bootstrap", async () => {

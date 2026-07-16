@@ -44,7 +44,7 @@ const EFFECTIVE_SSHD_CONFIG = [
   "authenticationmethods publickey",
   "disableforwarding no",
   "allowtcpforwarding no",
-  "allowstreamlocalforwarding local",
+  "allowstreamlocalforwarding no",
   "allowagentforwarding no",
   "x11forwarding no",
   "permittunnel no",
@@ -429,7 +429,7 @@ test("rejects an effective sshd policy mismatch before scanning a host key", asy
   const calls: RunnerCall[] = [];
   await assertSafeRejection(upFixture(paths, {
     runner: lifecycleRunner(calls, {
-      effectiveSshdConfig: EFFECTIVE_SSHD_CONFIG.replace("allowstreamlocalforwarding local", "allowstreamlocalforwarding no"),
+      effectiveSshdConfig: EFFECTIVE_SSHD_CONFIG.replace("allowstreamlocalforwarding no", "allowstreamlocalforwarding local"),
     }),
     env: { PATH: "/test/bin", SENTINEL_SECRET },
   }), /SSH daemon effective configuration mismatch/u);

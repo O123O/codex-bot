@@ -122,7 +122,7 @@ function requireEffectiveSshdConfig(value: string): void {
     "authenticationmethods publickey",
     "disableforwarding no",
     "allowtcpforwarding no",
-    "allowstreamlocalforwarding local",
+    "allowstreamlocalforwarding no",
     "allowagentforwarding no",
     "x11forwarding no",
     "permittunnel no",

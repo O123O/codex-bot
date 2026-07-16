@@ -1,16 +1,92 @@
 import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
 import { lstat, realpath } from "node:fs/promises";
+import { Agent, type ClientRequest, type ClientRequestArgs } from "node:http";
+import { Duplex, type Readable, type Writable } from "node:stream";
 import WebSocket from "ws";
 import type { RpcWire } from "./rpc-client.ts";
 
 const MAX_FRAME_BYTES = 1024 * 1024;
+
+export interface WebSocketByteStream {
+  readonly input: Writable;
+  readonly output: Readable;
+  onClose(listener: (error?: Error) => void): () => void;
+  close(): Promise<void>;
+}
+
+class SocketCompatibleDuplex extends Duplex {
+  private readonly removeStreamClose: () => void;
+  private closePromise?: Promise<void>;
+
+  constructor(private readonly stream: WebSocketByteStream) {
+    super();
+    const data = (chunk: Buffer) => { if (!this.push(chunk)) stream.output.pause(); };
+    const end = () => this.push(null);
+    const failed = () => this.destroy(new Error("App Server byte stream failed"));
+    stream.output.on("data", data);
+    stream.output.once("end", end);
+    stream.output.once("error", failed);
+    this.once("close", () => {
+      stream.output.off("data", data);
+      stream.output.off("end", end);
+      stream.output.off("error", failed);
+    });
+    this.removeStreamClose = stream.onClose((error) => this.destroy(error ?? new Error("App Server byte stream closed")));
+  }
+
+  override _read(): void { this.stream.output.resume(); }
+
+  override _write(chunk: Buffer, encoding: BufferEncoding, callback: (error?: Error | null) => void): void {
+    this.stream.input.write(chunk, encoding, callback);
+  }
+
+  override _final(callback: (error?: Error | null) => void): void { this.stream.input.end(callback); }
+
+  override _destroy(error: Error | null, callback: (error?: Error | null) => void): void {
+    this.removeStreamClose();
+    const closing = this.closePromise ?? this.stream.close();
+    this.closePromise = closing;
+    void closing.then(() => callback(error), () => callback(error ?? new Error("App Server byte stream cleanup failed")));
+  }
+
+  setTimeout(_milliseconds: number, _callback?: () => void): this { return this; }
+  setNoDelay(_enabled = true): this { return this; }
+  setKeepAlive(_enabled = false, _initialDelay = 0): this { return this; }
+}
+
+export function createSocketCompatibleDuplex(stream: WebSocketByteStream): Duplex {
+  return new SocketCompatibleDuplex(stream);
+}
+
+export class OneShotStreamAgent extends Agent {
+  private admitted = false;
+
+  constructor(private readonly streamSocket: Duplex) {
+    super({ keepAlive: false, maxSockets: 1 });
+  }
+
+  addRequest(request: ClientRequest, options: ClientRequestArgs): void {
+    if (this.admitted) {
+      throw new Error("one-shot App Server stream already admitted a request");
+    }
+    this.admitted = true;
+    const addRequest = (Agent.prototype as unknown as {
+      addRequest(request: ClientRequest, options: ClientRequestArgs): void;
+    }).addRequest;
+    addRequest.call(this, request, options);
+  }
+
+  override createConnection(): Duplex { return this.streamSocket; }
+}
 
 export class WebSocketWire implements RpcWire {
   private readonly messages = new Set<(message: string) => void>();
   private readonly closes = new Set<(error?: Error) => void>();
   private closed = false;
 
-  private constructor(private readonly socket: WebSocket) {
+  private disposed = false;
+
+  private constructor(private readonly socket: WebSocket, private readonly dispose?: () => void) {
     socket.on("message", (data, isBinary) => {
       const size = Array.isArray(data) ? data.reduce((total, item) => total + item.byteLength, 0) : data.byteLength;
       if (isBinary || size > MAX_FRAME_BYTES) {
@@ -34,22 +110,29 @@ export class WebSocketWire implements RpcWire {
       followRedirects: false,
       perMessageDeflate: false,
     });
-    await new Promise<void>((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        socket.once("error", () => undefined);
-        try { socket.terminate(); } catch { /* rejection below is authoritative */ }
-        cleanup();
-        reject(new Error("App Server WebSocket handshake timed out"));
-      }, options.timeoutMs);
-      const cleanup = () => { clearTimeout(timeout); socket.off("open", opened); socket.off("error", failed); socket.off("unexpected-response", unexpected); };
-      const opened = () => { cleanup(); if (socket.protocol) { socket.terminate(); reject(new Error("unexpected App Server WebSocket protocol")); } else resolve(); };
-      const failed = () => { cleanup(); reject(new Error("App Server WebSocket handshake failed")); };
-      const unexpected = (_request: unknown, response: { destroy(): void }) => { cleanup(); response.destroy(); reject(new Error("unexpected App Server WebSocket response")); };
-      socket.once("open", opened);
-      socket.once("error", failed);
-      socket.once("unexpected-response", unexpected);
-    });
+    await awaitHandshake(socket, options.timeoutMs);
     return new WebSocketWire(socket);
+  }
+
+  static async connectStream(stream: WebSocketByteStream, options: { timeoutMs: number }): Promise<WebSocketWire> {
+    const adapter = createSocketCompatibleDuplex(stream);
+    const agent = new OneShotStreamAgent(adapter);
+    const socket = new WebSocket("ws://qiyan-app-server.invalid/", {
+      agent,
+      handshakeTimeout: options.timeoutMs,
+      maxPayload: MAX_FRAME_BYTES,
+      followRedirects: false,
+      perMessageDeflate: false,
+    });
+    try { await awaitHandshake(socket, options.timeoutMs); }
+    catch (error) {
+      socket.once("error", () => undefined);
+      try { socket.terminate(); } catch { /* rejection below is authoritative */ }
+      agent.destroy();
+      adapter.destroy();
+      throw error;
+    }
+    return new WebSocketWire(socket, () => { agent.destroy(); adapter.destroy(); });
   }
 
   send(message: string): void { this.socket.send(message); }
@@ -60,8 +143,27 @@ export class WebSocketWire implements RpcWire {
   private fail(error?: Error): void {
     if (this.closed) return;
     this.closed = true;
+    if (!this.disposed) { this.disposed = true; this.dispose?.(); }
     for (const listener of this.closes) listener(error);
   }
+}
+
+async function awaitHandshake(socket: WebSocket, timeoutMs: number): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      socket.once("error", () => undefined);
+      try { socket.terminate(); } catch { /* rejection below is authoritative */ }
+      cleanup();
+      reject(new Error("App Server WebSocket handshake timed out"));
+    }, timeoutMs);
+    const cleanup = () => { clearTimeout(timeout); socket.off("open", opened); socket.off("error", failed); socket.off("unexpected-response", unexpected); };
+    const opened = () => { cleanup(); if (socket.protocol) { socket.terminate(); reject(new Error("unexpected App Server WebSocket protocol")); } else resolve(); };
+    const failed = () => { cleanup(); reject(new Error("App Server WebSocket handshake failed")); };
+    const unexpected = (_request: unknown, response: { destroy(): void }) => { cleanup(); response.destroy(); reject(new Error("unexpected App Server WebSocket response")); };
+    socket.once("open", opened);
+    socket.once("error", failed);
+    socket.once("unexpected-response", unexpected);
+  });
 }
 
 async function attestPrivateSocket(socketPath: string, trustedRoot: string): Promise<void> {
