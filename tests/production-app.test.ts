@@ -6,6 +6,7 @@ import {
   createManagedSessionRecoveryOwner,
   createEndpointReadyBuffer,
   EndpointRecoveryIncidents,
+  completeEndpointRecoveryIncident,
   createDurableEventWakeBoundary,
   createDurableEventSourceCallbacks,
   createExternalOwnershipCycleReporter,
@@ -52,6 +53,10 @@ import {
   reportAssistantTerminalFailure,
   reportOperationalSafely,
   requestOperationRecoveryForAttempt,
+  assistantPostTurnActionMatches,
+  assistantStartupCanDrainPostTurnActions,
+  finalizeAssistantStartup,
+  recoveryTurnSuffix,
   commitAssistantTerminalFinals,
   resolveAssistantTerminalTurn,
   settleAssistantTerminalTools,
@@ -81,6 +86,23 @@ test("only remote Codex recovery rejoins threads on the replacement connection",
   assert.equal(managedRecoveryRequiresConnectionResume("codex", true), true);
   assert.equal(managedRecoveryRequiresConnectionResume("codex", false), false);
   assert.equal(managedRecoveryRequiresConnectionResume("claude", true), false);
+});
+
+test("completed cutover does not drain assistant post-turn actions while the resumed thread is active", () => {
+  assert.equal(assistantStartupCanDrainPostTurnActions("active", []), false);
+  assert.equal(assistantStartupCanDrainPostTurnActions("idle", []), true);
+  assert.equal(assistantStartupCanDrainPostTurnActions("idle", [{ status: "inProgress" }]), false);
+  assert.equal(assistantStartupCanDrainPostTurnActions("idle", [{ status: "completed" }]), true);
+});
+
+test("assistant startup wiring always finalizes cutover but drains only an idle terminal thread", async () => {
+  const active: string[] = [];
+  await finalizeAssistantStartup("active", [], () => { active.push("finalize"); }, () => { active.push("drain"); });
+  assert.deepEqual(active, ["finalize"]);
+
+  const idle: string[] = [];
+  await finalizeAssistantStartup("idle", [{ status: "completed" }], () => { idle.push("finalize"); }, () => { idle.push("drain"); });
+  assert.deepEqual(idle, ["finalize", "drain"]);
 });
 
 test("assistant commentary from an active web turn is durably queued while terminal and final items stay excluded", () => {
@@ -287,22 +309,26 @@ test("operation recovery waits only for the exact in-process tool handler", () =
   assert.equal(operationRecoveryAction({ state: "dispatched", activeHandler: false }), "attempt");
 });
 
-test("shutdown stops operation waits before waiting for MCP handlers", async () => {
+test("shutdown closes Web goal admission and drains Web and MCP handlers with operation recovery", async () => {
   const events: string[] = [];
   let releaseRecovery!: () => void;
   const recoveryStopped = new Promise<void>((resolve) => { releaseRecovery = resolve; });
   const stopping = stopOperationRecoveryBeforeTools({
+    closeGoalAdmission: () => { events.push("web:close"); },
     stopOperationRecovery: () => { events.push("operation:stop"); return recoveryStopped; },
     waitForTools: async () => { events.push("tools:wait"); releaseRecovery(); },
+    waitForGoalControls: async () => { events.push("web:wait"); },
   });
   await stopping;
-  assert.deepEqual(events, ["operation:stop", "tools:wait"]);
+  assert.deepEqual(events, ["web:close", "operation:stop", "tools:wait", "web:wait"]);
 
   let releaseTools!: () => void;
   const toolsFinished = new Promise<void>((resolve) => { releaseTools = resolve; });
   const rejected = stopOperationRecoveryBeforeTools({
+    closeGoalAdmission: () => {},
     stopOperationRecovery: async () => { throw new Error("recovery stop failed"); },
     waitForTools: () => toolsFinished,
+    waitForGoalControls: async () => {},
   });
   await new Promise<void>((resolve) => setImmediate(resolve));
   releaseTools();
@@ -333,6 +359,7 @@ test("recoverable operation targets are exhaustive and fail closed", () => {
   ]);
   const resolve = {
     defaultProjectEndpointId: "local",
+    assistantEndpointId: "assistant-local",
     session: (nickname: string) => {
       const endpoint = sessionEndpoints.get(nickname);
       return endpoint ? { endpoint, thread_id: `thread-${nickname}`, project_dir: "/project", mapping_id: `mapping-${nickname}`, lifecycle_state: "managed" as const } : undefined;
@@ -354,6 +381,9 @@ test("recoverable operation targets are exhaustive and fail closed", () => {
   assert.deepEqual(target("create_session", { endpoint: "endpoint-a" }, { endpoint: "endpoint-b", dispatchStarted: true }), { policy: "ready_endpoint", endpointId: "endpoint-b" });
   assert.deepEqual(target("create_session", { endpoint: "" }), { policy: "ready_endpoint", endpointId: "local" });
   assert.deepEqual(target("send_to_session", { nickname: "worker-a" }), { policy: "ready_endpoint", endpointId: "endpoint-a" });
+  assert.deepEqual(target("compact_session", { nickname: "worker-a" }), { policy: "ready_endpoint", endpointId: "endpoint-a" });
+  assert.deepEqual(target("compact_session", { nickname: "worker-a" }, { endpointId: "endpoint-b" }), { policy: "ready_endpoint", endpointId: "endpoint-b" });
+  assert.deepEqual(target("compact_session", { nickname: "assistant" }), { policy: "local" });
   for (const kind of ["set_goal", "pause_goal", "resume_goal", "cancel_goal", "interrupt_session"]) {
     assert.deepEqual(target(kind, { nickname: "worker-b" }), { policy: "ready_endpoint", endpointId: "endpoint-b" }, kind);
   }
@@ -364,6 +394,7 @@ test("recoverable operation targets are exhaustive and fail closed", () => {
     assert.deepEqual(target(kind, { endpoint: "endpoint-a" }), { policy: "endpoint_lifecycle", endpointId: "endpoint-a" }, kind);
     assert.deepEqual(target(kind, { endpoint: "endpoint-a" }, { endpoint: "endpoint-b" }), { policy: "endpoint_lifecycle", endpointId: "endpoint-b" }, `${kind} checkpoint`);
   }
+  assert.deepEqual(target("restart_endpoint", { endpoint: "assistant-local" }), { policy: "local" });
   assert.deepEqual(target("future_operation", { endpoint: "endpoint-a" }), { policy: "unknown" });
   assert.deepEqual(target("send_to_session", { nickname: "missing" }), { policy: "unknown" });
   assert.deepEqual(recoverableOperationEndpointReferences([
@@ -387,6 +418,22 @@ test("recoverable operation targets are exhaustive and fail closed", () => {
     { kind: "disconnect_endpoint", args: {}, receipt: undefined },
     { kind: "restart_endpoint", args: { endpoint: "endpoint-a" }, receipt: undefined },
   ], resolve), ["endpoint-a", "local"]);
+});
+
+test("assistant post-turn operation recovery requires the exact durable target payload", () => {
+  const localIdentity = { kind: "local" as const, pid: 10, startTime: "10" };
+  assert.equal(assistantPostTurnActionMatches({
+    id: "op", kind: "compact", state: "pending", payload: { endpointId: "assistant-local", threadId: "thread" },
+  }, { kind: "compact", endpointId: "assistant-local", threadId: "thread" }), true);
+  assert.equal(assistantPostTurnActionMatches({
+    id: "op", kind: "compact", state: "pending", payload: { endpointId: "assistant-local", threadId: "other" },
+  }, { kind: "compact", endpointId: "assistant-local", threadId: "thread" }), false);
+  assert.equal(assistantPostTurnActionMatches({
+    id: "op", kind: "restart", state: "pending", payload: { endpointId: "assistant-local", runtimeIdentity: localIdentity },
+  }, { kind: "restart", endpointId: "assistant-local" }), true);
+  assert.equal(assistantPostTurnActionMatches({
+    id: "op", kind: "restart", state: "pending", payload: { endpointId: "assistant-local", runtimeIdentity: { kind: "local", pid: -1, startTime: "bad" } },
+  }, { kind: "restart", endpointId: "assistant-local" }), false);
 });
 
 test("a proven no-dispatch create recovery terminalizes without an endpoint lease", async () => {
@@ -445,13 +492,44 @@ test("send recovery does not terminalize history containing its correlated turn"
   assert.equal(reconcileAbsentRecoveredSendStart(store, store.listRecoverable()[0]!, {
     thread: {
       status: { type: "idle" },
-      turns: [{ items: [{ type: "userMessage", clientId: "ctx:call" }] }],
+      turns: [{ itemsView: "summary", items: [{ type: "userMessage", clientId: "ctx:call" }] }],
     },
   }, () => { released += 1; }), false);
 
   assert.equal(released, 0);
   assert.equal(store.get(operation.id)?.state, "uncertain");
   assert.deepEqual(store.get(operation.id)?.error, { message: "raw turn/start timeout" });
+});
+
+test("bounded start recovery proves absence from a nonempty baseline suffix and accepts legacy summaries", () => {
+  const turns = [
+    { id: "old", itemsView: "notLoaded" as const, items: [] },
+    { id: "candidate", itemsView: "summary" as const, items: [{ type: "userMessage", clientId: "someone-else" }] },
+  ];
+  assert.deepEqual(recoveryTurnSuffix(turns, "old").map((turn) => turn.id), ["candidate"]);
+  assert.throws(() => recoveryTurnSuffix(turns, "missing"), (error: unknown) => (
+    error instanceof AppError && error.code === "OPERATION_UNCERTAIN"
+  ));
+
+  const store = new OperationStore(createTestDatabase());
+  const args = { nickname: "worker", content: "message", attachment_ids: [], mode: "start" };
+  const operation = store.prepare({ contextId: "ctx", attemptId: "attempt", callId: "call", kind: "send_to_session", args });
+  store.markDispatched(operation.id);
+  store.fail(operation.id, { message: "timeout" }, true);
+  assert.equal(reconcileAbsentRecoveredSendStart(store, store.listRecoverable()[0]!, {
+    thread: { status: { type: "idle" }, turns: recoveryTurnSuffix(turns, "old") },
+  }, () => undefined), true);
+});
+
+test("start recovery never proves absence from an unhydrated suffix", () => {
+  const store = new OperationStore(createTestDatabase());
+  const args = { nickname: "worker", content: "message", attachment_ids: [], mode: "start" };
+  const operation = store.prepare({ contextId: "ctx", attemptId: "attempt", callId: "call", kind: "send_to_session", args });
+  store.markDispatched(operation.id);
+  store.fail(operation.id, { message: "timeout" }, true);
+  assert.equal(reconcileAbsentRecoveredSendStart(store, store.listRecoverable()[0]!, {
+    thread: { status: { type: "idle" }, turns: [{ itemsView: "notLoaded", items: [] }] },
+  }, () => assert.fail("unhydrated history is not proof")), false);
 });
 
 test("durable operation endpoints survive restart as startup identity references", async () => {
@@ -981,18 +1059,43 @@ test("durable overlap fences are endpoint-sequenced and nickname/thread exact", 
 });
 
 test("reconnection incidents compare-delete per endpoint and preserve a newer loss", () => {
-  const incidents = new EndpointRecoveryIncidents();
+  const incidents = new EndpointRecoveryIncidents("test-run");
   assert.equal(incidents.pending("endpoint-a"), undefined, "initial activation has no recovery incident");
   const first = incidents.record("endpoint-a");
   const other = incidents.record("endpoint-b");
-  assert.equal(incidents.pending("endpoint-a"), first);
-  assert.equal(incidents.pending("endpoint-b"), other);
+  assert.deepEqual(first, { sequence: 1, episode: "test-run:1" });
+  assert.deepEqual(other, { sequence: 2, episode: "test-run:2" });
+  assert.deepEqual(incidents.pending("endpoint-a"), first);
+  assert.deepEqual(incidents.pending("endpoint-b"), other);
   const newer = incidents.record("endpoint-a");
+  assert.deepEqual(newer, { sequence: 3, episode: first.episode }, "one unresolved outage keeps one notification episode");
   assert.equal(incidents.consume("endpoint-a", first), false);
-  assert.equal(incidents.pending("endpoint-a"), newer);
+  assert.deepEqual(incidents.pending("endpoint-a"), newer);
   assert.equal(incidents.consume("endpoint-a", newer), true);
   assert.equal(incidents.pending("endpoint-a"), undefined);
-  assert.equal(incidents.pending("endpoint-b"), other);
+  assert.deepEqual(incidents.pending("endpoint-b"), other);
+
+  const nextEpisode = incidents.record("endpoint-a");
+  assert.deepEqual(nextEpisode, { sequence: 4, episode: "test-run:4" }, "a confirmed recovery lets a later outage notify once again");
+});
+
+test("completed endpoint recovery opens a fresh notification episode for later outages", () => {
+  const incidents = new EndpointRecoveryIncidents("assistant-run");
+  const notices: string[] = [];
+  const complete = () => completeEndpointRecoveryIncident(incidents, "assistant-local", (incident) => {
+    notices.push(`endpoint-recovered:assistant-local:${incident.episode}`);
+  });
+
+  const first = incidents.record("assistant-local");
+  assert.equal(complete(), true);
+  assert.equal(complete(), false, "one recovery completion is emitted once");
+  const second = incidents.record("assistant-local");
+  assert.notEqual(second.episode, first.episode);
+  assert.equal(complete(), true);
+  assert.deepEqual(notices, [
+    `endpoint-recovered:assistant-local:${first.episode}`,
+    `endpoint-recovered:assistant-local:${second.episode}`,
+  ]);
 });
 
 test("managed recovery uses only source-specific transient and external dispositions", () => {

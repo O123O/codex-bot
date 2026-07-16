@@ -37,8 +37,8 @@ const userInputText = (content: unknown): string => Array.isArray(content)
 
 const stripSetup = (text: string): string => text.replace(/^\s*<environment_context>[\s\S]*?<\/environment_context>\s*/iu, "").trim();
 
-type NativeItem = { type?: string; id?: string; clientId?: string | null; text?: string; phase?: string | null; content?: unknown };
-type NativeTurn = { id?: string; status?: string; startedAt?: number | null; completedAt?: number | null; items?: NativeItem[] };
+type NativeItem = { type?: string; id?: string; clientId?: string | null; text?: string; phase?: string | null; content?: unknown; itemOrder?: number };
+type NativeTurn = { id?: string; status?: string; startedAt?: number | null; completedAt?: number | null; items?: NativeItem[]; turnOrder?: number };
 
 export function openWorkerTurnIds(turns: readonly unknown[]): string[] {
   const ids: string[] = [];
@@ -95,18 +95,20 @@ export function pageWorkerConversation(turns: readonly unknown[], count: number,
     const startedMs = toMillis(turn.startedAt ?? turn.completedAt);
     const completedMs = toMillis(turn.completedAt ?? turn.startedAt);
     const items = Array.isArray(turn.items) ? turn.items : [];
+    const stableTurnOrder = Number.isSafeInteger(turn.turnOrder) && Number(turn.turnOrder) >= 0 ? Number(turn.turnOrder) : turnOrder;
     items.forEach((item, itemOrder) => {
+      const stableItemOrder = Number.isSafeInteger(item.itemOrder) && Number(item.itemOrder) >= 0 ? Number(item.itemOrder) : itemOrder;
       const itemId = item.id ?? String(itemOrder);
       if (item.type === "userMessage") {
         const body = stripSetup(userInputText(item.content));
         if (!body) return;
         const clientId = typeof item.clientId === "string" && item.clientId ? item.clientId : undefined;
-        rows.push({ id: `u:${turnId}:${itemId}`, turnId, role: "you", body, completedAt: startedMs, terminalStatus: status, turnOrder, itemOrder, ...(clientId ? { clientId } : {}) });
+        rows.push({ id: `u:${turnId}:${itemId}`, turnId, role: "you", body, completedAt: startedMs, terminalStatus: status, turnOrder: stableTurnOrder, itemOrder: stableItemOrder, ...(clientId ? { clientId } : {}) });
         return;
       }
       if (item.type !== "agentMessage" || typeof item.text !== "string" || !item.text) return;
       const phase = typeof item.phase === "string" && item.phase ? item.phase : undefined;
-      rows.push({ id: `a:${turnId}:${itemId}`, turnId, role: "worker", body: item.text, completedAt: completedMs, terminalStatus: status, turnOrder, itemOrder, ...(phase ? { phase } : {}) });
+      rows.push({ id: `a:${turnId}:${itemId}`, turnId, role: "worker", body: item.text, completedAt: completedMs, terminalStatus: status, turnOrder: stableTurnOrder, itemOrder: stableItemOrder, ...(phase ? { phase } : {}) });
     });
   });
   rows.sort(compareKey);

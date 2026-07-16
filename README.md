@@ -42,9 +42,9 @@ Read this before installing or launching:
 
 - Linux
 - Node.js 24 or newer
-- `codex-cli 0.142.5` or newer (the assistant and Codex workers)
+- `codex-cli 0.144.4` or newer (the assistant and Codex workers)
 - The Claude Code CLI (`claude`) — only if you configure Claude workers
-- For remote workers: OpenSSH client; the remote Linux host needs Node.js 24+ and, per endpoint provider, either Codex 0.142.5+ and tmux (Codex) or the `claude` CLI (Claude), plus its own authenticated CLI profile
+- For remote workers: OpenSSH client; the remote Linux host needs Node.js 24+ and, per endpoint provider, either Codex 0.144.4+ and tmux (Codex) or the `claude` CLI (Claude), plus its own authenticated CLI profile
 - At least one chat adapter: Telegram owner credentials, Slack owner/workspace credentials, a managed personal WeChat login, or any combination
 
 ## Install

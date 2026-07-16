@@ -18,13 +18,14 @@ test("restores active mappings and strict provisional send hints before ingress"
   } as never);
   assert.deepEqual(recovery.restoreBeforeIngress().sort(), ["devbox", "offline"]);
   assert.deepEqual(active, [["devbox", "thread-1", "turn-1"]]);
-  assert.deepEqual(provisional, [["offline", "thread-2", "recovered:op-1", "message-2"]]);
+  assert.deepEqual(provisional, [["offline", "thread-2", "recovered:op-1", "message-2", undefined]]);
   assert.deepEqual(quarantined, []);
 });
 
 test("strictly rejects malformed or extended capacity hints", () => {
   const valid = { phase: "provisional-start", endpoint: "devbox", threadId: "t", mappingId: "m", clientUserMessageId: "c" };
   assert.deepEqual(parseCapacityHint(valid), valid);
+  assert.deepEqual(parseCapacityHint({ ...valid, baselineTurnId: null }), { ...valid, baselineTurnId: null });
   assert.equal(parseCapacityHint({ ...valid, unexpected: true }), undefined);
   assert.equal(parseCapacityHint({ ...valid, phase: "active" }), undefined);
 });

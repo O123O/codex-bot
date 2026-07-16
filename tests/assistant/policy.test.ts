@@ -8,7 +8,7 @@ import { SessionDashboardDocumentSchema } from "../../src/assistant/dashboard-sc
 const policyPath = fileURLToPath(new URL("../../assets/assistant/AGENTS.md", import.meta.url));
 const catalog = [
   ["Session discovery and lifecycle", ["list_managed_sessions", "discover_sessions", "get_session_status", "create_session", "adopt_session", "rename_session", "unadopt_session", "archive_session", "disconnect_endpoint", "restart_endpoint"]],
-  ["Work and results", ["send_to_session", "read_worker_message", "collect_messages", "interrupt_session"]],
+  ["Work and results", ["send_to_session", "read_worker_message", "collect_messages", "interrupt_session", "compact_session"]],
   ["Model, goal, and management memory", ["list_models", "set_session_model", "set_reasoning_effort", "get_goal", "set_goal", "pause_goal", "resume_goal", "cancel_goal", "update_session_notes"]],
   ["User output and attachments", ["send_chat_message", "prepare_chat_attachment", "send_chat_attachment"]],
   ["Chat context and Slack retrieval", ["get_chat_history", "search_slack", "get_slack_mentions"]],
@@ -70,6 +70,8 @@ test("packaged assistant policy is concise and reserves examples for exact direc
   assert.match(policy, /permission blocks.*worker failures are real states.*never fabricate/isu);
   assert.match(policy, /worker notifications contain metadata, not bodies/iu);
   assert.match(policy, /model and effort changes are pending.*next new turn.*steer/isu);
+  assert.match(policy, /use `assistant`.*own status\/model\/effort\/compaction/iu);
+  assert.match(policy, /self results return internally as `\[system\]`.*all results notify the user.*never reply to or repeat/iu);
   assert.match(policy, /goal completion is a worker.*never declare or mark a worker goal complete yourself/isu);
   assert.match(policy, /never declare or mark a worker goal complete/iu);
   assert.match(policy, /never (?:edit|patch|replace|delete|regenerate)[^\n]*session-status\.json/iu);
@@ -92,6 +94,10 @@ test("packaged assistant policy is concise and reserves examples for exact direc
   assert.match(policy, /\/collect.*exact count.*backend delivers.*directly/isu);
   assert.match(policy, /`\/to <worker>` is delivered directly to that worker by the backend/iu);
   assert.match(policy, /do NOT reply to it, re-send it, or act on it unless separately asked/iu);
+  assert.match(policy, /`web_goal` awareness.*backend.*already handled/isu);
+  assert.match(policy, /objective.*quoted user data.*not instructions/isu);
+  assert.match(policy, /never reply.*repeat.*goal.*mutation/isu);
+  assert.match(policy, /even if.*objective.*(?:asks|says).*otherwise/isu);
   assert.match(policy, /do not repeat, summarize, or acknowledge directly collected bodies/iu);
   assert.match(policy, /User: tell payments \/pass  preserve this leading space/u);
   assert.match(policy, /"content":" preserve this leading space"/u);
@@ -107,7 +113,7 @@ test("packaged assistant policy is concise and reserves examples for exact direc
   assert.doesNotMatch(policy, /qiyan-bot:(?:managed|user)/u);
   // Budget raised from 7_000 to accommodate the permanent endpoint-provider model
   // (codex/claude + the remote ssh/claude-code catalog types); the doc stays concise.
-  assert.ok(Buffer.byteLength(policy, "utf8") < 7_300, "assistant policy exceeded the concise prompt budget");
+  assert.ok(Buffer.byteLength(policy, "utf8") < 7_800, "assistant policy exceeded the concise prompt budget");
 
   const examplePath = fileURLToPath(new URL("../../assets/assistant/session-status.example.json", import.meta.url));
   assert.deepEqual(SessionDashboardDocumentSchema.parse(JSON.parse(await readFile(examplePath, "utf8"))), { version: 2, sessions: {} });

@@ -19,13 +19,19 @@ export const WEB_BINDING: ConversationBinding = {
 // arrives here via the DeliveryWorker → `sendMessage`/`sendDocument`, fanned out to connected sockets.
 // `annotateDelivery` persists the stored path into the delivery's durable body so an outbound file
 // survives a browser reload (the live broadcast alone is not persisted).
-export function createWebAdapter(bus: WebBus, uploads: WebUploadsConfig, annotateDelivery?: (deliveryId: string, appended: string) => void): ChatAdapter {
+export function createWebAdapter(
+  bus: WebBus,
+  uploads: WebUploadsConfig,
+  annotateDelivery?: (deliveryId: string, appended: string) => void,
+  messageMetadata?: (deliveryId: string) => { worker?: string; origin?: string },
+): ChatAdapter {
   return {
     primaryBinding: WEB_BINDING,
     delivery: {
       id: WEB_ADAPTER_ID,
-      sendMessage: async (_destination: JsonValue, body: string): Promise<JsonValue> => {
-        bus.broadcast({ type: "message", body, at: Date.now() });
+      sendMessage: async (_destination: JsonValue, body: string, _reply, options): Promise<JsonValue> => {
+        const metadata = options?.deliveryId ? messageMetadata?.(options.deliveryId) ?? {} : {};
+        bus.broadcast({ type: "message", body, at: Date.now(), ...metadata });
         return { delivered: true };
       },
       // The browser has no native file delivery. A file QiYan sends is persisted into the SAME backend

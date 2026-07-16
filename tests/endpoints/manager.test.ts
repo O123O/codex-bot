@@ -394,7 +394,7 @@ test("reconnect backoff escalates then gives up after ~48h of failures instead o
   assert.equal(scheduled.length, 0, "post-give-up on-demand use stays bounded (one direct attempt, no ramp)");
 });
 
-test("a successful reconnect resets the backoff so a later outage restarts at the fast ramp", async () => {
+test("only completed ready recovery resets reconnect backoff", async () => {
   const local = new FakeEndpoint("local");
   const remote = new FakeEndpoint("offline");
   remote.failStart = true;
@@ -418,13 +418,25 @@ test("a successful reconnect resets the backoff so a later outage restarts at th
   assert.deepEqual(scheduled.map((item) => item.delay), [10_000]); // second attempt
 
   remote.failStart = false;
-  scheduled.shift()!.run(); // succeeds → publishes and resets reconnectAttempt
+  scheduled.shift()!.run(); // transport reconnects and publishes, but owner recovery is not complete yet
   await settle();
-  assert.equal(manager.endpointGeneration("offline").endpoint.state, "ready");
+  const generation = manager.endpointGeneration("offline");
+  assert.equal(generation.endpoint.state, "ready");
   assert.equal(scheduled.length, 0);
 
   remote.failStart = true;
-  remote.fail("connection-lost"); // a fresh outage after recovery
+  remote.fail("connection-lost"); // recovery-stage failure: keep escalating instead of restarting at 5s
+  await settle();
+  assert.deepEqual(scheduled.map((item) => item.delay), [30_000]);
+
+  remote.failStart = false;
+  scheduled.shift()!.run();
+  await settle();
+  const recovered = manager.endpointGeneration("offline");
+  assert.equal(manager.acknowledgeReadyRecovery("offline", recovered.generation), true);
+
+  remote.failStart = true;
+  remote.fail("connection-lost"); // a fresh outage after completed owner recovery
   await settle();
   assert.deepEqual(scheduled.map((item) => item.delay), [5_000], "the backoff restarts at the fast ramp, not the previous escalation");
 });
@@ -457,11 +469,13 @@ test("the give-up latch re-arms after a recovery so a second sustained outage wa
   await driveToGiveUp();
   assert.deepEqual(gaveUp, [{ id: "offline", attempts: 53 }]);
 
-  // Cluster comes back: a successful activation publishes and clears the latch.
+  // Cluster comes back: activation publishes, then completed owner recovery clears the latch.
   remote.failStart = false;
   await manager.ensureReady("offline");
   await settle();
-  assert.equal(manager.endpointGeneration("offline").endpoint.state, "ready");
+  const recovered = manager.endpointGeneration("offline");
+  assert.equal(recovered.endpoint.state, "ready");
+  assert.equal(manager.acknowledgeReadyRecovery("offline", recovered.generation), true);
   assert.equal(scheduled.length, 0);
 
   // A second sustained outage — this time via the loss path (onUnavailable → scheduleReconnect,

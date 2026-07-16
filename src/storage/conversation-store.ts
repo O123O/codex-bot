@@ -10,7 +10,7 @@ import type { DeliveryStore } from "./delivery-store.ts";
 
 export interface InternalSource {
   id: string;
-  kind: "event_batch" | "recovery" | "direct_to";
+  kind: "event_batch" | "recovery" | "direct_to" | "web_goal" | "system_notice";
   sourceId: string;
   rawText: string;
   attachmentIds: readonly string[];
@@ -40,6 +40,7 @@ export interface AttemptSource {
   state: "pending" | "start_submitting" | "steer_submitting" | "uncertain" | "submitted" | "completed" | "failed" | "superseded";
   expectedTurnId?: string;
   observedTurnId?: string;
+  baselineTurnId?: string | null;
 }
 
 export interface ReservedSubmission extends AttemptSource {
@@ -117,18 +118,21 @@ export class ConversationStore {
   // merged with your inbound chat messages (source_class='chat'). The cursor is INCLUSIVE (`<=`) with a
   // stable-id tie-break (the caller dedups) so same-millisecond rows are never skipped; `created_at` is
   // millis but normalized defensively. Lease-free; the merge + pagination are one correct query.
-  listOwnerConversation(before: number | undefined, limit: number): Array<{ id: string; role: "you" | "assistant"; body: string; at: number }> {
+  listOwnerConversation(before: number | undefined, limit: number): Array<{ id: string; role: "you" | "assistant"; body: string; at: number; deliveryKind?: string }> {
     const clamped = Math.max(1, Math.min(50, limit));
     const cursor = before !== undefined && Number.isFinite(before);
     const NORM = "(CASE WHEN created_at < 1000000000000 THEN created_at * 1000 ELSE created_at END)";
-    const rows = this.db.prepare(`SELECT id, role, body, at FROM (
-        SELECT id AS id, 'assistant' AS role, body AS body, ${NORM} AS at FROM deliveries${cursor ? ` WHERE ${NORM} <= ?` : ""}
+    const rows = this.db.prepare(`SELECT id, role, body, at, delivery_kind FROM (
+        SELECT id AS id, 'assistant' AS role, body AS body, ${NORM} AS at, kind AS delivery_kind FROM deliveries${cursor ? ` WHERE ${NORM} <= ?` : ""}
         UNION ALL
-        SELECT id AS id, 'you' AS role, raw_text AS body, ${NORM} AS at FROM source_contexts
+        SELECT id AS id, 'you' AS role, raw_text AS body, ${NORM} AS at, NULL AS delivery_kind FROM source_contexts
           WHERE source_class = 'chat'${cursor ? ` AND ${NORM} <= ?` : ""}
       ) ORDER BY at DESC, id DESC LIMIT ?`)
-      .all(...(cursor ? [before, before, clamped] : [clamped])) as Array<{ id: string; role: string; body: string; at: number }>;
-    return rows.reverse().map((row) => ({ id: String(row.id), role: row.role === "you" ? "you" : "assistant", body: String(row.body), at: Number(row.at) }));
+      .all(...(cursor ? [before, before, clamped] : [clamped])) as Array<{ id: string; role: string; body: string; at: number; delivery_kind: string | null }>;
+    return rows.reverse().map((row) => ({
+      id: String(row.id), role: row.role === "you" ? "you" : "assistant", body: String(row.body), at: Number(row.at),
+      ...(row.delivery_kind ? { deliveryKind: String(row.delivery_kind) } : {}),
+    }));
   }
 
   createInternalSource(input: InternalSource): string {
@@ -377,6 +381,29 @@ export class ConversationStore {
     };
   }
 
+  checkpointSubmissionBaseline(attemptId: string, contextId: string, baselineTurnId: string | null): void {
+    inTransaction(this.db, () => {
+      const row = this.db.prepare(`SELECT baseline_recorded, baseline_turn_id FROM assistant_attempt_sources
+        WHERE attempt_id = ? AND context_id = ? AND submission_kind = 'start'
+          AND state IN ('start_submitting', 'uncertain')`).get(attemptId, contextId) as {
+            baseline_recorded: number;
+            baseline_turn_id: unknown;
+          } | undefined;
+      if (!row) this.conflict("assistant start submission is not awaiting a baseline checkpoint");
+      if (Number(row.baseline_recorded) === 1) {
+        const current = row.baseline_turn_id === null ? null : String(row.baseline_turn_id);
+        if (current !== baselineTurnId) this.conflict("assistant start baseline changed");
+        return;
+      }
+      const changed = this.db.prepare(`UPDATE assistant_attempt_sources
+        SET baseline_turn_id = ?, baseline_recorded = 1, updated_at = ?
+        WHERE attempt_id = ? AND context_id = ? AND submission_kind = 'start'
+          AND state IN ('start_submitting', 'uncertain') AND baseline_recorded = 0`)
+        .run(baselineTurnId, Date.now(), attemptId, contextId).changes;
+      if (changed !== 1) this.conflict("assistant start baseline checkpoint raced");
+    });
+  }
+
   clearLease(attemptId: string): void {
     inTransaction(this.db, () => {
       const current = this.lease();
@@ -553,6 +580,9 @@ export class ConversationStore {
       state: String(row.state) as AttemptSource["state"],
       ...(row.expected_turn_id ? { expectedTurnId: String(row.expected_turn_id) } : {}),
       ...(row.observed_turn_id ? { observedTurnId: String(row.observed_turn_id) } : {}),
+      ...(Number(row.baseline_recorded) === 1
+        ? { baselineTurnId: row.baseline_turn_id === null ? null : String(row.baseline_turn_id) }
+        : {}),
     };
   }
 
@@ -572,7 +602,7 @@ interface StoredSource {
   rawText: string;
   attachmentIds: readonly string[];
   failedAttachments: readonly FailedAttachmentDescriptor[];
-  state: "pending" | "active" | "completed" | "superseded";
+  state: "held" | "pending" | "active" | "completed" | "superseded";
   sourceClass: "chat" | "internal";
   arrivalSequence: number;
   queueNoticeRequired: boolean;

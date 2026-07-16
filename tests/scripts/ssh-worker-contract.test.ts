@@ -15,7 +15,7 @@ test("SSH worker image pins its base, packages, account, and copied inputs", asy
   const dockerfile = await readFixture("Dockerfile");
 
   assert.match(dockerfile, /^FROM node:24-bookworm-slim\n/u);
-  assert.match(dockerfile, /^ARG CODEX_VERSION=0\.142\.5$/mu);
+  assert.match(dockerfile, /^ARG CODEX_VERSION=0\.144\.4$/mu);
   assert.match(dockerfile, /^ENV CODEX_HOME=\/home\/codex\/\.codex$/mu);
   assert.match(
     dockerfile,
@@ -52,7 +52,7 @@ test("SSH worker Compose service is isolated and localhost-only", async () => {
   assert.doesNotMatch(compose, /^name:/mu);
   assert.match(compose, /^\s{6}context: \.$/mu);
   assert.match(compose, /^\s{6}dockerfile: Dockerfile$/mu);
-  assert.match(compose, /^\s{8}CODEX_VERSION: \$\{QIYAN_SSH_WORKER_CODEX_VERSION:-0\.142\.5\}$/mu);
+  assert.match(compose, /^\s{8}CODEX_VERSION: \$\{QIYAN_SSH_WORKER_CODEX_VERSION:-0\.144\.4\}$/mu);
   assert.match(
     compose,
     /^\s{4}ports:\n\s{6}- "127\.0\.0\.1:\$\{QIYAN_SSH_WORKER_PORT:-2222\}:22"\n\s{4}volumes:$/mu,

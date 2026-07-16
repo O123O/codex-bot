@@ -4,7 +4,7 @@ QiYan can run ordinary project sessions on remote Linux machines while the assis
 
 ## Remote requirements
 
-Install Node.js 24 or newer, `tmux`, and Codex 0.142.5 or newer on the remote host. Authenticate Codex on that host as the SSH user and configure its normal Codex profile for non-interactive automatic work; chat approvals are unsupported. QiYan does not copy local authentication or configuration.
+Install Node.js 24 or newer, `tmux`, and Codex 0.144.4 or newer on the remote host. Authenticate Codex on that host as the SSH user and configure its normal Codex profile for non-interactive automatic work; chat approvals are unsupported. QiYan does not copy local authentication or configuration.
 
 Verify the host key yourself. QiYan needs ordinary command channels only; TCP, stream-local, agent, X11, and tunnel-device forwarding can remain disabled. The endpoint name is an alias in the normal user SSH configuration.
 

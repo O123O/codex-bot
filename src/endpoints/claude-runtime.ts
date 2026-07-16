@@ -150,14 +150,20 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
 
   private async threadRead(params: Record<string, unknown>): Promise<{ thread: ClaudeThreadView }> {
     const threadId = requireString(params.threadId, "threadId");
-    return { thread: await this.withPath(threadId, await this.reconstruct(threadId)) };
+    const state = this.threads.get(threadId);
+    const projected = params.includeTurns !== true && state
+      ? this.stateOnlyThread(threadId, state)
+      : await this.reconstruct(threadId);
+    const thread = await this.withPath(threadId, projected);
+    return { thread: params.includeTurns === true ? thread : { ...thread, turns: [] } };
   }
 
   private async threadResume(params: Record<string, unknown>): Promise<{ thread: ClaudeThreadView }> {
     const threadId = requireString(params.threadId, "threadId");
     // Re-adopting a thread un-tombstones it (Codex parity: resuming an archived thread revives it).
     this.options.archives?.remove(this.id, threadId);
-    return { thread: await this.withPath(threadId, await this.reconstruct(threadId)) };
+    const thread = await this.withPath(threadId, await this.reconstruct(threadId));
+    return { thread: params.excludeTurns === true ? { ...thread, turns: [] } : thread };
   }
 
   // Attach the transcript path so the ownership path-resolver (which reads
@@ -191,6 +197,19 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
       ...(this.options.launchFlags.model === undefined ? {} : { model: this.options.launchFlags.model }),
     });
   }
+
+  private stateOnlyThread(threadId: string, state: ThreadState): ClaudeThreadView {
+    return {
+      id: threadId,
+      cwd: state.cwd,
+      status: { type: state.running ? "active" : "idle" },
+      itemsView: "full",
+      turns: [],
+      ...(state.threadSource === undefined ? {} : { threadSource: state.threadSource }),
+      ...(this.options.launchFlags.model === undefined ? {} : { model: this.options.launchFlags.model }),
+    };
+  }
+
 
   // Discover sessions for the endpoint (Claude has no thread/list API — enumerate the
   // transcript store via the runner). Emulated archive tombstones split the two `archived`

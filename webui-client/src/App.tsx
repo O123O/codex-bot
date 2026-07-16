@@ -8,7 +8,9 @@ import hljs from "highlight.js/lib/common";
 import "katex/dist/katex.min.css";
 import { formatGoalStatus, selectedWorkerGoal, type WorkerGoal } from "./goal-presentation";
 import { createBrowserUuid } from "./browser-uuid";
+import { assistantMessagePresentation } from "./chat-provenance";
 import { STYLES } from "./styles";
+import { parseWorkerCommand, WORKER_GOAL_HELP, type WorkerCommand } from "./worker-commands";
 import { workerStatus } from "./worker-status";
 import {
   acknowledgeWorkerSubscription,
@@ -46,8 +48,8 @@ const REVEAL_STEP = 20;      // reveal step when scrolling into in-memory histor
 const TOP_PX = 120, BOTTOM_PX = 80;
 const RECOVERY_RETRY_MS = [500, 1_500, 4_000] as const;
 
-interface Session { nickname: string; mappingId: string; endpoint: string; provider: string; projectDir: string; lifecycleState: string; nativeStatus: string | null; activeTurnId: string | null; model: string | null; goal: WorkerGoal | null; }
-interface Msg { id?: string; body: string; completedAt?: number; terminalStatus?: string; role?: "you" | "assistant" | "worker"; at?: number; origin?: string; phase?: string; streaming?: boolean; turnOrder?: number; itemOrder?: number; }
+interface Session { nickname: string; mappingId: string; endpoint: string; provider: string; projectDir: string; lifecycleState: string; nativeStatus: string | null; activeTurnId: string | null; model: string | null; effort: string | null; host: string; goal: WorkerGoal | null; }
+interface Msg { id?: string; body: string; completedAt?: number; terminalStatus?: string; role?: "you" | "assistant" | "worker"; at?: number; worker?: string; origin?: string; phase?: string; streaming?: boolean; turnOrder?: number; itemOrder?: number; }
 type FileResult = { kind: "dir"; path: string; entries: Array<{ name: string; type: "dir" | "file" | "other" }> } | { kind: "file"; path: string; content: string; truncated: boolean; encoding: string } | { error: string };
 interface GitStatus { branch: string; ahead: number; behind: number; staged: string[]; changes: string[]; untracked: string[] }
 type Preview =
@@ -141,6 +143,7 @@ const when = (m: Msg) => m.completedAt ?? m.at ?? 0;
 
 export function App() {
   const [sessions, setSessions] = useState<Session[]>([]);
+  const [assistantSession, setAssistantSession] = useState<Session | null>(null);
   const [selected, setSelected] = useState<string | null>(null); // null = QiYan
   const [theme, setTheme] = useState<"dark" | "light">(() => (localStorage.getItem("qiyan-theme") as "dark" | "light") || "dark");
   const [log, setLog] = useState<Record<string, Msg[]>>({}); // your sent echoes + live replies, keyed by tab
@@ -168,7 +171,8 @@ export function App() {
   const stickRef = useRef(true);                   // whether to stay pinned to the bottom
   const key = selected ?? ASSIST;
   const goal = selectedWorkerGoal(sessions, selected);
-  const selectedMappingId = selected === null ? null : sessions.find((session) => session.nickname === selected)?.mappingId ?? null;
+  const selectedSession = selected === null ? assistantSession : sessions.find((session) => session.nickname === selected) ?? null;
+  const selectedMappingId = selectedSession?.mappingId ?? null;
   const selectedRef = useRef(selected); selectedRef.current = selected; // for the WS handler's stale closure
   const sessionsRef = useRef(sessions); sessionsRef.current = sessions;
   const workerRef = useRef<WorkerStreamState | null>(workerChat); workerRef.current = workerChat;
@@ -176,6 +180,7 @@ export function App() {
   const wsRef = useRef<WebSocket | null>(null);
   const workerPageLoaderRef = useRef<((nickname: string, subscriptionId: string, snapshotPending: boolean, before?: string, recoveredTurnId?: string) => Promise<void>) | null>(null);
   const recoveryRetriesRef = useRef(new Map<string, { attempt: number; timer: number }>());
+  const emptyHistoryContinuationsRef = useRef(new Map<string, number>());
   const push = (k: string, m: Msg) => setLog((prev) => ({ ...prev, [k]: [...(prev[k] ?? []), m] }));
   const replaceWorker = useCallback((next: WorkerStreamState | null) => { workerRef.current = next; setWorkerChat(next); }, []);
   const clearRecoveryRetries = useCallback(() => {
@@ -204,7 +209,12 @@ export function App() {
 
   useEffect(() => { document.documentElement.dataset.theme = theme; localStorage.setItem("qiyan-theme", theme); }, [theme]);
 
-  const loadSessions = useCallback(async () => { try { setSessions((await api<{ sessions: Session[] }>("/api/sessions")).sessions); } catch { /* transient */ } }, []);
+  const loadSessions = useCallback(async () => {
+    try {
+      const snapshot = await api<{ sessions: Session[]; assistant: Session }>("/api/sessions");
+      setSessions(snapshot.sessions); setAssistantSession(snapshot.assistant);
+    } catch { /* transient */ }
+  }, []);
   const loadHistory = useCallback(async () => {
     try { const p = await api<{ messages: Msg[]; hasOlder: boolean }>(`/api/assistant/messages?limit=${PAGE}`); setHistory(p.messages); setHasOlder((h) => ({ ...h, [ASSIST]: p.hasOlder })); }
     catch { /* transient */ }
@@ -215,6 +225,7 @@ export function App() {
     const started = beginWorkerHistory(current, snapshotPending);
     if (!started.started) return;
     replaceWorker(started.state);
+    let emptyContinuation: string | undefined;
     try {
       const cursor = before === undefined ? "" : `&before=${encodeURIComponent(before)}`;
       const page = await api<WorkerSnapshot>(`/api/sessions/${nickname}/messages?limit=${PAGE}${cursor}&subscriptionId=${encodeURIComponent(subscriptionId)}`);
@@ -223,6 +234,16 @@ export function App() {
       const merged = applyWorkerSnapshot(latest, page, recoveredTurnId);
       replaceWorker(merged);
       setHasOlder((value) => ({ ...value, [nickname]: merged.hasOlder }));
+      const emptyKey = `${nickname}:${subscriptionId}`;
+      if (page.messages.length === 0 && page.nextCursor) {
+        const count = emptyHistoryContinuationsRef.current.get(emptyKey) ?? 0;
+        if (count < 8) {
+          emptyHistoryContinuationsRef.current.set(emptyKey, count + 1);
+          emptyContinuation = page.nextCursor;
+        }
+      } else {
+        emptyHistoryContinuationsRef.current.delete(emptyKey);
+      }
       if (recoveredTurnId && merged.recoveredTurnIds.includes(recoveredTurnId)) {
         const key = `${subscriptionId}:${recoveredTurnId}`;
         const retry = recoveryRetriesRef.current.get(key);
@@ -247,6 +268,8 @@ export function App() {
       if (queued.state !== latest) replaceWorker(queued.state);
       if (queued.turnId) {
         queueMicrotask(() => { void workerPageLoaderRef.current?.(nickname, subscriptionId, true, undefined, queued.turnId); });
+      } else if (emptyContinuation) {
+        queueMicrotask(() => { void workerPageLoaderRef.current?.(nickname, subscriptionId, true, emptyContinuation); });
       }
     }
   }, [replaceWorker, scheduleRecoveryRetry]);
@@ -264,6 +287,7 @@ export function App() {
 
   const subscribeWorker = useCallback((socket: WebSocket | null, nickname: string | null) => {
     clearRecoveryRetries();
+    emptyHistoryContinuationsRef.current.clear();
     if (!socket || socket.readyState !== WebSocket.OPEN) return;
     const previous = workerRef.current;
     const session = nickname ? sessionsRef.current.find((candidate) => candidate.nickname === nickname) : undefined;
@@ -297,8 +321,8 @@ export function App() {
       ws.onopen = () => { setLive(true); subscribeWorker(ws, selectedRef.current); };
       ws.onclose = () => { if (wsRef.current === ws) wsRef.current = null; setLive(false); if (!stop) setTimeout(connect, 2000); };
       ws.onmessage = (ev) => { let m; try { m = JSON.parse(ev.data); } catch { return; }
-        if (m.type === "sessions") setSessions(m.sessions);
-        else if (m.type === "message") { push(ASSIST, { role: "assistant", body: m.body, at: m.at }); if (selectedRef.current === null && !stickRef.current) setVisible((v) => v + 1); }
+        if (m.type === "sessions") { setSessions(m.sessions); setAssistantSession(m.assistant); }
+        else if (m.type === "message") { push(ASSIST, { role: "assistant", body: m.body, at: m.at, ...(typeof m.worker === "string" ? { worker: m.worker } : {}), ...(typeof m.origin === "string" ? { origin: m.origin } : {}) }); if (selectedRef.current === null && !stickRef.current) setVisible((v) => v + 1); }
         else if (m.type === "worker/subscribed") {
           const current = workerRef.current;
           if (!current || current.nickname !== m.nickname || current.requestId !== m.requestId || typeof m.subscriptionId !== "string") return;
@@ -400,6 +424,16 @@ export function App() {
     }
   };
 
+  const requestOlder = () => {
+    const el = logRef.current;
+    if (visible < shown.length) {
+      if (el) preserveRef.current = el.scrollHeight;
+      setVisible((value) => Math.min(value + REVEAL_STEP, shown.length));
+      return;
+    }
+    void loadOlder();
+  };
+
   const onText = (v: string) => {
     setText(v); setSugIdx(0);
     const at = /(?:^|\s)@([a-z0-9_-]*)$/i.exec(v); // @-autocomplete of worker nicknames
@@ -421,9 +455,30 @@ export function App() {
     } catch (e) { push(selected, { role: "assistant", body: `[exec failed: ${(e as { error?: string })?.error ?? e}]`, at: Date.now() }); }
   };
 
+  const runWorkerCommand = async (command: WorkerCommand, raw: string) => {
+    if (!selected) return;
+    const nickname = selected;
+    stickRef.current = true;
+    push(nickname, { role: "you", body: raw, at: Date.now() });
+    if (command.kind === "help") { push(nickname, { role: "assistant", body: WORKER_GOAL_HELP, at: Date.now() }); return; }
+    if (command.kind === "error") { push(nickname, { role: "assistant", body: `[goal command: ${command.message}]`, at: Date.now() }); return; }
+    try {
+      await api<{ ok: boolean; error?: string }>(`/api/sessions/${selected}/goal`, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ requestId: createBrowserUuid(), action: command.action, ...(command.action === "set" ? { objective: command.objective } : {}) }),
+      });
+      push(nickname, { role: "assistant", body: `[goal ${command.action} succeeded]`, at: Date.now() });
+      void loadSessions();
+    } catch (error) {
+      push(nickname, { role: "assistant", body: `[goal command failed: ${(error as { error?: string })?.error ?? error}]`, at: Date.now() });
+    }
+  };
+
   const send = async () => {
     const t = text.trim(); if (!t) return;
     if (selected && t.startsWith("!")) { setText(""); setSuggest([]); void runExec(t.slice(1).trim()); return; }
+    const workerCommand = selected ? parseWorkerCommand(t) : null;
+    if (workerCommand) { setText(""); setSuggest([]); void runWorkerCommand(workerCommand, t); return; }
     const m = /^@([a-z0-9][a-z0-9_-]*)\s+([\s\S]+)$/.exec(t);
     const redirect = m && sessions.some((s) => s.nickname === m[1]) ? m[1] : null;
     const target = redirect ?? selected ?? undefined;
@@ -626,7 +681,13 @@ export function App() {
       <header className="topbar">
         <div className="brand">QiYan</div>
         <nav className="tabs" onWheel={(e) => { if (e.deltaY !== 0) e.currentTarget.scrollLeft += e.deltaY; }}>
-          <button className={`tab ${selected === null ? "on" : ""}`} onClick={() => setSelected(null)}><span className="dot other" />QiYan</button>
+          {(() => {
+            const status = assistantSession ? workerStatus(assistantSession) : { label: "unavailable" as const, tone: "unavailable" as const };
+            return <button className={`tab ${selected === null ? "on" : ""}`} onClick={() => setSelected(null)} title={`codex · ${status.label}`}>
+              <span className={`dot ${status.tone}`} />
+              <span className="tab-copy"><span className="tab-name">QiYan</span><span className="tab-status">{status.label}</span></span>
+            </button>;
+          })()}
           {sessions.map((s) => {
             const status = workerStatus(s);
             return <button key={s.nickname} className={`tab ${selected === s.nickname ? "on" : ""}`} onClick={() => setSelected(s.nickname)} title={`${s.provider} · ${status.label}${s.goal ? " · goal:" + s.goal.status : ""}`}>
@@ -660,14 +721,15 @@ export function App() {
 
         <main className="chat">
           <div className="log" ref={logRef} onScroll={onScroll}>
-            {(hasOlder[key] || visible < shown.length) && <div className="older">{loadingOlder ? "loading…" : "scroll up for older messages"}</div>}
+            {(hasOlder[key] || visible < shown.length) && <button type="button" className="older" disabled={loadingOlder} onClick={requestOlder}>{loadingOlder ? "loading…" : "load older messages"}</button>}
             {shown.length === 0 && <div className="empty">{selected === null ? "Message QiYan — replies appear here." : `Message ${selected} — its replies appear here.`}</div>}
-            {rendered.map((m, i) => (
-              <div key={m.id ?? `${m.at ?? m.completedAt}-${i}`} className={`msg ${m.role === "you" ? "you" : ""}`}>
-                <div className="when">{m.role === "you" ? "you" : m.role === "assistant" ? "QiYan" : `${m.completedAt ? new Date(m.completedAt).toLocaleString() : ""} · ${m.terminalStatus ?? ""}`}</div>
+            {rendered.map((m, i) => {
+              const presentation = selected === null ? assistantMessagePresentation(m) : null;
+              return <div key={m.id ?? `${m.at ?? m.completedAt}-${i}`} className={`msg ${m.role === "you" ? "you" : presentation?.className ?? ""}`}>
+                <div className="when">{m.role === "you" ? "you" : m.role === "assistant" ? presentation?.label ?? "QiYan" : `${m.completedAt ? new Date(m.completedAt).toLocaleString() : ""} · ${m.terminalStatus ?? ""}`}</div>
                 <div className="md"><Markdown remarkPlugins={remark} rehypePlugins={[rehypeHighlight, rehypeKatex]} components={mdComponentsFor(selected ?? m.origin ?? null)}>{normalizeMath(m.body)}</Markdown></div>
-              </div>
-            ))}
+              </div>;
+            })}
           </div>
           {goal && <div className="goal-row" aria-label={`${selected} goal`} aria-live="polite">
             <div className="goal-meta"><span className="goal-label">Goal</span><span className="goal-status" data-status={goal.status}>{formatGoalStatus(goal.status)}</span></div>
@@ -681,6 +743,13 @@ export function App() {
               placeholder={selected === null ? "Message QiYan… (@worker to direct-message a worker)" : `Message ${selected}…`} />
             <button onClick={() => void send()}>Send</button>
           </div>
+          {selectedSession && <div className="worker-context" aria-label={`${selectedSession.nickname} session context`}>
+            <span>{selectedSession.provider}</span>
+            <span>model <strong>{selectedSession.model ?? "default"}</strong></span>
+            <span>effort <strong>{selectedSession.effort ?? "default"}</strong></span>
+            <span>cwd <strong>{selectedSession.projectDir}</strong></span>
+            <span>host <strong>{selectedSession.host}</strong></span>
+          </div>}
         </main>
       </div>
 

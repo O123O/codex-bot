@@ -447,6 +447,7 @@ test("the exact production MCP map succeeds for every local and remote manager a
         .get(fixture.endpoint, session.thread_id, session.mapping_id) as { native_status: string } | undefined;
       return row?.native_status === "idle";
     }, workerTimeoutMs, `${fixture.nickname} cancelled goal turn to become idle`);
+    await call("compact_session", { nickname: fixture.nickname }, fixture.endpoint);
 
     const longContent = "Run a shell command that sleeps for 120 seconds, then reply done.";
     const longStart = await call("send_to_session", {
@@ -710,7 +711,7 @@ test("the exact production MCP map succeeds for every local and remote manager a
 
   const endpointScoped: readonly AssistantToolName[] = [
     "list_managed_sessions", "discover_sessions", "get_session_status", "create_session", "adopt_session", "rename_session", "unadopt_session", "archive_session",
-    "send_to_session", "read_worker_message", "collect_messages", "interrupt_session", "list_models", "disconnect_endpoint", "restart_endpoint",
+    "send_to_session", "read_worker_message", "collect_messages", "interrupt_session", "compact_session", "list_models", "disconnect_endpoint", "restart_endpoint",
     "set_session_model", "set_reasoning_effort", "get_goal", "set_goal", "pause_goal", "resume_goal", "cancel_goal", "update_session_notes",
     "prepare_chat_attachment", "send_chat_attachment",
   ];

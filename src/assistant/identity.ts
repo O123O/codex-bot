@@ -10,6 +10,8 @@ interface AssistantEndpoint {
 
 interface ThreadResponse {
   thread: { id: string; cwd: string; threadSource?: string | null; name?: string | null; status?: { type?: string } };
+  model?: string;
+  reasoningEffort?: string | null;
 }
 
 export async function resumeAssistantIdentity(input: {
@@ -22,14 +24,21 @@ export async function resumeAssistantIdentity(input: {
   pendingThreadId?: string | null;
   recordPendingThread?(threadId: string): Promise<void>;
   clearPendingThread?(threadId: string): Promise<void>;
-}): Promise<{ threadId: string; nativeStatus: string }> {
+}): Promise<{ threadId: string; nativeStatus: string; model?: string; effort?: string | null }> {
   const { identity, configuredDir } = await validateRegistration(input.registry, input.endpoint.id, input.assistantDir);
   let response: ThreadResponse;
   if (identity.thread_id === "pending") {
     const creation = requireCreationState(input);
     response = await createOrRecoverPendingThread(input, configuredDir, creation);
   } else {
-    response = await input.endpoint.request<ThreadResponse>("thread/resume", { threadId: identity.thread_id, cwd: input.assistantDir, approvalPolicy: "never", sandbox: input.sandboxMode, config: input.config });
+    response = await input.endpoint.request<ThreadResponse>("thread/resume", {
+      threadId: identity.thread_id,
+      cwd: input.assistantDir,
+      approvalPolicy: "never",
+      sandbox: input.sandboxMode,
+      config: input.config,
+      excludeTurns: true,
+    });
     await verifyThread(response.thread, { id: identity.thread_id, cwd: configuredDir });
     if (input.creationNonce !== undefined) {
       const creation = requireCreationMetadata(input.creationNonce);
@@ -45,7 +54,12 @@ export async function resumeAssistantIdentity(input: {
   await input.registry.setAssistant({ endpoint: input.endpoint.id, thread_id: threadId, project_dir: input.assistantDir });
   if (input.pendingThreadId === threadId) await input.clearPendingThread?.(threadId);
   else if (identity.thread_id === "pending") await input.clearPendingThread?.(threadId);
-  return { threadId, nativeStatus: response.thread.status?.type ?? "idle" };
+  return {
+    threadId,
+    nativeStatus: response.thread.status?.type ?? "idle",
+    ...(typeof response.model === "string" ? { model: response.model } : {}),
+    ...(typeof response.reasoningEffort === "string" || response.reasoningEffort === null ? { effort: response.reasoningEffort } : {}),
+  };
 }
 
 export async function activateAssistantProfileIdentity(input: {
@@ -101,7 +115,12 @@ async function createOrRecoverPendingThread(
     if (read) {
       await verifyThread(read.thread, { id: input.pendingThreadId, cwd: configuredDir, nonce: creation.nonce, name: creation.name });
       const resumed = await input.endpoint.request<ThreadResponse>("thread/resume", {
-        threadId: input.pendingThreadId, cwd: input.assistantDir, approvalPolicy: "never", sandbox: input.sandboxMode, config: input.config,
+        threadId: input.pendingThreadId,
+        cwd: input.assistantDir,
+        approvalPolicy: "never",
+        sandbox: input.sandboxMode,
+        config: input.config,
+        excludeTurns: true,
       });
       await verifyThread(resumed.thread, { id: input.pendingThreadId, cwd: configuredDir, nonce: creation.nonce, name: creation.name });
       return resumed;

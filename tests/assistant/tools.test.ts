@@ -11,7 +11,7 @@ import { OperationStore } from "../../src/storage/operation-store.ts";
 const expected = [
   "list_managed_sessions", "discover_sessions", "get_session_status", "create_session", "adopt_session", "rename_session", "unadopt_session", "archive_session",
   "disconnect_endpoint", "restart_endpoint",
-  "send_to_session", "read_worker_message", "collect_messages", "interrupt_session", "list_models", "set_session_model", "set_reasoning_effort", "get_goal", "set_goal", "pause_goal", "resume_goal", "cancel_goal",
+  "send_to_session", "read_worker_message", "collect_messages", "interrupt_session", "compact_session", "list_models", "set_session_model", "set_reasoning_effort", "get_goal", "set_goal", "pause_goal", "resume_goal", "cancel_goal",
   "update_session_notes",
   "send_chat_message", "prepare_chat_attachment", "send_chat_attachment", "get_chat_history", "search_slack", "get_slack_mentions",
 ].sort();

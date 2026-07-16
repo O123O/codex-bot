@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { AppServerPool } from "../app-server/pool.ts";
+import { ThreadHistoryReader } from "../app-server/thread-history.ts";
 import type { Clock } from "../core/clock.ts";
 import { AppError } from "../core/errors.ts";
 import type { MappingIdentity, MappingLifecycleState, RegistrySession, SessionRegistry } from "../registry/session-registry.ts";
@@ -10,7 +11,7 @@ import { WorkspaceRouter } from "../endpoints/workspace-router.ts";
 import type { EndpointManager } from "../endpoints/manager.ts";
 import type { EndpointWorkLease } from "../endpoints/types.ts";
 import type { OwnershipInspection } from "./rollout-ownership.ts";
-import { isExactThreadNoRollout, isExactThreadNotLoaded, isExactThreadNotMaterialized } from "../app-server/thread-errors.ts";
+import { isExactThreadNoRollout, isExactThreadNotLoaded } from "../app-server/thread-errors.ts";
 
 interface ThreadView { id: string; cwd: string; path?: string | null; threadSource?: string | null; status: { type: string }; turns: Array<{ id: string; status?: unknown }> }
 interface ThreadResponse { thread: ThreadView; cwd?: string; model?: string; reasoningEffort?: string | null }
@@ -116,7 +117,7 @@ export class SessionLifecycle {
         catch (error) {
           if (!isExactThreadNotLoaded(error, threadId)) throw error;
           let response: ThreadResponse;
-          try { response = await this.pool.request<ThreadResponse>(endpointId, "thread/resume", { threadId }, undefined, lease); }
+          try { response = await this.pool.request<ThreadResponse>(endpointId, "thread/resume", this.resumeParams(threadId), undefined, lease); }
           catch (resumeError) {
             if (isExactThreadNoRollout(resumeError, threadId)) throw this.threadNotDurable(threadId);
             throw resumeError;
@@ -143,7 +144,7 @@ export class SessionLifecycle {
         let after = before;
         if (!resumed && this.requiresResume(before.thread)) {
           resumeAttempted = true;
-          const response = await this.pool.request<ThreadResponse>(endpointId, "thread/resume", { threadId }, undefined, lease);
+          const response = await this.pool.request<ThreadResponse>(endpointId, "thread/resume", this.resumeParams(threadId), undefined, lease);
           resumed = true;
           this.requireThreadIdentity(response.thread, threadId);
           after = await this.read(endpointId, threadId, lease);
@@ -264,7 +265,7 @@ export class SessionLifecycle {
           try { before = await this.read(session.endpoint, session.thread_id, lease); }
           catch (error) {
             if (!isExactThreadNotLoaded(error, session.thread_id)) throw error;
-            const response = await this.pool.request<ThreadResponse>(session.endpoint, "thread/resume", { threadId: session.thread_id }, undefined, lease);
+            const response = await this.pool.request<ThreadResponse>(session.endpoint, "thread/resume", this.resumeParams(session.thread_id), undefined, lease);
             resumed = true;
             this.requireThreadIdentity(response.thread, session.thread_id);
             before = await this.read(session.endpoint, session.thread_id, lease);
@@ -275,7 +276,7 @@ export class SessionLifecycle {
           this.assertExact(nickname, expected, "adopting");
           let native = before;
           if (!resumed && this.requiresResume(before.thread)) {
-            const response = await this.pool.request<ThreadResponse>(session.endpoint, "thread/resume", { threadId: session.thread_id }, undefined, lease);
+            const response = await this.pool.request<ThreadResponse>(session.endpoint, "thread/resume", this.resumeParams(session.thread_id), undefined, lease);
             resumed = true;
             this.requireThreadIdentity(response.thread, session.thread_id);
             const afterResume = this.assertExact(nickname, expected, "adopting");
@@ -332,40 +333,55 @@ export class SessionLifecycle {
       assertCurrent();
       if (project.path !== session.project_dir) throw new AppError("CWD_MISMATCH", "managed project directory changed");
       let resumed: ThreadResponse | undefined;
-      // Fast path for the common bot-restart case (the app-server kept the thread loaded → status "idle",
-      // and the session already has a persisted epoch): a metadata-only read is enough — the epoch and
-      // the delivery cursor already hold what recovery needs, so re-materializing the whole rollout (and
-      // re-resuming on the same connection) is pure waste. Fall back to the original full path when:
-      //   • the thread is non-idle ("notLoaded" must be resumed+materialized; "active"/other needs its
-      //     turns to recover the in-flight turn), or
-      //   • there is no epoch yet (first adoption) — beginEpoch below needs the last turn id as the
-      //     delivery baseline, so we must materialize.
+      const resumeForConnection = options?.resumeForConnection === true;
+      // Connection recovery only needs thread metadata and a live notification subscription. The
+      // persisted epoch and runtime active-turn id already contain QiYan's recovery cursors, so do not
+      // transfer the rollout through the replacement connection. A missing epoch needs only the latest
+      // turn id for its delivery baseline, which is obtained from one bounded summary page below.
       const hasEpoch = this.runtime.currentEpoch(session.endpoint, session.thread_id, session.mapping_id) !== undefined;
       let before: ThreadResponse;
       try {
-        if (hasEpoch) {
+        if (resumeForConnection || hasEpoch) {
           before = await this.readLight(session.endpoint, session.thread_id, lease);
-          // Idle → done (fast path). Non-idle ("active", …) still needs its turns to recover the in-flight turn.
-          if (before.thread.status.type !== "idle") before = await this.read(session.endpoint, session.thread_id, lease);
+          if (!resumeForConnection && before.thread.status.type !== "idle") {
+            before = await this.read(session.endpoint, session.thread_id, lease);
+          }
         } else {
           before = await this.read(session.endpoint, session.thread_id, lease);
         }
       } catch (error) {
         if (!isExactThreadNotLoaded(error, session.thread_id)) throw error;
-        resumed = await this.pool.request<ThreadResponse>(session.endpoint, "thread/resume", { threadId: session.thread_id }, undefined, lease);
+        resumed = await this.pool.request<ThreadResponse>(
+          session.endpoint,
+          "thread/resume",
+          this.resumeParams(session.thread_id),
+          undefined,
+          lease,
+        );
         assertCurrent();
         this.requireThreadIdentity(resumed.thread, session.thread_id);
-        // After resuming, take the same fast path: with a persisted epoch a metadata read is enough
-        // unless the thread came back non-idle (needs its turns for the in-flight turn).
-        before = hasEpoch ? await this.readLight(session.endpoint, session.thread_id, lease) : await this.read(session.endpoint, session.thread_id, lease);
-        if (hasEpoch && before.thread.status.type !== "idle") before = await this.read(session.endpoint, session.thread_id, lease);
+        before = resumeForConnection
+          ? this.withoutTurns(resumed)
+          : hasEpoch
+            ? await this.readLight(session.endpoint, session.thread_id, lease)
+            : await this.read(session.endpoint, session.thread_id, lease);
+        if (!resumeForConnection && hasEpoch && before.thread.status.type !== "idle") {
+          before = await this.read(session.endpoint, session.thread_id, lease);
+        }
       }
       assertCurrent();
       this.requireThreadIdentity(before.thread, session.thread_id);
       await this.verifyCwd(session.endpoint, before.thread.cwd, project.path, lease);
       assertCurrent();
       this.runtime.restoreMissingManagedSession(session.endpoint, session.thread_id, session.mapping_id);
-      const ownershipPreparation = await this.beforeManagedOwnership?.(session, lease, before.thread);
+      const recoveryLatestTurn = resumeForConnection
+        ? await this.latestTurn(session.endpoint, session.thread_id, lease)
+        : undefined;
+      assertCurrent();
+      const ownershipThread = recoveryLatestTurn === undefined
+        ? before.thread
+        : { ...before.thread, turns: [recoveryLatestTurn] };
+      const ownershipPreparation = await this.beforeManagedOwnership?.(session, lease, ownershipThread);
       assertCurrent();
       if (ownershipPreparation?.authorizedTurnId) {
         this.ownership?.authorizeTurnIfInitialized?.(session, ownershipPreparation.authorizedTurnId);
@@ -399,7 +415,11 @@ export class SessionLifecycle {
       }
       if (this.ownership) {
         await this.ownership.initialize(session, this.requireRolloutPath(before.thread), lease, {
-          allowUnmaterialized: options?.requireDurableRollout ? false : before.thread.turns.length === 0,
+          allowUnmaterialized: options?.requireDurableRollout
+            ? false
+            : resumeForConnection
+              ? recoveryLatestTurn === undefined
+              : before.thread.turns.length === 0,
           ...(ownershipPreparation?.authorizedTurnId ? { authorizedTurnId: ownershipPreparation.authorizedTurnId } : {}),
         });
         assertCurrent();
@@ -408,16 +428,22 @@ export class SessionLifecycle {
       assertCurrent();
       this.assertExact(nickname, expected, "managed");
       let authoritative = before;
-      // A detached App Server may keep an idle thread loaded after its client disconnects. Loaded
-      // state does not subscribe the replacement connection, so its generation recovery must resume
-      // once even though the persisted epoch still permits the metadata-only read above.
-      const resumeLoadedIdleThread = options?.resumeForConnection === true && before.thread.status.type === "idle";
-      if (!resumed && (resumeLoadedIdleThread || this.requiresResume(before.thread))) {
-        resumed = await this.pool.request<ThreadResponse>(session.endpoint, "thread/resume", { threadId: session.thread_id }, undefined, lease);
+      // Loaded state is not a subscription: every replacement remote connection must explicitly
+      // resume once, including when the native thread is active.
+      if (!resumed && (resumeForConnection || this.requiresResume(before.thread))) {
+        resumed = await this.pool.request<ThreadResponse>(
+          session.endpoint,
+          "thread/resume",
+          this.resumeParams(session.thread_id),
+          undefined,
+          lease,
+        );
         assertCurrent();
         this.requireThreadIdentity(resumed.thread, session.thread_id);
         const afterResume = this.assertExact(nickname, expected, "managed");
-        authoritative = resumeLoadedIdleThread ? resumed : await this.read(afterResume.endpoint, afterResume.thread_id, lease);
+        authoritative = resumeForConnection
+          ? this.withoutTurns(resumed)
+          : await this.read(afterResume.endpoint, afterResume.thread_id, lease);
       }
       assertCurrent();
       this.requireThreadIdentity(authoritative.thread, session.thread_id);
@@ -429,7 +455,13 @@ export class SessionLifecycle {
       assertCurrent();
       this.runtime.setSession(current.endpoint, current.thread_id, current.mapping_id, "managed", authoritative.thread.status.type);
       if (!this.runtime.currentEpoch(current.endpoint, current.thread_id, current.mapping_id)) {
-        this.runtime.beginEpoch(current.endpoint, current.thread_id, current.mapping_id, this.baseline(authoritative.thread), this.clock.now());
+        this.runtime.beginEpoch(
+          current.endpoint,
+          current.thread_id,
+          current.mapping_id,
+          recoveryLatestTurn?.id ?? this.baseline(authoritative.thread),
+          this.clock.now(),
+        );
       }
       return { ...resumed, thread: authoritative.thread };
     }), existingLease);
@@ -500,13 +532,14 @@ export class SessionLifecycle {
   }
 
   private async read(endpointId: string, threadId: string, lease?: EndpointWorkLease): Promise<ThreadResponse> {
-    try {
-      return await this.pool.request(endpointId, "thread/read", { threadId, includeTurns: true }, undefined, lease);
-    } catch (error) {
-      if (!isExactThreadNotMaterialized(error, threadId)) throw error;
-      const response = await this.pool.request<ThreadResponse>(endpointId, "thread/read", { threadId, includeTurns: false }, undefined, lease);
-      return { ...response, thread: { ...response.thread, turns: [] } };
-    }
+    const response = await this.pool.request<ThreadResponse>(
+      endpointId, "thread/read", { threadId, includeTurns: false }, undefined, lease,
+    );
+    const turns = await this.pool.historyReader(endpointId, lease).allTurns(threadId, {
+      sortDirection: "asc",
+      itemsView: "notLoaded",
+    });
+    return { ...response, thread: { ...response.thread, turns } };
   }
 
   // Metadata-only read (status, cwd, rollout path) — does NOT ask for turns, so codex/claude never
@@ -517,6 +550,20 @@ export class SessionLifecycle {
     // includeTurns:false does not return turns; normalize to [] (as the `read` fallback does) so callers
     // treat it as an unmaterialized view and never mistake it for "has turns".
     return { ...response, thread: { ...response.thread, turns: [] } };
+  }
+
+  private resumeParams(threadId: string): { threadId: string; excludeTurns: true } {
+    return { threadId, excludeTurns: true };
+  }
+
+  private withoutTurns(response: ThreadResponse): ThreadResponse {
+    return { ...response, thread: { ...response.thread, turns: [] } };
+  }
+
+  private async latestTurn(endpointId: string, threadId: string, lease?: EndpointWorkLease): Promise<{ id: string; status?: unknown } | undefined> {
+    return new ThreadHistoryReader((method, params) => this.pool.request(
+      endpointId, method, params, undefined, lease,
+    )).latestTurn(threadId);
   }
 
   private requireIdle(thread: ThreadView): void {

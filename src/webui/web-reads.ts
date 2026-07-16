@@ -1,23 +1,32 @@
 import type { RegistryDocument } from "../registry/session-registry.ts";
 import type { SessionDashboardDocument } from "../assistant/dashboard-schema.ts";
+import type { WorkerNativeHistoryPage } from "./worker-history-reader.ts";
 
 export interface WebReadsDeps {
   registrySnapshot(): RegistryDocument;
   dashboardSnapshot(): SessionDashboardDocument;
+  assistantSession(): WebSessionSummary;
   // Raw native turns for the active Web UI subscription. Production must acquire an already-ready
   // endpoint lease and pass the AbortSignal through; mapping happens only after identity revalidation.
-  readWorkerTurns(endpointId: string, threadId: string, signal: AbortSignal): Promise<unknown[]>;
+  readWorkerTurns(endpointId: string, threadId: string, limit: number, cursor: string | undefined, signal: AbortSignal): Promise<WorkerNativeHistoryPage>;
   // The owner↔QiYan conversation (your chat + everything the owner was sent — replies, [worker]
   // relays, notices), oldest → newest.
-  listOwnerConversation(before: number | undefined, limit: number): WebConvoMessage[];
+  listOwnerConversation(before: number | undefined, limit: number): OwnerConversationMessage[];
   provider(endpointId: string): "codex" | "claude";
+  // Lease-free display label: local process hostname or configured SSH alias.
+  host(endpointId: string): string;
 }
 
-export interface WebConvoMessage {
+export interface OwnerConversationMessage {
   id: string;
   role: "you" | "assistant";
   body: string;
   at: number;
+  deliveryKind?: string;
+}
+
+export interface WebConvoMessage extends Omit<OwnerConversationMessage, "deliveryKind"> {
+  worker?: string; // trusted worker-delivery author, retained even after the session is removed
   origin?: string; // the worker a relayed "[worker] …" message came from (routes its file paths to that host)
 }
 
@@ -37,6 +46,8 @@ export interface WebSessionSummary {
   nativeStatus: string | null;
   activeTurnId: string | null;
   model: string | null;
+  effort: string | null;
+  host: string;
   goal: { objective: string; status: string } | null;
 }
 
@@ -70,9 +81,15 @@ export function listSessions(deps: WebReadsDeps): WebSessionSummary[] {
       nativeStatus: info?.native_status ?? null,
       activeTurnId: info?.active_turn_id ?? null,
       model: info?.model.current ?? null,
+      effort: info?.reasoning_effort.current ?? null,
+      host: deps.host(session.endpoint),
       goal: goal ? { objective: goal.objective, status: goal.status } : null,
     };
   }).sort((a, b) => a.nickname.localeCompare(b.nickname));
+}
+
+export function sessionSnapshot(deps: WebReadsDeps): { sessions: WebSessionSummary[]; assistant: WebSessionSummary } {
+  return { sessions: listSessions(deps), assistant: deps.assistantSession() };
 }
 
 // The QiYan conversation (your chat + the assistant's replies), lease-free, oldest → newest, one
@@ -81,13 +98,21 @@ export function listSessions(deps: WebReadsDeps): WebSessionSummary[] {
 export function assistantTranscript(deps: WebReadsDeps, limit: number, before?: number): WebPage<WebConvoMessage> {
   const clamped = Math.max(1, Math.min(50, limit));
   const raw = deps.listOwnerConversation(before, clamped);
-  // Tag each relayed "[worker …] …" message with a validated origin worker (only the LEADING prefix is
-  // trusted; the relay always prepends it) so the client routes its file paths to that worker's host.
+  // Delivery kind is the authority for authorship; prefix parsing alone would mislabel a QiYan reply
+  // that happens to start with "[worker]". Keep presentation after unadopt, but route files only while
+  // the nickname still resolves to a managed session.
   const sessions = deps.registrySnapshot().sessions;
-  const messages = raw.map((m) => {
-    if (m.role !== "assistant") return m;
-    const match = /^\[([a-z0-9][a-z0-9_-]{0,63})(?:[^\]]*)\]/u.exec(m.body);
-    return match && sessions[match[1]!] ? { ...m, origin: match[1]! } : m;
+  const messages = raw.map(({ deliveryKind, ...message }) => {
+    if (message.role !== "assistant") return message;
+    const worker = workerDeliveryNickname(deliveryKind, message.body);
+    return worker ? { ...message, worker, ...(sessions[worker] ? { origin: worker } : {}) } : message;
   });
   return { messages, hasOlder: raw.length === clamped };
+}
+
+const WORKER_DELIVERY_KINDS = new Set(["worker_final", "collection"]);
+
+export function workerDeliveryNickname(kind: string | undefined, body: string): string | undefined {
+  if (!kind || !WORKER_DELIVERY_KINDS.has(kind)) return undefined;
+  return /^\[([a-z0-9][a-z0-9_-]{0,63})(?:[^\]]*)\]/u.exec(body)?.[1];
 }

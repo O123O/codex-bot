@@ -10,6 +10,7 @@ const capacityHintSchema = z.object({
   threadId: z.string().min(1),
   mappingId: z.string().min(1),
   clientUserMessageId: z.string().min(1),
+  baselineTurnId: z.string().min(1).nullable().optional(),
 }).strict();
 
 export type CapacityHint = z.infer<typeof capacityHintSchema>;
@@ -50,7 +51,9 @@ export class EndpointCapacityRecovery {
         this.options.quarantine(operation, "invalid provisional-start capacity checkpoint");
         continue;
       }
-      this.options.pool.restoreProvisionalTurnCapacity(hint.endpoint, hint.threadId, `recovered:${operation.id}`, hint.clientUserMessageId);
+      this.options.pool.restoreProvisionalTurnCapacity(
+        hint.endpoint, hint.threadId, `recovered:${operation.id}`, hint.clientUserMessageId, hint.baselineTurnId,
+      );
       endpointIds.add(hint.endpoint);
     }
     return [...endpointIds];

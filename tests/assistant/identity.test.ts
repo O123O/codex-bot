@@ -233,7 +233,10 @@ test("registered identity clears a matching stale creation receipt after verifie
       calls.push(method);
       assert.equal(params.threadId, "registered-thread");
       assert.deepEqual(params.config, config);
+      assert.equal(params.excludeTurns, true);
       return {
+        model: "gpt-5.4",
+        reasoningEffort: "xhigh",
         thread: {
           id: "registered-thread",
           cwd: dir,
@@ -253,6 +256,8 @@ test("registered identity clears a matching stale creation receipt after verifie
   });
   assert.deepEqual(calls, ["thread/resume"]);
   assert.equal(result.threadId, "registered-thread");
+  assert.equal(result.model, "gpt-5.4");
+  assert.equal(result.effort, "xhigh");
   assert.equal(cleared, "registered-thread");
 });
 

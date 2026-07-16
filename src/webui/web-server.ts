@@ -6,19 +6,21 @@ import { extname, join, normalize } from "node:path";
 import { WebSocketServer, type WebSocket } from "ws";
 import type { OperationalEvent } from "../core/operational-log.ts";
 import type { WebBus } from "./web-bus.ts";
-import { assistantTranscript, listSessions, type WebReadsDeps } from "./web-reads.ts";
+import { assistantTranscript, sessionSnapshot, type WebReadsDeps } from "./web-reads.ts";
 import { WorkerHistoryError, createWorkerHistoryReader, type WorkerHistoryReader } from "./worker-history-reader.ts";
 import { browse, confine, createEntry, resolvePath, type FileTarget, type WebFilesDeps } from "./web-files.ts";
 import { cleanupUploads, storeUpload, type WebUploadsConfig } from "./web-uploads.ts";
 import { runCommand } from "./web-exec.ts";
 import { discoverRepos, gitCommit, gitDiff, gitStage, gitStatus, gitUnstage } from "./web-git.ts";
 import { remoteBrowse, remoteDiscover, remoteGitCommit, remoteGitDiff, remoteGitStage, remoteGitStatus, remoteGitUnstage, remoteReadStream, type RemoteDeps } from "./web-remote.ts";
+import type { WebGoalControlInput, WebGoalControlResult } from "./web-goal-control.ts";
 
 const AUTH_COOKIE = "qiyan_web_token";
 const POLL_MS = 1_000;
 const NICKNAME = /^[a-z0-9][a-z0-9_-]{0,63}$/u;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const MAX_WS_INPUT_BYTES = 4 * 1024;
+const MAX_GOAL_OBJECTIVE_CODE_UNITS = 16_000;
 // Browser-native types are streamed raw (Content-Type set) so a new tab renders them; everything
 // else is served as JSON text via the preview endpoints. Unknown types download as octet-stream.
 const RAW_CONTENT_TYPES: Record<string, string> = {
@@ -104,6 +106,10 @@ export interface WebServerOptions {
   // ssh runtime root is only known after startup, so it must be resolved per request, not at wiring time.
   remote?: () => RemoteDeps | undefined;
   submitInput(text: string, target: string | undefined, clientInputId?: string): Promise<{ ok: boolean; error?: string; clientUserMessageId?: string }>;
+  controlGoal(input: WebGoalControlInput): Promise<WebGoalControlResult>;
+  openGoalAdmission(): void;
+  closeGoalAdmission(): void;
+  waitForGoalControls(): Promise<void>;
   report(event: OperationalEvent): void;
 }
 
@@ -126,6 +132,23 @@ async function readJson(request: IncomingMessage): Promise<Record<string, unknow
   let raw = "";
   for await (const chunk of request) { raw += chunk; if (raw.length > 256 * 1024) return undefined; }
   try { return raw ? JSON.parse(raw) : {}; } catch { return undefined; }
+}
+
+function parseGoalControl(nickname: string, body: Record<string, unknown>): WebGoalControlInput | undefined {
+  if (Array.isArray(body)) return undefined;
+  const requestId = body.requestId;
+  const action = body.action;
+  if (typeof requestId !== "string" || !UUID.test(requestId)
+    || (action !== "set" && action !== "pause" && action !== "resume" && action !== "cancel")) return undefined;
+  const expected = action === "set" ? ["action", "objective", "requestId"] : ["action", "requestId"];
+  if (Object.keys(body).sort().join("\0") !== expected.join("\0")) return undefined;
+  if (action === "set") {
+    if (typeof body.objective !== "string") return undefined;
+    const objective = body.objective.trim();
+    if (!objective || objective.length > MAX_GOAL_OBJECTIVE_CODE_UNITS) return undefined;
+    return { requestId, nickname, action, objective };
+  }
+  return { requestId, nickname, action };
 }
 
 function tokenValid(expected: string, actual: string | undefined): boolean {
@@ -200,7 +223,7 @@ export function createWebServer(options: WebServerOptions): WebServer {
     }
     const remote = options.remote?.(); // resolved per request (available after startup)
 
-    if (request.method === "GET" && url.pathname === "/api/sessions") { json(response, 200, { sessions: listSessions(options.reads) }); return; }
+    if (request.method === "GET" && url.pathname === "/api/sessions") { json(response, 200, sessionSnapshot(options.reads)); return; }
     if (request.method === "GET" && url.pathname === "/api/assistant/messages") {
       const { limit, before } = pageParams(url);
       json(response, 200, assistantTranscript(options.reads, limit, before));
@@ -229,6 +252,15 @@ export function createWebServer(options: WebServerOptions): WebServer {
         request.off("aborted", cancel);
         response.off("close", cancel);
       }
+      return;
+    }
+    const goal = /^\/api\/sessions\/([a-z0-9][a-z0-9_-]{0,63})\/goal$/u.exec(url.pathname);
+    if (request.method === "POST" && goal) {
+      const body = await readJson(request);
+      const input = body ? parseGoalControl(goal[1]!, body) : undefined;
+      if (!input) { json(response, 400, { error: "invalid goal command" }); return; }
+      const result = await options.controlGoal(input);
+      json(response, result.ok ? 200 : 400, result);
       return;
     }
     // File tree, confined to the session's project — local via fs, remote via ssh.
@@ -377,11 +409,15 @@ export function createWebServer(options: WebServerOptions): WebServer {
         server!.once("error", reject);
         server!.listen(options.port, host, () => { server!.off("error", reject); resolve(); });
       });
+      options.openGoalAdmission();
       // Poll the dashboard/registry and push a `sessions` event when the summary changes.
       poll = setInterval(() => {
         try {
-          const snapshot = JSON.stringify(listSessions(options.reads));
-          if (snapshot !== lastSessions) { lastSessions = snapshot; options.bus.broadcast({ type: "sessions", sessions: JSON.parse(snapshot), at: Date.now() }); }
+          const snapshot = JSON.stringify(sessionSnapshot(options.reads));
+          if (snapshot !== lastSessions) {
+            lastSessions = snapshot;
+            options.bus.broadcast({ type: "sessions", ...JSON.parse(snapshot), at: Date.now() });
+          }
         } catch (error) { options.report({ level: "warn", code: "background_task_failed", component: "web_ui", reason: error instanceof Error ? error.message : String(error) }); }
       }, POLL_MS);
       poll.unref?.();
@@ -403,6 +439,7 @@ export function createWebServer(options: WebServerOptions): WebServer {
       return { url: `http://${host}:${boundPort}/?token=${options.token}` };
     },
     async stop() {
+      options.closeGoalAdmission();
       if (poll) clearInterval(poll);
       if (uploadSweep) clearInterval(uploadSweep);
       historyReader?.dispose(); historyReader = undefined;
@@ -414,6 +451,7 @@ export function createWebServer(options: WebServerOptions): WebServer {
         // rebind or shutdown completes promptly instead of waiting out keepAliveTimeout.
         server.closeAllConnections?.();
       });
+      await options.waitForGoalControls();
     },
   };
 

@@ -6,6 +6,7 @@ import { inTransaction } from "./database.ts";
 
 const readOnlyOperationKinds = new Set(["list_managed_sessions", "discover_sessions", "get_session_status", "read_worker_message", "list_models", "get_goal"]);
 const currentRecoveryProtocol = 1;
+const webGoalIntentConflict = Symbol("web-goal-intent-conflict");
 
 function canonical(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
@@ -13,6 +14,17 @@ function canonical(value: unknown): string {
     return `{${Object.entries(value).sort(([a], [b]) => a.localeCompare(b)).map(([key, item]) => `${JSON.stringify(key)}:${canonical(item)}`).join(",")}}`;
   }
   return JSON.stringify(value) ?? "null";
+}
+
+function sameSourceIdentity(
+  stored: ReturnType<OperationStore["getSourceContext"]>,
+  expected: SourceContext,
+  compareRawText: boolean,
+): boolean {
+  return stored?.kind === expected.kind
+    && stored.sourceId === expected.sourceId
+    && (!compareRawText || stored.rawText === expected.rawText)
+    && JSON.stringify(stored.attachmentIds) === JSON.stringify(expected.attachmentIds);
 }
 
 function hash(value: unknown): string {
@@ -42,22 +54,73 @@ export interface RecoverableOperation extends OperationRecord {
   args: any;
 }
 
+export interface WebGoalIntent {
+  operation: SourceContext;
+  awareness: SourceContext;
+}
+
 export class OperationStore {
   constructor(private readonly db: Database) {}
 
   createSourceContext(context: SourceContext): boolean {
+    return this.insertSourceContext(context, "pending");
+  }
+
+  // Synthetic controller operations need a durable context for idempotency, but must never become
+  // assistant input. Persist the terminal state in the INSERT itself so a crash cannot expose a
+  // transient pending row to ConversationDispatcher after restart.
+  createCompletedSourceContext(context: SourceContext): boolean {
+    return this.insertSourceContext(context, "completed");
+  }
+
+  // A Web goal command must never be able to commit its manager intent without also committing a
+  // repairable QiYan-awareness intent. The awareness row is held (non-dispatchable) until the
+  // controller can describe the durable operation outcome and release it as pending assistant input.
+  createWebGoalIntent(input: WebGoalIntent): boolean {
+    try {
+      return inTransaction(this.db, () => {
+        this.insertSourceContext(input.operation, "completed");
+        const operation = this.getSourceContext(input.operation.id);
+        if (!sameSourceIdentity(operation, input.operation, true) || operation?.state !== "completed") throw webGoalIntentConflict;
+        this.insertSourceContext(input.awareness, "held");
+        const awareness = this.getSourceContext(input.awareness.id);
+        if (!sameSourceIdentity(awareness, input.awareness, awareness?.state === "held")
+          || (awareness?.state !== "held" && awareness?.state !== "pending" && awareness?.state !== "active"
+            && awareness?.state !== "completed" && awareness?.state !== "superseded")) {
+          throw webGoalIntentConflict;
+        }
+        return true;
+      });
+    } catch (error) {
+      if (error === webGoalIntentConflict) return false;
+      throw error;
+    }
+  }
+
+  listHeldSourceContexts(kind: SourceContext["kind"]): SourceContext[] {
+    const rows = this.db.prepare("SELECT id FROM source_contexts WHERE state = 'held' AND kind = ? ORDER BY arrival_sequence, id")
+      .all(kind) as Array<{ id: string }>;
+    return rows.map((row) => this.getSourceContext(row.id)!).filter(Boolean);
+  }
+
+  releaseHeldSourceContext(id: string, rawText: string): boolean {
+    return this.db.prepare("UPDATE source_contexts SET raw_text = ?, state = 'pending' WHERE id = ? AND state = 'held'")
+      .run(rawText, id).changes === 1;
+  }
+
+  private insertSourceContext(context: SourceContext, state: "pending" | "completed" | "held"): boolean {
     this.db.exec("SAVEPOINT create_source_context");
     try {
       const arrival = Number((this.db.prepare("SELECT next_value FROM arrival_sequence WHERE singleton = 1").get() as { next_value: number }).next_value);
       const inserted = this.db.prepare(`INSERT OR IGNORE INTO source_contexts
         (id, kind, source_id, raw_text, attachment_ids_json, adapter_id, conversation_key, destination_json, native_reply_json,
-          arrival_sequence, source_class, created_at, failed_attachments_json)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+          arrival_sequence, source_class, state, created_at, failed_attachments_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
         .run(context.id, context.kind, context.sourceId, context.rawText, JSON.stringify(context.attachmentIds),
           context.binding?.adapterId ?? null, context.binding?.conversationKey ?? null,
           context.binding === undefined ? null : JSON.stringify(context.binding.destination),
           context.binding?.reply === undefined ? null : JSON.stringify(context.binding.reply), arrival,
-          context.kind === "telegram" || context.kind === "slack" ? "chat" : "internal", Date.now(), JSON.stringify(context.failedAttachments ?? [])).changes === 1;
+          context.kind === "telegram" || context.kind === "slack" ? "chat" : "internal", state, Date.now(), JSON.stringify(context.failedAttachments ?? [])).changes === 1;
       if (inserted) this.db.prepare("UPDATE arrival_sequence SET next_value = ? WHERE singleton = 1").run(arrival + 1);
       this.db.exec("RELEASE SAVEPOINT create_source_context");
       return inserted;
@@ -67,7 +130,7 @@ export class OperationStore {
     }
   }
 
-  getSourceContext(id: string): (SourceContext & { state: "pending" | "active" | "completed" | "superseded"; supersededBy?: string }) | undefined {
+  getSourceContext(id: string): (SourceContext & { state: "held" | "pending" | "active" | "completed" | "superseded"; supersededBy?: string }) | undefined {
     const row = this.db.prepare("SELECT * FROM source_contexts WHERE id = ?").get(id) as Record<string, unknown> | undefined;
     if (!row) return undefined;
     return {
@@ -87,7 +150,7 @@ export class OperationStore {
       } : {}),
       ...(row.arrival_sequence == null ? {} : { arrivalSequence: Number(row.arrival_sequence) }),
       queueNoticeRequired: Number(row.queue_notice_required) === 1,
-      state: String(row.state) as "pending" | "active" | "completed" | "superseded",
+      state: String(row.state) as "held" | "pending" | "active" | "completed" | "superseded",
       ...(row.superseded_by ? { supersededBy: String(row.superseded_by) } : {}),
     };
   }

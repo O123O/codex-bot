@@ -4,7 +4,7 @@ services:
       context: .
       dockerfile: Dockerfile
       args:
-        CODEX_VERSION: ${QIYAN_SSH_WORKER_CODEX_VERSION:-0.142.5}
+        CODEX_VERSION: ${QIYAN_SSH_WORKER_CODEX_VERSION:-0.144.4}
     ports:
       - "127.0.0.1:${QIYAN_SSH_WORKER_PORT:-2222}:22"
     volumes:

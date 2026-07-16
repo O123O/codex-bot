@@ -30,7 +30,7 @@ export interface ClaudeThreadItem {
 export interface ClaudeThreadTurn {
   id: string;
   status: ClaudeTurnStatus;
-  itemsView: "full";
+  itemsView: "full" | "summary" | "notLoaded";
   items: ClaudeThreadItem[];
 }
 

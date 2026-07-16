@@ -68,12 +68,32 @@ class LifecycleEndpoint implements AppServerEndpoint {
       }
       return { thread } as T;
     }
+    if (method === "thread/turns/list") {
+      if (this.unmaterialized) {
+        throw new JsonRpcResponseError(-32600, `thread ${this.threadId} is not materialized yet; thread/turns/list is unavailable before first user message`);
+      }
+      return {
+        data: (params.sortDirection === "asc" ? this.turns : this.turns.slice().reverse())
+          .map((turn) => ({ ...turn, status: turn.status ?? "completed", itemsView: params.itemsView ?? "summary", items: [] })),
+        nextCursor: null,
+        backwardsCursor: null,
+      } as T;
+    }
     if (method === "thread/resume") {
       this.onResume?.();
       await this.resumeBarrier;
       if (this.resumeError) throw this.resumeError;
       if (this.failResume) throw new Error("resume response lost");
-      return { thread: { ...thread, id: this.resumeThreadId ?? thread.id }, cwd: this.cwd, model: "gpt-5", reasoningEffort: "high" } as T;
+      return {
+        thread: {
+          ...thread,
+          id: this.resumeThreadId ?? thread.id,
+          turns: params?.excludeTurns === true ? [] : thread.turns,
+        },
+        cwd: this.cwd,
+        model: "gpt-5",
+        reasoningEffort: "high",
+      } as T;
     }
     if (method === "thread/unsubscribe" && this.unsubscribeError) throw this.unsubscribeError;
     if (method === "thread/archive" && this.archiveError) throw this.archiveError;
@@ -236,8 +256,8 @@ test("adopt reserves before resume, uses only native cwd, and promotes after a s
   const session = required(registry);
   assert.equal(session.project_dir, dir);
   assert.equal(session.lifecycle_state, "managed");
-  assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/read", "thread/resume", "thread/read"]);
-  assert.deepEqual(endpoint.calls[1]?.params, { threadId: "thread-1" });
+  assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/read", "thread/turns/list", "thread/resume", "thread/read", "thread/turns/list"]);
+  assert.deepEqual(endpoint.calls.find((call) => call.method === "thread/resume")?.params, { threadId: "thread-1", excludeTurns: true });
   assert.deepEqual(checked, [dir, dir]);
   assert.equal(runtime.currentEpoch("local", "thread-1", session.mapping_id)?.baselineTurnId, "historical");
 });
@@ -255,7 +275,7 @@ test("adopt resumes a disk-backed notLoaded thread before enforcing idle", async
   const session = required(registry);
   assert.equal(session.lifecycle_state, "managed");
   assert.equal(runtime.getSession("local", "thread-1", session.mapping_id)?.nativeStatus, "idle");
-  assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/read", "thread/resume", "thread/read"]);
+  assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/read", "thread/turns/list", "thread/resume", "thread/read", "thread/turns/list"]);
 });
 
 test("adopt manages a loaded empty thread without requiring a nonexistent rollout resume", async () => {
@@ -272,8 +292,8 @@ test("adopt manages a loaded empty thread without requiring a nonexistent rollou
 
   assert.equal(required(registry).lifecycle_state, "managed");
   assert.deepEqual(endpoint.calls.map((call) => [call.method, call.params?.includeTurns]), [
-    ["thread/read", true],
     ["thread/read", false],
+    ["thread/turns/list", undefined],
   ]);
   assert.deepEqual(initialized, [{ allowUnmaterialized: true }]);
 });
@@ -295,8 +315,8 @@ test("loaded-empty adoption failure removes only its reservation and preserves o
 
   assert.equal(registry.get("payments"), undefined);
   assert.deepEqual(endpoint.calls.map((call) => [call.method, call.params?.includeTurns]), [
-    ["thread/read", true],
     ["thread/read", false],
+    ["thread/turns/list", undefined],
   ]);
   assert.deepEqual(released, []);
 });
@@ -310,7 +330,7 @@ test("adopt resumes an exact read-not-loaded thread and validates it before prom
   const session = required(registry);
   assert.equal(session.lifecycle_state, "managed");
   assert.equal(runtime.getSession("local", "thread-1", session.mapping_id)?.managementState, "managed");
-  assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/read", "thread/resume", "thread/read"]);
+  assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/read", "thread/resume", "thread/read", "thread/turns/list"]);
 });
 
 test("adopt proves a not-loaded empty thread without a rollout is no longer restorable", async () => {
@@ -352,7 +372,7 @@ test("an early adoption resume rolls back wrong identity and surfaces rollback u
     return true;
   });
   assert.equal(first.registry.get("payments"), undefined);
-  assert.deepEqual(first.endpoint.calls.map((call) => call.method), ["thread/read", "thread/resume", "thread/read", "thread/unsubscribe"]);
+  assert.deepEqual(first.endpoint.calls.map((call) => call.method), ["thread/read", "thread/resume", "thread/read", "thread/turns/list", "thread/unsubscribe"]);
 
   const second = await fixture();
   second.endpoint.readErrors.push(new JsonRpcResponseError(-32600, "thread not loaded: thread-1"));
@@ -372,7 +392,7 @@ test("an early adoption resume rolls back source and status validation failures"
     throw new AppError("OPERATION_UNCERTAIN", "recovered worker thread has the wrong creation source");
   }), /creation source/u);
   assert.equal(source.registry.get("payments"), undefined);
-  assert.deepEqual(source.endpoint.calls.map((call) => call.method), ["thread/read", "thread/resume", "thread/read", "thread/unsubscribe"]);
+  assert.deepEqual(source.endpoint.calls.map((call) => call.method), ["thread/read", "thread/resume", "thread/read", "thread/turns/list", "thread/unsubscribe"]);
 
   const active = await fixture();
   active.endpoint.readErrors.push(new JsonRpcResponseError(-32600, "thread not loaded: thread-1"));
@@ -382,7 +402,7 @@ test("an early adoption resume rolls back source and status validation failures"
     return true;
   });
   assert.equal(active.registry.get("payments"), undefined);
-  assert.deepEqual(active.endpoint.calls.map((call) => call.method), ["thread/read", "thread/resume", "thread/read", "thread/unsubscribe"]);
+  assert.deepEqual(active.endpoint.calls.map((call) => call.method), ["thread/read", "thread/resume", "thread/read", "thread/turns/list", "thread/unsubscribe"]);
 });
 
 test("adoption rollback accepts exact unsubscribe absence but requires exact reservation removal", async () => {
@@ -459,7 +479,7 @@ test("adopt rejects active and systemError threads before reservation or resume"
     );
 
     assert.equal(registry.get("payments"), undefined);
-    assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/read"]);
+    assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/read", "thread/turns/list"]);
   });
 });
 
@@ -473,7 +493,7 @@ test("adopt rolls back a proven subscription when the resumed thread is active",
   );
 
   assert.equal(registry.get("payments"), undefined);
-  assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/read", "thread/resume", "thread/read", "thread/unsubscribe"]);
+  assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/read", "thread/turns/list", "thread/resume", "thread/read", "thread/turns/list", "thread/unsubscribe"]);
 });
 
 test("adopt rolls back when rollout ownership finds an external active turn", async () => {
@@ -489,7 +509,7 @@ test("adopt rolls back when rollout ownership finds an external active turn", as
   );
 
   assert.equal(registry.get("payments"), undefined);
-  assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/read", "thread/resume", "thread/read", "thread/unsubscribe"]);
+  assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/read", "thread/turns/list", "thread/resume", "thread/read", "thread/turns/list", "thread/unsubscribe"]);
   assert.equal(released.length, 0, "rollback must preserve durable external-turn evidence");
 });
 
@@ -539,8 +559,8 @@ test("an uncertain resume remains adopting and startup reconciliation promotes o
   await lifecycle.reconcileAdopting();
   assert.equal(required(registry).mapping_id, reserved.mapping_id);
   assert.equal(required(registry).lifecycle_state, "managed");
-  assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/read", "thread/resume", "thread/read"]);
-  assert.deepEqual(endpoint.calls[1]?.params, { threadId: "thread-1" });
+  assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/read", "thread/turns/list", "thread/resume", "thread/read", "thread/turns/list"]);
+  assert.deepEqual(endpoint.calls.find((call) => call.method === "thread/resume")?.params, { threadId: "thread-1", excludeTurns: true });
 });
 
 test("adopting reconciliation resumes an exact read-not-loaded durable mapping", async () => {
@@ -554,7 +574,7 @@ test("adopting reconciliation resumes an exact read-not-loaded durable mapping",
   await lifecycle.reconcileAdopting();
 
   assert.equal(required(registry).lifecycle_state, "managed");
-  assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/read", "thread/resume", "thread/read"]);
+  assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/read", "thread/resume", "thread/read", "thread/turns/list"]);
 });
 
 test("adopting reconciliation promotes a loaded empty thread without rollout resume", async () => {
@@ -570,8 +590,8 @@ test("adopting reconciliation promotes a loaded empty thread without rollout res
 
   assert.equal(required(registry).lifecycle_state, "managed");
   assert.deepEqual(endpoint.calls.map((call) => [call.method, call.params?.includeTurns]), [
-    ["thread/read", true],
     ["thread/read", false],
+    ["thread/turns/list", undefined],
   ]);
 });
 
@@ -592,8 +612,8 @@ test("loaded-empty adopting reconciliation failure retains its mapping without u
 
   assert.equal(required(registry).lifecycle_state, "adopting");
   assert.deepEqual(endpoint.calls.map((call) => [call.method, call.params?.includeTurns]), [
-    ["thread/read", true],
     ["thread/read", false],
+    ["thread/turns/list", undefined],
   ]);
   assert.deepEqual(released, []);
 });
@@ -617,8 +637,8 @@ test("startup reconstructs a missing runtime row for an exact managed generation
 
   const resumed = await lifecycle.reconcileManaged("payments", required(registry));
 
-  assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/read", "thread/resume", "thread/read"]);
-  assert.deepEqual(endpoint.calls[1]?.params, { threadId: "thread-1" });
+  assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/read", "thread/turns/list", "thread/resume", "thread/read", "thread/turns/list"]);
+  assert.deepEqual(endpoint.calls.find((call) => call.method === "thread/resume")?.params, { threadId: "thread-1", excludeTurns: true });
   assert.equal(resumed.thread.id, "thread-1");
   assert.equal(runtime.getSession("local", "thread-1", "mapping-durable")?.managementState, "managed");
   assert.equal(runtime.currentEpoch("local", "thread-1", "mapping-durable")?.baselineTurnId, "historical");
@@ -671,8 +691,8 @@ test("managed recovery restores a loaded empty thread without rollout resume", a
   assert.equal(recovered.thread.id, "thread-1");
   assert.equal(runtime.getSession("local", "thread-1", "mapping-empty")?.managementState, "managed");
   assert.deepEqual(endpoint.calls.map((call) => [call.method, call.params?.includeTurns]), [
-    ["thread/read", true],
     ["thread/read", false],
+    ["thread/turns/list", undefined],
   ]);
 });
 
@@ -714,20 +734,60 @@ test("managed recovery rebinds an idle thread to a replacement notification conn
   );
 
   assert.equal(recovered.thread.id, "thread-1");
+  assert.deepEqual(recovered.thread.turns, []);
+  assert.deepEqual(endpoint.turns.map((turn) => turn.id), ["t1", "t2"]);
   assert.equal(runtime.getSession("local", "thread-1", "mapping-rebound")?.managementState, "managed");
-  assert.deepEqual(endpoint.calls.map((call) => [call.method, call.params?.includeTurns]), [
-    ["thread/read", false],
-    ["thread/resume", undefined],
+  assert.deepEqual(endpoint.calls, [
+    { method: "thread/read", params: { threadId: "thread-1", includeTurns: false } },
+    { method: "thread/turns/list", params: { threadId: "thread-1", limit: 1, sortDirection: "desc", itemsView: "notLoaded" } },
+    { method: "thread/resume", params: { threadId: "thread-1", excludeTurns: true } },
   ]);
 });
 
-test("managed recovery rebinds a loaded empty thread without a persisted epoch", async () => {
-  const { dir, registry, endpoint, runtime, lifecycle } = await fixture();
+test("managed connection recovery preserves an active turn without transferring persisted history", async () => {
+  const { dir, registry, endpoint, runtime, lifecycle } = await fixture(undefined, undefined, async (_identity, _lease, thread) => {
+    assert.deepEqual(thread?.turns.map((turn) => turn.id), ["t2"]);
+  });
+  await registry.createManaged("payments", {
+    endpoint: "local", thread_id: "thread-1", project_dir: dir, mapping_id: "mapping-active-rebound",
+  });
+  endpoint.status = "active";
+  endpoint.turns = [{ id: "t1", status: "completed" }, { id: "t2", status: "inProgress" }];
+  runtime.setSession("local", "thread-1", "mapping-active-rebound", "unavailable", "active");
+  runtime.setActiveTurn("local", "thread-1", "mapping-active-rebound", "t2");
+  runtime.beginEpoch("local", "thread-1", "mapping-active-rebound", "t1", 0);
+
+  const recovered = await lifecycle.reconcileManaged(
+    "payments",
+    required(registry),
+    undefined,
+    undefined,
+    { resumeForConnection: true },
+  );
+
+  assert.equal(recovered.thread.status.type, "active");
+  assert.deepEqual(recovered.thread.turns, []);
+  assert.equal(runtime.activeTurn("local", "thread-1", "mapping-active-rebound"), "t2");
+  assert.deepEqual(endpoint.turns.map((turn) => turn.id), ["t1", "t2"]);
+  assert.deepEqual(endpoint.calls, [
+    { method: "thread/read", params: { threadId: "thread-1", includeTurns: false } },
+    { method: "thread/turns/list", params: { threadId: "thread-1", limit: 1, sortDirection: "desc", itemsView: "notLoaded" } },
+    { method: "thread/resume", params: { threadId: "thread-1", excludeTurns: true } },
+  ]);
+});
+
+test("managed connection recovery establishes a baseline from one bounded turn summary", async () => {
+  const initialization: Array<{ allowUnmaterialized?: boolean }> = [];
+  const { dir, registry, endpoint, runtime, lifecycle } = await fixture({
+    initialize: async (_identity, _path, _lease, options) => { initialization.push(options ?? {}); },
+    inspectIfInitialized: async () => ({ state: "uninitialized" }),
+    release: () => undefined,
+  });
   await registry.createManaged("payments", {
     endpoint: "local", thread_id: "thread-1", project_dir: dir, mapping_id: "mapping-empty-rebound",
   });
   endpoint.status = "idle";
-  endpoint.turns = [];
+  endpoint.turns = [{ id: "t1", status: "completed" }, { id: "t2", status: "completed" }];
 
   const recovered = await lifecycle.reconcileManaged(
     "payments",
@@ -738,11 +798,37 @@ test("managed recovery rebinds a loaded empty thread without a persisted epoch",
   );
 
   assert.equal(recovered.thread.id, "thread-1");
+  assert.deepEqual(recovered.thread.turns, []);
   assert.equal(runtime.getSession("local", "thread-1", "mapping-empty-rebound")?.managementState, "managed");
-  assert.deepEqual(endpoint.calls.map((call) => [call.method, call.params?.includeTurns]), [
-    ["thread/read", true],
-    ["thread/resume", undefined],
+  assert.equal(runtime.currentEpoch("local", "thread-1", "mapping-empty-rebound")?.baselineTurnId, "t2");
+  assert.deepEqual(initialization, [{ allowUnmaterialized: false }]);
+  assert.deepEqual(endpoint.calls, [
+    { method: "thread/read", params: { threadId: "thread-1", includeTurns: false } },
+    { method: "thread/turns/list", params: { threadId: "thread-1", limit: 1, sortDirection: "desc", itemsView: "notLoaded" } },
+    { method: "thread/resume", params: { threadId: "thread-1", excludeTurns: true } },
   ]);
+});
+
+test("managed connection recovery treats the exact pre-message turns-list error as empty", async () => {
+  const { dir, registry, endpoint, runtime, lifecycle } = await fixture();
+  await registry.createManaged("payments", {
+    endpoint: "local", thread_id: "thread-1", project_dir: dir, mapping_id: "mapping-never-started",
+  });
+  endpoint.status = "idle";
+  endpoint.turns = [];
+  endpoint.unmaterialized = true;
+
+  const recovered = await lifecycle.reconcileManaged(
+    "payments",
+    required(registry),
+    undefined,
+    undefined,
+    { resumeForConnection: true },
+  );
+
+  assert.deepEqual(recovered.thread.turns, []);
+  assert.equal(runtime.currentEpoch("local", "thread-1", "mapping-never-started")?.baselineTurnId, undefined);
+  assert.equal(runtime.getSession("local", "thread-1", "mapping-never-started")?.managementState, "managed");
 });
 
 test("create-completion recovery drops a managed mapping whose rollout never materialized", async () => {
@@ -815,7 +901,7 @@ test("managed recovery validates native goal state before ownership after resumi
   await lifecycle.reconcileManaged("payments", required(registry));
 
   assert.deepEqual(seen, ["resume", "goal", "ownership", "initialize", "goal-cleanup"]);
-  assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/read", "thread/resume", "thread/read"]);
+  assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/read", "thread/resume", "thread/read", "thread/turns/list"]);
 });
 
 test("managed recovery rejects a wrong immediate resume identity before projecting settings", async () => {
@@ -837,7 +923,7 @@ test("managed recovery rejects a wrong immediate resume identity before projecti
     nativeObservationSequence: 0,
   });
   assert.equal(runtime.goalControl("local", "thread-1", "mapping-durable").known, false);
-  assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/read", "thread/resume"]);
+  assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/read", "thread/turns/list", "thread/resume"]);
 });
 
 test("stopping managed recovery while native resume is blocked fences every success publication", async () => {
@@ -920,7 +1006,7 @@ test("managed recovery checks an existing rollout guard after validating native 
   });
 
   assert.deepEqual(seen, ["ownership"]);
-  assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/read"]);
+  assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/read", "thread/turns/list"]);
 });
 
 test("managed recovery retry-tags only an unclassified ownership boundary", async () => {
@@ -936,7 +1022,7 @@ test("managed recovery retry-tags only an unclassified ownership boundary", asyn
     assert.equal((error as AppError).details?.recovery, "ownership_unclassified");
     return true;
   });
-  assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/read"]);
+  assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/read", "thread/turns/list"]);
 });
 
 test("managed recovery terminally removes a pathless mapping whose volatile thread was lost", async () => {
@@ -970,7 +1056,7 @@ test("adopting reconciliation validates native cwd before resuming", async () =>
   endpoint.cwd = join(dir, "drifted");
 
   await assert.rejects(lifecycle.reconcileAdopting(), /cwd|directory/iu);
-  assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/read"]);
+  assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/read", "thread/turns/list"]);
   assert.equal(required(registry).lifecycle_state, "adopting");
 });
 
@@ -983,7 +1069,7 @@ test("adopting reconciliation rolls back a proven subscription when post-resume 
 
   await assert.rejects(lifecycle.reconcileAdopting(), /cwd|directory/iu);
 
-  assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/read", "thread/resume", "thread/read", "thread/unsubscribe"]);
+  assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/read", "thread/turns/list", "thread/resume", "thread/read", "thread/turns/list", "thread/unsubscribe"]);
   assert.equal(registry.get("payments"), undefined);
 });
 

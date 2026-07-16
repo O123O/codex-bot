@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { constants as fsConstants, lstatSync, realpathSync, type Stats } from "node:fs";
 import {
   chmod,
@@ -122,7 +122,7 @@ export interface SshWorkerCliIo {
 }
 
 export const DEFAULT_SSH_PORT = 2222;
-export const DEFAULT_CODEX_VERSION = "0.142.5";
+export const DEFAULT_CODEX_VERSION = "0.144.4";
 export const SSH_ALIAS = "qiyan-ssh-worker";
 
 export function fixtureRuntimeOptions(env: NodeJS.ProcessEnv): { port: number; codexVersion: string } {
@@ -642,17 +642,26 @@ async function removeQuarantinedOperationLease(
   if (heldLease !== undefined) await revalidateOperationLease(trust, heldLease);
 }
 
-async function claimAndRemoveStaleOperationLease(
+function operationLeaseQuarantinePath(trust: FixtureTrust, stale: OperationLease): string {
+  const identityDigest = createHash("sha256")
+    .update(`${stale.directory.device}:${stale.directory.inode}:${stale.ownerFile.device}:${stale.ownerFile.inode}`)
+    .digest("hex")
+    .slice(0, 32);
+  return join(trust.state.path, `.operation-lease-quarantine-${identityDigest}`);
+}
+
+async function claimStaleOperationLease(
   trust: FixtureTrust,
   stale: OperationLease,
   beforeStaleLeaseClaim?: () => Promise<void>,
 ): Promise<boolean> {
   await beforeStaleLeaseClaim?.();
   await revalidateFixtureTrust(trust);
-  const quarantinePath = join(
-    trust.state.path,
-    `.operation-lease-quarantine-${randomUUID().replaceAll("-", "")}`,
-  );
+  // Every contender that inspected this exact stale inode must target the same non-empty
+  // quarantine. Keep it there until a winner installs its replacement lease. A loser can
+  // therefore see ENOENT while the fixed path is empty, or ENOTEMPTY after it is reused, but
+  // can never rename the winner's replacement through the stale pathname.
+  const quarantinePath = operationLeaseQuarantinePath(trust, stale);
   try {
     await rename(stale.directory.path, quarantinePath);
   } catch (error) {
@@ -682,11 +691,9 @@ async function claimAndRemoveStaleOperationLease(
   if (!sameOperationLease(quarantined, expected)) {
     return restoreUnexpectedQuarantine(trust, quarantinePath);
   }
-  try { await removeQuarantinedOperationLease(trust, expected); }
-  catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
-    throw error;
-  }
+  // The acquired replacement lease removes this quarantine while holding the fixed lease.
+  // A crash before acquisition leaves the fixed path empty, so a later caller can acquire it
+  // normally and perform the same validated cleanup.
   return true;
 }
 
@@ -739,7 +746,7 @@ async function acquireOperationLease(
       if (!await operationLeaseIsStale(existing.owner)) {
         throw new Error("SSH fixture operation already running");
       }
-      await claimAndRemoveStaleOperationLease(trust, existing, beforeStaleLeaseClaim);
+      await claimStaleOperationLease(trust, existing, beforeStaleLeaseClaim);
     }
     throw new Error("SSH fixture operation lease could not be acquired");
   } finally {

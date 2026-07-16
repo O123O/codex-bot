@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import { readdir, readFile, writeFile, mkdir, rm } from "node:fs/promises";
 import { join, relative } from "node:path";
 
-const expected = "codex-cli 0.142.5";
+const expected = "codex-cli 0.144.4";
 const version = execFileSync("codex", ["--version"], { encoding: "utf8" }).trim();
 if (version !== expected) throw new Error(`Expected ${expected}, found ${version}`);
 
@@ -13,8 +13,8 @@ await rm(generated, { recursive: true, force: true });
 await rm(schemas, { recursive: true, force: true });
 await mkdir(generated, { recursive: true });
 await mkdir(schemas, { recursive: true });
-execFileSync("codex", ["app-server", "generate-ts", "--out", generated], { stdio: "inherit" });
-execFileSync("codex", ["app-server", "generate-json-schema", "--out", schemas], { stdio: "inherit" });
+execFileSync("codex", ["app-server", "generate-ts", "--experimental", "--out", generated], { stdio: "inherit" });
+execFileSync("codex", ["app-server", "generate-json-schema", "--experimental", "--out", schemas], { stdio: "inherit" });
 
 async function files(dir) {
   const result = [];

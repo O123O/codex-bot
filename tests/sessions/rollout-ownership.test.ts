@@ -722,10 +722,10 @@ test("an unstarted thread (no rollout until the first turn) dispatches its first
 test("a committed pathless mapping resumes a durable thread or terminally detects its missing rollout", async (t) => {
   const identity = { endpoint: "local", thread_id: "thread-restart", mapping_id: "mapping-restart" };
   await t.test("resumable", async () => {
-    const calls: string[] = [];
+    const calls: Array<{ method: string; params: unknown }> = [];
     const resolver = createAppServerRolloutPathResolver({
-      request: async <T>(_endpoint: string, method: string) => {
-        calls.push(method);
+      request: async <T>(_endpoint: string, method: string, params: unknown) => {
+        calls.push({ method, params });
         if (method === "thread/read") throw new JsonRpcResponseError(-32600, "thread not loaded: thread-restart");
         return { thread: { id: identity.thread_id, path: "/tmp/rollout-thread-restart.jsonl" } } as T;
       },
@@ -733,7 +733,10 @@ test("a committed pathless mapping resumes a durable thread or terminally detect
     assert.deepEqual(await resolver(identity), {
       state: "resolved", path: "/tmp/rollout-thread-restart.jsonl",
     });
-    assert.deepEqual(calls, ["thread/read", "thread/resume"]);
+    assert.deepEqual(calls, [
+      { method: "thread/read", params: { threadId: "thread-restart", includeTurns: false } },
+      { method: "thread/resume", params: { threadId: "thread-restart", excludeTurns: true } },
+    ]);
   });
   await t.test("volatile rollout lost", async () => {
     const resolver = createAppServerRolloutPathResolver({

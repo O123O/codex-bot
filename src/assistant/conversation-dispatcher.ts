@@ -30,7 +30,11 @@ export interface TurnSteerParams extends TurnStartParams {
 }
 
 export interface AssistantTurnPort {
-  start(params: TurnStartParams, claim: TurnCapacityClaim): Promise<{ turn: TurnSnapshot }>;
+  start(
+    params: TurnStartParams,
+    claim: TurnCapacityClaim,
+    checkpointBaseline: (baselineTurnId: string | null) => void,
+  ): Promise<{ turn: TurnSnapshot }>;
   steer(params: TurnSteerParams): Promise<{ turnId: string }>;
   readThread(): Promise<ThreadSnapshot>;
 }
@@ -43,6 +47,7 @@ interface DispatcherOptions {
   runtimeObserver?: { hydrateActive(): unknown; beginTerminalizing?(turnId: string): unknown };
   onDeferredTerminal?: (turn: TurnSnapshot) => void;
   scheduler?: AssistantScheduler;
+  beforeStartAdmission?: () => Promise<void>;
   retryMs?: number;
   onOperationalEvent?: (event: DispatcherOperationalEvent) => void;
 }
@@ -52,6 +57,23 @@ export type DispatcherOperationalEvent =
   | "assistant_turn_steered"
   | "assistant_submission_uncertain"
   | "assistant_turn_terminal";
+
+export class AssistantStartPreDispatchError extends Error {
+  constructor(cause: unknown) {
+    super("assistant start pre-dispatch history read failed", { cause });
+    this.name = "AssistantStartPreDispatchError";
+  }
+}
+
+export async function prepareAssistantStartDispatch(
+  readBaseline: () => Promise<string | null>,
+  checkpointBaseline: (baselineTurnId: string | null) => void,
+): Promise<void> {
+  try { checkpointBaseline(await readBaseline()); }
+  catch (error) {
+    throw error instanceof AssistantStartPreDispatchError ? error : new AssistantStartPreDispatchError(error);
+  }
+}
 
 export class ConversationDispatcher {
   private tail: Promise<void> = Promise.resolve();
@@ -69,6 +91,9 @@ export class ConversationDispatcher {
   private nativeSubmissionCount = 0;
   private inFlightStartAttemptId: string | undefined;
   private eventWakeTimer: ReturnType<typeof setTimeout> | undefined;
+  private admissionRetryTimer: ReturnType<typeof setTimeout> | undefined;
+  private startAdmissionInFlight = false;
+  private startAdmissionGranted = false;
   private stopped = false;
 
   constructor(
@@ -232,6 +257,8 @@ export class ConversationDispatcher {
     this.unsubscribeCapacity();
     this.cancelRetry();
     this.cancelRecovery();
+    if (this.admissionRetryTimer) clearTimeout(this.admissionRetryTimer);
+    this.admissionRetryTimer = undefined;
     if (this.eventWakeTimer) clearTimeout(this.eventWakeTimer);
     const inFlightStart = this.inFlightStartAttemptId;
     this.inFlightStartAttemptId = undefined;
@@ -260,6 +287,18 @@ export class ConversationDispatcher {
         this.scheduleEventWake();
         return;
       }
+      if (this.options.beforeStartAdmission && !this.startAdmissionGranted) {
+        if (this.admissionRetryTimer) return;
+        if (this.startAdmissionInFlight) return;
+        this.startAdmissionInFlight = true;
+        this.launch(
+          this.options.beforeStartAdmission(),
+          () => { this.startAdmissionInFlight = false; this.startAdmissionGranted = true; },
+          () => { this.startAdmissionInFlight = false; this.scheduleAdmissionRetry(); },
+        );
+        return;
+      }
+      this.startAdmissionGranted = false;
       const claimId = `assistant:${candidate.contextId}`;
       let claim: TurnCapacityClaim;
       try {
@@ -313,7 +352,9 @@ export class ConversationDispatcher {
     this.inFlightStartAttemptId = submission.attemptId;
     this.options.runtimeObserver?.hydrateActive();
     this.launch(
-      this.trackNativeSubmission(() => this.runner.start(params, claim)),
+      this.trackNativeSubmission(() => this.runner.start(params, claim, (baselineTurnId) => {
+        this.store.checkpointSubmissionBaseline(submission.attemptId, submission.contextId, baselineTurnId);
+      })),
       (response) => {
         this.settleInFlightStart(submission.attemptId);
         if (recoveryGeneration !== undefined && recoveryGeneration !== this.recoveryGeneration) {
@@ -394,6 +435,15 @@ export class ConversationDispatcher {
   }
 
   private handleSubmissionFailure(submission: ReservedSubmission, claim: TurnCapacityClaim | undefined, error: unknown, recoveryGeneration?: number): void {
+    if (error instanceof AssistantStartPreDispatchError && submission.submissionKind === "start" && claim) {
+      this.pumpPaused = true;
+      this.store.restorePending(submission.attemptId, submission.contextId);
+      this.store.clearLease(submission.attemptId);
+      this.pool.releaseTurnCapacityClaim(claim);
+      this.options.membershipObserver?.notifyMembership(submission.contextId);
+      this.scheduleRecovery();
+      return;
+    }
     if (error instanceof TurnIdentityConflictError && submission.submissionKind === "start") {
       this.pauseIdentityConflict(submission.attemptId);
       return;
@@ -432,7 +482,27 @@ export class ConversationDispatcher {
       : [...thread.turns].reverse().find((turn) =>
         turn.items.some((item) => item.type === "userMessage" && item.clientId === submission.clientUserMessageId));
     if (positive) {
-      if (submission.submissionKind === "start") return;
+      if (submission.submissionKind === "start") {
+        if (!claim) return;
+        try { this.pool.bindTurnCapacityClaim(claim, positive.id); }
+        catch { this.pauseIdentityConflict(submission.attemptId); return; }
+        const terminal = isTerminal(positive.status);
+        const confirmation = this.store.confirmStart(submission.attemptId, submission.contextId, positive.id, { terminal });
+        if (confirmation === "conflict") { this.pauseIdentityConflict(submission.attemptId); return; }
+        if (confirmation === "bound") {
+          this.options.onOperationalEvent?.("assistant_turn_started");
+          this.options.membershipObserver?.notifyMembership(submission.contextId);
+        }
+        this.options.runtimeObserver?.hydrateActive();
+        if (terminal || confirmation === "already_terminal_same") {
+          this.noteConversationPeriod(this.store.lease());
+          this.options.runtimeObserver?.beginTerminalizing?.(positive.id);
+          this.pool.markTurnTerminal(this.options.endpointId, this.options.threadId, positive.id);
+          if (confirmation !== "already_terminal_same") this.options.onOperationalEvent?.("assistant_turn_terminal");
+          this.options.onDeferredTerminal?.(positive);
+        } else this.pump();
+        return;
+      }
       const confirmation = this.store.confirmSteer(submission.attemptId, submission.contextId, positive.id);
       if (confirmation === "conflict") return;
       if (confirmation === "bound") {
@@ -454,14 +524,15 @@ export class ConversationDispatcher {
     }
 
     const allFull = thread.turns.every((turn) => turn.itemsView === "full");
+    const allStartItemsKnown = thread.turns.every((turn) => turn.itemsView !== "notLoaded");
     const expected = submission.expectedTurnId
       ? thread.turns.find((turn) => turn.id === submission.expectedTurnId)
       : undefined;
     const noActiveTurn = !thread.turns.some((turn) => !isTerminal(turn.status));
     const threadStatus = typeof thread.status === "string" ? thread.status : thread.status?.type;
-    const provenAbsent = allFull && (submission.submissionKind === "steer"
-      ? !!expected && isTerminal(expected.status)
-      : noActiveTurn && threadStatus === "idle");
+    const provenAbsent = submission.submissionKind === "steer"
+      ? allFull && !!expected && isTerminal(expected.status)
+      : allStartItemsKnown && noActiveTurn && threadStatus === "idle";
     if (submission.submissionKind === "start" && this.store.lease()?.pauseReason === "unknown_terminal_observed") return;
     if (!provenAbsent) return;
 
@@ -570,6 +641,15 @@ export class ConversationDispatcher {
       if (!this.stopped) void this.post(() => this.pump());
     }, Math.max(0, wakeAt - Date.now()));
     this.eventWakeTimer.unref?.();
+  }
+
+  private scheduleAdmissionRetry(): void {
+    if (this.admissionRetryTimer || this.stopped) return;
+    this.admissionRetryTimer = setTimeout(() => {
+      this.admissionRetryTimer = undefined;
+      if (!this.stopped) void this.post(() => this.pump());
+    }, this.options.retryMs ?? 1_000);
+    this.admissionRetryTimer.unref?.();
   }
 
   private isKnownNonSteerable(error: unknown): boolean {

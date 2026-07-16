@@ -11,11 +11,12 @@ import type { EndpointWorkLease } from "../endpoints/types.ts";
 import type { MappingIdentity } from "../registry/session-registry.ts";
 import type { ThreadGate } from "../sessions/thread-gate.ts";
 import type { OwnershipInspection } from "../sessions/rollout-ownership.ts";
-import { isExactThreadNotMaterialized } from "../app-server/thread-errors.ts";
+import type { ThreadHistoryTurn } from "../app-server/thread-history.ts";
 
 interface TerminalTurn {
   id: string;
   status: string;
+  itemsView?: "full" | "summary" | "notLoaded";
   startedAt?: number | null;
   completedAt: number | null;
   items: Array<{ type: string; id: string; text?: string; phase?: string | null }>;
@@ -32,6 +33,7 @@ interface RelayTarget {
   turnId: string;
   mappingId: string;
   epochId: string;
+  fullTurn?: TerminalTurn;
 }
 
 interface RelayTimer {
@@ -112,9 +114,14 @@ export class EventRelay {
     if (method !== "turn/completed" || this.stopped) return "conclusively_ignored";
     const threadId = String(params.threadId);
     const turnId = String(params.turn.id);
-    const target = await this.gate.run(endpointId, threadId, async () => this.captureTarget(endpointId, threadId, turnId));
+    const target = await this.gate.run(endpointId, threadId, async () => this.captureTarget(
+      endpointId,
+      threadId,
+      turnId,
+      fullNotificationTurn(params.turn, turnId),
+    ));
     if (!target || this.stopped) return "conclusively_ignored";
-    this.retryTargets.set(relayTargetKey(target), target);
+    this.retryTargets.set(relayTargetKey(target), retryTarget(target));
     return this.enqueueEndpoint(endpointId, async () => {
       if (this.stopped) return "conclusively_ignored";
       const generation = this.endpointGeneration(endpointId);
@@ -206,7 +213,7 @@ export class EventRelay {
     await Promise.allSettled([...this.endpointTails.values()]);
   }
 
-  private captureTarget(endpointId: string, threadId: string, turnId: string): RelayTarget | undefined {
+  private captureTarget(endpointId: string, threadId: string, turnId: string, fullTurn?: TerminalTurn): RelayTarget | undefined {
     const mapping = this.mapping(endpointId, threadId);
     if (!mapping || mapping.session.lifecycle_state !== "managed") return undefined;
     const epoch = this.runtime.currentEpoch(endpointId, threadId, mapping.session.mapping_id);
@@ -217,6 +224,7 @@ export class EventRelay {
       turnId,
       mappingId: mapping.session.mapping_id,
       epochId: epoch.id,
+      ...(fullTurn ? { fullTurn } : {}),
     };
   }
 
@@ -249,13 +257,34 @@ export class EventRelay {
     if (!this.runIsCurrent(target.endpointId, generation)) return "retry";
     if (ownershipNeedsRetry(firstOwnership)) return "retry";
 
-    const history = await this.pool.request<{ thread: { turns: TerminalTurn[] } }>(
-      target.endpointId,
-      "thread/read",
-      { threadId: target.threadId, includeTurns: true },
-      undefined,
-      lease,
-    );
+    const epoch = this.runtime.currentEpoch(target.endpointId, target.threadId, target.mappingId)!;
+    if (target.turnId === epoch.baselineTurnId) return "conclusively_ignored";
+    const reader = this.pool.historyReader(target.endpointId, lease);
+    const suffix = epoch.baselineTurnId
+      ? await reader.descendingSuffix(target.threadId, epoch.baselineTurnId)
+      : undefined;
+    if (suffix && !suffix.anchorFound) return "retry";
+    const metadata = suffix
+      ? suffix.turns.find((candidate) => candidate.id === target.turnId)
+      : await reader.findTurn(target.threadId, target.turnId);
+    if (!this.runIsCurrent(target.endpointId, generation)) return "retry";
+
+    if (!metadata) {
+      if (suffix && epoch.baselineTurnId) {
+        const relation = await reader.classifyTurnAgainstAnchor(
+          target.threadId, target.turnId, epoch.baselineTurnId,
+        );
+        if (!this.runIsCurrent(target.endpointId, generation)) return "retry";
+        if (relation === "anchor" || relation === "older") return "conclusively_ignored";
+      }
+      return "retry";
+    }
+    let turn: TerminalTurn;
+    if (target.fullTurn) turn = { ...metadata, ...target.fullTurn };
+    else {
+      const exact = await reader.exactTurnItems(target.threadId, target.turnId, { allowLegacySummary: true });
+      turn = terminalTurn(metadata, exact.summaryTurn, exact.items);
+    }
     if (!this.runIsCurrent(target.endpointId, generation)) return "retry";
 
     const current = this.mapping(target.endpointId, target.threadId);
@@ -266,16 +295,6 @@ export class EventRelay {
 
     const stateAfter = this.targetState(target);
     if (stateAfter !== "deliverable") return stateAfter === "stale" ? "conclusively_ignored" : "retry";
-    const turns = history.thread.turns;
-    const turnIndex = turns.findIndex((candidate) => candidate.id === target.turnId);
-    if (turnIndex < 0) return "retry";
-    const epoch = this.runtime.currentEpoch(target.endpointId, target.threadId, target.mappingId)!;
-    if (epoch.baselineTurnId) {
-      const baselineIndex = turns.findIndex((candidate) => candidate.id === epoch.baselineTurnId);
-      if (baselineIndex < 0) return "retry";
-      if (turnIndex <= baselineIndex) return "conclusively_ignored";
-    }
-    const turn = turns[turnIndex]!;
     if (!this.isTerminal(turn.status)) return "retry";
     if (this.ownership && !this.ownership.ownsTurn(current.session, turn.id)) return "conclusively_ignored";
     if (!this.runIsCurrent(target.endpointId, generation)) return "retry";
@@ -298,7 +317,8 @@ export class EventRelay {
         const targetGeneration = { mappingId: session.mapping_id, epochId: epoch.id };
         const before = await this.inspectOwnership(session, lease);
         if (!this.runIsCurrent(endpointId, generation) || ownershipNeedsRetry(before)) return false;
-        const response = await this.readHistory(endpointId, session.thread_id, lease);
+        const anchorTurnId = state.deliveryCursor ?? epoch.baselineTurnId;
+        const suffix = await this.pool.historyReader(endpointId, lease).descendingSuffix(session.thread_id, anchorTurnId);
         if (!this.runIsCurrent(endpointId, generation)) return false;
         const current = this.mapping(endpointId, session.thread_id);
         if (!current) return true;
@@ -306,16 +326,20 @@ export class EventRelay {
         const after = await this.inspectOwnership(current.session, lease);
         if (!this.runIsCurrent(endpointId, generation) || ownershipNeedsRetry(after)
           || !this.isDeliverableGeneration(endpointId, session.thread_id, targetGeneration)) return false;
-        const turns = response.thread.turns;
-        let index = epoch.baselineTurnId ? turns.findIndex((turn) => turn.id === epoch.baselineTurnId) + 1 : 0;
-        if (epoch.baselineTurnId && index === 0) return false;
-        if (state.deliveryCursor) {
-          const cursorIndex = turns.findIndex((turn) => turn.id === state.deliveryCursor);
-          if (cursorIndex >= 0) index = Math.max(index, cursorIndex + 1);
-        }
-        for (const turn of turns.slice(index)) {
+        if (!suffix.anchorFound) return false;
+        const reader = this.pool.historyReader(endpointId, lease);
+        for (const metadata of [...suffix.turns].reverse()) {
+          const exact = await reader.exactTurnItems(session.thread_id, metadata.id, { allowLegacySummary: true });
+          const turn = terminalTurn(metadata, exact.summaryTurn, exact.items);
+          if (!this.runIsCurrent(endpointId, generation)) return false;
+          const currentAfterItems = this.mapping(endpointId, session.thread_id);
+          if (!currentAfterItems || currentAfterItems.session.mapping_id !== session.mapping_id) return false;
+          const afterItems = await this.inspectOwnership(currentAfterItems.session, lease);
+          if (!this.runIsCurrent(endpointId, generation)
+            || (after.state !== "external" && afterItems.state === "external") || ownershipNeedsRetry(afterItems)
+            || !this.isDeliverableGeneration(endpointId, session.thread_id, targetGeneration)) return false;
           if (!this.isTerminal(turn.status)) break;
-          if (this.ownership && !this.ownership.ownsTurn(current.session, turn.id)) {
+          if (this.ownership && !this.ownership.ownsTurn(currentAfterItems.session, turn.id)) {
             if (!this.runIsCurrent(endpointId, generation)) return false;
             this.runtime.setDeliveryCursor(endpointId, session.thread_id, session.mapping_id, turn.id);
             if (!this.runIsCurrent(endpointId, generation)) return false;
@@ -438,26 +462,6 @@ export class EventRelay {
     return this.ownership?.inspect(identity, lease) ?? Promise.resolve({ state: "owned" });
   }
 
-  private async readHistory(
-    endpointId: string,
-    threadId: string,
-    lease: EndpointWorkLease,
-  ): Promise<{ thread: { turns: TerminalTurn[] } }> {
-    try {
-      return await this.pool.request(endpointId, "thread/read", { threadId, includeTurns: true }, undefined, lease);
-    } catch (error) {
-      if (!isExactThreadNotMaterialized(error, threadId)) throw error;
-      const response = await this.pool.request<{ thread: object }>(
-        endpointId,
-        "thread/read",
-        { threadId, includeTurns: false },
-        undefined,
-        lease,
-      );
-      return { ...response, thread: { ...response.thread, turns: [] } };
-    }
-  }
-
   private settleTarget(
     target: RelayTarget,
     outcome: RelayOutcome,
@@ -466,7 +470,7 @@ export class EventRelay {
   ): RelayOutcome {
     const effective = this.runIsCurrent(target.endpointId, generation) ? outcome : "retry";
     if (!this.stopped) {
-      if (effective === "retry") this.retryTargets.set(relayTargetKey(target), target);
+      if (effective === "retry") this.retryTargets.set(relayTargetKey(target), retryTarget(target));
       else this.retryTargets.delete(relayTargetKey(target));
       if (!this.hasPendingWork(target.endpointId)) {
         this.clearRetryTimer(target.endpointId);
@@ -579,4 +583,51 @@ export class EventRelay {
   private mapping(endpointId: string, threadId: string) {
     return this.registry.getByIdentity(endpointId, threadId);
   }
+}
+
+function terminalTurn(
+  metadata: ThreadHistoryTurn,
+  summary: ThreadHistoryTurn | undefined,
+  items: TerminalTurn["items"],
+): TerminalTurn {
+  const source = summary ?? metadata;
+  return {
+    id: metadata.id,
+    status: source.status,
+    itemsView: summary?.itemsView ?? "full",
+    startedAt: source.startedAt ?? metadata.startedAt ?? null,
+    completedAt: source.completedAt ?? metadata.completedAt ?? null,
+    items,
+  };
+}
+
+function fullNotificationTurn(value: unknown, turnId: string): TerminalTurn | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const turn = value as Record<string, unknown>;
+  if (turn.id !== turnId || turn.itemsView !== "full" || typeof turn.status !== "string" || !Array.isArray(turn.items)) return undefined;
+  const items: TerminalTurn["items"] = [];
+  for (const raw of turn.items) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+    const item = raw as Record<string, unknown>;
+    if (typeof item.type !== "string" || typeof item.id !== "string") return undefined;
+    items.push({
+      type: item.type,
+      id: item.id,
+      ...(typeof item.text === "string" ? { text: item.text } : {}),
+      ...(item.phase === null || typeof item.phase === "string" ? { phase: item.phase } : {}),
+    });
+  }
+  return {
+    id: turnId,
+    status: turn.status,
+    itemsView: "full",
+    startedAt: typeof turn.startedAt === "number" || turn.startedAt === null ? turn.startedAt : null,
+    completedAt: typeof turn.completedAt === "number" || turn.completedAt === null ? turn.completedAt : null,
+    items,
+  };
+}
+
+function retryTarget(target: RelayTarget): RelayTarget {
+  const { fullTurn: _discarded, ...identity } = target;
+  return identity;
 }

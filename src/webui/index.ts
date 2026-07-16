@@ -8,6 +8,7 @@ import type { WebReadsDeps } from "./web-reads.ts";
 import type { WebFilesDeps } from "./web-files.ts";
 import type { WebUploadsConfig } from "./web-uploads.ts";
 import type { RemoteDeps } from "./web-remote.ts";
+import type { WebGoalControlInput, WebGoalControlResult } from "./web-goal-control.ts";
 import { WEB_BINDING } from "./web-adapter.ts";
 import { createWebServer } from "./web-server.ts";
 import { readWebUiState } from "./webui-state.ts";
@@ -30,6 +31,10 @@ export interface WebUiPhaseDeps {
   uploads?: WebUploadsConfig;
   remote?: () => RemoteDeps | undefined; // provider — the ssh runtime root is only known after startup
   acceptChat(source: CanonicalChatSource, effects: ChatAcceptanceEffects): Promise<void>;
+  controlGoal(input: WebGoalControlInput): Promise<WebGoalControlResult>;
+  openGoalAdmission(): void;
+  closeGoalAdmission(): void;
+  waitForGoalControls(): Promise<void>;
   report(event: OperationalEvent): void;
   onStarted(url: string): void;
   statePath: string; // <qiyanHome>/webui.json — persisted control state for the `web-ui` command
@@ -120,7 +125,9 @@ export function createWebUiPhase(deps: WebUiPhaseDeps): AppPhase {
 
   const createServer = (host: string, port: number): WebServerHandle => createWebServer({
     host, port, token: deps.token, staticDir: deps.staticDir,
-    bus: deps.bus, reads: deps.reads, files: deps.files, ...(deps.uploads ? { uploads: deps.uploads } : {}), ...(deps.remote ? { remote: deps.remote } : {}), submitInput, report: deps.report,
+    bus: deps.bus, reads: deps.reads, files: deps.files, ...(deps.uploads ? { uploads: deps.uploads } : {}), ...(deps.remote ? { remote: deps.remote } : {}),
+    submitInput, controlGoal: deps.controlGoal, openGoalAdmission: deps.openGoalAdmission,
+    closeGoalAdmission: deps.closeGoalAdmission, waitForGoalControls: deps.waitForGoalControls, report: deps.report,
   });
   const resolveTarget = (): WebUiTarget => {
     const state = readWebUiState(deps.statePath);

@@ -11,7 +11,7 @@ import { WorkspaceRouter } from "../endpoints/workspace-router.ts";
 import type { EndpointManager } from "../endpoints/manager.ts";
 import type { EndpointWorkLease } from "../endpoints/types.ts";
 import type { OwnershipInspection } from "./rollout-ownership.ts";
-import { isExactThreadNotMaterialized } from "../app-server/thread-errors.ts";
+import { isExactThreadItemsUnsupported } from "../app-server/thread-errors.ts";
 
 interface SessionOwnershipCheck {
   inspect(identity: Pick<RegistrySession, "endpoint" | "thread_id" | "mapping_id">, lease?: EndpointWorkLease): Promise<OwnershipInspection>;
@@ -41,7 +41,13 @@ export class SessionService {
     input?: unknown[];
     settings?: { model?: string; effort?: string };
     prepareInput?(context: { session: RegistrySession; projectRoot: string; lease?: EndpointWorkLease }): Promise<unknown[]>;
-    onBeforeNativeDispatch?(context: { session: RegistrySession; mode: "start" | "steer"; activeTurnId?: string; lease?: EndpointWorkLease }): void | Promise<void>;
+    onBeforeNativeDispatch?(context: {
+      session: RegistrySession;
+      mode: "start" | "steer";
+      activeTurnId?: string;
+      baselineTurnId?: string | null;
+      lease?: EndpointWorkLease;
+    }): void | Promise<void>;
   } = {}): Promise<{ mode: "start" | "steer"; turnId: string; terminal?: boolean; appliedSettings?: { model?: string; effort?: string } }> {
     return this.runVerifiedExecution(nickname, async (session, cwd, lease) => {
       const activeTurn = this.runtime.activeTurn(session.endpoint, session.thread_id, session.mapping_id);
@@ -65,21 +71,24 @@ export class SessionService {
           return { mode: "steer" as const, turnId: response.turnId };
         } catch (error) {
           if (!options.clientUserMessageId) throw error;
-          const history = await this.pool.request<any>(session.endpoint, "thread/read", { threadId: session.thread_id, includeTurns: true }, undefined, lease);
-          const proven = history.thread.turns.find((turn: any) => turn.id === activeTurn && turn.items.some((item: any) => item.type === "userMessage" && item.clientId === options.clientUserMessageId));
+          const items = await this.pool.historyReader(session.endpoint, lease).exactTurnItems(
+            session.thread_id, activeTurn, { allowLegacySummary: true },
+          );
+          const proven = items.items.some((item) => item.type === "userMessage" && item.clientId === options.clientUserMessageId);
           if (!proven) throw error;
           return { mode: "steer" as const, turnId: activeTurn };
         }
       }
       const settings = options.settings ?? this.runtime.settings(session.endpoint, session.thread_id, session.mapping_id);
       this.assertExactManaged(nickname, session.mapping_id);
-      await options.onBeforeNativeDispatch?.({ session, mode: "start", ...(lease ? { lease } : {}) });
+      const baselineTurnId = (await this.pool.historyReader(session.endpoint, lease).latestTurn(session.thread_id))?.id ?? null;
+      await options.onBeforeNativeDispatch?.({ session, mode: "start", baselineTurnId, ...(lease ? { lease } : {}) });
       this.assertExactManaged(nickname, session.mapping_id);
       await this.assertOwned(nickname, session, lease);
       this.assertExactManaged(nickname, session.mapping_id);
       const response = await this.pool.startTurn<{ turn: { id: string; status?: string } }>(session.endpoint, {
         threadId: session.thread_id, cwd, ...(options.clientUserMessageId ? { clientUserMessageId: options.clientUserMessageId } : {}), input, ...settings,
-      }, undefined, lease);
+      }, undefined, lease, baselineTurnId);
       this.consumeSettingsIfNative(session.endpoint, session.thread_id, session.mapping_id, settings);
       const terminal = new Set(["completed", "failed", "interrupted"]).has(response.turn.status ?? "");
       if (!terminal) this.runtime.setActiveTurn(session.endpoint, session.thread_id, session.mapping_id, response.turn.id);
@@ -90,30 +99,103 @@ export class SessionService {
   async interrupt(nickname: string, turnId?: string, options: {
     existingLease?: EndpointWorkLease;
     recoverExactTurn?: boolean;
-  } = {}): Promise<void> {
-    const expected = this.managed(nickname);
-    await this.withMutationLease(expected.endpoint, (lease) => this.gate.run(expected.endpoint, expected.thread_id, async () => {
-      const session = this.assertExactManaged(nickname, expected.mapping_id);
-      await this.assertOwned(nickname, session, lease);
-      this.assertExactManaged(nickname, expected.mapping_id);
+    onBeforeNativeDispatch?(turnId: string): void;
+  } = {}): Promise<string> {
+    const expected = this.registeredControl(nickname);
+    return this.withMutationLease(expected.endpoint, (lease) => this.gate.run(expected.endpoint, expected.thread_id, async () => {
+      const session = this.assertExactRegisteredControl(nickname, expected.mapping_id);
       let active = this.runtime.activeTurn(session.endpoint, session.thread_id, session.mapping_id);
-      if (!active && options.recoverExactTurn && turnId) {
+      const state = this.runtime.getSession(session.endpoint, session.thread_id, session.mapping_id);
+      if (state?.managementState === "unavailable" || (!active && options.recoverExactTurn && turnId)) {
         const native = await this.readWithTurns(session.endpoint, session.thread_id, lease);
-        const target = native.thread.turns.find((candidate: any) => candidate.id === turnId);
-        if (target && isTerminalStatus(target.status)) return;
-        if (!target) throw new AppError("OPERATION_UNCERTAIN", `turn ${turnId} is not present in authoritative history`);
-        active = turnId;
+        const target = turnId ? native.thread.turns.find((candidate: any) => candidate.id === turnId) : undefined;
+        if (target && isTerminalStatus(target.status) && options.recoverExactTurn) return turnId!;
+        if (turnId && !target) throw new AppError("OPERATION_UNCERTAIN", `turn ${turnId} is not present in authoritative history`);
+        active = [...native.thread.turns].reverse().find((candidate: any) => !isTerminalStatus(candidate.status))?.id;
       }
       if (!active) throw new AppError("SESSION_IDLE", `${nickname} has no active turn`);
       if (turnId && turnId !== active) throw new AppError("OPERATION_CONFLICT", `active turn is ${active}, not ${turnId}`);
+      await this.assertOwned(nickname, session, lease);
+      this.assertExactRegisteredControl(nickname, expected.mapping_id);
+      options.onBeforeNativeDispatch?.(String(active));
       await this.pool.interrupt(session.endpoint, session.thread_id, active, lease);
-      this.runtime.clearActiveTurn(session.endpoint, session.thread_id, session.mapping_id, active);
+      this.runtime.reconcileNativeState(session.endpoint, session.thread_id, session.mapping_id, "idle");
+      return String(active);
     }), options.existingLease);
+  }
+
+  async compact(nickname: string, options: {
+    onBeforeNativeDispatch?(evidence: {
+      endpointId: string;
+      threadId: string;
+      mappingId: string;
+      baselineCompactionItemIds: string[];
+      baselineTurnId: string | null;
+    }): void;
+  } = {}): Promise<{ compactionItemId: string; baselineCompactionItemIds: string[] }> {
+    return this.runVerifiedExecution(nickname, async (session, _cwd, lease) => {
+      const before = await this.readWithTurns(session.endpoint, session.thread_id, lease);
+      if (before.thread.status?.type === "active" || before.thread.turns.some((turn: any) => !isTerminalStatus(turn.status))) {
+        throw new AppError("SESSION_BUSY", `${nickname} has an active turn`);
+      }
+      const baselineTurnId = before.thread.turns.at(-1)?.id ?? null;
+      await this.assertCompactionPagingSupported(session.endpoint, session.thread_id, baselineTurnId, lease);
+      const baselineCompactionItemIds: string[] = [];
+      options.onBeforeNativeDispatch?.({
+        endpointId: session.endpoint,
+        threadId: session.thread_id,
+        mappingId: session.mapping_id,
+        baselineCompactionItemIds,
+        baselineTurnId,
+      });
+      await this.pool.request(session.endpoint, "thread/compact/start", { threadId: session.thread_id }, undefined, lease);
+      const observed = await this.compactionItemIdsAfter(session.endpoint, session.thread_id, baselineTurnId, lease);
+      const compactionItemId = observed[0];
+      if (!compactionItemId) throw new AppError("OPERATION_UNCERTAIN", `compaction completion is not yet visible for ${nickname}`);
+      return { compactionItemId, baselineCompactionItemIds };
+    });
   }
 
   authorizeTurn(nickname: string, turnId: string): void {
     const session = this.managed(nickname);
     this.ownership?.authorizeTurn?.(session, turnId);
+  }
+
+  async compactionItemIdsAfter(
+    endpointId: string,
+    threadId: string,
+    baselineTurnId: string | null,
+    lease?: EndpointWorkLease,
+  ): Promise<string[]> {
+    const reader = this.pool.historyReader(endpointId, lease);
+    const suffix = await reader.descendingSuffix(threadId, baselineTurnId ?? undefined);
+    if (baselineTurnId && !suffix.anchorFound) {
+      throw new AppError("OPERATION_UNCERTAIN", "compaction baseline turn is absent from authoritative history");
+    }
+    const ids: string[] = [];
+    for (const turn of [...suffix.turns].reverse()) {
+      const exact = await reader.exactTurnItems(threadId, turn.id);
+      ids.push(...exact.items.filter((item) => item.type === "contextCompaction").map((item) => item.id));
+    }
+    return ids;
+  }
+
+  async assertCompactionPagingSupported(
+    endpointId: string,
+    threadId: string,
+    baselineTurnId: string | null,
+    lease?: EndpointWorkLease,
+  ): Promise<void> {
+    try {
+      await this.pool.historyReader(endpointId, lease).itemsPage(threadId, {
+        ...(baselineTurnId ? { turnId: baselineTurnId } : {}),
+        limit: 1,
+        sortDirection: "desc",
+      });
+    } catch (error) {
+      if (!isExactThreadItemsUnsupported(error)) throw error;
+      throw new AppError("OPERATION_UNCERTAIN", "bounded compaction evidence is unavailable for this legacy session");
+    }
   }
 
   async authorizeActiveTurn(nickname: string, existingLease?: EndpointWorkLease): Promise<string | undefined> {
@@ -190,22 +272,30 @@ export class SessionService {
 
   async setModel(nickname: string, model: string): Promise<void> {
     const session = this.managed(nickname);
-    const available = await this.listModels(session.endpoint);
-    if (!available.some((candidate) => candidate.id === model || candidate.model === model)) throw new AppError("UNSUPPORTED_CAPABILITY", `unknown model for ${session.endpoint}: ${model}`);
-    this.runtime.setModel(session.endpoint, session.thread_id, session.mapping_id, model);
+    await this.setModelForIdentity(session.endpoint, session.thread_id, session.mapping_id, model);
   }
 
   async setEffort(nickname: string, effort: string): Promise<void> {
     const session = this.managed(nickname);
-    const available = await this.listModels(session.endpoint);
-    const pendingModel = this.runtime.settings(session.endpoint, session.thread_id, session.mapping_id).model;
-    const native = await this.pool.request<any>(session.endpoint, "thread/read", { threadId: session.thread_id, includeTurns: false });
+    await this.setEffortForIdentity(session.endpoint, session.thread_id, session.mapping_id, effort);
+  }
+
+  async setModelForIdentity(endpointId: string, threadId: string, mappingId: string, model: string): Promise<void> {
+    const available = await this.listModels(endpointId);
+    if (!available.some((candidate) => candidate.id === model || candidate.model === model)) throw new AppError("UNSUPPORTED_CAPABILITY", `unknown model for ${endpointId}: ${model}`);
+    this.runtime.setModel(endpointId, threadId, mappingId, model);
+  }
+
+  async setEffortForIdentity(endpointId: string, threadId: string, mappingId: string, effort: string): Promise<void> {
+    const available = await this.listModels(endpointId);
+    const pendingModel = this.runtime.settings(endpointId, threadId, mappingId).model;
+    const native = await this.pool.request<any>(endpointId, "thread/read", { threadId, includeTurns: false });
     const configuredModel = pendingModel ?? native.thread.model;
     const model = available.find((candidate) => candidate.id === configuredModel || candidate.model === configuredModel) ?? available.find((candidate) => candidate.isDefault) ?? available[0];
     if (model?.supportedReasoningEfforts && !model.supportedReasoningEfforts.some((candidate: any) => candidate.reasoningEffort === effort || candidate === effort)) {
       throw new AppError("UNSUPPORTED_CAPABILITY", `reasoning effort ${effort} is not supported by ${model.id ?? model.model}`);
     }
-    this.runtime.setEffort(session.endpoint, session.thread_id, session.mapping_id, effort);
+    this.runtime.setEffort(endpointId, threadId, mappingId, effort);
   }
 
   // Consume the pending model/effort ONLY when the endpoint's backend persists them itself
@@ -347,6 +437,19 @@ export class SessionService {
     return session;
   }
 
+  private assertExactRegisteredControl(nickname: string, mappingId: string): RegistrySession {
+    const session = this.registry.get(nickname);
+    if (!session || session.mapping_id !== mappingId || session.lifecycle_state !== "managed") {
+      throw new AppError("SESSION_DETACHED", `${nickname} mapping changed or is not managed`);
+    }
+    const runtime = this.runtime.getSession(session.endpoint, session.thread_id, session.mapping_id);
+    if (!runtime || (runtime.managementState !== "managed"
+      && !(runtime.managementState === "unavailable" && runtime.restoreState === "managed"))) {
+      throw new AppError("SESSION_DETACHED", `${nickname} is not available for managed control`);
+    }
+    return session;
+  }
+
   private async listModels(endpointId: string): Promise<any[]> {
     const data: any[] = [];
     let cursor: string | null = null;
@@ -359,13 +462,14 @@ export class SessionService {
   }
 
   private async readWithTurns(endpointId: string, threadId: string, lease?: EndpointWorkLease): Promise<any> {
-    try {
-      return await this.pool.request<any>(endpointId, "thread/read", { threadId, includeTurns: true }, undefined, lease);
-    } catch (error) {
-      if (!isExactThreadNotMaterialized(error, threadId)) throw error;
-      const response = await this.pool.request<any>(endpointId, "thread/read", { threadId, includeTurns: false }, undefined, lease);
-      return { ...response, thread: { ...response.thread, turns: [] } };
-    }
+    const response = await this.pool.request<any>(
+      endpointId, "thread/read", { threadId, includeTurns: false }, undefined, lease,
+    );
+    const turns = await this.pool.historyReader(endpointId, lease).allTurns(threadId, {
+      sortDirection: "asc",
+      itemsView: "notLoaded",
+    });
+    return { ...response, thread: { ...response.thread, turns } };
   }
 
   private required(nickname: string) {
@@ -379,6 +483,21 @@ export class SessionService {
     if (session.lifecycle_state !== "managed" || this.runtime.getSession(session.endpoint, session.thread_id, session.mapping_id)?.managementState !== "managed") throw new AppError("SESSION_DETACHED", `${nickname} is not managed`);
     return session;
   }
+
+  private registeredControl(nickname: string): RegistrySession {
+    const session = this.required(nickname);
+    return this.assertExactRegisteredControl(nickname, session.mapping_id);
+  }
+}
+
+export function requireCompactionItemIds(thread: { turns?: any[] }): string[] {
+  const turns = thread.turns ?? [];
+  if (turns.some((turn) => turn.itemsView !== "full" || !Array.isArray(turn.items))) {
+    throw new AppError("OPERATION_CONFLICT", "full native history is required to reconcile compaction");
+  }
+  return turns.flatMap((turn) => turn.items
+    .filter((item: any) => item?.type === "contextCompaction" && typeof item.id === "string")
+    .map((item: any) => String(item.id)));
 }
 
 function isTerminalStatus(status: unknown): boolean {

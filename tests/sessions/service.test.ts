@@ -5,6 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import type { AppServerEndpoint } from "../../src/app-server/pool.ts";
 import { AppServerPool } from "../../src/app-server/pool.ts";
+import { JsonRpcResponseError } from "../../src/app-server/rpc-client.ts";
 import { SessionObservationProcessor } from "../../src/assistant/session-observer.ts";
 import { AppError } from "../../src/core/errors.ts";
 import { SessionRegistry } from "../../src/registry/session-registry.ts";
@@ -40,7 +41,21 @@ class ServiceEndpoint implements AppServerEndpoint {
   loseNextGoalResponse = false;
   rejectNextGoalSetBeforeEffect = false;
   rejectNextGoalGet = false;
+  legacyItemsUnsupported = false;
   onTurnStart: (() => void) | undefined;
+  private historyTurns(): any[] {
+    return this.threadTurns ?? (this.lastClientId ? [{
+      id: "started-1",
+      ...(this.historyTurnStatus ? { status: this.historyTurnStatus } : {}),
+      items: [{ type: "userMessage", clientId: this.lastClientId }],
+    }] : []);
+  }
+  private historyItems(turn: any): any[] {
+    return (turn.items ?? []).map((item: any, index: number) => ({
+      id: item.id ?? `${turn.id}-item-${index}`,
+      ...item,
+    }));
+  }
   async request<T>(method: string, params: any): Promise<T> {
     this.calls.push({ method, params });
     if (method === "turn/start") {
@@ -53,7 +68,43 @@ class ServiceEndpoint implements AppServerEndpoint {
     if (method === "thread/read") {
       this.onThreadReadRequest?.();
       await this.threadReadBarrier;
-      return { thread: { id: "thread", cwd: this.cwd, status: { type: this.status }, turns: this.threadTurns ?? (this.lastClientId ? [{ id: "started-1", ...(this.historyTurnStatus ? { status: this.historyTurnStatus } : {}), items: [{ type: "userMessage", clientId: this.lastClientId }] }] : []) } } as T;
+      return { thread: { id: "thread", cwd: this.cwd, status: { type: this.status }, turns: params.includeTurns ? this.historyTurns() : [] } } as T;
+    }
+    if (method === "thread/turns/list") {
+      const source = params.sortDirection === "desc" ? [...this.historyTurns()].reverse() : this.historyTurns();
+      return {
+        data: source.map((turn) => ({
+          ...turn,
+          status: turn.status ?? "completed",
+          itemsView: params.itemsView,
+          items: params.itemsView === "notLoaded" ? [] : this.historyItems(turn),
+        })),
+        nextCursor: null,
+        backwardsCursor: null,
+      } as T;
+    }
+    if (method === "thread/items/list") {
+      if (this.legacyItemsUnsupported) {
+        throw new JsonRpcResponseError(-32601, "thread/items/list is not supported yet");
+      }
+      const turns = params.turnId === undefined
+        ? this.historyTurns()
+        : this.historyTurns().filter((candidate) => candidate.id === params.turnId);
+      return {
+        data: turns.flatMap((turn) => this.historyItems(turn)),
+        nextCursor: null,
+        backwardsCursor: null,
+      } as T;
+    }
+    if (method === "thread/compact/start") {
+      const turns = this.threadTurns ?? (this.threadTurns = []);
+      turns.push({
+        id: `compact-turn-${turns.length + 1}`,
+        status: "completed",
+        itemsView: "full",
+        items: [{ type: "contextCompaction", id: "compact-1" }],
+      });
+      return {} as T;
     }
     if (method === "thread/goal/get") {
       this.onGoalRequest?.();
@@ -146,8 +197,8 @@ test("prepares worker input inside the verified execution fence before native di
 test("execution performs a fresh native cwd and project check before every mutation", async () => {
   const { endpoint, service, failWorkspace } = await fixture();
   await service.send("payments", "start");
-  assert.deepEqual(endpoint.calls.slice(0, 2).map((call) => call.method), ["thread/read", "turn/start"]);
-  assert.equal(endpoint.calls[1]?.params.cwd, endpoint.cwd);
+  assert.deepEqual(endpoint.calls.slice(0, 3).map((call) => call.method), ["thread/read", "thread/turns/list", "turn/start"]);
+  assert.equal(endpoint.calls[2]?.params.cwd, endpoint.cwd);
 
   endpoint.calls.length = 0;
   failWorkspace();
@@ -221,6 +272,67 @@ test("interrupt recovery resumes the exact native active turn when runtime cache
 
   assert.ok(value.endpoint.calls.some((call) => call.method === "turn/interrupt"
     && call.params.turnId === "recovered-active"));
+});
+
+test("an unavailable registered worker with managed restore state can be interrupted from authoritative history", async () => {
+  const value = await fixture({ inspect: async () => ({ state: "owned" }) });
+  value.runtime.setSession("local", "thread", mappingId, "unavailable", "notLoaded");
+  value.endpoint.status = "active";
+  value.endpoint.threadTurns = [{ id: "remote-active", status: "inProgress", itemsView: "full", items: [] }];
+
+  assert.equal(await value.service.interrupt("payments"), "remote-active");
+
+  assert.ok(value.endpoint.calls.some((call) => call.method === "turn/interrupt" && call.params.turnId === "remote-active"));
+  assert.equal(value.runtime.activeTurn("local", "thread", mappingId), undefined);
+});
+
+test("unavailable interrupt rejects a runtime row whose restore state is not managed", async () => {
+  const value = await fixture({ inspect: async () => ({ state: "owned" }) });
+  value.runtime.setSession("local", "thread", mappingId, "archiving", "active");
+  value.runtime.setSession("local", "thread", mappingId, "unavailable", "notLoaded");
+  value.endpoint.status = "active";
+  value.endpoint.threadTurns = [{ id: "remote-active", status: "inProgress", itemsView: "full", items: [] }];
+
+  await assert.rejects(value.service.interrupt("payments"), (error: unknown) => (
+    error instanceof AppError && error.code === "SESSION_DETACHED"
+  ));
+  assert.equal(value.endpoint.calls.some((call) => call.method === "turn/interrupt"), false);
+});
+
+test("compaction requires an idle managed worker and observes a new native compaction item", async () => {
+  const value = await fixture({ inspect: async () => ({ state: "owned" }) });
+  value.endpoint.threadTurns = [{ id: "finished", status: "completed", itemsView: "full", items: [] }];
+  let checkpoint: unknown;
+
+  const result = await value.service.compact("payments", {
+    onBeforeNativeDispatch: (evidence) => { checkpoint = evidence; },
+  });
+
+  assert.deepEqual(checkpoint, {
+    endpointId: "local", threadId: "thread", mappingId, baselineCompactionItemIds: [], baselineTurnId: "finished",
+  });
+  assert.deepEqual(result, { compactionItemId: "compact-1", baselineCompactionItemIds: [] });
+  assert.ok(value.endpoint.calls.some((call) => call.method === "thread/compact/start" && call.params.threadId === "thread"));
+  const itemReads = value.endpoint.calls.filter((call) => call.method === "thread/items/list");
+  assert.equal(itemReads.length, 2);
+  assert.deepEqual(itemReads.map((call) => call.params.turnId), ["finished", "compact-turn-2"]);
+
+  value.endpoint.status = "active";
+  value.endpoint.threadTurns.push({ id: "active", status: "inProgress", itemsView: "full", items: [] });
+  await assert.rejects(value.service.compact("payments"), (error: unknown) => (
+    error instanceof AppError && error.code === "SESSION_BUSY"
+  ));
+});
+
+test("legacy compaction recovery stays unresolved without dispatching another compaction", async () => {
+  const value = await fixture({ inspect: async () => ({ state: "owned" }) });
+  value.endpoint.threadTurns = [{ id: "finished", status: "completed", itemsView: "full", items: [] }];
+  value.endpoint.legacyItemsUnsupported = true;
+
+  await assert.rejects(value.service.compact("payments"), (error: unknown) => (
+    error instanceof AppError && error.code === "OPERATION_UNCERTAIN"
+  ));
+  assert.equal(value.endpoint.calls.some((call) => call.method === "thread/compact/start"), false);
 });
 
 test("active goal transition snapshots exact native turn ownership before marker revocation", async () => {
@@ -345,7 +457,8 @@ test("status derives the active turn from authoritative history instead of cache
 
   const status = await service.status("payments") as any;
   assert.equal(status.activeTurnId, "active-turn");
-  assert.equal(endpoint.calls.find((call) => call.method === "thread/read")?.params.includeTurns, true);
+  assert.equal(endpoint.calls.find((call) => call.method === "thread/read")?.params.includeTurns, false);
+  assert.ok(endpoint.calls.some((call) => call.method === "thread/turns/list"));
 });
 
 test("status binds its native snapshot before a blocked goal read so a newer notification wins", async () => {

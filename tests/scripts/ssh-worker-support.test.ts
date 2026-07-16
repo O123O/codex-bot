@@ -96,7 +96,7 @@ async function installConnectionState(paths: FixturePaths): Promise<void> {
 function probeRunner(): CommandRunner {
   return async (command, args) => {
     if (command === "ssh-keygen") return successfulResult(`${PUBLIC_KEY}\n`);
-    if (args.includes("--version")) return successfulResult("codex-cli 0.142.5\n");
+    if (args.includes("--version")) return successfulResult("codex-cli 0.144.4\n");
     return successfulResult();
   };
 }
@@ -180,7 +180,7 @@ test("resolves every fixture path beneath a canonical repository root", async (t
   const stateDir = join(root, ".tmp", "ssh-worker");
 
   assert.equal(DEFAULT_SSH_PORT, 2222);
-  assert.equal(DEFAULT_CODEX_VERSION, "0.142.5");
+  assert.equal(DEFAULT_CODEX_VERSION, "0.144.4");
   assert.equal(SSH_ALIAS, "qiyan-ssh-worker");
   assert.deepEqual(resolveFixturePaths(root), {
     repositoryRoot: root,
@@ -257,7 +257,7 @@ test("builds SSH arguments with only the dedicated config before the fixed alias
 });
 
 test("parses one validated port and Codex version consistently for every fixture command", () => {
-  assert.deepEqual(fixtureRuntimeOptions({}), { port: 2222, codexVersion: "0.142.5" });
+  assert.deepEqual(fixtureRuntimeOptions({}), { port: 2222, codexVersion: "0.144.4" });
   assert.deepEqual(fixtureRuntimeOptions({
     QIYAN_SSH_WORKER_PORT: "2201",
     QIYAN_SSH_WORKER_CODEX_VERSION: "1.2.3",
@@ -285,7 +285,7 @@ test("checks the fixed remote environment and authenticated App Server without c
       ...(options?.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
     });
     if (command === "ssh-keygen") return successfulResult(`${PUBLIC_KEY}\n`);
-    if (args.includes("--version")) return successfulResult("codex-cli 0.142.5\n");
+    if (args.includes("--version")) return successfulResult("codex-cli 0.144.4\n");
     return successfulResult();
   };
   const writes: string[] = [];
@@ -296,7 +296,7 @@ test("checks the fixed remote environment and authenticated App Server without c
     yield Buffer.from(`${JSON.stringify({
       id: 1,
       result: {
-        userAgent: "codex_app_server/0.142.5",
+        userAgent: "codex_app_server/0.144.4",
         codexHome: "/home/codex/.codex",
         platformFamily: "unix",
         platformOs: "linux",
@@ -363,7 +363,7 @@ test("terminates malformed App Server probes without exposing response data", as
   await writeFile(paths.sshConfig, formatSshConfig(paths), { mode: 0o600 });
   const runner: CommandRunner = async (command, args) => {
     if (command === "ssh-keygen") return successfulResult(`${PUBLIC_KEY}\n`);
-    if (args.includes("--version")) return successfulResult("codex-cli 0.142.5\n");
+    if (args.includes("--version")) return successfulResult("codex-cli 0.144.4\n");
     return successfulResult();
   };
   const signals: NodeJS.Signals[] = [];
@@ -392,14 +392,14 @@ test("returns only an unauthenticated verdict when App Server has no account", a
   await writeFile(paths.sshConfig, formatSshConfig(paths), { mode: 0o600 });
   const runner: CommandRunner = async (command, args) => {
     if (command === "ssh-keygen") return successfulResult(`${PUBLIC_KEY}\n`);
-    if (args.includes("--version")) return successfulResult("codex-cli 0.142.5\n");
+    if (args.includes("--version")) return successfulResult("codex-cli 0.144.4\n");
     return successfulResult();
   };
   async function* stdout(): AsyncGenerator<Uint8Array> {
     yield Buffer.from(`${JSON.stringify({
       id: 1,
       result: {
-        userAgent: "codex_app_server/0.142.5",
+        userAgent: "codex_app_server/0.144.4",
         codexHome: "/home/codex/.codex",
         platformFamily: "unix",
         platformOs: "linux",
@@ -436,14 +436,14 @@ test("rejects a malformed non-null App Server account instead of reporting authe
   await writeFile(paths.sshConfig, formatSshConfig(paths), { mode: 0o600 });
   const runner: CommandRunner = async (command, args) => {
     if (command === "ssh-keygen") return successfulResult(`${PUBLIC_KEY}\n`);
-    if (args.includes("--version")) return successfulResult("codex-cli 0.142.5\n");
+    if (args.includes("--version")) return successfulResult("codex-cli 0.144.4\n");
     return successfulResult();
   };
   async function* stdout(): AsyncGenerator<Uint8Array> {
     yield Buffer.from(`${JSON.stringify({
       id: 1,
       result: {
-        userAgent: "codex_app_server/0.142.5",
+        userAgent: "codex_app_server/0.144.4",
         codexHome: "/home/codex/.codex",
         platformFamily: "unix",
         platformOs: "linux",
@@ -483,7 +483,7 @@ test("kills an SSH child whose App Server process never reaches the startup boun
   await writeFile(paths.sshConfig, formatSshConfig(paths), { mode: 0o600 });
   const runner: CommandRunner = async (command, args) => {
     if (command === "ssh-keygen") return successfulResult(`${PUBLIC_KEY}\n`);
-    if (args.includes("--version")) return successfulResult("codex-cli 0.142.5\n");
+    if (args.includes("--version")) return successfulResult("codex-cli 0.144.4\n");
     return successfulResult();
   };
   const signals: NodeJS.Signals[] = [];
@@ -556,7 +556,7 @@ test("bounds protocol writes, reads, and unexpected exits and escalates shutdown
     yield Buffer.from(`${JSON.stringify({
       id: 1,
       result: {
-        userAgent: "codex_app_server/0.142.5",
+        userAgent: "codex_app_server/0.144.4",
         codexHome: "/home/codex/.codex",
         platformFamily: "unix",
         platformOs: "linux",

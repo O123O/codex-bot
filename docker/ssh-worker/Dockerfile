@@ -1,6 +1,6 @@
 FROM node:24-bookworm-slim
 
-ARG CODEX_VERSION=0.142.5
+ARG CODEX_VERSION=0.144.4
 ENV CODEX_HOME=/home/codex/.codex
 
 RUN apt-get update \

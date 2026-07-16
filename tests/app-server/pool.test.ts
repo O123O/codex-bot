@@ -14,11 +14,31 @@ class FakeEndpoint implements AppServerEndpoint {
 
   async request<T>(method: string): Promise<T> {
     if (this.fail) throw new Error("transport failed");
+    if (method === "thread/turns/list") {
+      return { data: [], nextCursor: null, backwardsCursor: null } as T;
+    }
     if (method === "turn/start") {
       return { turn: { id: `turn-${this.nextTurn++}` } } as T;
     }
     return {} as T;
   }
+}
+
+function pagedHistory<T>(method: string, params: any, thread: {
+  status?: string | { type?: string };
+  turns: Array<{ id: string; status: string; itemsView?: "full" | "summary" | "notLoaded"; items?: any[] }>;
+}): T {
+  if (method === "thread/read") return { thread: { status: thread.status } } as T;
+  if (method === "thread/turns/list") return {
+    data: [...thread.turns].reverse().map((turn) => ({ ...turn, itemsView: params.itemsView ?? turn.itemsView ?? "summary", items: params.itemsView === "notLoaded" ? [] : turn.items ?? [] })),
+    nextCursor: null,
+    backwardsCursor: thread.turns.length > 0 ? "back" : null,
+  } as T;
+  if (method === "thread/items/list") {
+    const turn = thread.turns.find((candidate) => candidate.id === params.turnId);
+    return { data: turn?.items ?? [], nextCursor: null, backwardsCursor: turn?.items?.length ? "back" : null } as T;
+  }
+  return {} as T;
 }
 
 class AdmissionRaceEndpoint implements ManagedAppServerEndpoint {
@@ -67,9 +87,9 @@ test("turn permits remain reserved until terminal completion", async () => {
 test("a failed start releases capacity only after full idle history proves it absent", async () => {
   const endpoint: AppServerEndpoint = {
     id: "local", state: "ready",
-    request: async <T>(method: string) => {
+    request: async <T>(method: string, params: any) => {
       if (method === "turn/start") throw new Error("start failed");
-      return { thread: { status: "idle", turns: [] } } as T;
+      return pagedHistory<T>(method, params, { status: "idle", turns: [] });
     },
   };
   const pool = new AppServerPool([endpoint], { maxConcurrentTurns: 1, reconciliationTimeoutMs: 0 });
@@ -82,6 +102,9 @@ test("implicit starts send a correlation and retain capacity when a response is 
   const endpoint: AppServerEndpoint = {
     id: "local", state: "ready",
     request: async <T>(method: string, params: unknown) => {
+      if (method === "thread/turns/list") {
+        return { data: [], nextCursor: null, backwardsCursor: null } as T;
+      }
       if (method === "turn/start") {
         sent = params as Record<string, unknown>;
         throw new Error("response lost");
@@ -113,7 +136,7 @@ test("a successful turn/start response remains authoritative over a stale correl
       : (reads += 1, { thread: { turns: [{ id: "turn-stale", status: "completed", items: [{ type: "userMessage", clientId: "message-1" }] }] } }) as T,
   };
   const pool = new AppServerPool([endpoint], { maxConcurrentTurns: 1, sleep: async () => undefined });
-  const starting = pool.startTurn("local", { threadId: "t1", clientUserMessageId: "message-1", input: [] });
+  const starting = pool.startTurn("local", { threadId: "t1", clientUserMessageId: "message-1", input: [] }, undefined, undefined, null);
   pool.markTurnTerminal("local", "t1", "turn-stale");
   resolveStart({ turn: { id: "turn-live", status: "inProgress" } });
   assert.equal((await starting).turn.id, "turn-live");
@@ -216,9 +239,11 @@ test("a lost turn/start response is proven from history instead of retransmitted
   let starts = 0;
   const endpoint: AppServerEndpoint = {
     id: "local", state: "ready",
-    request: async <T>(method: string) => {
+    request: async <T>(method: string, params: any) => {
       if (method === "turn/start") { starts += 1; throw new Error("response lost"); }
-      return { thread: { turns: [{ id: "created", status: "inProgress", items: [{ type: "userMessage", clientId: "stable-client-id" }] }] } } as T;
+      return pagedHistory<T>(method, params, { status: starts > 0 ? "active" : "idle", turns: starts > 0 ? [{
+        id: "created", status: "inProgress", items: [{ type: "userMessage", id: "user", clientId: "stable-client-id" }],
+      }] : [] });
     },
   };
   const pool = new AppServerPool([endpoint], { maxConcurrentTurns: 1 });
@@ -227,9 +252,14 @@ test("a lost turn/start response is proven from history instead of retransmitted
 });
 
 test("a failed history read after turn/start uncertainty remains operation uncertainty", async () => {
+  let baselineRead = false;
   const endpoint: AppServerEndpoint = {
     id: "local", state: "ready",
     request: async <T>(method: string) => {
+      if (method === "thread/turns/list" && !baselineRead) {
+        baselineRead = true;
+        return { data: [], nextCursor: null, backwardsCursor: null } as T;
+      }
       if (method === "turn/start") throw new Error("start response timed out");
       throw new Error("history read timed out");
     },
@@ -244,9 +274,9 @@ test("a failed history read after turn/start uncertainty remains operation uncer
 test("a lost interrupt response succeeds only when the exact turn is proven terminal", async () => {
   const endpoint: AppServerEndpoint = {
     id: "local", state: "ready",
-    request: async <T>(method: string) => {
+    request: async <T>(method: string, params: any) => {
       if (method === "turn/interrupt") throw new Error("response lost");
-      return { thread: { turns: [{ id: "turn-1", status: "interrupted" }] } } as T;
+      return pagedHistory<T>(method, params, { status: "idle", turns: [{ id: "turn-1", status: "interrupted", items: [] }] });
     },
   };
   const pool = new AppServerPool([endpoint], { maxConcurrentTurns: 1 });
@@ -408,14 +438,14 @@ test("connection loss retains and coalesces cold active and provisional claims",
   let terminal = false;
   const endpoint: AppServerEndpoint = {
     id: "devbox", state: "ready",
-    request: async <T>() => ({ thread: {
+    request: async <T>(method: string, params: any) => pagedHistory<T>(method, params, {
       status: { type: terminal ? "idle" : "active" },
-      turns: [{ id: "turn-a", status: terminal ? "completed" : "inProgress", itemsView: "full", items: [{ type: "userMessage", clientId: "message-a" }] }],
-    } }) as T,
+      turns: [{ id: "turn-a", status: terminal ? "completed" : "inProgress", itemsView: "full", items: [{ type: "userMessage", id: "user", clientId: "message-a" }] }],
+    }),
   };
   const pool = new AppServerPool([endpoint], { maxConcurrentTurns: 1 });
   pool.restoreObservedActiveTurn("devbox", "thread-a", "turn-a");
-  pool.restoreProvisionalTurnCapacity("devbox", "thread-a", "recovered:op-a", "message-a");
+  pool.restoreProvisionalTurnCapacity("devbox", "thread-a", "recovered:op-a", "message-a", null);
   assert.equal(pool.activeTurnCount, 2);
   pool.markEndpointUnavailable("devbox", "connection-lost");
   assert.equal(pool.activeTurnCount, 2);
@@ -517,20 +547,90 @@ test("a provisional claim bound during recovery stays resolved after its turn te
   let terminal = false;
   const endpoint: AppServerEndpoint = {
     id: "devbox", state: "ready",
-    request: async <T>() => ({ thread: {
+    request: async <T>(method: string, params: any) => pagedHistory<T>(method, params, {
       status: terminal ? "idle" : "active",
-      turns: [{ id: "turn-a", status: terminal ? "completed" : "inProgress", itemsView: "full", items: [{ type: "userMessage", clientId: "message-a" }] }],
-    } }) as T,
+      turns: [{ id: "turn-a", status: terminal ? "completed" : "inProgress", itemsView: "full", items: [{ type: "userMessage", id: "user", clientId: "message-a" }] }],
+    }),
   };
   const pool = new AppServerPool([endpoint], { maxConcurrentTurns: 1 });
-  pool.restoreProvisionalTurnCapacity("devbox", "thread-a", "recovered:op-a", "message-a");
+  pool.restoreProvisionalTurnCapacity("devbox", "thread-a", "recovered:op-a", "message-a", null);
   await pool.reconcileEndpointClaims("devbox");
   assert.equal(pool.activeTurnCount, 1);
   terminal = true;
   await pool.reconcileEndpointClaims("devbox");
   assert.equal(pool.activeTurnCount, 0);
-  assert.equal(pool.restoreProvisionalTurnCapacity("devbox", "thread-a", "recovered:op-a", "message-a"), undefined);
+  assert.equal(pool.restoreProvisionalTurnCapacity("devbox", "thread-a", "recovered:op-a", "message-a", null), undefined);
   assert.equal(pool.activeTurnCount, 0);
+});
+
+test("provisional reconciliation hydrates only turns newer than its durable baseline", async () => {
+  const hydrated: string[] = [];
+  const turns = [
+    { id: "historical", status: "completed", items: [{ type: "userMessage", id: "old-user", clientId: "message-a" }] },
+    { id: "baseline", status: "completed", items: [{ type: "agentMessage", id: "baseline-agent", text: "baseline" }] },
+    { id: "candidate", status: "inProgress", items: [{ type: "userMessage", id: "new-user", clientId: "message-a" }] },
+  ];
+  const endpoint: AppServerEndpoint = {
+    id: "devbox", state: "ready",
+    request: async <T>(method: string, params: any) => {
+      if (method === "thread/items/list") hydrated.push(params.turnId);
+      return pagedHistory<T>(method, params, { status: "active", turns });
+    },
+  };
+  const pool = new AppServerPool([endpoint], { maxConcurrentTurns: 1 });
+  pool.restoreProvisionalTurnCapacity("devbox", "thread-a", "recovered:bounded", "message-a", "baseline");
+
+  await pool.reconcileEndpointClaims("devbox");
+  pool.markTurnTerminal("devbox", "thread-a", "candidate");
+
+  assert.deepEqual(hydrated, ["candidate"]);
+  assert.equal(pool.activeTurnCount, 0, "the matching candidate was bound before terminal release");
+});
+
+test("a nonterminal reconciliation candidate is rescanned when its user item materializes", async () => {
+  let itemReads = 0;
+  const endpoint: AppServerEndpoint = {
+    id: "devbox", state: "ready",
+    request: async <T>(method: string, params: any) => {
+      const turns = [{
+        id: "candidate", status: "inProgress",
+        items: itemReads > 0 ? [{ type: "userMessage", id: "user", clientId: "message-a" }] : [],
+      }];
+      if (method === "thread/items/list") itemReads += 1;
+      return pagedHistory<T>(method, params, { status: "active", turns });
+    },
+  };
+  const pool = new AppServerPool([endpoint], { maxConcurrentTurns: 1 });
+  pool.restoreProvisionalTurnCapacity("devbox", "thread-a", "recovered:late-item", "message-a", null);
+
+  await pool.reconcileEndpointClaims("devbox");
+  assert.equal(pool.activeTurnCount, 1);
+  await pool.reconcileEndpointClaims("devbox");
+  pool.markTurnTerminal("devbox", "thread-a", "candidate");
+
+  assert.equal(itemReads, 2);
+  assert.equal(pool.activeTurnCount, 0, "the second scan bound the same candidate");
+});
+
+test("legacy restored provisional claims without a baseline remain unresolved", async () => {
+  let itemReads = 0;
+  const endpoint: AppServerEndpoint = {
+    id: "devbox", state: "ready",
+    request: async <T>(method: string, params: any) => {
+      if (method === "thread/items/list") itemReads += 1;
+      return pagedHistory<T>(method, params, {
+        status: "idle",
+        turns: [{ id: "historical", status: "completed", items: [{ type: "userMessage", id: "user", clientId: "message-a" }] }],
+      });
+    },
+  };
+  const pool = new AppServerPool([endpoint], { maxConcurrentTurns: 1 });
+  pool.restoreProvisionalTurnCapacity("devbox", "thread-a", "recovered:legacy", "message-a");
+
+  await pool.reconcileEndpointClaims("devbox");
+
+  assert.equal(itemReads, 0);
+  assert.equal(pool.activeTurnCount, 1);
 });
 
 test("a restored provisional claim cannot change its stable message correlation", () => {

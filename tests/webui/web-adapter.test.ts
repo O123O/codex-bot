@@ -39,3 +39,19 @@ test("sendDocument rejects a stream exceeding the size limit", async () => {
   async function* big() { yield Buffer.from("toolong"); }
   await assert.rejects(adapter.delivery.sendDocument!({ surface: "web" }, { stream: big(), size: 7, displayName: "x.txt", mediaType: "text/plain", deliveryId: "d" }));
 });
+
+test("sendMessage includes authoritative delivery provenance in the live broadcast", async () => {
+  const bus = new WebBus();
+  const events: Array<Record<string, unknown>> = [];
+  bus.add(fakeSocket(events) as never);
+  const dir = await mkdtemp(join(tmpdir(), "qiyan-out-"));
+  const adapter = createWebAdapter(bus, { dir, maxBytes: 1024, ttlMs: 1e9 }, undefined,
+    (deliveryId) => deliveryId === "worker-1" ? { worker: "payments", origin: "payments" } : {});
+
+  await adapter.delivery.sendMessage({ surface: "web" }, "[payments] shipped", undefined, { deliveryId: "worker-1" });
+  assert.equal(events.length, 1);
+  assert.equal(events[0]?.type, "message");
+  assert.equal(events[0]?.body, "[payments] shipped");
+  assert.equal(events[0]?.worker, "payments");
+  assert.equal(events[0]?.origin, "payments");
+});

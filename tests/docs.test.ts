@@ -59,7 +59,7 @@ test("SSH worker guides document supported endpoints and the source-checkout fix
   const readme = await readFile(resolve("README.md"), "utf8");
   assert.equal(readme.includes("docs/development/ssh-worker-fixture.md"), true, "README does not link the SSH worker development guide");
   const supported = await readFile(resolve("docs/ssh-workers.md"), "utf8");
-  for (const required of ["SSH worker endpoints", "endpoints.json", "0.142.5 or newer", "tmux -L qiyan-bot", "list-sessions", "disconnect_endpoint", "restart_endpoint", "unavailable SSH endpoint", "capacity stays reserved"]) {
+  for (const required of ["SSH worker endpoints", "endpoints.json", "0.144.4 or newer", "tmux -L qiyan-bot", "list-sessions", "disconnect_endpoint", "restart_endpoint", "unavailable SSH endpoint", "capacity stays reserved"]) {
     assert.equal(supported.includes(required), true, `SSH worker guide is missing: ${required}`);
   }
   assert.match(supported, /ControlPath \$\{XDG_RUNTIME_DIR\}\/qiyan-ssh-%C.*private filesystem/isu);

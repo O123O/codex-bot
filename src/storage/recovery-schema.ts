@@ -5,6 +5,7 @@ export const RECOVERY_TABLES = [
   "arrival_sequence",
   "assistant_attempt_sources",
   "assistant_attempts",
+  "assistant_post_turn_actions",
   "assistant_turn_lease",
   "attachments",
   "claude_archived_threads",

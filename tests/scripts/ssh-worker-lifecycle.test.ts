@@ -160,7 +160,7 @@ async function installExistingClientKey(paths: FixturePaths): Promise<void> {
   await writeFile(paths.publicKey, `${CLIENT_PUBLIC_KEY} qiyan-ssh-worker\n`, { mode: 0o600 });
 }
 
-function fixtureEnvironment(paths: FixturePaths, port = 2222, codexVersion = "0.142.5") {
+function fixtureEnvironment(paths: FixturePaths, port = 2222, codexVersion = "0.144.4") {
   return {
     PATH: "/test/bin",
     SENTINEL_SECRET,
@@ -312,7 +312,7 @@ test("validates the port and exact three-component Codex version before dispatch
     );
     assert.equal(calls.length, 0);
   }
-  for (const codexVersion of ["0.142", "v0.142.5", "0.142.5-beta", "0.142.5.1", " 0.142.5"] ) {
+  for (const codexVersion of ["0.144", "v0.144.4", "0.144.4-beta", "0.144.4.1", " 0.144.4"] ) {
     const calls: RunnerCall[] = [];
     await assert.rejects(
       upFixture(paths, { runner: lifecycleRunner(calls), codexVersion }),

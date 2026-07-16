@@ -9,6 +9,7 @@ import {
   type ClaudeTurnStatus,
 } from "../../src/endpoints/claude-command-runner.ts";
 import { JsonRpcResponseError } from "../../src/app-server/rpc-client.ts";
+import { ThreadHistoryReader } from "../../src/app-server/thread-history.ts";
 import { ClaudeGoalStore } from "../../src/sessions/claude-goals.ts";
 import { createTestDatabase } from "../../src/storage/database.ts";
 
@@ -17,6 +18,7 @@ import { createTestDatabase } from "../../src/storage/database.ts";
 // (end_turn) row appears only on genuine completion — an interrupted turn has none.
 class FakeRunner implements ClaudeCommandRunner {
   readonly requests: ClaudeTurnRequest[] = [];
+  transcriptReadCount = 0;
   private readonly transcripts = new Map<string, unknown[]>();
   private readonly pending: Array<{ threadId: string; marker: string; settle: (s: ClaudeTurnStatus) => void; settled: boolean }> = [];
 
@@ -42,7 +44,7 @@ class FakeRunner implements ClaudeCommandRunner {
     }
     entry.settle(status);
   }
-  async readTranscript(threadId: string) { return this.transcripts.get(threadId) ?? []; }
+  async readTranscript(threadId: string) { this.transcriptReadCount += 1; return this.transcripts.get(threadId) ?? []; }
   async transcriptPath(threadId: string) { return this.transcripts.has(threadId) ? `/fake/${threadId}.jsonl` : undefined; }
   async listThreads(cwd?: string) {
     return [...this.transcripts.keys()].map((id) => ({ id, cwd: cwd ?? "/fake", updatedAt: 0, preview: "" }));
@@ -99,6 +101,56 @@ test("first turn uses --session-id, resumes after; turn/completed fires; thread/
   // second turn resumes
   await rt.request("turn/start", { threadId, clientUserMessageId: "ctx:call-2", input: [{ type: "text", text: "again" }] });
   assert.equal(runner.requests[1]?.resume, true); // --resume after materialization
+});
+
+test("Claude paging uses one operation-scoped full transcript fallback without backend retention", async () => {
+  const runner = new FakeRunner();
+  const rt = makeRuntime(runner);
+  await rt.start();
+  const { thread } = await rt.request<{ thread: any }>("thread/start", { cwd: "/w" });
+  for (const clientId of ["ctx:one", "ctx:two"]) {
+    await rt.request("turn/start", { threadId: thread.id, clientUserMessageId: clientId, input: [{ type: "text", text: clientId }] });
+    runner.complete("completed");
+    await delay(5);
+  }
+
+  const history = new ThreadHistoryReader((method, params) => rt.request(method, params));
+  const latest = await history.turnsPage(thread.id, {
+    threadId: thread.id, limit: 1, sortDirection: "desc", itemsView: "notLoaded",
+  } as any);
+  assert.deepEqual(latest.data.map((turn: any) => ({ id: turn.id, itemsView: turn.itemsView, items: turn.items })), [
+    { id: "ctx:two", itemsView: "notLoaded", items: [] },
+  ]);
+  assert.equal(typeof latest.nextCursor, "string");
+
+  const older = await history.turnsPage(thread.id, {
+    cursor: latest.nextCursor!, limit: 1, sortDirection: "desc", itemsView: "notLoaded",
+  });
+  assert.deepEqual(older.data.map((turn: any) => turn.id), ["ctx:one"]);
+  assert.equal(older.nextCursor, null);
+
+  const firstItems = await history.itemsPage(thread.id, {
+    turnId: "ctx:two", limit: 1, sortDirection: "asc",
+  });
+  assert.equal(firstItems.data[0]?.type, "userMessage");
+  assert.equal(firstItems.data[0]?.clientId, "ctx:two");
+  assert.equal(typeof firstItems.nextCursor, "string");
+  assert.equal(runner.transcriptReadCount, 1);
+
+  const metadata = await rt.request<any>("thread/read", { threadId: thread.id, includeTurns: false });
+  assert.deepEqual(metadata.thread.turns, []);
+  assert.deepEqual((await rt.request<any>("thread/read", { threadId: thread.id })).thread.turns, []);
+  assert.equal(metadata.thread.status.type, "idle");
+  assert.equal(runner.transcriptReadCount, 1);
+  const resumed = await rt.request<any>("thread/resume", { threadId: thread.id, excludeTurns: true });
+  assert.deepEqual(resumed.thread.turns, []);
+  assert.equal(runner.transcriptReadCount, 2);
+  const afterResume = new ThreadHistoryReader((method, params) => rt.request(method, params));
+  const stillPersisted = await afterResume.turnsPage(thread.id, { limit: 10, sortDirection: "asc", itemsView: "notLoaded" });
+  assert.deepEqual(stillPersisted.data.map((turn: any) => turn.id), ["ctx:one", "ctx:two"]);
+  const defaultItems = await afterResume.itemsPage(thread.id, { turnId: "ctx:two", limit: 50, sortDirection: "asc" });
+  assert.equal(defaultItems.data[0]?.type, "userMessage");
+  assert.equal(runner.transcriptReadCount, 3);
 });
 
 test("turn/interrupt kills the running turn and marks it interrupted (terminal)", async () => {

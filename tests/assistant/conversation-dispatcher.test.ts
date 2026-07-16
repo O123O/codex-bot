@@ -13,7 +13,7 @@ import type {
   TurnStartParams,
   TurnSteerParams,
 } from "../../src/assistant/conversation-dispatcher.ts";
-import { ConversationDispatcher } from "../../src/assistant/conversation-dispatcher.ts";
+import { AssistantStartPreDispatchError, ConversationDispatcher, prepareAssistantStartDispatch } from "../../src/assistant/conversation-dispatcher.ts";
 import { AttachmentStore } from "../../src/attachments/store.ts";
 import type { ConversationBinding } from "../../src/chat-apps/shared/binding.ts";
 import { createTestDatabase } from "../../src/storage/database.ts";
@@ -47,8 +47,19 @@ class FakeRunner implements AssistantTurnPort {
   history: ThreadSnapshot = { status: "idle", turns: [] };
   historyErrors: unknown[] = [];
   historyReads = 0;
+  preDispatchError: unknown;
 
-  start(params: TurnStartParams, claim: TurnCapacityClaim): Promise<{ turn: TurnSnapshot }> {
+  start(
+    params: TurnStartParams,
+    claim: TurnCapacityClaim,
+    checkpointBaseline: (baselineTurnId: string | null) => void,
+  ): Promise<{ turn: TurnSnapshot }> {
+    if (this.preDispatchError) {
+      const error = this.preDispatchError;
+      this.preDispatchError = undefined;
+      return Promise.reject(error);
+    }
+    checkpointBaseline(null);
     const result = deferred<{ turn: TurnSnapshot }>();
     this.starts.push({ params, claim, result });
     return result.promise;
@@ -67,6 +78,31 @@ class FakeRunner implements AssistantTurnPort {
     return this.history;
   }
 }
+
+test("a proven pre-dispatch assistant baseline failure releases its claim and retries without a new message", async () => {
+  const { db, store, pool, runner, dispatcher } = fixture();
+  runner.preDispatchError = new AssistantStartPreDispatchError(new Error("history unavailable"));
+  await dispatcher.accept(chat("first"));
+  await waitFor(() => runner.starts.length === 1);
+
+  assert.equal(store.lease()?.phase, "starting");
+  assert.equal(db.prepare("SELECT state FROM source_contexts WHERE id = 'first'").get()!.state, "active");
+  assert.equal(pool.activeTurnCount, 1);
+  assert.equal(runner.historyReads, 0);
+  runner.starts[0]!.result.reject(new Error("stop"));
+  await dispatcher.stop();
+});
+
+test("assistant start preparation wraps both baseline reads and checkpoint writes as proven pre-dispatch failures", async () => {
+  await assert.rejects(prepareAssistantStartDispatch(
+    async () => { throw new Error("read failed"); },
+    () => assert.fail("checkpoint must not run"),
+  ), (error: unknown) => error instanceof AssistantStartPreDispatchError);
+  await assert.rejects(prepareAssistantStartDispatch(
+    async () => "turn-1",
+    () => { throw new Error("checkpoint failed"); },
+  ), (error: unknown) => error instanceof AssistantStartPreDispatchError);
+});
 
 const route = (conversationKey: string): ConversationBinding => ({
   adapterId: "telegram",
@@ -88,6 +124,7 @@ function fixture(maxConcurrentTurns = 1, dispatcherOptions: {
   onOperationalEvent?: (event: "assistant_turn_started" | "assistant_turn_steered" | "assistant_submission_uncertain" | "assistant_turn_terminal") => void;
   scheduler?: AssistantScheduler;
   membershipObserver?: { notifyMembership(contextId: string): void };
+  beforeStartAdmission?: () => Promise<void>;
 } = {}) {
   const db = createTestDatabase();
   const deliveries = new DeliveryStore(db);
@@ -103,6 +140,42 @@ function fixture(maxConcurrentTurns = 1, dispatcherOptions: {
   });
   return { db, deliveries, store, pool, runner, dispatcher };
 }
+
+test("start admission completes before capacity, lease, or submission reservation", async () => {
+  const admission = deferred<void>();
+  let admissions = 0;
+  const { store, runner, dispatcher } = fixture(1, {
+    beforeStartAdmission: () => { admissions += 1; return admission.promise; },
+  });
+
+  const accepted = dispatcher.accept(chat("first"));
+  await accepted;
+  assert.equal(admissions, 1);
+  assert.equal(store.lease(), undefined);
+  assert.equal(runner.starts.length, 0);
+
+  admission.resolve();
+  await waitFor(() => runner.starts.length === 1);
+  assert.equal(admissions, 1);
+  assert.equal(store.lease()?.phase, "starting");
+  runner.starts[0]!.result.resolve({ turn: { id: "turn-1", status: "inProgress", itemsView: "full", items: [] } });
+  await dispatcher.idle();
+  await dispatcher.stop();
+});
+
+test("failed start admission retries on the configured timer without reserving a submission", async () => {
+  let admissions = 0;
+  const { store, runner, dispatcher } = fixture(1, {
+    beforeStartAdmission: async () => { admissions += 1; throw new Error("not ready"); },
+  });
+  await dispatcher.accept(chat("first"));
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(admissions, 1);
+  assert.equal(store.lease(), undefined);
+  assert.equal(runner.starts.length, 0);
+  await waitFor(() => admissions >= 2);
+  await dispatcher.stop();
+});
 
 test("stop durably marks an unresolved native submission and awaits its handler", async () => {
   const { db, runner, dispatcher } = fixture();
@@ -402,7 +475,7 @@ test("stop awaits an active authoritative recovery read without a time bound", a
   assert.equal(stopped, true);
 });
 
-test("startup recovery retains history-only identity until an authoritative started notification", async () => {
+test("startup recovery binds a correlated turn from the persisted post-baseline suffix", async () => {
   const { store, pool, runner, dispatcher } = fixture();
   await dispatcher.accept(chat("first"));
   const clientId = runner.starts[0]!.params.clientUserMessageId;
@@ -432,9 +505,6 @@ test("startup recovery retains history-only identity until an authoritative star
 
   await recoveredDispatcher.recover();
   await waitFor(() => recoveryRunner.historyReads >= 3);
-  await recoveredDispatcher.started({
-    id: "recovered", status: "inProgress", itemsView: "full", items: [{ type: "userMessage", clientId }],
-  });
   await waitFor(() => store.membersForAttempt(store.lease()!.attemptId)[0]?.state === "submitted");
   assert.ok(recoveryRunner.historyReads >= 3);
   assert.equal(store.lease()?.turnId, "recovered");
@@ -537,14 +607,14 @@ test("recovery waits until an immediate native start response is durably committ
   await recoveredDispatcher.stop();
 });
 
-test("a synchronous native start failure remains fenced until durable reconciliation", async () => {
+test("a synchronous post-checkpoint native start failure reconciles from the bounded suffix", async () => {
   const { store, pool } = fixture();
   store.acceptChatSource(chat("first"));
   const claim = pool.claimTurnCapacity("assistant-local", "assistant", "sync-failed-start");
   const lease = store.acquireLease({ kind: "chat", contextId: "first" }, claim.id);
   let historyReads = 0;
   const runner: AssistantTurnPort = {
-    start: () => { throw new Error("synchronous start failure"); },
+    start: (_params, _claim, checkpointBaseline) => { checkpointBaseline(null); throw new Error("synchronous start failure"); },
     steer: async () => { throw new Error("unused"); },
     readThread: async () => {
       historyReads += 1;
@@ -565,11 +635,6 @@ test("a synchronous native start failure remains fenced until durable reconcilia
   await recoveredDispatcher.idle();
 
   assert.equal(historyReads, 1);
-  assert.equal(store.membersForAttempt(lease.attemptId)[0]?.state, "uncertain");
-  assert.equal(store.lease()?.turnId, undefined);
-  await recoveredDispatcher.started({
-    id: "recovered", status: "inProgress", itemsView: "full", items: [{ type: "userMessage", clientId: lease.clientUserMessageId }],
-  });
   assert.equal(store.membersForAttempt(lease.attemptId)[0]?.state, "submitted");
   assert.equal(store.lease()?.turnId, "recovered");
   await recoveredDispatcher.stop();
@@ -601,11 +666,7 @@ test("recovery-launched start keeps reconciling after ambiguous nested history",
   await recoveredDispatcher.recover();
   recoveryRunner.starts[0]!.result.reject(new Error("start outcome unknown"));
   await waitFor(() => recoveryRunner.historyReads >= 2);
-  assert.equal(store.membersForAttempt(lease.attemptId)[0]?.state, "uncertain");
-  await recoveredDispatcher.started({
-    id: "recovered", status: "inProgress", itemsView: "full", items: [{ type: "userMessage", clientId: lease.clientUserMessageId }],
-  });
-
+  assert.equal(store.membersForAttempt(lease.attemptId)[0]?.state, "submitted");
   assert.ok(recoveryRunner.historyReads >= 2);
   assert.equal(store.lease()?.turnId, "recovered");
   await recoveredDispatcher.stop();
@@ -1121,7 +1182,7 @@ test("an active thread with empty full history cannot prove an ambiguous start a
   await dispatcher.stop();
 });
 
-test("positive full-history correlation never mints an ambiguous start identity", async () => {
+test("positive post-baseline history correlation binds an ambiguous start identity", async () => {
   const { db, pool, runner, dispatcher } = fixture();
   await dispatcher.accept(chat("first"));
   runner.history = {
@@ -1132,12 +1193,12 @@ test("positive full-history correlation never mints an ambiguous start identity"
   await dispatcher.idle();
   assert.equal(runner.starts.length, 1);
   assert.equal(pool.activeTurnCount, 1);
-  assert.equal(db.prepare("SELECT turn_id FROM assistant_turn_lease").get()!.turn_id, null);
-  assert.equal(db.prepare("SELECT state FROM assistant_attempt_sources").get()!.state, "uncertain");
+  assert.equal(db.prepare("SELECT turn_id FROM assistant_turn_lease").get()!.turn_id, "recovered-turn");
+  assert.equal(db.prepare("SELECT state FROM assistant_attempt_sources").get()!.state, "submitted");
   await dispatcher.stop();
 });
 
-test("terminal history correlation cannot mint an identity or trigger finalization", async () => {
+test("terminal post-baseline history correlation binds identity and triggers finalization", async () => {
   const db = createTestDatabase();
   const store = new ConversationStore(db, new DeliveryStore(db));
   const endpoint: AppServerEndpoint = { id: "assistant-local", state: "ready", request: async () => { throw new Error("unused"); } };
@@ -1156,9 +1217,9 @@ test("terminal history correlation cannot mint an identity or trigger finalizati
   };
   runner.starts[0]!.result.reject(new Error("response lost"));
   await dispatcher.idle();
-  assert.deepEqual(terminal, []);
-  assert.equal(store.lease()?.phase, "starting");
-  assert.equal(store.lease()?.turnId, undefined);
+  assert.deepEqual(terminal.map((turn) => turn.id), ["recovered-terminal"]);
+  assert.equal(store.lease()?.phase, "terminalizing");
+  assert.equal(store.lease()?.turnId, "recovered-terminal");
   await dispatcher.stop();
 });
 

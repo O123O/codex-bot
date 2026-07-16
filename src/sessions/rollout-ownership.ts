@@ -81,6 +81,7 @@ export function createAppServerRolloutPathResolver(
       try {
         response = await pool.request(identity.endpoint, "thread/resume", {
           threadId: identity.thread_id,
+          excludeTurns: true,
         }, undefined, lease);
       } catch (resumeError) {
         if (isExactThreadNoRollout(resumeError, identity.thread_id)) return { state: "lost" };

@@ -1,10 +1,10 @@
 // All client styling in one string, injected via <style>. Themes switch on <html data-theme>.
 export const STYLES = `
 :root, :root[data-theme="dark"] { color-scheme: dark;
-  --bg:#0f1720; --panel:#17212b; --panel2:#1e2b36; --line:#26333f; --muted:#8aa0b0; --accent:#16b8a6; --accent-fg:#04110f; --text:#e6eef2; --code:#0b1219; --you:#193040;
+  --bg:#0f1720; --panel:#17212b; --panel2:#1e2b36; --line:#26333f; --muted:#8aa0b0; --accent:#16b8a6; --accent-fg:#04110f; --text:#e6eef2; --code:#0b1219; --you:#193040; --qiyan-border:#168f85; --worker-relay-border:#8d70bd;
   --hl-bg:#0d1117; --hl-fg:#c9d1d9; --hl-comment:#8b949e; --hl-kw:#ff7b72; --hl-str:#a5d6ff; --hl-num:#79c0ff; --hl-title:#d2a8ff; --hl-attr:#7ee787; --hl-type:#ffa657; }
 :root[data-theme="light"] { color-scheme: light;
-  --bg:#f6f8fa; --panel:#ffffff; --panel2:#eef2f5; --line:#d6dee6; --muted:#5b6b78; --accent:#0f8f83; --accent-fg:#ffffff; --text:#111b22; --code:#f0f3f6; --you:#e3f0ee;
+  --bg:#f6f8fa; --panel:#ffffff; --panel2:#eef2f5; --line:#d6dee6; --muted:#5b6b78; --accent:#0f8f83; --accent-fg:#ffffff; --text:#111b22; --code:#f0f3f6; --you:#e3f0ee; --qiyan-border:#0f8f83; --worker-relay-border:#7e56a8;
   --hl-bg:#f6f8fa; --hl-fg:#24292e; --hl-comment:#6a737d; --hl-kw:#d73a49; --hl-str:#032f62; --hl-num:#005cc5; --hl-title:#6f42c1; --hl-attr:#22863a; --hl-type:#e36209; }
 * { box-sizing:border-box; }
 body { margin:0; }
@@ -41,7 +41,9 @@ body { margin:0; }
 .commit button { background:var(--accent); color:var(--accent-fg); border:0; border-radius:8px; padding:6px; cursor:pointer; font-weight:600; } .commit button:disabled { opacity:.45; cursor:default; }
 .files-head { padding:8px 14px; border-bottom:1px solid var(--line); font-weight:600; display:flex; align-items:center; justify-content:space-between; }
 .ghost.sm { padding:2px 8px; font-size:15px; line-height:1; }
-.older { text-align:center; color:var(--muted); font-size:12px; padding:6px 0 10px; }
+.older { align-self:center; background:transparent; border:0; color:var(--muted); cursor:pointer; font:inherit; font-size:12px; margin:0; padding:6px 10px 10px; }
+.older:hover:not(:disabled) { color:var(--text); text-decoration:underline; }
+.older:disabled { cursor:default; }
 .file-link { background:transparent; border:0; padding:0; color:var(--accent); cursor:pointer; font:inherit; text-decoration:underline; }
 .tree { overflow-y:auto; padding:8px; }
 .crumbs { color:var(--muted); font-size:12px; margin-bottom:8px; word-break:break-all; } .crumbs a { color:var(--accent); cursor:pointer; }
@@ -57,6 +59,8 @@ body { margin:0; }
 .empty { color:var(--muted); text-align:center; margin-top:40px; }
 .msg { border:1px solid var(--line); border-radius:10px; padding:8px 12px; margin-bottom:10px; background:var(--panel); }
 .msg.you { background:var(--you); margin-left:15%; }
+.msg.qiyan { border-color:var(--qiyan-border); }
+.msg.worker-relay { border-color:var(--worker-relay-border); }
 .msg .when { color:var(--muted); font-size:11px; margin-bottom:4px; }
 .md { word-break:break-word; } .md > *:first-child { margin-top:0; } .md > *:last-child { margin-bottom:0; }
 .md p { margin:.4em 0; } .md pre { margin:.4em 0; border:1px solid var(--line); border-radius:8px; overflow:auto; }
@@ -88,6 +92,8 @@ body { margin:0; }
 .composer { position:relative; border-top:1px solid var(--line); padding:10px 14px; display:flex; gap:8px; background:var(--panel); }
 .composer textarea { flex:1; background:var(--bg); color:var(--text); border:1px solid var(--line); border-radius:8px; padding:8px 10px; resize:none; font:inherit; }
 .composer button { background:var(--accent); color:var(--accent-fg); border:0; border-radius:8px; padding:0 18px; cursor:pointer; font-weight:600; }
+.worker-context { border-top:1px solid var(--line); padding:5px 14px 7px; background:var(--panel2); color:var(--muted); display:flex; flex-wrap:wrap; gap:4px 14px; font-size:11px; }
+.worker-context strong { color:var(--text); font-weight:500; overflow-wrap:anywhere; }
 .suggest { position:absolute; bottom:calc(100% + 4px); left:14px; background:var(--panel); border:1px solid var(--line); border-radius:8px; overflow:hidden; box-shadow:0 6px 20px rgba(0,0,0,.3); }
 .srow { padding:6px 14px; cursor:pointer; } .srow:hover, .srow.on { background:var(--panel2); }
 

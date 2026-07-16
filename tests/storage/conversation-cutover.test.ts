@@ -120,16 +120,17 @@ test("client-correlated cutover history cannot replace a provisional attempt ide
   db.close();
 });
 
-test("summary history cannot finalize an active legacy attempt", async () => {
+test("metadata-only history finalizes an exact active legacy attempt", async () => {
   const { db } = await legacyDatabase();
   db.prepare(`INSERT INTO assistant_attempts(id, context_id, turn_id, trigger_kind, state, created_at)
     VALUES ('attempt-active', 'chat-pending', 'turn-1', 'user', 'active', 60)`).run();
   runConversationRoutingBackfill(db, telegram);
-  assert.throws(() => finalizeConversationCutover(db, {
+  finalizeConversationCutover(db, {
     threadId: "assistant",
-    turns: [{ id: "turn-1", status: "inProgress", itemsView: "summary", items: [] }],
-  }), /full/i);
-  assert.equal(db.prepare("SELECT phase FROM conversation_cutover WHERE singleton = 1").get()!.phase, "routing_backfilled");
-  assert.equal(db.prepare("SELECT state_version FROM qiyan_state WHERE product = 'qiyan-bot'").get()!.state_version, 2);
+    turns: [{ id: "turn-1", status: "inProgress", itemsView: "notLoaded", items: [] }],
+  });
+  assert.equal(db.prepare("SELECT phase FROM conversation_cutover WHERE singleton = 1").get()!.phase, "complete");
+  assert.equal(db.prepare("SELECT phase FROM assistant_turn_lease WHERE singleton = 1").get()!.phase, "active");
+  assert.equal(db.prepare("SELECT state_version FROM qiyan_state WHERE product = 'qiyan-bot'").get()!.state_version, 3);
   db.close();
 });

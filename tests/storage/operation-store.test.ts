@@ -65,6 +65,40 @@ test("pending Telegram and recovery contexts survive process-local queue loss", 
   assert.deepEqual(store.listPendingSourceContexts(["telegram", "recovery"]).map((context) => context.id), ["recovery-1"]);
 });
 
+test("a Web goal operation and held awareness intent commit atomically before awareness release", () => {
+  const db = createTestDatabase();
+  const operations = new OperationStore(db);
+  const conversations = new ConversationStore(db, new DeliveryStore(db));
+  const command = '{"action":"set","nickname":"payments","objective":"ship"}';
+  assert.equal(operations.createWebGoalIntent({
+    operation: { id: "web-goal-operation:req-1", kind: "web_goal", sourceId: "operation:req-1", rawText: command, attachmentIds: [] },
+    awareness: { id: "web-goal-awareness:req-1", kind: "web_goal", sourceId: "awareness:req-1", rawText: command, attachmentIds: [] },
+  }), true);
+
+  assert.equal(operations.getSourceContext("web-goal-operation:req-1")?.state, "completed");
+  assert.equal(operations.getSourceContext("web-goal-awareness:req-1")?.state, "held");
+  assert.equal(conversations.nextPendingCandidate(), undefined, "held awareness cannot dispatch before it has an outcome");
+  assert.equal(operations.releaseHeldSourceContext("web-goal-awareness:req-1", "awareness only"), true);
+  assert.equal(operations.getSourceContext("web-goal-awareness:req-1")?.state, "pending");
+  assert.equal(conversations.nextPendingCandidate()?.contextId, "web-goal-awareness:req-1",
+    "a restart can dispatch awareness but never the synthetic operation source");
+  assert.equal((db.prepare("SELECT COUNT(*) AS count FROM source_contexts WHERE kind = 'web_goal'").get() as { count: number }).count, 2,
+    "the unique (kind, source_id) index retains both identities");
+});
+
+test("a conflicting awareness identity rolls the new Web goal operation source back", () => {
+  const operations = new OperationStore(createTestDatabase());
+  operations.createSourceContext({
+    id: "other-awareness", kind: "web_goal", sourceId: "awareness:req-1", rawText: "other", attachmentIds: [],
+  });
+  const accepted = operations.createWebGoalIntent({
+    operation: { id: "web-goal-operation:req-1", kind: "web_goal", sourceId: "operation:req-1", rawText: "command", attachmentIds: [] },
+    awareness: { id: "web-goal-awareness:req-1", kind: "web_goal", sourceId: "awareness:req-1", rawText: "command", attachmentIds: [] },
+  });
+  assert.equal(accepted, false);
+  assert.equal(operations.getSourceContext("web-goal-operation:req-1"), undefined);
+});
+
 test("recoverable operations retain their canonical arguments and stable call identity", () => {
   const store = new OperationStore(createTestDatabase());
   const operation = store.prepare({ contextId: "ctx", attemptId: "attempt", callId: "call", kind: "send_chat_message", args: { content: "hello" } });

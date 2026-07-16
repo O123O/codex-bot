@@ -83,7 +83,8 @@ test("a replacement mapping cannot inherit an optimistic row", () => {
 
 test("the selected panel resubscribes when its mapping identity changes", async () => {
   const source = await readFile(new URL("../../webui-client/src/App.tsx", import.meta.url), "utf8");
-  assert.match(source, /const selectedMappingId = selected === null \? null : sessions\.find\([^;]+\?\.mappingId \?\? null;/u);
+  assert.match(source, /const selectedSession = selected === null \? assistantSession : sessions\.find\([^;]+\?\? null;/u);
+  assert.match(source, /const selectedMappingId = selectedSession\?\.mappingId \?\? null;/u);
   assert.match(source, /\}, \[selected, selectedMappingId, subscribeWorker, loadDir\]\);/u);
   assert.match(source, /active\?\.nickname === target && active\.mappingId === mappingId/u);
 });

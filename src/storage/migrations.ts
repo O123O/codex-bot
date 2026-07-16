@@ -681,4 +681,30 @@ export const migrations: readonly Migration[] = [
     client_id TEXT PRIMARY KEY,
     created_at INTEGER NOT NULL
   );`,
+  // Actions QiYan schedules from inside its own turn and which are therefore safe to run only
+  // after that turn becomes terminal. The operation id is the idempotency key shared with the
+  // manager-tool operation ledger.
+  `
+  CREATE TABLE IF NOT EXISTS assistant_post_turn_actions (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL CHECK(kind IN ('compact', 'restart')),
+    payload_json TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('pending', 'running', 'completed', 'failed')),
+    error_json TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS assistant_post_turn_actions_pending
+    ON assistant_post_turn_actions(state, created_at, id);`,
+  // Durable anchor for bounded assistant start reconciliation. `baseline_recorded`
+  // distinguishes a legitimately empty thread (NULL baseline) from a legacy row that
+  // predates this checkpoint and therefore cannot safely prove an absent dispatch.
+  (db) => {
+    const columns = new Set((db.prepare("PRAGMA table_info(assistant_attempt_sources)").all() as Array<{ name: string }>).map((row) => row.name));
+    if (!columns.has("baseline_turn_id")) db.exec("ALTER TABLE assistant_attempt_sources ADD COLUMN baseline_turn_id TEXT");
+    if (!columns.has("baseline_recorded")) {
+      db.exec(`ALTER TABLE assistant_attempt_sources ADD COLUMN baseline_recorded INTEGER NOT NULL DEFAULT 0
+        CHECK(baseline_recorded IN (0, 1))`);
+    }
+  },
 ];

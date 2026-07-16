@@ -19,18 +19,35 @@ function localEndpoint(): ManagedAppServerEndpoint {
   });
 }
 
-function captureNextTurn(endpoint: ManagedAppServerEndpoint, threadId: string, timeoutMs = 120_000): { completed: Promise<any>; cancel(): void } {
+function captureNextTurn(endpoint: ManagedAppServerEndpoint, threadId: string, timeoutMs = 120_000): {
+  completed: Promise<any>;
+  expect(turnId: string): void;
+  cancel(): void;
+} {
   let unsubscribe: () => void = () => undefined;
   let timeout: ReturnType<typeof setTimeout>;
+  let expectedTurnId: string | undefined;
+  const buffered = new Map<string, any>();
+  let settle!: (turn: any) => void;
   const completed = new Promise((resolve, reject) => {
+    settle = (turn) => { clearTimeout(timeout); unsubscribe(); resolve(turn); };
     timeout = setTimeout(() => { unsubscribe(); reject(new Error(`timed out waiting for a terminal turn on ${threadId}`)); }, timeoutMs);
     unsubscribe = endpoint.onNotification((method, params: any) => {
       if (method === "turn/completed" && params.threadId === threadId) {
-        clearTimeout(timeout); unsubscribe(); resolve(params.turn);
+        if (params.turn.id === expectedTurnId) settle(params.turn);
+        else if (expectedTurnId === undefined) buffered.set(params.turn.id, params.turn);
       }
     });
   });
-  return { completed, cancel: () => { clearTimeout(timeout); unsubscribe(); } };
+  return {
+    completed,
+    expect: (turnId) => {
+      expectedTurnId = turnId;
+      const turn = buffered.get(turnId);
+      if (turn !== undefined) settle(turn);
+    },
+    cancel: () => { clearTimeout(timeout); unsubscribe(); },
+  };
 }
 
 test("pinned app-server supports multiple threads, discovery, goals, turns, and restart", { skip: !enabled, timeout: 180_000 }, async (t) => {
@@ -42,11 +59,14 @@ test("pinned app-server supports multiple threads, discovery, goals, turns, and 
   const first = await endpoint.request<any>("thread/start", { cwd: firstDir, approvalPolicy: "never", sandbox: "danger-full-access", ephemeral: false });
   const second = await endpoint.request<any>("thread/start", { cwd: secondDir, approvalPolicy: "never", sandbox: "danger-full-access", ephemeral: false });
   assert.notEqual(first.thread.id, second.thread.id);
-  assert.equal(first.cwd, firstDir);
+  assert.equal(first.thread.cwd, firstDir);
 
-  await endpoint.request("thread/goal/set", { threadId: first.thread.id, objective: "integration objective", status: "active" });
-  assert.equal((await endpoint.request<any>("thread/goal/get", { threadId: first.thread.id })).goal.objective, "integration objective");
-  await endpoint.request("thread/goal/clear", { threadId: first.thread.id });
+  // Keep the persistence/resume probe on a thread with no goal-loop notifications. Goal API
+  // coverage uses the independent second thread so its background lifecycle cannot win the
+  // exact manual-turn waiter below.
+  await endpoint.request("thread/goal/set", { threadId: second.thread.id, objective: "integration objective", status: "active" });
+  assert.equal((await endpoint.request<any>("thread/goal/get", { threadId: second.thread.id })).goal.objective, "integration objective");
+  await endpoint.request("thread/goal/clear", { threadId: second.thread.id });
 
   const pool = new AppServerPool([endpoint], { maxConcurrentTurns: 1 });
   const terminal = captureNextTurn(endpoint, first.thread.id);
@@ -55,6 +75,7 @@ test("pinned app-server supports multiple threads, discovery, goals, turns, and 
     clientUserMessageId: "qiyan-bot-integration-1",
     input: [{ type: "text", text: "Reply with exactly: INTEGRATION_OK", text_elements: [] }],
   });
+  terminal.expect(started.turn.id);
   const completed = await terminal.completed;
   assert.equal(completed.id, started.turn.id);
   pool.markTurnTerminal(endpoint.id, first.thread.id, started.turn.id);
@@ -74,9 +95,19 @@ test("pinned app-server supports multiple threads, discovery, goals, turns, and 
   await endpoint.request("thread/unarchive", { threadId: first.thread.id });
   await endpoint.closeConnection();
   await endpoint.start();
-  const resumed = await endpoint.request<any>("thread/resume", { threadId: first.thread.id });
+  const resumed = await endpoint.request<any>("thread/resume", { threadId: first.thread.id, excludeTurns: true });
   assert.equal(resumed.thread.id, first.thread.id);
   assert.equal(resumed.thread.cwd, firstDir);
+  assert.deepEqual(resumed.thread.turns, []);
+  const resumedTurns = await endpoint.request<any>("thread/turns/list", {
+    threadId: first.thread.id, limit: 100, sortDirection: "desc", itemsView: "notLoaded",
+  });
+  assert.ok(resumedTurns.data.some((turn: any) => turn.id === started.turn.id));
+  const resumedItems = await pool.historyReader(endpoint.id).exactTurnItems(
+    first.thread.id, started.turn.id, { allowLegacySummary: true },
+  );
+  assert.ok(resumedItems.items.some((item: any) => item.type === "userMessage" && item.clientId === "qiyan-bot-integration-1"));
+  assert.ok(resumedItems.items.some((item: any) => item.type === "agentMessage" && item.text.includes("INTEGRATION_OK")));
 });
 
 test("active turn steering persists its client correlation ID", { skip: !steerEnabled, timeout: 240_000 }, async (t) => {
@@ -98,6 +129,7 @@ test("active turn steering persists its client correlation ID", { skip: !steerEn
       clientUserMessageId: startId,
       input: [{ type: "text", text: "Use the shell tool to run `sleep 5`, then reply with DONE.", text_elements: [] }],
     });
+    terminal.expect(turn.turn.id);
     try {
       await endpoint.request("turn/steer", {
         threadId,

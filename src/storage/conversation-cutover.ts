@@ -157,14 +157,17 @@ export function finalizeConversationCutover(db: Database, assistant: FullAssista
   });
 }
 
+export function conversationCutoverNeedsAssistantHistory(db: Database): boolean {
+  return cutoverPhase(db) !== "complete";
+}
+
 function finalizeActiveAttempt(db: Database, attempt: Record<string, unknown>, assistant: FullAssistantThreadSnapshot): void {
   const turnId = typeof attempt.turn_id === "string" ? attempt.turn_id : undefined;
   if (!turnId || turnId.startsWith("pending:")) {
     throw configuration("active assistant attempt requires an exact authoritative turn identity");
   }
-  const full = assistant.turns.filter((turn) => turn.itemsView === "full");
-  const turn = full.find((candidate) => candidate.id === turnId);
-  if (!turn) throw configuration("active assistant attempt requires exact full authoritative turn history");
+  const turn = assistant.turns.find((candidate) => candidate.id === turnId);
+  if (!turn) throw configuration("active assistant attempt requires exact authoritative turn history");
   const terminal = new Set(["completed", "failed", "interrupted"]).has(turn.status);
   const now = Date.now();
   db.prepare(`INSERT OR IGNORE INTO assistant_attempt_sources

@@ -6,7 +6,8 @@ import test from "node:test";
 import { WebSocket } from "ws";
 import { WebBus } from "../../src/webui/web-bus.ts";
 import { createWebServer } from "../../src/webui/web-server.ts";
-import type { WebReadsDeps } from "../../src/webui/web-reads.ts";
+import { assistantTranscript, workerDeliveryNickname, type WebReadsDeps } from "../../src/webui/web-reads.ts";
+import type { WebGoalControlInput } from "../../src/webui/web-goal-control.ts";
 
 const TOKEN = "test-token-abc";
 
@@ -15,9 +16,14 @@ const reads: WebReadsDeps = {
     payments: { endpoint: "local", thread_id: "t1", project_dir: "/p", mapping_id: "m1", lifecycle_state: "managed" },
   } } as never),
   dashboardSnapshot: () => ({ version: 2, sessions: {
-    payments: { identity: { thread_id: "t1", endpoint: "local", project_dir: "/p" }, auto_session_info: { management_state: "managed", native_status: "idle", active_turn_id: null, last_sent: null, last_worker_event: null, model: { current: "gpt-5", pending: null }, reasoning_effort: { current: null, pending: null }, token_usage: null, goal: { objective: "ship it", status: "active", token_budget: null }, observed_at: null }, manager_notes: {} },
+    payments: { identity: { thread_id: "t1", endpoint: "local", project_dir: "/p" }, auto_session_info: { management_state: "managed", native_status: "idle", active_turn_id: null, last_sent: null, last_worker_event: null, model: { current: "gpt-5", pending: null }, reasoning_effort: { current: "high", pending: null }, token_usage: null, goal: { objective: "ship it", status: "active", token_budget: null }, observed_at: null }, manager_notes: {} },
   } } as never),
-  readWorkerTurns: async () => [
+  assistantSession: () => ({
+    nickname: "assistant", mappingId: "assistant-mapping", endpoint: "assistant-local", provider: "codex",
+    projectDir: "/a", lifecycleState: "managed", nativeStatus: "active", activeTurnId: "assistant-turn",
+    model: "gpt-5.4", effort: "xhigh", host: "test-host", goal: null,
+  }),
+  readWorkerTurns: async () => ({ turns: [
     { id: "turn-0", status: "completed", startedAt: 0.999, completedAt: 1, items: [
       { type: "userMessage", id: "u0", clientId: "client-u0", content: [{ type: "text", text: "do the thing" }] },
       { type: "agentMessage", id: "a0", text: "final 0", phase: "final_answer" },
@@ -25,18 +31,24 @@ const reads: WebReadsDeps = {
     { id: "turn-1", status: "completed", startedAt: 1.0005, completedAt: 1.001, items: [
       { type: "agentMessage", id: "a1", text: "final 1", phase: "final_answer" },
     ] },
-  ],
+  ] }),
   listOwnerConversation: (before, limit) => {
     const convo = [{ id: "s1", role: "you" as const, body: "hi there", at: 500 }, { id: "f0", role: "assistant" as const, body: "final 0", at: 1000 }, { id: "f1", role: "assistant" as const, body: "final 1", at: 1001 }];
     const older = convo.filter((m) => before === undefined || m.at <= before); // inclusive cursor
     return older.slice(Math.max(0, older.length - limit));
   },
   provider: () => "codex",
+  host: () => "test-host",
 };
 
-async function withServer(run: (base: string, calls: { inputs: Array<{ text: string; target?: string; clientInputId?: string }> }, bus: WebBus, uploadsDir: string) => Promise<void>): Promise<void> {
+interface ServerCalls {
+  inputs: Array<{ text: string; target?: string; clientInputId?: string }>;
+  goals: WebGoalControlInput[];
+}
+
+async function withServer(run: (base: string, calls: ServerCalls, bus: WebBus, uploadsDir: string) => Promise<void>): Promise<void> {
   const bus = new WebBus();
-  const calls = { inputs: [] as Array<{ text: string; target?: string; clientInputId?: string }> };
+  const calls: ServerCalls = { inputs: [], goals: [] };
   const staticDir = await mkdtemp(join(tmpdir(), "qiyan-webui-"));
   await writeFile(join(staticDir, "index.html"), "<!doctype html><title>ok</title>");
   const uploadsDir = await mkdtemp(join(tmpdir(), "qiyan-webui-up-"));
@@ -45,6 +57,8 @@ async function withServer(run: (base: string, calls: { inputs: Array<{ text: str
     files: { projectDir: () => undefined, fileTarget: () => undefined, maxFileBytes: 1024 },
     uploads: { dir: uploadsDir, maxBytes: 1024, ttlMs: 1e9 },
     submitInput: async (text, target, clientInputId) => { calls.inputs.push({ text, ...(target ? { target } : {}), ...(clientInputId ? { clientInputId } : {}) }); return { ok: true, ...(clientInputId ? { clientUserMessageId: `to:web:${clientInputId}` } : {}) }; },
+    controlGoal: async (input) => { calls.goals.push(input); return { ok: true }; },
+    openGoalAdmission: () => {}, closeGoalAdmission: () => {}, waitForGoalControls: async () => {},
     report: () => {},
   });
   const { url } = await server.start();
@@ -59,7 +73,8 @@ test("the server handle is restartable: start → stop → start re-listens and 
   const server = createWebServer({
     host: "127.0.0.1", port: 0, token: TOKEN, staticDir, bus, reads,
     files: { projectDir: () => undefined, fileTarget: () => undefined, maxFileBytes: 1024 },
-    submitInput: async () => ({ ok: true }), report: () => {},
+    submitInput: async () => ({ ok: true }), controlGoal: async () => ({ ok: true }),
+    openGoalAdmission: () => {}, closeGoalAdmission: () => {}, waitForGoalControls: async () => {}, report: () => {},
   });
   const httpBase = (u: string) => u.slice(0, u.indexOf("/?"));
 
@@ -77,6 +92,50 @@ test("the server handle is restartable: start → stop → start re-listens and 
   await server.stop();
 });
 
+test("server shutdown closes goal admission and drains an admitted goal request", async () => {
+  const bus = new WebBus();
+  const staticDir = await mkdtemp(join(tmpdir(), "qiyan-webui-"));
+  await writeFile(join(staticDir, "index.html"), "<!doctype html><title>ok</title>");
+  let release!: () => void;
+  let active!: Promise<void>;
+  let activeDone!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  const events: string[] = [];
+  const server = createWebServer({
+    host: "127.0.0.1", port: 0, token: TOKEN, staticDir, bus, reads,
+    files: { projectDir: () => undefined, fileTarget: () => undefined, maxFileBytes: 1024 },
+    submitInput: async () => ({ ok: true }),
+    controlGoal: async () => {
+      events.push("goal:start");
+      active = new Promise<void>((resolve) => { activeDone = resolve; });
+      await held;
+      events.push("goal:done");
+      activeDone();
+      return { ok: true };
+    },
+    openGoalAdmission: () => { events.push("admission:open"); },
+    closeGoalAdmission: () => { events.push("admission:close"); },
+    waitForGoalControls: async () => { events.push("goal:wait"); await active; events.push("goal:drained"); },
+    report: () => {},
+  });
+  const { url } = await server.start();
+  const base = url.slice(0, url.indexOf("/?"));
+  const request = fetch(`${base}/api/sessions/payments/goal?token=${TOKEN}`, {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ requestId: crypto.randomUUID(), action: "pause" }),
+  }).catch(() => undefined);
+  while (!events.includes("goal:start")) await new Promise<void>((resolve) => setImmediate(resolve));
+  let stopped = false;
+  const stopping = server.stop().then(() => { stopped = true; });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(stopped, false);
+  assert.deepEqual(events.slice(0, 4), ["admission:open", "goal:start", "admission:close", "goal:wait"]);
+  release();
+  await stopping;
+  await request;
+  assert.deepEqual(events.slice(-2), ["goal:done", "goal:drained"]);
+});
+
 test("requires the token on every route", async () => {
   await withServer(async (base) => {
     assert.equal((await fetch(`${base}/api/sessions`)).status, 401);
@@ -89,8 +148,16 @@ test("serves the session list but never reads worker history without an active s
   await withServer(async (base) => {
     const list = await (await fetch(`${base}/api/sessions?token=${TOKEN}`)).json();
     assert.deepEqual(list.sessions.map((s: { nickname: string }) => s.nickname), ["payments"]);
+    assert.deepEqual(list.assistant, {
+      nickname: "assistant", mappingId: "assistant-mapping", endpoint: "assistant-local", provider: "codex",
+      projectDir: "/a", lifecycleState: "managed", nativeStatus: "active", activeTurnId: "assistant-turn",
+      model: "gpt-5.4", effort: "xhigh", host: "test-host", goal: null,
+    });
     assert.equal(list.sessions[0].mappingId, "m1");
     assert.equal(list.sessions[0].provider, "codex");
+    assert.equal(list.sessions[0].model, "gpt-5");
+    assert.equal(list.sessions[0].effort, "high");
+    assert.equal(list.sessions[0].host, "test-host");
     assert.deepEqual(list.sessions[0].goal, { objective: "ship it", status: "active" });
 
     assert.equal((await fetch(`${base}/api/sessions/payments/messages?count=5&token=${TOKEN}`)).status, 409);
@@ -109,6 +176,27 @@ test("serves the assistant's persisted two-sided history, merged by time", async
     ]);
     assert.equal(h.hasOlder, false);
   });
+});
+
+test("derives persisted worker presentation only from trusted delivery kinds and keeps routing separate", () => {
+  assert.equal(workerDeliveryNickname("worker_final", "[payments] shipped"), "payments");
+  assert.equal(workerDeliveryNickname("collection", "[retired · failed] old result"), "retired");
+  assert.equal(workerDeliveryNickname("assistant_final", "[payments] text QiYan wrote"), undefined);
+  assert.equal(workerDeliveryNickname("worker_warning", "[payments] warning"), undefined);
+
+  const page = assistantTranscript({
+    ...reads,
+    listOwnerConversation: () => [
+      { id: "current", role: "assistant", body: "[payments] shipped", at: 1, deliveryKind: "worker_final" },
+      { id: "old", role: "assistant", body: "[retired] archived", at: 2, deliveryKind: "collection" },
+      { id: "qiyan", role: "assistant", body: "[payments] this is QiYan", at: 3, deliveryKind: "assistant_final" },
+    ],
+  }, 10);
+  assert.deepEqual(page.messages, [
+    { id: "current", role: "assistant", body: "[payments] shipped", at: 1, worker: "payments", origin: "payments" },
+    { id: "old", role: "assistant", body: "[retired] archived", at: 2, worker: "retired" },
+    { id: "qiyan", role: "assistant", body: "[payments] this is QiYan", at: 3 },
+  ]);
 });
 
 test("paginates older messages with an inclusive before cursor (no same-ms skip)", async () => {
@@ -135,6 +223,42 @@ test("POST /api/input forwards text and target to submitInput", async () => {
     assert.equal((await fetch(`${base}/api/input?token=${TOKEN}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text: "missing id", target: "payments" }) })).status, 400);
     assert.equal((await fetch(`${base}/api/input?token=${TOKEN}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text: "bad id", target: "payments", clientInputId: "not-a-uuid" }) })).status, 400);
     assert.equal((await fetch(`${base}/api/input?token=${TOKEN}`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" })).status, 400);
+  });
+});
+
+test("POST /api/sessions/:nickname/goal strictly validates and dispatches path-authoritative goal controls", async () => {
+  await withServer(async (base, calls) => {
+    const setId = crypto.randomUUID();
+    const set = await fetch(`${base}/api/sessions/payments/goal?token=${TOKEN}`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ requestId: setId, action: "set", objective: "  ship the release  " }),
+    });
+    assert.equal(set.status, 200);
+    const pauseId = crypto.randomUUID();
+    assert.equal((await fetch(`${base}/api/sessions/payments/goal?token=${TOKEN}`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ requestId: pauseId, action: "pause" }),
+    })).status, 200);
+    assert.deepEqual(calls.goals, [
+      { requestId: setId, nickname: "payments", action: "set", objective: "ship the release" },
+      { requestId: pauseId, nickname: "payments", action: "pause" },
+    ]);
+
+    const invalid = [
+      { requestId: "not-a-uuid", action: "pause" },
+      { requestId: crypto.randomUUID(), action: "set", objective: "" },
+      { requestId: crypto.randomUUID(), action: "set", objective: "x".repeat(16_001) },
+      { requestId: crypto.randomUUID(), action: "pause", objective: "not allowed" },
+      { requestId: crypto.randomUUID(), action: "unknown" },
+      { requestId: crypto.randomUUID(), action: "cancel", nickname: "other-authority" },
+      { requestId: crypto.randomUUID(), action: "cancel", extra: true },
+    ];
+    for (const body of invalid) {
+      const response = await fetch(`${base}/api/sessions/payments/goal?token=${TOKEN}`, {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
+      });
+      assert.equal(response.status, 400, JSON.stringify(body));
+    }
+    assert.equal(calls.goals.length, 2, "invalid commands never reach goal control");
   });
 });
 
@@ -189,7 +313,8 @@ test("dispatches a remote session's files over ssh (browse + raw stream)", async
     host: "127.0.0.1", port: 0, token: TOKEN, staticDir, bus, reads,
     files: { projectDir: () => undefined, maxFileBytes: 4096, fileTarget: (n) => (n === "rworker" ? { transport: "remote", projectDir: remoteRoot, host: "testhost" } : undefined) },
     remote: () => ({ sshBinary: ssh, sshRuntimeRoot: sshRt }),
-    submitInput: async () => ({ ok: true }), report: () => {},
+    submitInput: async () => ({ ok: true }), controlGoal: async () => ({ ok: true }),
+    openGoalAdmission: () => {}, closeGoalAdmission: () => {}, waitForGoalControls: async () => {}, report: () => {},
   });
   const { url } = await server.start();
   const base = url.slice(0, url.indexOf("/?"));
