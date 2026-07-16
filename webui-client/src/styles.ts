@@ -73,6 +73,16 @@ body { margin:0; }
 .md a { color:var(--accent); } .md table { border-collapse:collapse; } .md td, .md th { border:1px solid var(--line); padding:4px 8px; }
 .md blockquote { margin:.4em 0; padding-left:10px; border-left:3px solid var(--line); color:var(--muted); }
 
+.goal-row { border-top:1px solid var(--line); padding:8px 14px; background:var(--panel); display:flex; align-items:flex-start; gap:12px; }
+.goal-meta { flex:0 0 auto; display:flex; align-items:center; gap:7px; padding-top:1px; }
+.goal-label { font-weight:700; }
+.goal-status { display:inline-flex; align-items:center; gap:5px; color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.4px; }
+.goal-status::before { content:""; width:7px; height:7px; border-radius:50%; background:var(--muted); }
+.goal-status[data-status="active"]::before, .goal-status[data-status="complete"]::before { background:#3fd68a; }
+.goal-status[data-status="paused"]::before, .goal-status[data-status="usageLimited"]::before, .goal-status[data-status="budgetLimited"]::before { background:#f5b13d; }
+.goal-status[data-status="blocked"]::before { background:#ef6b73; }
+.goal-objective { min-width:0; max-height:4.65em; overflow:auto; white-space:pre-wrap; word-break:break-word; }
+
 .composer { position:relative; border-top:1px solid var(--line); padding:10px 14px; display:flex; gap:8px; background:var(--panel); }
 .composer textarea { flex:1; background:var(--bg); color:var(--text); border:1px solid var(--line); border-radius:8px; padding:8px 10px; resize:none; font:inherit; }
 .composer button { background:var(--accent); color:var(--accent-fg); border:0; border-radius:8px; padding:0 18px; cursor:pointer; font-weight:600; }

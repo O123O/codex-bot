@@ -6,6 +6,7 @@ import rehypeHighlight from "rehype-highlight";
 import rehypeKatex from "rehype-katex";
 import hljs from "highlight.js/lib/common";
 import "katex/dist/katex.min.css";
+import { formatGoalStatus, selectedWorkerGoal, type WorkerGoal } from "./goal-presentation";
 import { STYLES } from "./styles";
 
 const TOKEN = new URLSearchParams(location.search).get("token") ?? "";
@@ -22,7 +23,7 @@ const RENDER_CAP = 30;       // messages rendered initially per tab
 const REVEAL_STEP = 20;      // reveal step when scrolling into in-memory history
 const TOP_PX = 120, BOTTOM_PX = 80;
 
-interface Session { nickname: string; endpoint: string; provider: string; projectDir: string; lifecycleState: string; nativeStatus: string | null; activeTurnId: string | null; model: string | null; goal: { objective: string; status: string } | null; }
+interface Session { nickname: string; endpoint: string; provider: string; projectDir: string; lifecycleState: string; nativeStatus: string | null; activeTurnId: string | null; model: string | null; goal: WorkerGoal | null; }
 interface Msg { id?: string; body: string; completedAt?: number; terminalStatus?: string; role?: "you" | "assistant"; at?: number; origin?: string; }
 type FileResult = { kind: "dir"; path: string; entries: Array<{ name: string; type: "dir" | "file" | "other" }> } | { kind: "file"; path: string; content: string; truncated: boolean; encoding: string } | { error: string };
 interface GitStatus { branch: string; ahead: number; behind: number; staged: string[]; changes: string[]; untracked: string[] }
@@ -144,6 +145,7 @@ export function App() {
   const preserveRef = useRef<number | null>(null); // scrollHeight snapshot to keep position on prepend
   const stickRef = useRef(true);                   // whether to stay pinned to the bottom
   const key = selected ?? ASSIST;
+  const goal = selectedWorkerGoal(sessions, selected);
   const selectedRef = useRef(selected); selectedRef.current = selected; // for the WS handler's stale closure
   const push = (k: string, m: Msg) => setLog((prev) => ({ ...prev, [k]: [...(prev[k] ?? []), m] }));
 
@@ -209,7 +211,7 @@ export function App() {
     const el = logRef.current; if (!el) return;
     if (preserveRef.current !== null) { el.scrollTop += el.scrollHeight - preserveRef.current; preserveRef.current = null; }
     else if (stickRef.current) el.scrollTop = el.scrollHeight;
-  }, [rendered.length, selected]);
+  }, [rendered.length, selected, goal?.objective, goal?.status]);
 
   const loadOlder = useCallback(async () => {
     if (loadingOlder) return;
@@ -500,6 +502,10 @@ export function App() {
               </div>
             ))}
           </div>
+          {goal && <div className="goal-row" aria-label={`${selected} goal`} aria-live="polite">
+            <div className="goal-meta"><span className="goal-label">Goal</span><span className="goal-status" data-status={goal.status}>{formatGoalStatus(goal.status)}</span></div>
+            <div className="goal-objective">{goal.objective}</div>
+          </div>}
           <div className="composer">
             {suggest.length > 0 && <div className="suggest">{suggest.map((n, i) => <div key={n} className={`srow ${i === sugIdx ? "on" : ""}`} onMouseDown={(e) => { e.preventDefault(); pickSuggest(n); }}>@{n}</div>)}</div>}
             <input ref={fileInput} type="file" hidden onChange={(e) => { const f = e.target.files?.[0]; if (f) void uploadFile(f); e.target.value = ""; }} />
