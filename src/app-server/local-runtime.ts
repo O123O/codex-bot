@@ -113,11 +113,18 @@ export class LocalAppServerRuntime implements AppServerRuntimeService {
 class LocalConnection implements AppServerConnection {
   readonly wire: RpcWire;
   private readonly closes = new Set<(error?: Error) => void>();
+  private readonly removeWireClose: () => void;
   private intentional = false;
+  private disposed = false;
   closed = false;
 
   constructor(private readonly runtime: LocalAppServerRuntime, private readonly child: ChildProcessWithoutNullStreams) {
     this.wire = new JsonlWire(child.stdout, child.stdin);
+    this.removeWireClose = this.wire.onClose((error) => {
+      const failure = error ?? new Error("local App Server wire closed");
+      // Let the wire deliver its exact failure to the RPC client before endpoint cleanup closes it.
+      queueMicrotask(() => this.lost(failure));
+    });
     child.once("error", (error) => this.lost(error));
     child.once("exit", () => this.lost(new Error("app-server process exited")));
   }
@@ -132,9 +139,11 @@ class LocalConnection implements AppServerConnection {
   }
 
   async close(): Promise<void> {
-    if (this.closed) return;
+    if (this.disposed) return;
+    this.disposed = true;
     this.intentional = true;
     this.closed = true;
+    this.removeWireClose();
     this.runtime.release(this);
     this.wire.close();
     await stopChild(this.child);
@@ -143,6 +152,7 @@ class LocalConnection implements AppServerConnection {
   private lost(error: Error): void {
     if (this.intentional || this.closed) return;
     this.closed = true;
+    this.removeWireClose();
     this.runtime.release(this);
     for (const listener of this.closes) listener(error);
   }

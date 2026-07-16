@@ -12,8 +12,8 @@ import {
 import { runBoundedProcess, type BoundedProcessResult } from "./ssh-process.ts";
 import { parseRuntimeIdentity, type EndpointLossKind, type RuntimeIdentity } from "./types.ts";
 
-export const REMOTE_HELPER_SHA256 = "85c081164ce2c93d93395f53f033e97406b29142715a325351f9a553d7540bb6";
-export const REMOTE_LAUNCHER_SHA256 = "db138ff3173f9b72d1fa8cc5fbc94c4958247691a401232d84edf0e3417bd334";
+export const REMOTE_HELPER_SHA256 = "69909db2559937c2e08634468cc2f5712b18f93f419a180a356ea6b07ab14d2c";
+export const REMOTE_LAUNCHER_SHA256 = "643dd9424f3d7fb5cca8d9f7cbd835fb40a57e8a7e728ed1529259e92fa793c5";
 
 const MAX_REMOTE_ARGUMENT_BYTES = 16 * 1024;
 const NFS_SUPER_MAGIC = 0x6969;

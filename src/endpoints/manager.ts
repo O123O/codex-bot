@@ -526,7 +526,9 @@ export class EndpointManager {
         throw new AppError("OPERATION_UNCERTAIN", `could not prove managed thread idle on endpoint ${endpointId}`, { cause: error });
       }
       const status = typeof response.thread?.status === "string" ? response.thread.status : response.thread?.status?.type;
-      if (status !== "idle") throw new AppError("OPERATION_CONFLICT", `managed thread is not idle on endpoint ${endpointId}`);
+      // Codex reports persisted threads that are not resident in app-server memory as notLoaded.
+      // Such a thread cannot have an active turn, so it is as safe to stop as an idle loaded thread.
+      if (status !== "idle" && status !== "notLoaded") throw new AppError("OPERATION_CONFLICT", `managed thread is not idle on endpoint ${endpointId}`);
     }
   }
 

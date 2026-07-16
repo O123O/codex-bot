@@ -32,6 +32,7 @@ import {
   reconcileLifecycleTransitions,
   reconcileOwnershipBeforeRelay,
   reconcileOwnershipBeforeRelayWithLease,
+  reconcileAbsentRecoveredSendStart,
   recoverManagedEndpointReady,
   recoverStartupManagedEndpoint,
   requireManagedRecoveryAcknowledged,
@@ -346,6 +347,49 @@ test("a proven no-dispatch create recovery terminalizes without an endpoint leas
 
   assert.equal(endpointCalls, 0);
   assert.equal(store.get(operation.id)?.state, "failed");
+});
+
+test("idle send recovery preserves its raw dispatch error when history proves no turn", () => {
+  const store = new OperationStore(createTestDatabase());
+  store.createSourceContext({ id: "ctx", kind: "telegram", sourceId: "source", rawText: "/pass private", attachmentIds: [] });
+  const args = { nickname: "worker", content: "private", attachment_ids: [], mode: "start" };
+  const operation = store.prepare({ contextId: "ctx", attemptId: "attempt", callId: "call", kind: "send_to_session", args });
+  store.markDispatched(operation.id);
+  store.bindDirective("ctx", "pass", args, operation.id);
+  store.fail(operation.id, { message: "raw turn/start timeout" }, true);
+  let released = 0;
+
+  assert.equal(reconcileAbsentRecoveredSendStart(store, store.listRecoverable()[0]!, {
+    thread: { status: { type: "idle" }, turns: [] },
+  }, () => { released += 1; }), true);
+
+  assert.equal(released, 1);
+  assert.equal(store.get(operation.id)?.state, "failed");
+  assert.deepEqual(store.get(operation.id)?.error, {
+    dispatch: { message: "raw turn/start timeout" },
+    reconciliation: { message: "thread history proves the requested start did not create a turn" },
+  });
+  assert.equal(store.replayDirective("ctx", "pass", args), undefined);
+});
+
+test("send recovery does not terminalize history containing its correlated turn", () => {
+  const store = new OperationStore(createTestDatabase());
+  const args = { nickname: "worker", content: "private", attachment_ids: [], mode: "start" };
+  const operation = store.prepare({ contextId: "ctx", attemptId: "attempt", callId: "call", kind: "send_to_session", args });
+  store.markDispatched(operation.id);
+  store.fail(operation.id, { message: "raw turn/start timeout" }, true);
+  let released = 0;
+
+  assert.equal(reconcileAbsentRecoveredSendStart(store, store.listRecoverable()[0]!, {
+    thread: {
+      status: { type: "idle" },
+      turns: [{ items: [{ type: "userMessage", clientId: "ctx:call" }] }],
+    },
+  }, () => { released += 1; }), false);
+
+  assert.equal(released, 0);
+  assert.equal(store.get(operation.id)?.state, "uncertain");
+  assert.deepEqual(store.get(operation.id)?.error, { message: "raw turn/start timeout" });
 });
 
 test("durable operation endpoints survive restart as startup identity references", async () => {

@@ -20,7 +20,7 @@ class FakeEndpoint implements ManagedAppServerEndpoint {
   identityAvailable = true;
   identityToken = "a".repeat(32);
   localPid = 10;
-  threadStatus: "idle" | "active" | "systemError" = "idle";
+  threadStatus: "notLoaded" | "idle" | "active" | "systemError" = "idle";
   requestError: Error | undefined;
   readonly requests: Array<{ method: string; params: unknown }> = [];
   onRuntimeIdentity: (() => void) | undefined;
@@ -831,6 +831,22 @@ test("active history prevents disconnect and reopens admission without stopping"
   assert.equal(endpoint.runtimeStops, 0);
   assert.equal(value.manager.desiredState("devbox"), "automatic");
   await value.manager.withWorkLease("devbox", "rpc", async () => undefined);
+});
+
+test("unloaded managed history permits a guarded local restart", async () => {
+  const { manager, local } = queuedFixture([], ["thread-1"]);
+  local.rotateIdentityOnStop = true;
+  await manager.ensureReady("local");
+  local.threadStatus = "notLoaded";
+
+  await manager.restart("local");
+
+  assert.equal(local.runtimeStops, 1);
+  assert.equal(local.state, "ready");
+  assert.deepEqual(local.requests, [{
+    method: "thread/read",
+    params: { threadId: "thread-1", includeTurns: false },
+  }]);
 });
 
 test("leases reject foreign generations and old endpoint callbacks cannot replace a newer generation", async () => {

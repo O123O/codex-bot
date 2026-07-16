@@ -37,9 +37,59 @@ test("the helper hard-codes the isolated tmux server and disables user tmux conf
   assert.match(helper, /"-L", "qiyan-bot", "-f", "\/dev\/null"/u);
   assert.doesNotMatch(helper, /kill-server/u);
   assert.doesNotMatch(helper, /shell:\s*true/u);
+  assert.match(helper, /command -v codex; command -v tmux; command -v tail/u);
   const launcher = await readFile(launcherPath, "utf8");
   assert.match(launcher, /QIYAN_RUNTIME_TOKEN/u);
   assert.match(helper, /processHasToken/u);
+});
+
+test("the remote app-server launcher retains one bounded owner-only diagnostic generation", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "qiyan-launcher-log-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const bin = join(root, "bin");
+  await mkdir(bin);
+  await writeFile(join(bin, "codex"), [
+    "#!/bin/sh",
+    "printf 'stdout marker\\n'",
+    "printf 'stderr marker\\n' >&2",
+    "printf 'filter=%s\\n' \"$RUST_LOG\"",
+    "printf 'args=%s\\n' \"$*\"",
+    "",
+  ].join("\n"), { mode: 0o700 });
+  const token = "0123456789abcdef0123456789abcdef";
+  const socketPath = join(root, "app-server.sock");
+  const identityPath = join(root, "identity.json");
+  const logPath = join(root, "app-server.log");
+  const previousLogPath = join(root, "app-server.previous.log");
+  await writeFile(logPath, Buffer.alloc(1024 * 1024 + 1, "x"), { mode: 0o644 });
+
+  const launch = async () => {
+    const result = await runBoundedProcess("env", [
+      `PATH=${bin}:${process.env.PATH ?? ""}`,
+      "sh", launcherPath.pathname, token, socketPath, identityPath,
+    ], { timeoutMs: 5_000, maxOutputBytes: 64 * 1024 });
+    assert.equal(result.stdout.byteLength, 0);
+    assert.equal(result.stderr.byteLength, 0);
+  };
+
+  await launch();
+  assert.equal((await stat(previousLogPath)).size, 1024 * 1024);
+  assert.equal((await stat(previousLogPath)).mode & 0o777, 0o600);
+  assert.equal((await readFile(logPath, "utf8")).match(/stdout marker/gu)?.length, 1);
+
+  await launch();
+  const log = await readFile(logPath, "utf8");
+  const previousLog = await readFile(previousLogPath, "utf8");
+  assert.equal(log.match(/stdout marker/gu)?.length, 1);
+  assert.equal(log.match(/stderr marker/gu)?.length, 1);
+  assert.equal(previousLog.match(/stdout marker/gu)?.length, 1);
+  assert.equal(previousLog.match(/stderr marker/gu)?.length, 1);
+  assert.match(log, /filter=off,codex_app_server::app_server_tracing=info,codex_app_server::transport=info/u);
+  assert.doesNotMatch(log, /codex_app_server_transport/u);
+  assert.doesNotMatch(log, /filter=.*(?:^|,)warn(?:,|$)/mu);
+  assert.doesNotMatch(log, /filter=.*codex_app_server=info/u);
+  assert.match(log, /args=app-server --listen unix:\/\//u);
+  assert.equal((await stat(logPath)).mode & 0o777, 0o600);
 });
 
 test("the helper emits one versioned response frame", async () => {

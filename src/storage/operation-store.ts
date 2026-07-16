@@ -242,6 +242,14 @@ export class OperationStore {
     });
   }
 
+  failAndUnbindWithReconciliation(id: string, error: unknown, toolFence?: number): void {
+    inTransaction(this.db, () => {
+      const dispatchError = this.get(id)?.error;
+      this.fail(id, dispatchError === undefined ? error : { dispatch: dispatchError, reconciliation: error }, false, toolFence);
+      this.unbindDirective(id);
+    });
+  }
+
   markAttemptOperationsUncertain(attemptId: string): number {
     return Number(this.db.prepare(`UPDATE operations SET state = 'uncertain', updated_at = ?
       WHERE attempt_id = ? AND state = 'dispatched'`).run(Date.now(), attemptId).changes);

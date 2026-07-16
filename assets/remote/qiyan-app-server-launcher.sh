@@ -13,6 +13,14 @@ case "$socket_path:$identity_path" in
   *[!A-Za-z0-9_./:-]*) exit 64 ;;
 esac
 
+log_directory=${identity_path%/*}
+log_path=${log_directory}/app-server.log
+previous_log_path=${log_directory}/app-server.previous.log
+previous_temporary=${previous_log_path}.tmp.$$
+case "$log_path:$previous_log_path:$previous_temporary" in
+  *[!A-Za-z0-9_./:-]*) exit 64 ;;
+esac
+
 codex_path=$(command -v codex)
 case "$codex_path" in
   /*) ;;
@@ -25,6 +33,23 @@ esac
 
 QIYAN_RUNTIME_TOKEN=$token
 export QIYAN_RUNTIME_TOKEN
+RUST_LOG='off,codex_app_server::app_server_tracing=info,codex_app_server::transport=info'
+export RUST_LOG
+
+if [ -L "$log_path" ]; then
+  exit 73
+elif [ -f "$log_path" ]; then
+  chmod 600 "$log_path"
+  if [ -d "$previous_log_path" ]; then exit 73; fi
+  mv -f "$log_path" "$previous_log_path"
+  tail -c 1048576 "$previous_log_path" > "$previous_temporary"
+  chmod 600 "$previous_temporary"
+  mv -f "$previous_temporary" "$previous_log_path"
+elif [ -e "$log_path" ]; then
+  exit 73
+fi
+: >> "$log_path"
+chmod 600 "$log_path"
 
 start_time=$(cut -d ' ' -f 22 "/proc/$$/stat")
 process_group=$(ps -o pgid= -p "$$" | tr -d ' ')
@@ -38,4 +63,4 @@ printf '{"kind":"ssh","token":"%s","pid":%s,"linuxStartTime":"%s","processGroupI
 chmod 600 "$temporary"
 mv -f "$temporary" "$identity_path"
 
-exec "$codex_path" app-server --listen "unix://${socket_path}"
+exec "$codex_path" app-server --listen "unix://${socket_path}" >> "$log_path" 2>&1

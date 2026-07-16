@@ -144,6 +144,20 @@ test("failing an operation and releasing its directive are one transaction", () 
   assert.equal(store.replayDirective("ctx", "pass", { content: "exact" }), undefined);
 });
 
+test("terminal reconciliation preserves the original uncertain dispatch error", () => {
+  const store = new OperationStore(createTestDatabase());
+  const operation = store.prepare({ contextId: "ctx", attemptId: "attempt", callId: "call", kind: "send_to_session", args: {} });
+  store.markDispatched(operation.id);
+  store.fail(operation.id, { message: "raw turn/start timeout" }, true);
+
+  store.failAndUnbindWithReconciliation(operation.id, { message: "thread history proves no turn was created" });
+
+  assert.deepEqual(store.get(operation.id)?.error, {
+    dispatch: { message: "raw turn/start timeout" },
+    reconciliation: { message: "thread history proves no turn was created" },
+  });
+});
+
 test("operations receive a monotonic order even when creation timestamps tie", () => {
   const originalNow = Date.now;
   Date.now = () => 1_000;

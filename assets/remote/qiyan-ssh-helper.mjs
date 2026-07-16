@@ -55,7 +55,7 @@ function preflight() {
   if (!Number.isSafeInteger(uid) || uid < 1 || !isAbsolute(account.homedir) || !shell || !SAFE_PATH.test(shell)) throw new Error("invalid account environment");
   if (!SAFE_PATH.test(process.execPath)) throw new Error("invalid Node.js executable");
   // Host-preflight is provider-neutral: it validates only the coreutils every helper op needs
-  // (cut/ps/tr/mv/chmod). Codex-specific tooling (codex, tmux) is probed on the Codex `start`
+  // (cut/ps/tr/mv/chmod). Codex-specific tooling (codex, tmux, tail) is probed on the Codex `start`
   // path so a Claude-only host still bootstraps.
   const check = spawnSync(shell, ["-lc", "command -v cut; command -v ps; command -v tr; command -v mv; command -v chmod"], { encoding: "utf8", timeout: 10_000, maxBuffer: 64 * 1024 });
   if (check.status !== 0) throw new Error("required remote command is unavailable");
@@ -101,10 +101,10 @@ async function start(value) {
   const paths = runtimePaths(value);
   if (!HEX_128.test(value?.token ?? "") || typeof value?.shell !== "string" || !SAFE_PATH.test(value.shell)) throw new Error("invalid start request");
   // Codex capability probe (moved off host-preflight): the app-server launcher execs `codex`
-  // inside a `tmux` session, so both must be on the login PATH before we start.
-  const capability = spawnSync(value.shell, ["-lc", "command -v codex; command -v tmux"], { encoding: "utf8", timeout: 10_000, maxBuffer: 64 * 1024 });
+  // inside a `tmux` session and rotates its log with `tail`, so all three must be on the login PATH.
+  const capability = spawnSync(value.shell, ["-lc", "command -v codex; command -v tmux; command -v tail"], { encoding: "utf8", timeout: 10_000, maxBuffer: 64 * 1024 });
   const capabilityPaths = (capability.stdout ?? "").split(/\r?\n/u).map((line) => line.trim()).filter((line) => SAFE_PATH.test(line));
-  if (capability.status !== 0 || capabilityPaths.slice(-2).length !== 2) throw new Error("codex and tmux are required to start a remote runtime");
+  if (capability.status !== 0 || capabilityPaths.slice(-3).length !== 3) throw new Error("codex, tmux, and tail are required to start a remote runtime");
   const before = await inspect(value);
   if (before.status === "healthy") return { identity: before.identity };
   if (before.status === "unhealthy") throw new Error("existing runtime is unhealthy");

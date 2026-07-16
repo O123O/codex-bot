@@ -506,6 +506,29 @@ export function recoverableOperationTarget(
   }
 }
 
+interface RecoveredSendHistory {
+  thread: {
+    status?: { type?: string };
+    turns: ReadonlyArray<{ items: ReadonlyArray<{ type?: string; clientId?: string }> }>;
+  };
+}
+
+export function reconcileAbsentRecoveredSendStart(
+  operations: Pick<OperationStore, "failAndUnbindWithReconciliation">,
+  operation: Pick<RecoverableOperation, "id" | "contextId" | "callId" | "kind" | "args">,
+  history: RecoveredSendHistory,
+  releaseHolds: () => void,
+): boolean {
+  const args = operation.args as { mode?: unknown };
+  if (operation.kind !== "send_to_session" || args.mode !== "start" || history.thread.status?.type !== "idle") return false;
+  const clientId = `${operation.contextId}:${operation.callId}`;
+  const created = history.thread.turns.some((turn) => turn.items.some((item) => item.type === "userMessage" && item.clientId === clientId));
+  if (created) return false;
+  releaseHolds();
+  operations.failAndUnbindWithReconciliation(operation.id, { message: "thread history proves the requested start did not create a turn" });
+  return true;
+}
+
 export function recoverableOperationEndpointReferences(
   operations: readonly Pick<RecoverableOperation, "kind" | "args" | "receipt">[],
   resolver: OperationRecoveryTargetResolver,
@@ -3904,15 +3927,17 @@ export async function buildProductionApp(
               advanceNativeWatermark(args.nickname);
               observeLifecycle(args.nickname);
             });
-          } else if (args.mode === "start" && history.thread.status?.type === "idle") {
-            for (const hold of holds) attachments.releaseOperation(hold.id);
-            operations.failAndUnbind(operation.id, { message: "thread history proves the requested start did not create a turn" });
-          } else if (args.mode === "steer") {
-            const targetTurnId = (operation.receipt as { turnId?: string } | undefined)?.turnId;
-            const target = targetTurnId ? history.thread.turns.find((candidate: any) => candidate.id === targetTurnId) : undefined;
-            if (target && isTerminalStatus(target.status)) {
+          } else {
+            const reconciledStart = reconcileAbsentRecoveredSendStart(operations, operation, history, () => {
               for (const hold of holds) attachments.releaseOperation(hold.id);
-              operations.failAndUnbind(operation.id, { message: "terminal target history proves the requested steer was not appended" });
+            });
+            if (!reconciledStart && args.mode === "steer") {
+              const targetTurnId = (operation.receipt as { turnId?: string } | undefined)?.turnId;
+              const target = targetTurnId ? history.thread.turns.find((candidate: any) => candidate.id === targetTurnId) : undefined;
+              if (target && isTerminalStatus(target.status)) {
+                for (const hold of holds) attachments.releaseOperation(hold.id);
+                operations.failAndUnbind(operation.id, { message: "terminal target history proves the requested steer was not appended" });
+              }
             }
           }
         } else if (operation.kind === "set_session_model" || operation.kind === "set_reasoning_effort") {

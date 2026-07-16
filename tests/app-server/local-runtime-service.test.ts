@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import test from "node:test";
 import { LocalAppServerRuntime, resolveMcpClientIdentity } from "../../src/app-server/local-runtime.ts";
+import { ManagedAppServerEndpoint } from "../../src/app-server/managed-endpoint.ts";
 
 class FakeChild extends EventEmitter {
   constructor(readonly pid: number) { super(); }
@@ -172,4 +173,66 @@ test("local child loss closes only its current connection and classifies runtime
   assert.deepEqual(losses, ["closed"]);
   assert.equal(await runtime.runtimeIdentity(), undefined);
   assert.equal(await runtime.classifyLoss(), "runtime-lost");
+});
+
+test("local stdout loss closes the connection and releases the runtime before child exit", async () => {
+  const child = new FakeChild(601);
+  const runtime = new LocalAppServerRuntime({
+    codexBinary: "codex", spawn: () => child as never,
+    resolveMcpClientIdentity: async (pid) => ({ pid, startTime: String(pid) }),
+  });
+  const connection = await runtime.open();
+  await connection.confirmInitialized({});
+  const losses: string[] = [];
+  connection.onClose((error) => losses.push(error?.message ?? "closed"));
+
+  child.stdout.end();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(losses, ["app-server stream ended"]);
+  assert.equal(await runtime.runtimeIdentity(), undefined);
+  await connection.close();
+  assert.equal(child.killed, true, "wire loss cleanup stops a child that has not exited");
+});
+
+test("local stdout loss preserves the wire error while making the managed endpoint unavailable once", async () => {
+  const child = new FakeChild(602);
+  let pendingRequestWritten!: () => void;
+  const requestWritten = new Promise<void>((resolve) => { pendingRequestWritten = resolve; });
+  let input = "";
+  child.stdin.on("data", (chunk: Buffer) => {
+    input += chunk.toString("utf8");
+    for (;;) {
+      const newline = input.indexOf("\n");
+      if (newline < 0) break;
+      const line = input.slice(0, newline);
+      input = input.slice(newline + 1);
+      const request = JSON.parse(line) as { id?: number; method?: string };
+      if (request.method === "thread/read") {
+        pendingRequestWritten();
+      } else if (request.id !== undefined && request.method === "initialize") {
+        child.stdout.write(`${JSON.stringify({ id: request.id, result: {} })}\n`);
+      } else if (request.id !== undefined && request.method === "account/read") {
+        child.stdout.write(`${JSON.stringify({ id: request.id, result: { account: {}, requiresOpenaiAuth: false } })}\n`);
+      }
+    }
+  });
+  const runtime = new LocalAppServerRuntime({
+    codexBinary: "codex", spawn: () => child as never,
+    resolveMcpClientIdentity: async (pid) => ({ pid, startTime: String(pid) }),
+  });
+  const endpoint = new ManagedAppServerEndpoint({ id: "local", runtime });
+  await endpoint.start();
+  const losses: string[] = [];
+  endpoint.onUnavailable((kind) => losses.push(kind));
+
+  const pending = endpoint.request("thread/read", { threadId: "thread-1" });
+  await requestWritten;
+  child.stdout.end();
+
+  await assert.rejects(pending, /app-server stream ended/u);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(endpoint.state, "unavailable");
+  assert.deepEqual(losses, ["runtime-lost"]);
+  assert.equal(child.killed, true);
 });
