@@ -30,7 +30,7 @@ import { composeApp, type AppPhase, type BotApp } from "./app.ts";
 import type { BotConfig } from "./config.ts";
 import { parseDirective } from "./directives/parser.ts";
 import { deliverDirectTo } from "./assistant/direct-to.ts";
-import { WebBus, createWebAdapter, createWebUiPhase } from "./webui/index.ts";
+import { WebBus, createWebAdapter, createWebUiPhase, WEB_ADAPTER_ID } from "./webui/index.ts";
 import { webUiStatePath } from "./webui/webui-state.ts";
 import { claudeLaunchPolicy } from "./config.ts";
 import { AppError } from "./core/errors.ts";
@@ -83,7 +83,7 @@ import { acquireDatabaseLease, type DatabaseLease } from "./storage/database-lea
 import { openStateDatabaseWithAutomaticRecovery } from "./storage/automatic-dashboard-recovery.ts";
 import { DeliveryStore, type DeliveryRecord } from "./storage/delivery-store.ts";
 import { BackgroundFailureStore } from "./storage/background-failure-store.ts";
-import { ConversationStore, type ChatAcceptanceEffects } from "./storage/conversation-store.ts";
+import { ConversationStore, type AssistantLease, type ChatAcceptanceEffects } from "./storage/conversation-store.ts";
 import { finalizeConversationCutover, preflightConversationCutover, runConversationRoutingBackfill } from "./storage/conversation-cutover.ts";
 import { OperationStore, type RecoverableOperation } from "./storage/operation-store.ts";
 import { RuntimeStore } from "./storage/runtime-store.ts";
@@ -172,6 +172,32 @@ export function reportAssistantTerminalFailure(
 ): void {
   try { report(); }
   finally { dispatcher?.requestRecovery(); }
+}
+
+export function prepareAssistantWebCommentary(
+  conversations: { lease(): AssistantLease | undefined },
+  deliveries: { prepare(input: { id: string; kind: string; binding: ConversationBinding; body: string; mandatory: boolean }): unknown },
+  expectedThreadId: string,
+  method: string,
+  params: unknown,
+): boolean {
+  if (method !== "item/completed" || !params || typeof params !== "object" || Array.isArray(params)) return false;
+  const notification = params as Record<string, unknown>;
+  if (notification.threadId !== expectedThreadId || typeof notification.turnId !== "string"
+    || !notification.item || typeof notification.item !== "object" || Array.isArray(notification.item)) return false;
+  const item = notification.item as Record<string, unknown>;
+  if (item.type !== "agentMessage" || item.phase !== "commentary" || typeof item.id !== "string"
+    || typeof item.text !== "string" || item.text.trim().length === 0) return false;
+  const lease = conversations.lease();
+  if (lease?.phase !== "active" || lease.turnId !== notification.turnId || lease.binding?.adapterId !== WEB_ADAPTER_ID) return false;
+  deliveries.prepare({
+    id: `assistant-commentary:${notification.turnId}:${item.id}`,
+    kind: "assistant_commentary",
+    binding: lease.binding,
+    body: item.text,
+    mandatory: true,
+  });
+  return true;
 }
 
 type AssistantTerminalTurn = {
@@ -3693,6 +3719,8 @@ export async function buildProductionApp(
 
   async function onNotification(endpointId: string, method: string, params: any): Promise<void> {
     const identity = registry.snapshot().assistant;
+    if (endpointId === identity.endpoint
+      && prepareAssistantWebCommentary(conversations, deliveries, identity.thread_id, method, params)) return;
     const assistantLifecycle = parseAssistantLifecycleNotification(method, params);
     if (assistantLifecycle && endpointId === identity.endpoint && assistantLifecycle.params.threadId === identity.thread_id) {
       await assistantLifecycleBuffer.accept(assistantLifecycle, handleAssistantLifecycleNotification);

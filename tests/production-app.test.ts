@@ -26,6 +26,7 @@ import {
   recoverableCreateHasNoDispatch,
   projectReadyRecoveryDisposition,
   parseEndpointLifecycleCheckpoint,
+  prepareAssistantWebCommentary,
   processWorkerTerminalNotification,
   stopOperationRecoveryBeforeTools,
   reconcileLifecycleAndOwnership,
@@ -74,6 +75,60 @@ import { createTestDatabase } from "../src/storage/database.ts";
 import { OperationStore } from "../src/storage/operation-store.ts";
 import { EndpointManager } from "../src/endpoints/manager.ts";
 import { SessionOwnershipWatcher } from "../src/sessions/ownership-watcher.ts";
+
+test("assistant commentary from an active web turn is durably queued while terminal and final items stay excluded", () => {
+  const prepared: unknown[] = [];
+  const lease = {
+    phase: "active" as const,
+    attemptId: "attempt",
+    primaryContextId: "context",
+    binding: { adapterId: "web", conversationKey: "web:owner", destination: { surface: "web" } },
+    clientUserMessageId: "client-message",
+    turnId: "turn-1",
+    triggerKind: "chat" as const,
+    capacityClaimId: "claim",
+    steerPaused: false,
+  };
+  const deliveries = { prepare: (delivery: unknown) => { prepared.push(delivery); } };
+
+  assert.equal(prepareAssistantWebCommentary(
+    { lease: () => lease },
+    deliveries,
+    "assistant-thread",
+    "item/completed",
+    { threadId: "assistant-thread", turnId: "turn-1", item: { type: "agentMessage", id: "update-1", text: "Still working", phase: "commentary" } },
+  ), true);
+  assert.deepEqual(prepared, [{
+    id: "assistant-commentary:turn-1:update-1",
+    kind: "assistant_commentary",
+    binding: lease.binding,
+    body: "Still working",
+    mandatory: true,
+  }]);
+
+  assert.equal(prepareAssistantWebCommentary(
+    { lease: () => lease },
+    deliveries,
+    "assistant-thread",
+    "item/completed",
+    { threadId: "assistant-thread", turnId: "turn-1", item: { type: "agentMessage", id: "final-1", text: "Done", phase: "final_answer" } },
+  ), false);
+  assert.equal(prepareAssistantWebCommentary(
+    { lease: () => ({ ...lease, binding: { ...lease.binding, adapterId: "slack" } }) },
+    deliveries,
+    "assistant-thread",
+    "item/completed",
+    { threadId: "assistant-thread", turnId: "turn-1", item: { type: "agentMessage", id: "update-2", text: "Still working", phase: "commentary" } },
+  ), false);
+  assert.equal(prepareAssistantWebCommentary(
+    { lease: () => ({ ...lease, phase: "terminalizing" }) },
+    deliveries,
+    "assistant-thread",
+    "item/completed",
+    { threadId: "assistant-thread", turnId: "turn-1", item: { type: "agentMessage", id: "update-3", text: "Stale update", phase: "commentary" } },
+  ), false);
+  assert.equal(prepared.length, 1);
+});
 
 test("every production durable event source forwards only successful inserts to one wake boundary", async () => {
   let accepting = false;
