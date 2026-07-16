@@ -62,8 +62,8 @@ test("SSH worker guides document supported endpoints and the source-checkout fix
   for (const required of ["SSH worker endpoints", "endpoints.json", "0.142.5 or newer", "tmux -L qiyan-bot", "list-sessions", "disconnect_endpoint", "restart_endpoint", "unavailable SSH endpoint", "capacity stays reserved"]) {
     assert.equal(supported.includes(required), true, `SSH worker guide is missing: ${required}`);
   }
-  assert.match(supported, /ControlPath \$\{XDG_RUNTIME_DIR\}\/qiyan-ssh-%C.*private local filesystem/isu);
-  assert.match(supported, /NFS.*ControlMaster.*not supported/isu);
+  assert.match(supported, /ControlPath \$\{XDG_RUNTIME_DIR\}\/qiyan-ssh-%C.*private filesystem/isu);
+  assert.match(supported, /NFS-backed user-owned ControlMaster.*accepted.*authoritative liveness/isu);
   assert.match(supported, /ServerAliveInterval 15.*ServerAliveCountMax 3/isu);
   assert.doesNotMatch(supported, /ControlPath\s+~\/\.ssh/iu);
   assert.doesNotMatch(supported, /install -d|qiyan-ssh-controlmasters/iu);

@@ -79,6 +79,23 @@ export function buildSshRemoteArgs(plan: SshConnectionPlan, command: readonly st
   return [...baseArgs(plan, true), plan.alias, ...command];
 }
 
+// Carries a locally pinned, gzip-compressed Node.js module in a shell-safe base64url
+// argument. Unlike `node -`, this leaves stdin available for bounded streaming uploads.
+// The only shell syntax is this fixed loader; the program and all caller arguments remain
+// strict safe tokens.
+export function buildSshRemoteNodeProgramArgs(
+  plan: SshConnectionPlan,
+  programBase64Url: string,
+  command: readonly string[],
+): string[] {
+  const loader = 'import("node:zlib").then(m=>import("data:text/javascript;base64,"+m.gunzipSync(Buffer.from(process.argv[1],"base64url")).toString("base64")))';
+  if (!/^[A-Za-z0-9_-]+$/u.test(programBase64Url) || programBase64Url.length > 64 * 1024
+    || command.length === 0 || command.some((token) => !/^[A-Za-z0-9_./-]+$/u.test(token))) {
+    throw new AppError("CONFIGURATION_ERROR", "unsafe SSH remote Node.js program");
+  }
+  return [...baseArgs(plan, true), plan.alias, "node", "-e", `'${loader}'`, programBase64Url, ...command];
+}
+
 // Runs a single opaque shell command string over the endpoint's existing ControlMaster
 // (established eagerly at bootstrap). Unlike buildSshRemoteArgs, the command is NOT
 // tokenized/validated per token — the caller (SshClaudeCommandRunner) builds it with

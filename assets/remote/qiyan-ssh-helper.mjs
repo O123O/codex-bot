@@ -1,11 +1,10 @@
 import { createHash, randomUUID } from "node:crypto";
-import { constants, lstatSync, readdirSync, readFileSync, renameSync, unlinkSync } from "node:fs";
+import { constants, lstatSync, readdirSync, readFileSync, realpathSync, renameSync, statfsSync, unlinkSync } from "node:fs";
 import { chmod, lstat, mkdir, open, readFile, realpath, rm, stat, unlink } from "node:fs/promises";
 import { userInfo } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 
-const TMUX = ["-L", "qiyan-bot", "-f", "/dev/null"];
 const SAFE_PATH = /^\/[A-Za-z0-9_./+-]+$/u;
 const SAFE_NAME = /^[a-z0-9][a-z0-9_-]{0,63}$/u;
 const HEX_128 = /^[a-f0-9]{32}$/u;
@@ -14,6 +13,8 @@ const DECIMAL = /^\d+$/u;
 // Declared with the other top-level consts so it is initialized before the entry `try`.
 const CLAUDE_CLIENT_MARKER = /<!--\s*qiyan-cid:([A-Za-z0-9:_.-]{1,256})\s*-->/u;
 const MAX_ARGUMENT_BYTES = 64 * 1024;
+const MAX_UNIX_SOCKET_PATH_BYTES = 107;
+const NFS_SUPER_MAGIC = 0x6969;
 const RESPONSE_PREFIX = "qiyan-helper-v1:";
 
 const operation = process.argv[2];
@@ -61,25 +62,26 @@ function preflight() {
   if (check.status !== 0) throw new Error("required remote command is unavailable");
   const paths = check.stdout.split(/\r?\n/u).map((value) => value.trim()).filter((value) => SAFE_PATH.test(value));
   if (paths.slice(-5).length !== 5) throw new Error("required remote command is unavailable");
-  return { uid, home: account.homedir, shell };
+  return { uid, home: account.homedir, shell, runtimeBase: selectedRuntimeBase() };
 }
 
 async function bootstrap(value) {
   const { runtimeDir, helperBase64, helperSha256, launcherBase64, launcherSha256 } = value ?? {};
-  requireRuntimeDir(runtimeDir);
+  requireRuntimeDir(runtimeDir, true);
   if (![helperSha256, launcherSha256].every((item) => typeof item === "string" && /^[a-f0-9]{64}$/u.test(item))) throw new Error("invalid asset digest");
   const helper = decodeAsset(helperBase64, helperSha256);
   const launcher = decodeAsset(launcherBase64, launcherSha256);
   await ensurePrivateDirectory(dirname(runtimeDir));
   await ensurePrivateDirectory(runtimeDir);
+  requireRuntimeDir(runtimeDir);
   await atomicWrite(join(runtimeDir, "qiyan-ssh-helper.mjs"), helper, 0o700);
   await atomicWrite(join(runtimeDir, "qiyan-app-server-launcher.sh"), launcher, 0o700);
   return { installed: true };
 }
 
 async function inspect(value) {
-  const paths = runtimePaths(value);
-  const tmux = await run("tmux", [...TMUX, "has-session", "-t", paths.session], true);
+  const paths = runtimePaths(value, true);
+  const tmux = await run("tmux", [...tmuxArgs(paths), "has-session", "-t", paths.session], true);
   const identityFile = await stat(paths.identityPath).catch(() => undefined);
   const socketFile = await stat(paths.socketPath).catch(() => undefined);
   const identity = await readIdentity(paths.identityPath);
@@ -113,7 +115,7 @@ async function start(value) {
   const inner = `exec ${paths.launcherPath} ${value.token} ${paths.socketPath} ${paths.identityPath}`;
   if (![paths.launcherPath, paths.socketPath, paths.identityPath].every((item) => SAFE_PATH.test(item))) throw new Error("unsafe launcher path");
   const command = `${value.shell} -lc '${inner}'`;
-  await run("tmux", [...TMUX, "new-session", "-d", "-s", paths.session, command]);
+  await run("tmux", [...tmuxArgs(paths), "new-session", "-d", "-s", paths.session, command]);
   for (let attempt = 0; attempt < 100; attempt += 1) {
     const state = await inspect(value);
     if (state.status === "healthy") return { identity: state.identity };
@@ -142,7 +144,7 @@ async function stop(value) {
       if (ownedGroupMembers(identity).length > 0) throw new Error("runtime process group did not stop");
     }
   }
-  await run("tmux", [...TMUX, "kill-session", "-t", paths.session], true);
+  await run("tmux", [...tmuxArgs(paths), "kill-session", "-t", paths.session], true);
   await rm(paths.socketPath, { force: true });
   await rm(paths.identityPath, { force: true });
   return { stopped: true };
@@ -636,22 +638,95 @@ async function mkdirAbsoluteNoFollow(path, options) {
   } finally { await parent.close().catch(() => undefined); }
 }
 
-function runtimePaths(value) {
+function runtimePaths(value, allowMissing = false) {
   const runtimeDir = value?.runtimeDir;
   const session = value?.session;
-  requireRuntimeDir(runtimeDir);
+  const tmuxMode = value?.tmuxMode;
+  requireRuntimeDir(runtimeDir, allowMissing);
   if (typeof session !== "string" || !SAFE_NAME.test(session)) throw new Error("invalid tmux session");
+  if (tmuxMode !== "explicit" && tmuxMode !== "legacy") throw new Error("invalid tmux mode");
   return {
     runtimeDir,
     session,
+    tmuxMode,
+    tmuxSocketPath: join(runtimeDir, "tmux.sock"),
     socketPath: join(runtimeDir, "app-server.sock"),
     identityPath: join(runtimeDir, "identity.json"),
     launcherPath: join(runtimeDir, "qiyan-app-server-launcher.sh"),
   };
 }
 
-function requireRuntimeDir(value) {
-  if (typeof value !== "string" || value.split("/")[2] !== `qiyan-${process.getuid?.()}` || !/^\/tmp\/qiyan-\d+\/[a-f0-9]{24}$/u.test(value)) throw new Error("invalid runtime directory");
+function tmuxArgs(paths) {
+  if (paths.tmuxMode === "legacy") return ["-L", "qiyan-bot", "-f", "/dev/null"];
+  return ["-S", paths.tmuxSocketPath, "-f", "/dev/null"];
+}
+
+function requireRuntimeDir(value, allowMissing = false) {
+  if (typeof value !== "string" || !SAFE_PATH.test(value) || !isAbsolute(value) || resolve(value) !== value
+    || !/^[a-f0-9]{24}$/u.test(basename(value))) throw new Error("invalid runtime directory");
+  const base = dirname(value);
+  const { fallback, shared } = allowedRuntimeBases();
+  if (base !== fallback && base !== shared) throw new Error("invalid runtime directory");
+  if (base === fallback) attestFallbackRoot();
+  attestRuntimeDirectory(base, allowMissing);
+  attestRuntimeDirectory(value, allowMissing);
+  if (Buffer.byteLength(join(value, "app-server.sock")) > MAX_UNIX_SOCKET_PATH_BYTES) throw new Error("invalid runtime directory");
+}
+
+function selectedRuntimeBase() {
+  const shared = sharedRuntimeBase();
+  if (shared) return shared;
+  attestFallbackRoot();
+  return fallbackRuntimeBase();
+}
+
+function allowedRuntimeBases() {
+  return { fallback: fallbackRuntimeBase(), shared: sharedRuntimeBase() };
+}
+
+function fallbackRuntimeBase() {
+  const uid = process.getuid?.();
+  if (!Number.isSafeInteger(uid) || uid < 1) throw new Error("invalid account environment");
+  return `/tmp/qiyan-${uid}`;
+}
+
+function attestFallbackRoot() {
+  const root = "/tmp";
+  const state = lstatSync(root);
+  const uid = process.getuid?.();
+  const untrustedWritable = (state.mode & 0o022) !== 0;
+  const protectedSharedRoot = state.uid === 0 && (state.mode & 0o1000) !== 0;
+  if (!state.isDirectory() || state.isSymbolicLink() || realpathSync(root) !== root
+    || (state.uid !== 0 && state.uid !== uid) || (untrustedWritable && !protectedSharedRoot)
+    || Number(statfsSync(root).type) === NFS_SUPER_MAGIC) throw new Error("unsafe runtime filesystem");
+}
+
+function sharedRuntimeBase() {
+  const root = process.env.XDG_RUNTIME_DIR;
+  if (typeof root !== "string" || !SAFE_PATH.test(root) || !isAbsolute(root) || resolve(root) !== root) return undefined;
+  try { if (!attestPrivateDirectory(root)) return undefined; }
+  catch { return undefined; }
+  const base = join(root, "qiyan-bot");
+  if (Buffer.byteLength(join(base, "f".repeat(24), "app-server.sock")) > MAX_UNIX_SOCKET_PATH_BYTES) return undefined;
+  try { if (!attestPrivateDirectory(base)) return undefined; }
+  catch (error) { if (error?.code !== "ENOENT") return undefined; }
+  return base;
+}
+
+function attestRuntimeDirectory(path, allowMissing) {
+  try {
+    if (!attestPrivateDirectory(path)) throw new Error("unsafe runtime directory");
+  } catch (error) {
+    if (allowMissing && error?.code === "ENOENT") return;
+    throw error;
+  }
+}
+
+function attestPrivateDirectory(path) {
+  const state = lstatSync(path);
+  return state.isDirectory() && !state.isSymbolicLink() && state.uid === process.getuid?.()
+    && (state.mode & 0o077) === 0 && realpathSync(path) === path
+    && Number(statfsSync(path).type) !== NFS_SUPER_MAGIC;
 }
 
 async function ensurePrivateDirectory(path) {

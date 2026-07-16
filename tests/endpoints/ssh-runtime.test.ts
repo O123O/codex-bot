@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdtemp, rm, symlink } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, symlink } from "node:fs/promises";
 import { createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,7 +10,9 @@ import {
   attestUserControlMaster,
   decodeRemoteArgument,
   encodeRemoteArgument,
+  prepareRemoteHost,
   type RemoteRuntimeClient,
+  type RemoteBootstrapPayload,
 } from "../../src/endpoints/ssh-runtime.ts";
 import { AppError } from "../../src/core/errors.ts";
 import type { SshConnectionPlan } from "../../src/endpoints/ssh-config.ts";
@@ -23,6 +25,7 @@ const userMasterPlan: SshConnectionPlan = {
   ownsControlMaster: false,
 };
 const helperPath = "/tmp/qiyan-1000/abcdef0123456789abcdef01/qiyan-ssh-helper.mjs";
+const helperSource = await readFile(new URL("../../assets/remote/qiyan-ssh-helper.mjs", import.meta.url));
 const framedOk = Buffer.from('qiyan-helper-v1:{"ok":true}\n');
 
 async function privateUserMaster(t: test.TestContext, mode = 0o600): Promise<{ plan: SshConnectionPlan; server: Server }> {
@@ -51,10 +54,44 @@ class FakeRemote implements RemoteRuntimeClient {
   async bootstrap(): Promise<void> { this.calls.push({ operation: "bootstrap", args: [] }); }
   async invoke<T>(operation: string, args: readonly string[]): Promise<T> {
     this.calls.push({ operation, args: [...args] });
-    if (operation === "preflight") return { uid: 1000, home: "/home/test", shell: "/bin/bash" } as T;
+    if (operation === "preflight") return { uid: 1000, home: "/home/test", shell: "/bin/bash", runtimeBase: "/tmp/qiyan-1000" } as T;
     if (operation === "inspect") return { status: this.status, ...((this.status === "healthy" || this.status === "unhealthy") && this.exposeIdentity ? { identity: this.identity } : {}) } as T;
     if (operation === "start") { this.status = "healthy"; return { identity: this.identity } as T; }
     if (operation === "stop") { this.status = "absent"; return { stopped: true } as T; }
+    throw new Error(`unexpected operation ${operation}`);
+  }
+}
+
+class NamespaceRemote implements RemoteRuntimeClient {
+  readonly identity = { kind: "ssh" as const, token: "c".repeat(32), pid: 303, linuxStartTime: "404", processGroupId: 303 };
+  readonly calls: Array<{ operation: string; value?: Record<string, unknown>; helperPath?: string }> = [];
+  legacyStatus: "absent" | "healthy" | "unhealthy" = "absent";
+  sharedStatus: "absent" | "healthy" | "unhealthy" = "absent";
+  runtimeBase = "/run/user/1000/qiyan-bot";
+
+  async bootstrap(payload: RemoteBootstrapPayload): Promise<void> {
+    this.calls.push({ operation: "bootstrap", value: { runtimeDir: payload.runtimeDir } });
+  }
+
+  async invoke<T>(operation: string, args: readonly string[], helperPath?: string): Promise<T> {
+    if (operation === "preflight") {
+      return { uid: 1000, home: "/home/test", shell: "/bin/bash", runtimeBase: this.runtimeBase } as T;
+    }
+    const value = JSON.parse(args[0] ?? "{}") as Record<string, unknown>;
+    this.calls.push({ operation, value, ...(helperPath ? { helperPath } : {}) });
+    const legacy = value.tmuxMode === "legacy";
+    const status = legacy ? this.legacyStatus : this.sharedStatus;
+    if (operation === "inspect") return { status, ...(status === "absent" ? {} : { identity: this.identity }) } as T;
+    if (operation === "start") {
+      if (legacy) this.legacyStatus = "healthy";
+      else this.sharedStatus = "healthy";
+      return { identity: this.identity } as T;
+    }
+    if (operation === "stop") {
+      if (legacy) this.legacyStatus = "absent";
+      else this.sharedStatus = "absent";
+      return { stopped: true } as T;
+    }
     throw new Error(`unexpected operation ${operation}`);
   }
 }
@@ -70,12 +107,19 @@ test("remote arguments round-trip only as bounded base64url tokens", () => {
   assert.throws(() => decodeRemoteArgument("not+base64"), /invalid/u);
 });
 
+test("the SSH client refuses remote helper source that does not match the pinned digest", () => {
+  assert.throws(() => new SshRemoteClient({
+    plan: { ...userMasterPlan, ownsControlMaster: true },
+    helperSource: Buffer.concat([helperSource, Buffer.from("\nmodified")]),
+  }), /integrity verification/u);
+});
+
 test("user-owned helper and transfer calls rely on their authoritative SSH operations", async (t) => {
   const { plan } = await privateUserMaster(t);
   const calls: Array<{ args: string[]; timeoutMs: number }> = [];
   const remote = new SshRemoteClient({
     plan,
-    helperSource: Buffer.from("helper"),
+    helperSource,
     run: async (_command, args, options) => {
       calls.push({ args: [...args], timeoutMs: options.timeoutMs });
       return {
@@ -103,7 +147,7 @@ test("helper response framing ignores unrelated remote shell stdout", async (t) 
   const framed = 'qiyan-helper-v1:{"ok":true}\n';
   const remote = new SshRemoteClient({
     plan,
-    helperSource: Buffer.from("helper"),
+    helperSource,
     run: async (_command, args) => ({
       stdout: args.includes("-O") ? Buffer.alloc(0) : Buffer.from(`remote shell banner\n${framed}`),
       stderr: Buffer.alloc(0),
@@ -118,7 +162,7 @@ test("a failed user-owned helper operation preserves its direct SSH failure", as
   const calls: string[][] = [];
   const remote = new SshRemoteClient({
     plan,
-    helperSource: Buffer.from("helper"),
+    helperSource,
     run: async (_command, args) => {
       calls.push([...args]);
       throw new AppError("ENDPOINT_UNAVAILABLE", "SSH process failed (exit 255)");
@@ -137,7 +181,7 @@ test("a missing socket in a safe local parent reaches the authoritative helper o
   const calls: string[][] = [];
   const remote = new SshRemoteClient({
     plan: { ...userMasterPlan, controlPath: join(root, "master") },
-    helperSource: Buffer.from("helper"),
+    helperSource,
     run: async (_command, args) => {
       calls.push([...args]);
       throw new AppError("ENDPOINT_UNAVAILABLE", "SSH process failed (exit 255)");
@@ -159,12 +203,12 @@ test("user-owned ControlMaster attestation rejects unsafe parents and sockets be
   };
   const shared = new SshRemoteClient({
     plan: { ...userMasterPlan, controlPath: join(tmpdir(), `qiyan-unsafe-master-${process.pid}`) },
-    helperSource: Buffer.from("helper"), run,
+    helperSource, run,
   });
   await assert.rejects(shared.invoke("inspect", ["{}"], helperPath), /unsafe user-owned SSH ControlMaster/u);
 
   const { plan: broadPlan } = await privateUserMaster(t, 0o660);
-  const broad = new SshRemoteClient({ plan: broadPlan, helperSource: Buffer.from("helper"), run });
+  const broad = new SshRemoteClient({ plan: broadPlan, helperSource, run });
   await assert.rejects(broad.invoke("inspect", ["{}"], helperPath), /unsafe user-owned SSH ControlMaster/u);
 
   const root = await mkdtemp(join(tmpdir(), "qiyan-master-link-"));
@@ -181,31 +225,26 @@ test("user-owned ControlMaster attestation rejects unsafe parents and sockets be
     await Promise.all([rm(root, { recursive: true, force: true }), rm(target, { recursive: true, force: true })]);
   });
   const linked = new SshRemoteClient({
-    plan: { ...userMasterPlan, controlPath: join(root, "link", "master") }, helperSource: Buffer.from("helper"), run,
+    plan: { ...userMasterPlan, controlPath: join(root, "link", "master") }, helperSource, run,
   });
   await assert.rejects(linked.invoke("inspect", ["{}"], helperPath), /unsafe user-owned SSH ControlMaster/u);
   assert.equal(calls.length, 0);
 });
 
-test("user-owned ControlMaster attestation rejects NFS socket directories", async (t) => {
+test("user-owned ControlMaster attestation accepts a private NFS socket directory", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "qiyan-nfs-master-"));
   await chmod(root, 0o700);
   t.after(() => rm(root, { recursive: true, force: true }));
   const nfsPlan = { ...userMasterPlan, controlPath: join(root, "missing-master") };
 
-  await assert.rejects(
-    attestUserControlMaster(nfsPlan, async () => ({ type: 0x6969 })),
-    (error: unknown) => error instanceof AppError
-      && error.code === "CONFIGURATION_ERROR"
-      && /private local filesystem/u.test(error.message),
-  );
+  await assert.doesNotReject(attestUserControlMaster(nfsPlan, async () => ({ type: 0x6969 })));
 });
 
 test("owned transport cleanup exits only its persistent QiYan ControlMaster", async () => {
   const calls: string[][] = [];
   const remote = new SshRemoteClient({
     plan: { ...userMasterPlan, ownsControlMaster: true },
-    helperSource: Buffer.from("helper"),
+    helperSource,
     run: async (_command, args) => {
       calls.push([...args]);
       return { stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) };
@@ -232,6 +271,62 @@ test("reuses a healthy detached runtime and changes identity only after replacem
   assert.equal(remote.calls.filter((call) => call.operation === "bootstrap").length, 1);
   remote.identity = { ...remote.identity, token: "b".repeat(32), linuxStartTime: "303" };
   assert.notDeepEqual(await runtime.runtimeIdentity(), first);
+});
+
+test("reuses a healthy legacy runtime without duplication and moves to shared XDG state after exact stop", async () => {
+  const remote = new NamespaceRemote();
+  remote.legacyStatus = "healthy";
+  const runtime = new SshRuntime({ endpointId: "devbox", remote });
+
+  assert.deepEqual(await runtime.ensureStarted(), remote.identity);
+  assert.equal(remote.calls.filter((call) => call.operation === "start").length, 0);
+  assert.equal(runtime.remoteRuntimeDir, "/run/user/1000/qiyan-bot/2ff8ddd61f5e0a0c72ad9390");
+  assert.equal(runtime.remoteHelperPath, `${runtime.remoteRuntimeDir}/qiyan-ssh-helper.mjs`);
+  assert.equal(runtime.remoteSocketPath, "/tmp/qiyan-1000/2ff8ddd61f5e0a0c72ad9390/app-server.sock");
+  assert.equal(remote.calls.some((call) => call.operation === "inspect" && call.value?.tmuxMode === "legacy"), true);
+
+  await runtime.stop(remote.identity);
+  assert.deepEqual(await runtime.ensureStarted(), remote.identity);
+  const starts = remote.calls.filter((call) => call.operation === "start");
+  assert.equal(starts.length, 1);
+  assert.equal(starts[0]!.value?.runtimeDir, runtime.remoteRuntimeDir);
+  assert.equal(starts[0]!.value?.tmuxMode, "explicit");
+  assert.equal(runtime.remoteSocketPath, `${runtime.remoteRuntimeDir}/app-server.sock`);
+});
+
+test("an unhealthy legacy runtime is never shadowed by a duplicate shared runtime", async () => {
+  const remote = new NamespaceRemote();
+  remote.legacyStatus = "unhealthy";
+  const runtime = new SshRuntime({ endpointId: "devbox", remote });
+
+  await assert.rejects(runtime.ensureStarted(), /unhealthy/u);
+  assert.equal(remote.calls.some((call) => call.operation === "start"), false);
+});
+
+test("fallback paths probe both tmux namespaces before classifying overlapping legacy files as unhealthy", async () => {
+  const remote = new NamespaceRemote();
+  remote.runtimeBase = "/tmp/qiyan-1000";
+  remote.sharedStatus = "unhealthy";
+  remote.legacyStatus = "healthy";
+  const runtime = new SshRuntime({ endpointId: "devbox", remote });
+
+  assert.deepEqual(await runtime.ensureStarted(), remote.identity);
+  assert.equal(remote.calls.some((call) => call.operation === "start"), false);
+  assert.equal(runtime.remoteSocketPath, "/tmp/qiyan-1000/2ff8ddd61f5e0a0c72ad9390/app-server.sock");
+});
+
+test("remote host preparation rejects an unvalidated runtime base before bootstrap", async () => {
+  let bootstrapped = false;
+  const remote: RemoteRuntimeClient = {
+    bootstrap: async () => { bootstrapped = true; },
+    invoke: async <T>(operation: string) => {
+      if (operation === "preflight") return { uid: 1000, home: "/home/test", shell: "/bin/bash", runtimeBase: "/unsafe path" } as T;
+      throw new Error("unexpected operation");
+    },
+  };
+
+  await assert.rejects(prepareRemoteHost({ endpointId: "devbox", remote }), /runtime|preflight|invalid/iu);
+  assert.equal(bootstrapped, false);
 });
 
 test("starts and stops only its endpoint runtime and refuses unhealthy replacement", async () => {

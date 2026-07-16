@@ -1,22 +1,24 @@
 import { createHash, randomBytes } from "node:crypto";
 import { lstat, mkdir, readFile, realpath, statfs } from "node:fs/promises";
-import { dirname, resolve } from "node:path";
+import { dirname, posix, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { gzipSync } from "node:zlib";
 import { z } from "zod";
 import { AppError } from "../core/errors.ts";
 import {
   buildControlMasterExitArgs,
-  buildSshRemoteArgs,
+  buildSshRemoteNodeProgramArgs,
   type SshConnectionPlan,
 } from "./ssh-config.ts";
 import { runBoundedProcess, type BoundedProcessResult } from "./ssh-process.ts";
 import { parseRuntimeIdentity, type EndpointLossKind, type RuntimeIdentity } from "./types.ts";
 
-export const REMOTE_HELPER_SHA256 = "69909db2559937c2e08634468cc2f5712b18f93f419a180a356ea6b07ab14d2c";
+export const REMOTE_HELPER_SHA256 = "a331b76f1e336f04c71b745ee7766055a124ab0452b8f116b5511c4d9a77cc99";
 export const REMOTE_LAUNCHER_SHA256 = "643dd9424f3d7fb5cca8d9f7cbd835fb40a57e8a7e728ed1529259e92fa793c5";
 
 const MAX_REMOTE_ARGUMENT_BYTES = 16 * 1024;
-const NFS_SUPER_MAGIC = 0x6969;
+const MAX_UNIX_SOCKET_PATH_BYTES = 107;
+const SAFE_REMOTE_PATH = /^\/[A-Za-z0-9_./+-]+$/u;
 const REMOTE_HELPER_RESPONSE_PREFIX = "qiyan-helper-v1:";
 const REMOTE_HELPER_TIMEOUT_MS = 300_000;
 const helperOperations = new Set(["preflight", "bootstrap", "inspect", "start", "stop", "read-file", "write-file", "rollout-scan", "claude-rollout-scan", "workspace"]);
@@ -24,6 +26,7 @@ const preflightSchema = z.object({
   uid: z.number().int().positive(),
   home: z.string().startsWith("/"),
   shell: z.string().regex(/^\/[A-Za-z0-9_./+-]+$/u),
+  runtimeBase: z.string(),
 }).strict();
 const inspectSchema = z.discriminatedUnion("status", [
   z.object({ status: z.literal("absent") }).strict(),
@@ -69,27 +72,26 @@ export async function attestUserControlMaster(
     if (!controlPath || resolve(controlPath) !== controlPath) throw new Error("invalid path");
     parent = dirname(controlPath);
     if (await realpath(parent) !== parent) throw new Error("aliased parent");
-    const [directory, fileSystem] = await Promise.all([
+    const [directory] = await Promise.all([
       lstat(parent),
       inspectFileSystem(parent),
     ]);
     if (!directory.isDirectory() || directory.isSymbolicLink() || (directory.mode & 0o077) !== 0
-      || (uid !== undefined && directory.uid !== uid)
-      || Number(fileSystem.type) === NFS_SUPER_MAGIC) {
+      || (uid !== undefined && directory.uid !== uid)) {
       throw new Error("unsafe identity");
     }
   } catch {
-    throw new AppError("CONFIGURATION_ERROR", "unsafe user-owned SSH ControlMaster; use a private local filesystem");
+    throw new AppError("CONFIGURATION_ERROR", "unsafe user-owned SSH ControlMaster; use a private filesystem");
   }
   let socket;
   try { socket = await lstat(controlPath!); }
   catch (error) {
     if (isErrno(error, "ENOENT")) return;
-    throw new AppError("CONFIGURATION_ERROR", "unsafe user-owned SSH ControlMaster; use a private local filesystem");
+    throw new AppError("CONFIGURATION_ERROR", "unsafe user-owned SSH ControlMaster; use a private filesystem");
   }
   if (!socket.isSocket() || socket.isSymbolicLink() || (socket.mode & 0o077) !== 0
     || (uid !== undefined && socket.uid !== uid)) {
-    throw new AppError("CONFIGURATION_ERROR", "unsafe user-owned SSH ControlMaster; use a private local filesystem");
+    throw new AppError("CONFIGURATION_ERROR", "unsafe user-owned SSH ControlMaster; use a private filesystem");
   }
 }
 
@@ -106,6 +108,7 @@ export interface SshRuntimeController {
 // worker file bridge, ownership scan). A Codex remote satisfies this via SshRuntime; a
 // Claude remote (no app-server) builds a lean one over the same bootstrapped helper.
 export interface RemoteHost {
+  readonly remoteUid: number;
   readonly remoteHome: string;
   readonly remoteRuntimeDir: string;
   readonly remoteHelperPath: string;
@@ -124,10 +127,12 @@ export async function prepareRemoteHost(options: {
   if (!/^[a-z0-9][a-z0-9_-]{0,63}$/u.test(options.endpointId)) throw new AppError("CONFIGURATION_ERROR", "invalid SSH endpoint ID");
   const preflight = preflightSchema.parse(await options.remote.invoke("preflight", []));
   const endpointHash = createHash("sha256").update(options.endpointId).digest("hex").slice(0, 24);
-  const remoteRuntimeDir = `/tmp/qiyan-${preflight.uid}/${endpointHash}`;
+  const runtimeBase = validateRemoteRuntimeBase(preflight.runtimeBase, preflight.uid, endpointHash);
+  const remoteRuntimeDir = posix.join(runtimeBase, endpointHash);
   const assets = await loadRemoteAssets(options.assetRoot);
   await options.remote.bootstrap({ runtimeDir: remoteRuntimeDir, ...assets });
   return {
+    remoteUid: preflight.uid,
     remoteHome: preflight.home,
     remoteRuntimeDir,
     remoteHelperPath: `${remoteRuntimeDir}/qiyan-ssh-helper.mjs`,
@@ -137,7 +142,13 @@ export async function prepareRemoteHost(options: {
 }
 
 export class SshRuntime implements SshRuntimeController, RemoteHost {
-  private prepared?: { runtimeDir: string; helperPath: string; session: string; shell: string; home: string };
+  private prepared?: {
+    host: RemoteHost;
+    runtimeDir: string;
+    session: string;
+    shell: string;
+    tmuxMode: "explicit" | "legacy";
+  };
 
   constructor(private readonly options: { endpointId: string; remote: RemoteRuntimeClient; assetRoot?: string }) {
     if (!/^[a-z0-9][a-z0-9_-]{0,63}$/u.test(options.endpointId)) throw new AppError("CONFIGURATION_ERROR", "invalid SSH endpoint ID");
@@ -149,15 +160,19 @@ export class SshRuntime implements SshRuntimeController, RemoteHost {
   }
   get remoteHelperPath(): string {
     if (!this.prepared) throw new AppError("ENDPOINT_UNAVAILABLE", "SSH runtime is not prepared");
-    return this.prepared.helperPath;
+    return this.prepared.host.remoteHelperPath;
   }
   get remoteRuntimeDir(): string {
     if (!this.prepared) throw new AppError("ENDPOINT_UNAVAILABLE", "SSH runtime is not prepared");
-    return this.prepared.runtimeDir;
+    return this.prepared.host.remoteRuntimeDir;
   }
   get remoteHome(): string {
     if (!this.prepared) throw new AppError("ENDPOINT_UNAVAILABLE", "SSH runtime is not prepared");
-    return this.prepared.home;
+    return this.prepared.host.remoteHome;
+  }
+  get remoteUid(): number {
+    if (!this.prepared) throw new AppError("ENDPOINT_UNAVAILABLE", "SSH runtime is not prepared");
+    return this.prepared.host.remoteUid;
   }
   get remote(): RemoteRuntimeClient { return this.options.remote; }
 
@@ -166,12 +181,17 @@ export class SshRuntime implements SshRuntimeController, RemoteHost {
     const current = await this.inspectPrepared(prepared);
     if (current.status === "healthy") return current.identity;
     if (current.status === "unhealthy") throw new AppError("ENDPOINT_UNAVAILABLE", `existing SSH runtime is unhealthy: ${this.options.endpointId}`);
+    if (prepared.tmuxMode === "legacy") {
+      delete this.prepared;
+      return this.ensureStarted();
+    }
     const result = await this.options.remote.invoke<{ identity: unknown }>("start", [JSON.stringify({
       runtimeDir: prepared.runtimeDir,
       session: prepared.session,
       shell: prepared.shell,
+      tmuxMode: prepared.tmuxMode,
       token: randomBytes(16).toString("hex"),
-    })], prepared.helperPath);
+    })], prepared.host.remoteHelperPath);
     return parseRuntimeIdentity(result.identity);
   }
 
@@ -191,7 +211,15 @@ export class SshRuntime implements SshRuntimeController, RemoteHost {
   async stop(expectedIdentity: RuntimeIdentity): Promise<void> {
     const prepared = await this.prepare();
     if (expectedIdentity?.kind !== "ssh") throw new AppError("OPERATION_CONFLICT", "exact SSH runtime identity is required for shutdown");
-    try { await this.options.remote.invoke("stop", [JSON.stringify({ runtimeDir: prepared.runtimeDir, session: prepared.session, expected: expectedIdentity })], prepared.helperPath); }
+    try {
+      await this.options.remote.invoke("stop", [JSON.stringify({
+        runtimeDir: prepared.runtimeDir,
+        session: prepared.session,
+        tmuxMode: prepared.tmuxMode,
+        expected: expectedIdentity,
+      })], prepared.host.remoteHelperPath);
+      if (prepared.tmuxMode === "legacy") delete this.prepared;
+    }
     finally { await this.closeTransport(); }
   }
 
@@ -201,22 +229,36 @@ export class SshRuntime implements SshRuntimeController, RemoteHost {
     if (this.prepared) return this.prepared;
     const host = await prepareRemoteHost({ endpointId: this.options.endpointId, remote: this.options.remote, ...(this.options.assetRoot ? { assetRoot: this.options.assetRoot } : {}) });
     const endpointHash = createHash("sha256").update(this.options.endpointId).digest("hex").slice(0, 24);
-    this.prepared = {
+    const shared = {
+      host,
       runtimeDir: host.remoteRuntimeDir,
-      helperPath: host.remoteHelperPath,
       session: `qiyan-${endpointHash}`,
       shell: host.shell,
-      home: host.remoteHome,
+      tmuxMode: "explicit" as const,
     };
-    return this.prepared;
+    const legacy = {
+      ...shared,
+      runtimeDir: `/tmp/qiyan-${host.remoteUid}/${endpointHash}`,
+      tmuxMode: "legacy" as const,
+    };
+    const sharedState = await this.inspectPrepared(shared);
+    if (shared.runtimeDir !== legacy.runtimeDir && sharedState.status !== "absent") return (this.prepared = shared);
+    const legacyState = await this.inspectPrepared(legacy);
+    if (shared.runtimeDir === legacy.runtimeDir) {
+      if (sharedState.status === "healthy") return (this.prepared = shared);
+      if (legacyState.status === "healthy") return (this.prepared = legacy);
+      if (sharedState.status === "unhealthy") return (this.prepared = shared);
+      if (legacyState.status === "unhealthy") return (this.prepared = legacy);
+    }
+    return (this.prepared = legacyState.status === "absent" ? shared : legacy);
   }
 
   private async inspectPrepared(prepared: NonNullable<SshRuntime["prepared"]>): Promise<
     { status: "absent" } | { status: "unhealthy"; identity?: RuntimeIdentity } | { status: "healthy"; identity: RuntimeIdentity }
   > {
     const parsed = inspectSchema.parse(await this.options.remote.invoke("inspect", [JSON.stringify({
-      runtimeDir: prepared.runtimeDir, session: prepared.session,
-    })], prepared.helperPath));
+      runtimeDir: prepared.runtimeDir, session: prepared.session, tmuxMode: prepared.tmuxMode,
+    })], prepared.host.remoteHelperPath));
     if (parsed.status === "unhealthy") return { status: "unhealthy", ...(parsed.identity === undefined ? {} : { identity: parseRuntimeIdentity(parsed.identity) }) };
     if (parsed.status !== "healthy") return parsed;
     return { status: "healthy", identity: parseRuntimeIdentity(parsed.identity) };
@@ -224,12 +266,17 @@ export class SshRuntime implements SshRuntimeController, RemoteHost {
 }
 
 export class SshRemoteClient implements RemoteRuntimeClient {
+  private readonly helperProgram: string;
+
   constructor(private readonly options: {
     plan: SshConnectionPlan;
     sshBinary?: string;
     helperSource: Buffer;
     run?: typeof runBoundedProcess;
-  }) {}
+  }) {
+    requireDigest(options.helperSource, REMOTE_HELPER_SHA256);
+    this.helperProgram = gzipSync(options.helperSource).toString("base64url");
+  }
 
   async bootstrap(payload: RemoteBootstrapPayload): Promise<void> {
     const value = JSON.stringify({
@@ -239,15 +286,13 @@ export class SshRemoteClient implements RemoteRuntimeClient {
       launcherBase64: payload.launcher.toString("base64url"),
       launcherSha256: REMOTE_LAUNCHER_SHA256,
     });
-    await this.execute(["node", "-", "bootstrap", encodeRemoteBootstrapArgument(value)], this.options.helperSource);
+    await this.executeHelper("bootstrap", [encodeRemoteBootstrapArgument(value)]);
   }
 
   async invoke<T>(operation: string, args: readonly string[], installedHelperPath?: string): Promise<T> {
     if (!helperOperations.has(operation)) throw new AppError("CONFIGURATION_ERROR", "unsupported SSH helper operation");
-    const command = installedHelperPath
-      ? buildInstalledHelperCommand(installedHelperPath, operation, args)
-      : ["node", "-", operation, ...args.map(encodeRemoteArgument)];
-    const result = await this.execute(command, installedHelperPath ? undefined : this.options.helperSource);
+    if (installedHelperPath) validateInstalledHelperPath(installedHelperPath);
+    const result = await this.executeHelper(operation, args.map(encodeRemoteArgument));
     return parseRemoteHelperResponse<T>(result.stdout, operation);
   }
 
@@ -257,8 +302,14 @@ export class SshRemoteClient implements RemoteRuntimeClient {
     options: { input?: AsyncIterable<Uint8Array | string>; maxOutputBytes: number; timeoutMs?: number },
     installedHelperPath: string,
   ): Promise<T> {
-    const command = buildInstalledHelperCommand(installedHelperPath, operation, args);
-    const result = await this.executePrepared(command, options.input, options.maxOutputBytes, options.timeoutMs ?? REMOTE_HELPER_TIMEOUT_MS);
+    validateInstalledHelperPath(installedHelperPath);
+    const result = await this.executeHelper(
+      operation,
+      args.map(encodeRemoteArgument),
+      options.input,
+      options.maxOutputBytes,
+      options.timeoutMs ?? REMOTE_HELPER_TIMEOUT_MS,
+    );
     return parseRemoteHelperResponse<T>(result.stdout, operation);
   }
 
@@ -270,12 +321,9 @@ export class SshRemoteClient implements RemoteRuntimeClient {
     }).catch(() => undefined);
   }
 
-  private execute(command: readonly string[], input?: Buffer): Promise<BoundedProcessResult> {
-    return this.executePrepared(command, input);
-  }
-
-  private async executePrepared(
-    command: readonly string[],
+  private async executeHelper(
+    operation: string,
+    encodedArgs: readonly string[],
     input?: Uint8Array | AsyncIterable<Uint8Array | string>,
     maxOutputBytes = 1024 * 1024,
     timeoutMs = REMOTE_HELPER_TIMEOUT_MS,
@@ -291,7 +339,12 @@ export class SshRemoteClient implements RemoteRuntimeClient {
     }
     const run = this.options.run ?? runBoundedProcess;
     if (!this.options.plan.ownsControlMaster) await attestUserControlMaster(this.options.plan);
-    return run(this.options.sshBinary ?? "ssh", buildSshRemoteArgs(this.options.plan, command), {
+    const args = buildSshRemoteNodeProgramArgs(
+      this.options.plan,
+      this.helperProgram,
+      [operation, ...encodedArgs],
+    );
+    return run(this.options.sshBinary ?? "ssh", args, {
       timeoutMs,
       maxOutputBytes,
       ...(input ? { input } : {}),
@@ -331,11 +384,29 @@ export function parseRemoteHelperResponse<T = unknown>(stdout: Buffer, operation
   catch { throw invalidHelperResponse(operation); }
 }
 
-export function buildInstalledHelperCommand(helperPath: string, operation: string, args: readonly string[]): string[] {
-  if (!/^\/tmp\/qiyan-\d+\/[a-f0-9]{24}\/qiyan-ssh-helper\.mjs$/u.test(helperPath) || !helperOperations.has(operation)) {
-    throw new AppError("CONFIGURATION_ERROR", "invalid installed SSH helper invocation");
+export function validateInstalledHelperPath(helperPath: string): void {
+  const parent = posix.dirname(helperPath);
+  if (!SAFE_REMOTE_PATH.test(helperPath)
+    || !posix.isAbsolute(helperPath)
+    || posix.normalize(helperPath) !== helperPath
+    || posix.basename(helperPath) !== "qiyan-ssh-helper.mjs"
+    || !/^[a-f0-9]{24}$/u.test(posix.basename(parent))) {
+    throw new AppError("CONFIGURATION_ERROR", "invalid installed SSH helper path");
   }
-  return ["node", helperPath, operation, ...args.map(encodeRemoteArgument)];
+}
+
+function validateRemoteRuntimeBase(value: string, uid: number, endpointHash: string): string {
+  const fallback = `/tmp/qiyan-${uid}`;
+  const shared = value.endsWith("/qiyan-bot") && value.length > "/qiyan-bot".length;
+  const socketPath = posix.join(value, endpointHash, "app-server.sock");
+  if (!SAFE_REMOTE_PATH.test(value)
+    || !posix.isAbsolute(value)
+    || posix.normalize(value) !== value
+    || (value !== fallback && !shared)
+    || Buffer.byteLength(socketPath) > MAX_UNIX_SOCKET_PATH_BYTES) {
+    throw new AppError("CONFIGURATION_ERROR", "remote preflight returned an invalid runtime base");
+  }
+  return value;
 }
 
 async function loadRemoteAssets(root?: string): Promise<RemoteAssets> {

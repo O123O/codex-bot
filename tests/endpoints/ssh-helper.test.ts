@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash, randomBytes } from "node:crypto";
-import { appendFile, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { appendFile, chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Readable } from "node:stream";
@@ -8,10 +8,11 @@ import test from "node:test";
 import {
   REMOTE_HELPER_SHA256,
   REMOTE_LAUNCHER_SHA256,
-  buildInstalledHelperCommand,
+  SshRemoteClient,
   encodeRemoteBootstrapArgument,
   encodeRemoteArgument,
   parseRemoteHelperResponse,
+  validateInstalledHelperPath,
 } from "../../src/endpoints/ssh-runtime.ts";
 import { runBoundedProcess } from "../../src/endpoints/ssh-process.ts";
 
@@ -24,16 +25,19 @@ test("packaged remote assets match their pinned digests", async () => {
   assert.equal(digest(await readFile(launcherPath)), REMOTE_LAUNCHER_SHA256);
 });
 
-test("installed helper commands contain only fixed safe tokens and encoded data", () => {
-  const hostile = "folder/'\" $() `x`\n你好";
-  const command = buildInstalledHelperCommand("/tmp/qiyan-1000/abcdef0123456789abcdef01/qiyan-ssh-helper.mjs", "inspect", [hostile]);
-  assert.deepEqual(command.slice(0, 2), ["node", "/tmp/qiyan-1000/abcdef0123456789abcdef01/qiyan-ssh-helper.mjs"]);
-  assert.equal(command.join(" ").includes(hostile), false);
-  for (const token of command) assert.match(token, /^[A-Za-z0-9_./-]+$/u);
+test("installed helper locators accept normalized fallback and shared paths", () => {
+  assert.doesNotThrow(() => validateInstalledHelperPath("/tmp/qiyan-1000/abcdef0123456789abcdef01/qiyan-ssh-helper.mjs"));
+  assert.doesNotThrow(() => validateInstalledHelperPath("/run/user/1000/qiyan-bot/abcdef0123456789abcdef01/qiyan-ssh-helper.mjs"));
+  assert.throws(
+    () => validateInstalledHelperPath("/run/user/1000/qiyan-bot/../abcdef0123456789abcdef01/qiyan-ssh-helper.mjs"),
+    /invalid/u,
+  );
 });
 
-test("the helper hard-codes the isolated tmux server and disables user tmux config", async () => {
+test("the helper uses explicit shared tmux sockets, retains legacy inspection, and disables user tmux config", async () => {
   const helper = await readFile(helperPath, "utf8");
+  assert.match(helper, /"-S", paths\.tmuxSocketPath, "-f", "\/dev\/null"/u);
+  assert.match(helper, /tmuxMode === "legacy"/u);
   assert.match(helper, /"-L", "qiyan-bot", "-f", "\/dev\/null"/u);
   assert.doesNotMatch(helper, /kill-server/u);
   assert.doesNotMatch(helper, /shell:\s*true/u);
@@ -41,6 +45,118 @@ test("the helper hard-codes the isolated tmux server and disables user tmux conf
   const launcher = await readFile(launcherPath, "utf8");
   assert.match(launcher, /QIYAN_RUNTIME_TOKEN/u);
   assert.match(helper, /processHasToken/u);
+});
+
+test("preflight selects a private XDG runtime and falls back when it is no longer private", async (t) => {
+  const uid = process.getuid?.();
+  assert.ok(uid);
+  const xdg = await mkdtemp(join(tmpdir(), "qiyan-remote-xdg-"));
+  t.after(() => rm(xdg, { recursive: true, force: true }));
+  await chmod(xdg, 0o700);
+  const preflight = async () => {
+    const result = await runBoundedProcess("env", [`XDG_RUNTIME_DIR=${xdg}`, process.execPath, helperPath.pathname, "preflight"], {
+      timeoutMs: 5_000, maxOutputBytes: 64 * 1024,
+    });
+    return parseRemoteHelperResponse<{ runtimeBase: string }>(result.stdout, "preflight");
+  };
+
+  assert.equal((await preflight()).runtimeBase, `${xdg}/qiyan-bot`);
+  await chmod(xdg, 0o755);
+  assert.equal((await preflight()).runtimeBase, `/tmp/qiyan-${uid}`);
+});
+
+test("every shared runtime operation re-attests its XDG root", async (t) => {
+  const xdg = await mkdtemp(join(tmpdir(), "qiyan-remote-attest-"));
+  t.after(() => rm(xdg, { recursive: true, force: true }));
+  await chmod(xdg, 0o700);
+  const runtimeDir = `${xdg}/qiyan-bot/${randomBytes(12).toString("hex")}`;
+  const helper = await readFile(helperPath);
+  const launcher = await readFile(launcherPath);
+  const bootstrap = encodeRemoteBootstrapArgument(JSON.stringify({
+    runtimeDir,
+    helperBase64: helper.toString("base64url"),
+    helperSha256: REMOTE_HELPER_SHA256,
+    launcherBase64: launcher.toString("base64url"),
+    launcherSha256: REMOTE_LAUNCHER_SHA256,
+  }));
+  await runBoundedProcess("env", [`XDG_RUNTIME_DIR=${xdg}`, process.execPath, helperPath.pathname, "bootstrap", bootstrap], {
+    timeoutMs: 5_000, maxOutputBytes: 64 * 1024,
+  });
+  await chmod(xdg, 0o755);
+  const inspect = encodeRemoteArgument(JSON.stringify({ runtimeDir, session: `qiyan-${runtimeDir.slice(-24)}`, tmuxMode: "explicit" }));
+  await assert.rejects(
+    runBoundedProcess("env", [`XDG_RUNTIME_DIR=${xdg}`, `${runtimeDir}/qiyan-ssh-helper.mjs`, "inspect", inspect], {
+      timeoutMs: 5_000, maxOutputBytes: 64 * 1024,
+    }),
+    /failed/u,
+  );
+});
+
+test("an unsafe XDG replacement cannot execute cached helper bytes", async (t) => {
+  const xdg = await mkdtemp(join(tmpdir(), "qiyan-trusted-helper-"));
+  t.after(() => rm(xdg, { recursive: true, force: true }));
+  await chmod(xdg, 0o700);
+  const endpointHash = randomBytes(12).toString("hex");
+  const runtimeDir = `${xdg}/qiyan-bot/${endpointHash}`;
+  const controlPath = join(xdg, "control", "master");
+  const helper = await readFile(helperPath);
+  const launcher = await readFile(launcherPath);
+  const remote = new SshRemoteClient({
+    plan: {
+      alias: "local-fixture",
+      destination: { hostname: "localhost", user: "fixture", port: 22 },
+      commonArgs: [],
+      controlPath,
+      ownsControlMaster: true,
+    },
+    helperSource: helper,
+    run: async (_command, args, options) => {
+      const alias = args.lastIndexOf("local-fixture");
+      assert.notEqual(alias, -1);
+      return runBoundedProcess("env", [
+        `XDG_RUNTIME_DIR=${xdg}`,
+        "sh", "-c", args.slice(alias + 1).join(" "),
+      ], options);
+    },
+  });
+  await remote.bootstrap({ runtimeDir, helper, launcher });
+  const upload = Buffer.from("trusted-program-upload");
+  const uploadSha = createHash("sha256").update(upload).digest("hex");
+  const uploaded = await remote.invokeTransfer<{ path: string }>("write-file", [JSON.stringify({
+    runtimeDir, size: upload.byteLength, sha256: uploadSha,
+  })], { input: Readable.from([upload]), maxOutputBytes: 64 * 1024 }, join(runtimeDir, "qiyan-ssh-helper.mjs"));
+  assert.equal(await readFile(uploaded.path, "utf8"), upload.toString());
+  const marker = join(xdg, "cached-helper-executed");
+  const installedHelper = join(runtimeDir, "qiyan-ssh-helper.mjs");
+  await writeFile(installedHelper, [
+    'import { writeFileSync } from "node:fs";',
+    `writeFileSync(${JSON.stringify(marker)}, "executed");`,
+    'process.stdout.write(`qiyan-helper-v1:{"status":"absent"}\\n`);',
+  ].join("\n"), { mode: 0o700 });
+  await chmod(xdg, 0o755);
+
+  await assert.rejects(remote.invoke("inspect", [JSON.stringify({
+    runtimeDir, session: `qiyan-${endpointHash}`, tmuxMode: "explicit",
+  })], installedHelper), /failed|unsafe|invalid/iu);
+  await assert.rejects(stat(marker));
+});
+
+test("the fallback rejects an untrusted-writable non-sticky temporary root", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "qiyan-unsafe-fallback-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await chmod(root, 0o777);
+  const source = await readFile(helperPath, "utf8");
+  const rewritten = source.replace('const root = "/tmp";', `const root = ${JSON.stringify(root)};`);
+  assert.notEqual(rewritten, source);
+  const mockedHelper = join(root, "qiyan-ssh-helper.mjs");
+  await writeFile(mockedHelper, rewritten, { mode: 0o700 });
+
+  await assert.rejects(
+    runBoundedProcess("env", ["-u", "XDG_RUNTIME_DIR", process.execPath, mockedHelper, "preflight"], {
+      timeoutMs: 5_000, maxOutputBytes: 64 * 1024,
+    }),
+    /failed/u,
+  );
 });
 
 test("the remote app-server launcher retains one bounded owner-only diagnostic generation", async (t) => {
@@ -141,7 +257,9 @@ test("the packaged helper bootstraps owner-only assets and inspects an absent is
   assert.equal((await stat(runtimeDir)).mode & 0o777, 0o700);
   assert.equal((await stat(`${runtimeDir}/qiyan-ssh-helper.mjs`)).mode & 0o777, 0o700);
   assert.equal((await stat(`${runtimeDir}/qiyan-app-server-launcher.sh`)).mode & 0o777, 0o700);
-  const inspectArg = encodeRemoteArgument(JSON.stringify({ runtimeDir, session: `qiyan-${runtimeDir.slice(-24)}` }));
+  const inspectArg = encodeRemoteArgument(JSON.stringify({
+    runtimeDir, session: `qiyan-${runtimeDir.slice(-24)}`, tmuxMode: "explicit",
+  }));
   const inspected = await runBoundedProcess(process.execPath, [`${runtimeDir}/qiyan-ssh-helper.mjs`, "inspect", inspectArg], { timeoutMs: 5_000, maxOutputBytes: 64 * 1024 });
   assert.deepEqual(parseRemoteHelperResponse(inspected.stdout, "inspect"), { status: "absent" });
 
