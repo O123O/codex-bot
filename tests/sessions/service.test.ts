@@ -20,11 +20,13 @@ import { DeliveryStore } from "../../src/storage/delivery-store.ts";
 import { SessionControlStore } from "../../src/storage/session-control-store.ts";
 import { ManagedEpochStore } from "../../src/storage/managed-epoch-store.ts";
 import { SessionDashboardStore } from "../../src/storage/session-dashboard-store.ts";
+import type { EndpointManager } from "../../src/endpoints/manager.ts";
+import type { EndpointWorkLease, ManagedAppServerEndpoint } from "../../src/endpoints/types.ts";
 
 const mappingId = "mapping-1";
 
 class ServiceEndpoint implements AppServerEndpoint {
-  readonly id = "local";
+  readonly id: string;
   state: AppServerEndpoint["state"] = "ready";
   readonly calls: Array<{ method: string; params: any }> = [];
   status = "idle";
@@ -45,6 +47,7 @@ class ServiceEndpoint implements AppServerEndpoint {
   rejectNextGoalGet = false;
   legacyItemsUnsupported = false;
   onTurnStart: (() => void) | undefined;
+  constructor(id = "local") { this.id = id; }
   private historyTurns(): any[] {
     return this.threadTurns ?? (this.lastClientId ? [{
       id: "started-1",
@@ -130,20 +133,23 @@ class ServiceEndpoint implements AppServerEndpoint {
 async function fixture(ownership?: {
   inspect(identity: { endpoint: string; thread_id: string; mapping_id: string }): Promise<OwnershipInspection>;
   authorizeTurn?(identity: { endpoint: string; thread_id: string; mapping_id: string }, turnId: string): void;
-}) {
+}, options: { coldEndpoint?: boolean } = {}) {
   const dir = await realpath(await mkdtemp(join(tmpdir(), "qiyan-bot-service-")));
+  const endpointId = options.coldEndpoint ? "prenyx" : "local";
   const registry = await SessionRegistry.open(join(dir, "sessions.json"), {
     version: 3, assistant: { endpoint: "local", thread_id: "coord", project_dir: dir },
-    sessions: { payments: { endpoint: "local", thread_id: "thread", project_dir: dir, mapping_id: mappingId, lifecycle_state: "managed" } },
+    sessions: { payments: { endpoint: endpointId, thread_id: "thread", project_dir: dir, mapping_id: mappingId, lifecycle_state: "managed" } },
   });
   const db = createTestDatabase();
-  const endpoint = new ServiceEndpoint();
+  const endpoint = new ServiceEndpoint(endpointId);
   endpoint.cwd = dir;
-  const pool = new AppServerPool([endpoint], { maxConcurrentTurns: 4, reconciliationTimeoutMs: 20, reconciliationPollMs: 1 });
+  const pool = new AppServerPool(options.coldEndpoint ? [] : [endpoint], { maxConcurrentTurns: 4, reconciliationTimeoutMs: 20, reconciliationPollMs: 1 });
   const native = new NativeSessionState();
-  const nativeGeneration = pool.endpointGeneration("local").generation;
-  native.register({ endpointId: "local", threadId: "thread", mappingId }, nativeGeneration);
-  native.applyRefresh(native.captureRefresh({ endpointId: "local", threadId: "thread", mappingId }, nativeGeneration), { status: "idle" });
+  const nativeGeneration = options.coldEndpoint ? 0 : pool.endpointGeneration("local").generation;
+  if (!options.coldEndpoint) {
+    native.register({ endpointId: "local", threadId: "thread", mappingId }, nativeGeneration);
+    native.applyRefresh(native.captureRefresh({ endpointId: "local", threadId: "thread", mappingId }, nativeGeneration), { status: "idle" });
+  }
   const controls = new SessionControlStore(db);
   const finals = new FinalMessageStore(db);
   const deliveries = new DeliveryStore(db);
@@ -155,7 +161,27 @@ async function fixture(ownership?: {
     assertDispatchable: async () => { onWorkspaceCheck?.(); await workspaceBarrier; if (workspaceFailure) throw workspaceFailure; },
   };
   const gate = new ThreadGate();
-  const service = new SessionService(pool, registry, native, controls, finals, deliveries, workspaces, gate, undefined, ownership);
+  let leaseAcquisitions = 0;
+  let coldGeneration: number | undefined;
+  const coldLease = (): EndpointWorkLease => {
+    coldGeneration ??= pool.replaceEndpoint(endpoint);
+    return { endpointId, endpointGeneration: coldGeneration, lifecycleGeneration: 1, leaseId: "cold-status-lease" };
+  };
+  const endpoints = options.coldEndpoint ? {
+    withWorkLease: async <T>(id: string, _kind: "rpc" | "session-mutation" | "file-transfer", run: (managed: ManagedAppServerEndpoint, lease: EndpointWorkLease) => Promise<T>): Promise<T> => {
+      assert.equal(id, endpointId);
+      leaseAcquisitions += 1;
+      return run(endpoint as unknown as ManagedAppServerEndpoint, coldLease());
+    },
+    runWithWorkLease: async <T>(id: string, existing: EndpointWorkLease | undefined, run: (lease: EndpointWorkLease | undefined) => Promise<T>): Promise<T> => {
+      assert.equal(id, endpointId);
+      if (!existing) leaseAcquisitions += 1;
+      else assert.equal(existing.leaseId, "cold-status-lease");
+      return run(existing ?? coldLease());
+    },
+  } satisfies Pick<EndpointManager, "withWorkLease" | "runWithWorkLease"> : undefined;
+  if (endpoints) pool.setWorkLeaseProvider((id, lease, run) => endpoints.runWithWorkLease(id, lease, run));
+  const service = new SessionService(pool, registry, native, controls, finals, deliveries, workspaces, gate, endpoints, ownership);
   const observeNative = (status: "idle" | "active", turnId?: string) => {
     if (status === "active" && turnId) {
       native.observe("local", nativeGeneration, "turn/started", { threadId: "thread", turn: { id: turnId, status: "inProgress" } });
@@ -166,6 +192,7 @@ async function fixture(ownership?: {
   return {
     db, dir, endpoint, pool, registry, native, nativeGeneration, controls, finals, deliveries, service, gate, workspaces,
     observeNative,
+    leaseAcquisitions: () => leaseAcquisitions,
     failWorkspace: () => { workspaceFailure = new AppError("CONFIGURATION_ERROR", "project workspace changed unexpectedly"); },
     setWorkspaceBarrier: (barrier: Promise<void> | undefined, onCheck?: () => void) => { workspaceBarrier = barrier; onWorkspaceCheck = onCheck; },
   };
@@ -497,6 +524,17 @@ test("status composes registry, live native state, and goal", async () => {
   assert.equal("pendingSettings" in status, false);
   assert.equal("configuredSettings" in status, false);
   assert.equal(status.goal, null);
+});
+
+test("status activates a cold managed endpoint before reading its native generation", async () => {
+  const { endpoint, leaseAcquisitions, service } = await fixture(undefined, { coldEndpoint: true });
+
+  const status = await service.status("payments") as any;
+
+  assert.equal(leaseAcquisitions(), 1);
+  assert.equal(status.identity.endpoint, "prenyx");
+  assert.equal(status.nativeStatus, "idle");
+  assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/read", "thread/goal/get"]);
 });
 
 test("status derives the active turn from authoritative history without a runtime cache", async () => {

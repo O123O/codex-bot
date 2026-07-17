@@ -278,19 +278,24 @@ export class SessionService {
     observeNative?(snapshot: { nativeStatus: string; activeTurnId: string | null }): void;
   } = {}): Promise<unknown> {
     const session = this.required(nickname);
-    const current = await this.refreshNative(session);
-    const nativeStatus = current.status;
-    const activeTurnId = current.activeTurnId;
-    options.observeNative?.({ nativeStatus, activeTurnId });
-    const goal = await this.getGoal(nickname);
-    return {
-      nickname,
-      identity: { endpoint: session.endpoint, threadId: session.thread_id, projectDir: session.project_dir },
-      managementState: session.lifecycle_state,
-      nativeStatus,
-      activeTurnId,
-      goal: goal && typeof goal === "object" && "goal" in goal ? (goal as any).goal : goal ?? null,
+    const read = async (lease?: EndpointWorkLease): Promise<unknown> => {
+      const current = await this.refreshNative(session, lease);
+      const nativeStatus = current.status;
+      const activeTurnId = current.activeTurnId;
+      options.observeNative?.({ nativeStatus, activeTurnId });
+      const goal = await this.getGoal(nickname, lease);
+      return {
+        nickname,
+        identity: { endpoint: session.endpoint, threadId: session.thread_id, projectDir: session.project_dir },
+        managementState: session.lifecycle_state,
+        nativeStatus,
+        activeTurnId,
+        goal: goal && typeof goal === "object" && "goal" in goal ? (goal as any).goal : goal ?? null,
+      };
     };
+    return this.endpoints
+      ? this.endpoints.withWorkLease(session.endpoint, "rpc", (_endpoint, lease) => read(lease))
+      : read();
   }
 
   async refreshNativeState(nickname: string): Promise<void> {
@@ -335,8 +340,9 @@ export class SessionService {
     if (this.settingsPersistNatively(endpointId)) this.controls.consumeSettings(endpointId, threadId, mappingId, settings);
   }
 
-  getGoal(nickname: string): Promise<unknown> {
-    const session = this.required(nickname); return this.pool.request(session.endpoint, "thread/goal/get", { threadId: session.thread_id });
+  getGoal(nickname: string, lease?: EndpointWorkLease): Promise<unknown> {
+    const session = this.required(nickname);
+    return this.pool.request(session.endpoint, "thread/goal/get", { threadId: session.thread_id }, undefined, lease);
   }
 
   async setGoal(
