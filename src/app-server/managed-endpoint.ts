@@ -3,6 +3,7 @@ import type { LinuxProcessIdentity } from "../core/process-identity.ts";
 import { AppError } from "../core/errors.ts";
 import { parseRuntimeIdentity, type EndpointLossKind, type RuntimeIdentity } from "../endpoints/types.ts";
 import { APP_VERSION } from "../version.ts";
+import type { DynamicToolCallResponse } from "./generated/v2/DynamicToolCallResponse.ts";
 import type { RpcRequest } from "./protocol.ts";
 import { RpcClient, type RpcWire } from "./rpc-client.ts";
 import { requireMinimumCodexVersion } from "./version-compat.ts";
@@ -198,6 +199,12 @@ export class ManagedAppServerEndpoint {
       } satisfies PermissionBlockedEvent);
       if (request.method === "item/permissions/requestApproval") throw new AppError("PERMISSION_BLOCKED", "permission escalation is disabled");
       return { decision: "decline" };
+    }
+    if (request.method === "item/tool/call") {
+      return {
+        success: false,
+        contentItems: [{ type: "inputText", text: "Interactive client tools are unavailable in this managed session. Continue without this tool." }],
+      } satisfies DynamicToolCallResponse;
     }
     throw new Error(`Unhandled app-server request: ${request.method}`);
   }

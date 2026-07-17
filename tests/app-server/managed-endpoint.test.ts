@@ -125,6 +125,29 @@ test("approval handling is common to every runtime", async () => {
   });
 });
 
+test("unsupported interactive dynamic tools fail closed without leaving the turn waiting", async () => {
+  const wire = new FakeWire();
+  const endpoint = new ManagedAppServerEndpoint({
+    id: "worker", runtime: new FakeRuntime([new FakeConnection(wire, { runtime: firstIdentity })]), minimumVersion: "0.142.5",
+  });
+  await endpoint.start();
+
+  wire.receive({
+    id: 93,
+    method: "item/tool/call",
+    params: { threadId: "t", turnId: "turn", callId: "call", namespace: null, tool: "request_plugin_install", arguments: { plugin_id: "example" } },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(wire.responses.find((response) => response.id === 93), {
+    id: 93,
+    result: {
+      success: false,
+      contentItems: [{ type: "inputText", text: "Interactive client tools are unavailable in this managed session. Continue without this tool." }],
+    },
+  });
+});
+
 test("common minimum-version rejection never exposes the raw user agent", async () => {
   const wire = new FakeWire();
   wire.initialize = { userAgent: "codex_app_server/0.142.4 (DO_NOT_LEAK)" };
