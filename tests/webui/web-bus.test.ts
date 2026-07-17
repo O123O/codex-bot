@@ -43,7 +43,7 @@ test("worker delivery targets only the socket's one active subscription", () => 
   assert.equal(idle.sent.length, 0);
   assert.deepEqual(JSON.parse(one.sent[0]!), {
     type: "worker/event", nickname: "one", requestId: first.requestId,
-    subscriptionId: first.subscriptionId,
+    subscriptionId: first.subscriptionId, streamId: first.subscriptionId, seq: 1,
     event: { kind: "agent-message-delta", turnId: "turn", itemId: "item", delta: "hello" },
   });
 
@@ -73,7 +73,7 @@ test("unsubscribe, socket removal, and mapping invalidation clear exact subscrip
   assert.deepEqual(new Set(removed), new Set([first.subscriptionId, second.subscriptionId]));
 });
 
-test("a slow worker socket is closed before its outbound queue exceeds the cap", () => {
+test("a slow worker socket detaches for bounded replay before its outbound queue exceeds the cap", () => {
   const bus = new WebBus();
   const slow = socket(); slow.bufferedAmount = 1024 * 1024;
   bus.add(slow as unknown as WebSocket);
@@ -81,7 +81,71 @@ test("a slow worker socket is closed before its outbound queue exceeds the cap",
 
   bus.publishWorker("local", "t1", { kind: "agent-message-delta", turnId: "turn", itemId: "item", delta: "x" });
 
-  assert.equal(bus.subscription(subscription.subscriptionId, "one"), undefined);
+  assert.equal(bus.subscription(subscription.subscriptionId, "one")?.threadId, "t1");
   assert.deepEqual(slow.closed, [{ code: 1013, reason: "worker stream backpressure" }]);
   assert.equal(slow.sent.length, 0);
+});
+
+test("an endpoint discontinuity reaches only its active worker panels", () => {
+  const bus = new WebBus();
+  const local = socket(), remote = socket();
+  bus.add(local as unknown as WebSocket); bus.add(remote as unknown as WebSocket);
+  const localSubscription = bus.subscribe(local as unknown as WebSocket, target("one", "t1"));
+  bus.subscribe(remote as unknown as WebSocket, { ...target("two", "t2"), endpointId: "remote" });
+
+  bus.publishWorkerDiscontinuity("local");
+
+  assert.deepEqual(JSON.parse(local.sent[0]!), {
+    type: "worker/event", nickname: "one", requestId: localSubscription.requestId,
+    subscriptionId: localSubscription.subscriptionId, streamId: localSubscription.subscriptionId, seq: 1,
+    event: { kind: "stream-discontinuity" },
+  });
+  assert.equal(remote.sent.length, 0);
+});
+
+test("a foreground subscription replays sequenced events after a transient socket disconnect", () => {
+  const bus = new WebBus();
+  const firstSocket = socket();
+  bus.add(firstSocket as unknown as WebSocket);
+  const first = bus.subscribe(firstSocket as unknown as WebSocket, target("one", "t1", "11111111-1111-4111-8111-111111111111"));
+  bus.publishWorker("local", "t1", { kind: "agent-message-delta", turnId: "turn", itemId: "item", delta: "one" });
+  bus.remove(firstSocket as unknown as WebSocket);
+  bus.publishWorker("local", "t1", { kind: "agent-message-delta", turnId: "turn", itemId: "item", delta: "two" });
+
+  const replacementSocket = socket();
+  bus.add(replacementSocket as unknown as WebSocket);
+  const resumed = bus.subscribe(replacementSocket as unknown as WebSocket, target("one", "t1", "33333333-3333-4333-8333-333333333333"), {
+    subscriptionId: first.subscriptionId, afterSeq: 1,
+  });
+  assert.equal(resumed.subscriptionId, first.subscriptionId);
+  assert.equal(resumed.resumed, true);
+  assert.equal(resumed.replayGap, false);
+  assert.equal(resumed.latestSeq, 2);
+  bus.replay(resumed.subscriptionId, 1);
+
+  assert.deepEqual(replacementSocket.sent.map((payload) => {
+    const event = JSON.parse(payload);
+    return [event.seq, event.requestId, event.event.delta];
+  }), [[2, resumed.requestId, "two"]]);
+});
+
+test("bounded worker replay reports a gap instead of silently skipping events", () => {
+  const bus = new WebBus({ maxReplayEvents: 2 });
+  const firstSocket = socket();
+  bus.add(firstSocket as unknown as WebSocket);
+  const first = bus.subscribe(firstSocket as unknown as WebSocket, target("one", "t1"));
+  bus.remove(firstSocket as unknown as WebSocket);
+  for (const delta of ["one", "two", "three"]) {
+    bus.publishWorker("local", "t1", { kind: "agent-message-delta", turnId: "turn", itemId: "item", delta });
+  }
+  const replacementSocket = socket();
+  bus.add(replacementSocket as unknown as WebSocket);
+  const resumed = bus.subscribe(replacementSocket as unknown as WebSocket, target("one", "t1"), {
+    subscriptionId: first.subscriptionId, afterSeq: 0,
+  });
+  assert.equal(resumed.resumed, true);
+  assert.equal(resumed.replayGap, true);
+  assert.equal(resumed.latestSeq, 3);
+  bus.replay(resumed.subscriptionId, 0);
+  assert.equal(replacementSocket.sent.length, 0);
 });

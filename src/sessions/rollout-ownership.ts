@@ -304,6 +304,10 @@ export class SessionOwnershipGuard {
       .get(identity.endpoint, identity.thread_id, identity.mapping_id, turnId) !== undefined;
   }
 
+  managedRolloutPath(identity: MappingIdentity): string | undefined {
+    return this.row(identity)?.rolloutPath;
+  }
+
   authorizeTurn(identity: MappingIdentity, turnId: string): void {
     if (!this.row(identity)) throw ownershipUnclassified("session ownership guard is not initialized");
     this.recordOwnedTurn(identity, turnId);

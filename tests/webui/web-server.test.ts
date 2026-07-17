@@ -24,15 +24,19 @@ const reads: WebReadsDeps = {
     projectDir: "/a", lifecycleState: "managed", nativeStatus: "active", activeTurnId: "assistant-turn",
     model: "gpt-5.4", effort: "xhigh", host: "test-host", goal: null,
   }),
-  readWorkerTurns: async () => ({ turns: [
-    { id: "turn-0", status: "completed", startedAt: 0.999, completedAt: 1, items: [
-      { type: "userMessage", id: "u0", clientId: "client-u0", content: [{ type: "text", text: "do the thing" }] },
-      { type: "agentMessage", id: "a0", text: "final 0", phase: "final_answer" },
-    ] },
-    { id: "turn-1", status: "completed", startedAt: 1.0005, completedAt: 1.001, items: [
-      { type: "agentMessage", id: "a1", text: "final 1", phase: "final_answer" },
-    ] },
-  ] }),
+  readWorkerTurns: async (_endpoint, _thread, _mapping, limit, cursor) => {
+    const all = [
+      { id: "u:turn-0:u0", turnId: "turn-0", body: "do the thing", completedAt: 999, terminalStatus: "completed", turnOrder: 0, itemOrder: 0, role: "you" as const, clientId: "client-u0" },
+      { id: "a:turn-0:a0", turnId: "turn-0", body: "final 0", completedAt: 1_000, terminalStatus: "completed", turnOrder: 0, itemOrder: 1, phase: "final_answer" },
+      { id: "a:turn-1:a1", turnId: "turn-1", body: "final 1", completedAt: 1_001, terminalStatus: "completed", turnOrder: 1, itemOrder: 0, phase: "final_answer" },
+    ];
+    const end = cursor ? Number(cursor) : all.length;
+    const start = Math.max(0, end - limit);
+    return {
+      messages: all.slice(start, end), hasOlder: start > 0, ...(start > 0 ? { nextCursor: String(start) } : {}),
+      openTurnIds: [], terminalTurnIds: [...new Set(all.slice(start, end).map((message) => message.turnId))],
+    };
+  },
   listOwnerConversation: (before, limit) => {
     const convo = [{ id: "s1", role: "you" as const, body: "hi there", at: 500 }, { id: "f0", role: "assistant" as const, body: "final 0", at: 1000 }, { id: "f1", role: "assistant" as const, body: "final 1", at: 1001 }];
     const older = convo.filter((m) => before === undefined || m.at <= before); // inclusive cursor
@@ -475,5 +479,49 @@ test("the QiYan foreground can subscribe to native assistant history", async () 
     const page = await response.json() as any;
     assert.deepEqual(page.messages.map((message: any) => message.body), ["do the thing", "final 0", "final 1"]);
     ws.close();
+  });
+});
+
+test("the WebSocket protocol resumes the foreground worker stream before replaying missed events", async () => {
+  await withServer(async (base, _calls, bus) => {
+    const open = async () => {
+      const socket = new WebSocket(`${base.replace("http", "ws")}/ws?token=${TOKEN}`);
+      await new Promise<void>((resolve, reject) => { socket.once("open", resolve); socket.once("error", reject); });
+      return socket;
+    };
+    const first = await open();
+    const firstRequestId = crypto.randomUUID();
+    const firstAck = new Promise<any>((resolve) => first.on("message", (raw) => {
+      const event = JSON.parse(String(raw)); if (event.type === "worker/subscribed") resolve(event);
+    }));
+    first.send(JSON.stringify({ type: "worker/subscribe", nickname: "payments", requestId: firstRequestId }));
+    const subscribed = await firstAck;
+    bus.publishWorker("local", "t1", { kind: "agent-message-delta", turnId: "turn", itemId: "agent", delta: "one" });
+    await new Promise<void>((resolve) => first.once("message", () => resolve()));
+    first.close();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    bus.publishWorker("local", "t1", { kind: "agent-message-delta", turnId: "turn", itemId: "agent", delta: "two" });
+
+    const second = await open();
+    const requestId = crypto.randomUUID();
+    const received: any[] = [];
+    const completed = new Promise<void>((resolve) => second.on("message", (raw) => {
+      received.push(JSON.parse(String(raw)));
+      if (received.some((event) => event.type === "worker/subscribed") && received.some((event) => event.type === "worker/event")) resolve();
+    }));
+    second.send(JSON.stringify({
+      type: "worker/subscribe", nickname: "payments", requestId,
+      resumeSubscriptionId: subscribed.subscriptionId, afterSeq: 1,
+    }));
+    await completed;
+    const ack = received.find((event) => event.type === "worker/subscribed");
+    const replay = received.find((event) => event.type === "worker/event");
+    assert.equal(ack.resumed, true);
+    assert.equal(ack.replayGap, false);
+    assert.equal(ack.latestSeq, 2);
+    assert.equal(replay.seq, 2);
+    assert.equal(replay.event.delta, "two");
+    assert.ok(received.indexOf(ack) < received.indexOf(replay));
+    second.close();
   });
 });

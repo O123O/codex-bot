@@ -452,6 +452,31 @@ test("the remote helper scans rollout ownership without returning message bodies
   assert.deepEqual(parseRemoteHelperResponse<any>(result.stdout, "rollout-scan").results[0].starts, [{ turnId: "turn-remote", clientId: "ctx:call", hasUserMessage: true }]);
 });
 
+test("the remote helper returns a bounded exact Codex conversation page", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "qiyan-remote-history-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const threadId = "thread-history";
+  const path = join(root, `rollout-now-${threadId}.jsonl`);
+  await writeFile(path, [
+    JSON.stringify({ timestamp: "2026-01-01T00:00:00.000Z", type: "event_msg", payload: { type: "task_started", turn_id: "turn" } }),
+    JSON.stringify({ timestamp: "2026-01-01T00:00:01.000Z", type: "event_msg", payload: { type: "user_message", message: "question", client_id: "client" } }),
+    JSON.stringify({ timestamp: "2026-01-01T00:00:02.000Z", type: "response_item", payload: { type: "message", role: "assistant", id: "agent", phase: "commentary", content: [{ type: "output_text", text: "answer" }] } }),
+    "",
+  ].join("\n"));
+  const argument = encodeRemoteArgument(JSON.stringify({ path, threadId, limit: 20 }));
+
+  const result = await runBoundedProcess(process.execPath, [helperPath.pathname, "codex-history", argument], {
+    timeoutMs: 5_000, maxOutputBytes: 1024 * 1024,
+  });
+
+  assert.deepEqual(parseRemoteHelperResponse<any>(result.stdout, "codex-history").messages.map((message: any) => ({
+    id: message.id, turnId: message.turnId, body: message.body, clientId: message.clientId, phase: message.phase,
+  })), [
+    { id: "u:turn:client", turnId: "turn", body: "question", clientId: "client", phase: undefined },
+    { id: "a:turn:agent", turnId: "turn", body: "answer", clientId: undefined, phase: "commentary" },
+  ]);
+});
+
 test("the remote helper reports an allowed missing rollout without masking it as SSH failure", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "qiyan-remote-rollout-"));
   t.after(() => rm(root, { recursive: true, force: true }));

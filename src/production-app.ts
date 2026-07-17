@@ -77,7 +77,8 @@ import { SessionDiscovery } from "./sessions/discovery.ts";
 import { FinalMessageStore } from "./sessions/final-messages.ts";
 import { SessionLifecycle } from "./sessions/lifecycle.ts";
 import { readReadyWorkerTurns } from "./webui/worker-native-read.ts";
-import { createWorkerStream, offerWorkerNotification } from "./webui/worker-stream.ts";
+import { CodexHistoryAccess } from "./webui/codex-history-access.ts";
+import { createWorkerStream, offerWorkerDiscontinuity, offerWorkerNotification } from "./webui/worker-stream.ts";
 import { OwnershipEventStore } from "./sessions/ownership-event-store.ts";
 import {
   ExternalOwnershipMonitor,
@@ -2149,6 +2150,7 @@ export async function buildProductionApp(
   let discovery!: SessionDiscovery;
   let lifecycle!: SessionLifecycle;
   let ownership!: SessionOwnershipGuard;
+  let codexHistoryAccess!: CodexHistoryAccess;
   let ownershipEvents!: OwnershipEventStore;
   let ownershipWatcher!: SessionOwnershipWatcher;
   let externalOwnershipMonitor!: ExternalOwnershipMonitor;
@@ -3019,6 +3021,14 @@ export async function buildProductionApp(
           local: isLocalEndpoint,
           scanLocalClaude: scanLocalClaudeTranscript,
         });
+        codexHistoryAccess = new CodexHistoryAccess({
+          remote: (id) => {
+            const context = remoteContexts.get(id);
+            return context ? { remote: context.remote, helperPath: context.host.remoteHelperPath } : undefined;
+          },
+          isLocal: (id) => id === assistantEndpoint.id || isLocalEndpoint(id),
+          validateLease: (id, lease) => endpointManager.validateWorkLease(lease, id),
+        });
         // A Claude session's transcript is only written by the first `claude -p`, so its
         // rollout path is unresolvable ("pending") until then — but that is terminal-safe (no
         // turn has run), not a transient binding window like Codex. Report it as "unstarted"
@@ -3188,7 +3198,11 @@ export async function buildProductionApp(
           () => reportAssistantTerminalFailure(dispatcherAvailable ? dispatcher : undefined, () => recordBackgroundFailure("assistant notification")),
         );
         }));
+        unsubscribers.push(assistantEndpoint.onReady(() => {
+          offerWorkerDiscontinuity(webWorkerStream, assistantEndpoint.id);
+        }));
         unsubscribers.push(assistantEndpoint.onUnavailable((kind) => {
+          offerWorkerDiscontinuity(webWorkerStream, assistantEndpoint.id);
           nativeSessions.invalidateEndpoint(assistantEndpoint.id, pool.endpointGeneration(assistantEndpoint.id).generation);
           assistantToolReadiness.block();
           assistant.clearActive();
@@ -3447,10 +3461,25 @@ export async function buildProductionApp(
             unsubscribeDashboard();
           };
         },
-        readWorkerTurns: (endpointId, threadId, limit, cursor, signal) => readReadyWorkerTurns({
-          withReadyWorkLease: (id, run) => endpointManager.withReadyWorkLease(id, run),
-          request: (id, method, params, requestSignal, lease) => pool.request(id, method, params, requestSignal, lease),
-        }, endpointId, threadId, limit, cursor, signal),
+        readWorkerTurns: (endpointId, threadId, mappingId, limit, cursor, signal) => {
+          if (sessionProvider(endpointId) === "claude") {
+            return readReadyWorkerTurns({
+              withReadyWorkLease: (id, run) => endpointManager.withReadyWorkLease(id, run),
+              request: (id, method, params, requestSignal, lease) => pool.request(id, method, params, requestSignal, lease),
+            }, endpointId, threadId, limit, cursor, signal);
+          }
+          const readCodexPage = async (lease?: EndpointWorkLease) => {
+            if (signal.aborted) throw signal.reason;
+            const path = ownership.managedRolloutPath({ endpoint: endpointId, thread_id: threadId, mapping_id: mappingId });
+            if (!path) return { messages: [], hasOlder: false, openTurnIds: [], terminalTurnIds: [] };
+            const page = await codexHistoryAccess.read(endpointId, { path, threadId, limit, ...(cursor ? { cursor } : {}) }, lease, signal);
+            if (signal.aborted) throw signal.reason;
+            return page;
+          };
+          return endpointId === assistantEndpoint.id
+            ? readCodexPage()
+            : endpointManager.withReadyWorkLease(endpointId, readCodexPage);
+        },
         listOwnerConversation: (before, limit) => conversations.listOwnerConversation(before, limit),
         provider: (id) => sessionProvider(id),
         host: (id) => {
@@ -4155,6 +4184,7 @@ export async function buildProductionApp(
   }
 
   function bindProjectEndpoint(target: ManagedEndpointContract, generation: number): void {
+    if (projectEndpointSubscriptions.has(target.id)) offerWorkerDiscontinuity(webWorkerStream, target.id);
     for (const unsubscribe of projectEndpointSubscriptions.get(target.id) ?? []) unsubscribe();
     const previousRetry = projectReadyRetryTimers.get(target.id);
     if (previousRetry) clearTimeout(previousRetry.timer);
@@ -4231,12 +4261,16 @@ export async function buildProductionApp(
         }
         if (!observations.accept(target.id, method, params)) runBackground(() => onNotification(target.id, method, params), () => recordBackgroundFailure("project notification"));
       }),
+      target.onReady(() => {
+        if (current()) offerWorkerDiscontinuity(webWorkerStream, target.id);
+      }),
       target.onPermissionBlocked((event) => {
         if (!current()) return;
         runBackground(() => relay.handlePermissionBlocked(target.id, event), () => recordBackgroundFailure("permission notification"));
       }),
       target.onUnavailable((kind) => {
         if (!current()) return;
+        offerWorkerDiscontinuity(webWorkerStream, target.id);
         nativeSessions.invalidateEndpoint(target.id, generation);
         runBackground(() => handleEndpointUnavailable(target, kind), () => recordBackgroundFailure("project unavailable handling"));
       }),

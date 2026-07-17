@@ -493,14 +493,23 @@ export function createWebServer(options: WebServerOptions): WebServer {
     }
     const nickname = typeof command.nickname === "string" ? command.nickname : "";
     if (command.type !== "worker/subscribe" || !NICKNAME.test(nickname)) { subscriptionError(socket, requestId, "invalid-request"); return; }
+    const resumeSubscriptionId = typeof command.resumeSubscriptionId === "string" ? command.resumeSubscriptionId : undefined;
+    const afterSeq = command.afterSeq;
+    if ((resumeSubscriptionId === undefined) !== (afterSeq === undefined)
+      || (resumeSubscriptionId !== undefined && (!UUID.test(resumeSubscriptionId)
+        || !Number.isSafeInteger(afterSeq) || Number(afterSeq) < 0))) {
+      subscriptionError(socket, requestId, "invalid-request"); return;
+    }
     const session = streamIdentity(nickname);
     if (!session) { options.bus.unsubscribe(socket); subscriptionError(socket, requestId, "unknown-worker"); return; }
     const subscription = options.bus.subscribe(socket, {
       nickname, ...session, requestId,
-    });
+    }, resumeSubscriptionId ? { subscriptionId: resumeSubscriptionId, afterSeq: Number(afterSeq) } : undefined);
     options.bus.send(socket, {
       type: "worker/subscribed", nickname, requestId,
       subscriptionId: subscription.subscriptionId, mappingId: subscription.mappingId,
+      resumed: subscription.resumed, replayGap: subscription.replayGap, latestSeq: subscription.latestSeq,
     });
+    if (subscription.resumed && !subscription.replayGap) options.bus.replay(subscription.subscriptionId, Number(afterSeq));
   }
 }

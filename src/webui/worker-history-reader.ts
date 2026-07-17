@@ -1,7 +1,5 @@
-import { Buffer } from "node:buffer";
 import type { WebBus, WorkerSubscription } from "./web-bus.ts";
 import type { StreamSessionIdentity } from "./worker-stream.ts";
-import { openWorkerTurnIds, pageWorkerConversation, terminalWorkerTurnIds } from "./worker-conversation.ts";
 
 export type WorkerHistoryErrorCode = "busy" | "cancelled" | "stale";
 
@@ -42,13 +40,11 @@ interface NativeRead {
 }
 
 export interface WorkerNativeHistoryPage {
-  turns: unknown[];
-  nextTurnCursor?: string;
-}
-
-interface WorkerHistoryCursor {
-  turnCursor?: string;
-  messageBoundary?: string;
+  messages: WorkerHistoryMessage[];
+  hasOlder: boolean;
+  nextCursor?: string;
+  openTurnIds: string[];
+  terminalTurnIds: string[];
 }
 
 interface Consumer {
@@ -69,7 +65,7 @@ function mappingCurrent(resolveSession: (nickname: string) => StreamSessionIdent
 export function createWorkerHistoryReader(deps: {
   bus: WebBus;
   resolveSession(nickname: string): StreamSessionIdentity | undefined;
-  readTurns(endpointId: string, threadId: string, limit: number, cursor: string | undefined, signal: AbortSignal): Promise<WorkerNativeHistoryPage>;
+  readTurns(endpointId: string, threadId: string, mappingId: string, limit: number, cursor: string | undefined, signal: AbortSignal): Promise<WorkerNativeHistoryPage>;
 }): WorkerHistoryReader {
   const reads = new Map<string, NativeRead>();
   const consumers = new Map<string, Consumer>();
@@ -99,13 +95,12 @@ export function createWorkerHistoryReader(deps: {
     if (!subscription || !mappingCurrent(deps.resolveSession, subscription)) throw new WorkerHistoryError("stale", "worker subscription is stale");
     if (signal?.aborted) throw new WorkerHistoryError("cancelled", "history request was cancelled");
 
-    const cursor = decodeHistoryCursor(before);
-    const key = `${identityKey(subscription)}\0${limit}\0${cursor.turnCursor ?? ""}`;
+    const key = `${identityKey(subscription)}\0${limit}\0${before ?? ""}`;
     let native = reads.get(key);
     if (!native) {
       const controller = new AbortController();
-      const created: NativeRead = { controller, consumers: new Set(), promise: Promise.resolve({ turns: [] }) };
-      created.promise = deps.readTurns(subscription.endpointId, subscription.threadId, limit, cursor.turnCursor, controller.signal)
+      const created: NativeRead = { controller, consumers: new Set(), promise: Promise.resolve({ messages: [], hasOlder: false, openTurnIds: [], terminalTurnIds: [] }) };
+      created.promise = deps.readTurns(subscription.endpointId, subscription.threadId, subscription.mappingId, limit, before, controller.signal)
         .finally(() => { if (reads.get(key) === created && created.consumers.size === 0) reads.delete(key); });
       native = created;
       reads.set(key, native);
@@ -126,23 +121,12 @@ export function createWorkerHistoryReader(deps: {
       if (!deps.bus.isSubscriptionCurrent(subscription) || !mappingCurrent(deps.resolveSession, subscription)) {
         throw new WorkerHistoryError("stale", "worker mapping changed during history read");
       }
-      const page = pageWorkerConversation(nativePage.turns, limit, cursor.messageBoundary);
-      const nextCursor = page.hasOlder && page.nextCursor
-        ? encodeHistoryCursor({ ...cursor, messageBoundary: page.nextCursor })
-        : nativePage.nextTurnCursor
-          ? encodeHistoryCursor({ turnCursor: nativePage.nextTurnCursor })
-          : undefined;
       return {
-        messages: page.messages.map((row) => ({
-          id: row.id, turnId: row.turnId, body: row.body, completedAt: row.completedAt,
-          terminalStatus: row.terminalStatus, turnOrder: row.turnOrder, itemOrder: row.itemOrder,
-          ...(row.role === "you" ? { role: "you" as const } : {}),
-          ...(row.clientId ? { clientId: row.clientId } : {}), ...(row.phase ? { phase: row.phase } : {}),
-        })),
-        hasOlder: nextCursor !== undefined,
-        ...(nextCursor ? { nextCursor } : {}),
-        openTurnIds: openWorkerTurnIds(nativePage.turns),
-        terminalTurnIds: terminalWorkerTurnIds(nativePage.turns).slice(-50),
+        messages: nativePage.messages,
+        hasOlder: nativePage.hasOlder,
+        ...(nativePage.nextCursor ? { nextCursor: nativePage.nextCursor } : {}),
+        openTurnIds: nativePage.openTurnIds,
+        terminalTurnIds: nativePage.terminalTurnIds,
       };
     } finally {
       signal?.removeEventListener("abort", abort);
@@ -160,31 +144,5 @@ export function createWorkerHistoryReader(deps: {
       for (const native of reads.values()) native.controller.abort(new WorkerHistoryError("cancelled", "history reader stopped"));
       reads.clear();
     },
-  };
-}
-
-function encodeHistoryCursor(cursor: WorkerHistoryCursor): string {
-  return Buffer.from(JSON.stringify({ v: 1, turnCursor: cursor.turnCursor ?? null, messageBoundary: cursor.messageBoundary ?? null }), "utf8")
-    .toString("base64url");
-}
-
-function decodeHistoryCursor(value: string | undefined): WorkerHistoryCursor {
-  if (value === undefined) return {};
-  if (!value || value.length > 4_096 || !/^[A-Za-z0-9_-]+$/u.test(value)) throw new Error("invalid worker history cursor");
-  let decoded: unknown;
-  try { decoded = JSON.parse(Buffer.from(value, "base64url").toString("utf8")); }
-  catch { throw new Error("invalid worker history cursor"); }
-  if (!decoded || typeof decoded !== "object" || Array.isArray(decoded)) throw new Error("invalid worker history cursor");
-  const cursor = decoded as Record<string, unknown>;
-  const turnCursor = cursor.turnCursor === null ? undefined : cursor.turnCursor;
-  const messageBoundary = cursor.messageBoundary === null ? undefined : cursor.messageBoundary;
-  if (cursor.v !== 1
-    || (turnCursor !== undefined && (typeof turnCursor !== "string" || turnCursor.length === 0 || turnCursor.length > 2_048))
-    || (messageBoundary !== undefined && (typeof messageBoundary !== "string" || messageBoundary.length === 0 || messageBoundary.length > 512))) {
-    throw new Error("invalid worker history cursor");
-  }
-  return {
-    ...(typeof turnCursor === "string" ? { turnCursor } : {}),
-    ...(typeof messageBoundary === "string" ? { messageBoundary } : {}),
   };
 }

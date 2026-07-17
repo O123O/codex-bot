@@ -145,6 +145,44 @@ test("user-owned helper and transfer calls rely on their authoritative SSH opera
   assert.equal(calls.some(({ args }) => args.includes("exit")), false);
 });
 
+test("an SSH helper invocation forwards its cancellation signal to the child process", async (t) => {
+  const { plan } = await privateUserMaster(t);
+  const controller = new AbortController();
+  let observed: AbortSignal | undefined;
+  const remote = new SshRemoteClient({
+    plan,
+    helperSource,
+    run: async (_command, _args, options) => {
+      observed = options.signal;
+      return { stdout: framedOk, stderr: Buffer.alloc(0) };
+    },
+  });
+
+  await remote.invoke("inspect", ["{}"], helperPath, { signal: controller.signal });
+  assert.equal(observed, controller.signal);
+});
+
+test("bootstrap streams packaged assets instead of placing them in SSH argv", async (t) => {
+  const { plan } = await privateUserMaster(t);
+  let observedArgs: readonly string[] = [];
+  let observedInput: Uint8Array | AsyncIterable<Uint8Array | string> | undefined;
+  const remote = new SshRemoteClient({
+    plan,
+    helperSource,
+    run: async (_command, args, options) => {
+      observedArgs = args;
+      observedInput = options.input;
+      return { stdout: framedOk, stderr: Buffer.alloc(0) };
+    },
+  });
+
+  await remote.bootstrap({ runtimeDir: "/tmp/qiyan-1000/abcdef0123456789abcdef01", helper: helperSource, launcher: Buffer.from("launcher") });
+  assert.ok(observedArgs.every((argument) => argument.length < 64 * 1024));
+  assert.ok(observedInput instanceof Uint8Array);
+  const payload = JSON.parse(Buffer.from(observedInput as Uint8Array).toString("utf8")) as { helperBase64: string };
+  assert.equal(Buffer.from(payload.helperBase64, "base64url").equals(helperSource), true);
+});
+
 test("the SSH client opens an identity-bound helper stream over the authenticated master", async (t) => {
   const { plan } = await privateUserMaster(t);
   const input = new PassThrough();

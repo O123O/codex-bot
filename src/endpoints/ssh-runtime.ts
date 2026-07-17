@@ -20,7 +20,7 @@ import {
 } from "./ssh-process.ts";
 import { parseRuntimeIdentity, type EndpointLossKind, type RuntimeIdentity } from "./types.ts";
 
-export const REMOTE_HELPER_SHA256 = "d69342b241add2190df27b67849672886252d04e6b45a9b4b560c5d85217ba9b";
+export const REMOTE_HELPER_SHA256 = "75b73bde5d818a9b19aeef8b07845f819611721fd065ba58c23ef3eb2442f868";
 export const REMOTE_LAUNCHER_SHA256 = "643dd9424f3d7fb5cca8d9f7cbd835fb40a57e8a7e728ed1529259e92fa793c5";
 export const REMOTE_APP_SERVER_PROXY_READY = Buffer.from("qiyan-app-server-proxy-v1-ready\n");
 
@@ -29,7 +29,7 @@ const MAX_UNIX_SOCKET_PATH_BYTES = 107;
 const SAFE_REMOTE_PATH = /^\/[A-Za-z0-9_./+-]+$/u;
 const REMOTE_HELPER_RESPONSE_PREFIX = "qiyan-helper-v1:";
 const REMOTE_HELPER_TIMEOUT_MS = 300_000;
-const helperOperations = new Set(["preflight", "bootstrap", "inspect", "start", "stop", "read-file", "write-file", "rollout-scan", "claude-rollout-scan", "workspace"]);
+const helperOperations = new Set(["preflight", "bootstrap", "inspect", "start", "stop", "read-file", "write-file", "rollout-scan", "claude-rollout-scan", "codex-history", "workspace"]);
 const preflightSchema = z.object({
   uid: z.number().int().positive(),
   home: z.string().startsWith("/"),
@@ -49,7 +49,7 @@ export interface RemoteAssets {
 
 export interface RemoteRuntimeClient {
   bootstrap(payload: RemoteBootstrapPayload): Promise<void>;
-  invoke<T>(operation: string, args: readonly string[], installedHelperPath?: string): Promise<T>;
+  invoke<T>(operation: string, args: readonly string[], installedHelperPath?: string, options?: { signal?: AbortSignal }): Promise<T>;
   openAppServerStream?(request: RemoteAppServerProxyRequest, installedHelperPath: string): Promise<ReadyProcessStream>;
   closeControlMaster?(): Promise<void>;
 }
@@ -312,13 +312,15 @@ export class SshRemoteClient implements RemoteRuntimeClient {
       launcherBase64: payload.launcher.toString("base64url"),
       launcherSha256: REMOTE_LAUNCHER_SHA256,
     });
-    await this.executeHelper("bootstrap", [encodeRemoteBootstrapArgument(value)]);
+    // Keep the large asset payload off argv: the pinned helper program itself is already carried
+    // there, and their combined size can exceed the host's execve limit.
+    await this.executeHelper("bootstrap", [], Buffer.from(value, "utf8"));
   }
 
-  async invoke<T>(operation: string, args: readonly string[], installedHelperPath?: string): Promise<T> {
+  async invoke<T>(operation: string, args: readonly string[], installedHelperPath?: string, options?: { signal?: AbortSignal }): Promise<T> {
     if (!helperOperations.has(operation)) throw new AppError("CONFIGURATION_ERROR", "unsupported SSH helper operation");
     if (installedHelperPath) validateInstalledHelperPath(installedHelperPath);
-    const result = await this.executeHelper(operation, args.map(encodeRemoteArgument));
+    const result = await this.executeHelper(operation, args.map(encodeRemoteArgument), undefined, 1024 * 1024, REMOTE_HELPER_TIMEOUT_MS, options?.signal);
     return parseRemoteHelperResponse<T>(result.stdout, operation);
   }
 
@@ -376,6 +378,7 @@ export class SshRemoteClient implements RemoteRuntimeClient {
     input?: Uint8Array | AsyncIterable<Uint8Array | string>,
     maxOutputBytes = 1024 * 1024,
     timeoutMs = REMOTE_HELPER_TIMEOUT_MS,
+    signal?: AbortSignal,
   ): Promise<BoundedProcessResult> {
     await this.prepareConnection();
     const run = this.options.run ?? runBoundedProcess;
@@ -389,6 +392,7 @@ export class SshRemoteClient implements RemoteRuntimeClient {
         timeoutMs,
         maxOutputBytes,
         ...(input ? { input } : {}),
+        ...(signal ? { signal } : {}),
       });
     } catch (error) {
       return this.throwFreshChannelFailure(error);
@@ -447,7 +451,7 @@ export function encodeRemoteArgument(value: string): string {
 
 export function encodeRemoteBootstrapArgument(value: string): string {
   const bytes = Buffer.from(value, "utf8");
-  if (bytes.byteLength === 0 || bytes.byteLength > 64 * 1024) throw new AppError("CONFIGURATION_ERROR", "remote bootstrap argument is too large");
+  if (bytes.byteLength === 0 || bytes.byteLength > 96 * 1024) throw new AppError("CONFIGURATION_ERROR", "remote bootstrap argument is too large");
   return bytes.toString("base64url");
 }
 

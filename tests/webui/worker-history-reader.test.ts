@@ -4,9 +4,12 @@ import type { WebSocket } from "ws";
 import { WebBus } from "../../src/webui/web-bus.ts";
 import { WorkerHistoryError, createWorkerHistoryReader } from "../../src/webui/worker-history-reader.ts";
 import { readReadyWorkerTurns } from "../../src/webui/worker-native-read.ts";
-import { JsonRpcResponseError } from "../../src/app-server/rpc-client.ts";
 
 const turn = (text = "done") => ({ id: "turn", status: "completed", startedAt: 1, completedAt: 2, items: [{ type: "agentMessage", id: "a1", text, phase: "final_answer" }] });
+const nativePage = (body = "done") => ({
+  messages: [{ id: "a:turn:a1", turnId: "turn", body, completedAt: 2_000, terminalStatus: "completed", turnOrder: 0, itemOrder: 0 }],
+  hasOlder: false, openTurnIds: [], terminalTurnIds: ["turn"],
+});
 const resolveWorker = (mappingId = "m1") => (nickname: string) => nickname === "worker"
   ? { endpointId: "local", threadId: "thread", mappingId }
   : undefined;
@@ -22,15 +25,15 @@ function subscribe(bus: WebBus, socket: WebSocket) {
 
 test("shares one native read across subscriptions but rejects overlap from the same subscription", async () => {
   const bus = new WebBus(); const first = subscribe(bus, fakeSocket()), second = subscribe(bus, fakeSocket());
-  let resolve!: (page: { turns: unknown[] }) => void; let reads = 0;
-  const pending = new Promise<{ turns: unknown[] }>((done) => { resolve = done; });
+  let resolve!: (page: ReturnType<typeof nativePage>) => void; let reads = 0;
+  const pending = new Promise<ReturnType<typeof nativePage>>((done) => { resolve = done; });
   const reader = createWorkerHistoryReader({ bus, resolveSession: resolveWorker(), readTurns: async () => { reads += 1; return pending; } });
 
   const one = reader.read(first.subscriptionId, "worker", 20);
   const two = reader.read(second.subscriptionId, "worker", 20);
   await assert.rejects(reader.read(first.subscriptionId, "worker", 20), (error) => error instanceof WorkerHistoryError && error.code === "busy");
   assert.equal(reads, 1);
-  resolve({ turns: [turn()] });
+  resolve(nativePage());
   assert.deepEqual((await one).messages.map((message) => message.body), ["done"]);
   assert.deepEqual((await two).messages.map((message) => message.body), ["done"]);
 });
@@ -40,7 +43,7 @@ test("subscription removal and HTTP cancellation detach consumers and abort the 
   let aborted = false;
   const reader = createWorkerHistoryReader({
     bus, resolveSession: resolveWorker(),
-    readTurns: async (_endpoint, _thread, _limit, _cursor, signal) => new Promise((_resolve, reject) => signal.addEventListener("abort", () => { aborted = true; reject(signal.reason); }, { once: true })),
+    readTurns: async (_endpoint, _thread, _mapping, _limit, _cursor, signal) => new Promise((_resolve, reject) => signal.addEventListener("abort", () => { aborted = true; reject(signal.reason); }, { once: true })),
   });
   const requestAbort = new AbortController();
   const read = reader.read(subscription.subscriptionId, "worker", 20, undefined, requestAbort.signal);
@@ -58,17 +61,16 @@ test("subscription removal and HTTP cancellation detach consumers and abort the 
 
 test("revalidates the complete mapping after the raw read before extracting text", async () => {
   const bus = new WebBus(); const subscription = subscribe(bus, fakeSocket());
-  let mappingId = "m1"; let resolve!: (page: { turns: unknown[] }) => void;
-  const pending = new Promise<{ turns: unknown[] }>((done) => { resolve = done; });
+  let mappingId = "m1"; let resolve!: (page: ReturnType<typeof nativePage>) => void;
+  const pending = new Promise<ReturnType<typeof nativePage>>((done) => { resolve = done; });
   const reader = createWorkerHistoryReader({ bus, resolveSession: (nickname) => resolveWorker(mappingId)(nickname), readTurns: async () => pending });
-  const item = new Proxy({ type: "agentMessage", id: "a1", phase: "final_answer" }, { get(target, key) { if (key === "text") throw new Error("text extracted"); return Reflect.get(target, key); } });
   const read = reader.read(subscription.subscriptionId, "worker", 20);
   mappingId = "m2";
-  resolve({ turns: [{ id: "turn", status: "completed", items: [item] }] });
+  resolve(nativePage("must not be returned"));
   await assert.rejects(read, (error) => error instanceof WorkerHistoryError && error.code === "stale");
 });
 
-test("ready native reads pass the atomically acquired existing lease and never activate", async () => {
+test("ready native reads request complete turns through the existing lease and never activate", async () => {
   const lease = { endpointId: "local", endpointGeneration: 3, leaseId: "lease" } as never;
   const requests: unknown[][] = [];
   const page = await readReadyWorkerTurns({
@@ -76,19 +78,23 @@ test("ready native reads pass the atomically acquired existing lease and never a
     request: async (...args) => {
       requests.push(args);
       if (args[1] === "thread/turns/list") return {
-        data: [{ ...turn(), itemsView: "summary" }], nextCursor: "older-page", backwardsCursor: null,
-      };
-      if (args[1] === "thread/items/list") return {
-        data: turn().items, nextCursor: null, backwardsCursor: null,
+        data: [{
+          ...turn(), itemsView: "full",
+          items: [
+            { type: "agentMessage", id: "a0", text: "checking", phase: "commentary" },
+            { type: "agentMessage", id: "a1", text: "done", phase: "final_answer" },
+          ],
+        }],
+        nextCursor: "older-page", backwardsCursor: null,
       };
       throw new Error(`unexpected method: ${String(args[1])}`);
     },
   }, "local", "thread", 1, undefined, new AbortController().signal);
-  assert.deepEqual((page.turns[0] as any).items.map((item: any) => item.id), ["a1"]);
-  assert.equal(typeof page.nextTurnCursor, "string");
-  assert.deepEqual(requests.map((request) => request[1]), ["thread/turns/list", "thread/items/list"]);
+  assert.deepEqual(page.messages.map((message) => message.body), ["checking", "done"]);
+  assert.equal(page.nextCursor, "older-page");
+  assert.deepEqual(requests.map((request) => request[1]), ["thread/turns/list"]);
   assert.equal((requests[0]?.[2] as any).cursor, undefined);
-  assert.equal((requests[0]?.[2] as any).itemsView, "notLoaded");
+  assert.equal((requests[0]?.[2] as any).itemsView, "full");
   assert.ok(requests.every((request) => request[0] === "local" && request[4] === lease));
   assert.equal(requests.some((request) => request[1] === "thread/read"), false);
 
@@ -100,43 +106,42 @@ test("ready native reads pass the atomically acquired existing lease and never a
   assert.equal(touched, false);
 });
 
-test("native Web UI paging caps tool-only scans and returns a continuation", async () => {
+test("native Web UI paging uses one stable turn cursor without head-relative message boundaries", async () => {
   let requests = 0;
   const page = await readReadyWorkerTurns({
     withReadyWorkLease: async (_endpoint, run) => run({ endpointId: "local", endpointGeneration: 1, leaseId: "lease" } as never),
     request: async (_endpoint, method, params) => {
       requests += 1;
-      if (method === "thread/turns/list") return {
-        data: [{ id: "turn", status: "completed", itemsView: "notLoaded", items: [] }],
-        nextCursor: "older-turn", backwardsCursor: null,
-      };
-      const cursor = (params as any).cursor;
-      const offset = cursor ? Number(String(cursor).slice(1)) : 0;
+      assert.equal(method, "thread/turns/list");
+      assert.equal((params as any).itemsView, "full");
       return {
-        data: [{ type: "reasoning", id: `tool-${offset}` }],
-        nextCursor: `i${offset + 1}`,
+        data: [{ id: "turn", status: "completed", itemsView: "full", items: [{ type: "reasoning", id: "tool" }] }],
+        nextCursor: "older",
         backwardsCursor: null,
       };
     },
   }, "local", "thread", 20, undefined, new AbortController().signal);
 
-  assert.deepEqual(page.turns, []);
-  assert.equal(typeof page.nextTurnCursor, "string");
-  assert.equal(requests, 8);
+  assert.deepEqual(page.messages, []);
+  assert.equal(page.nextCursor, "older");
+  assert.equal(requests, 1);
 });
 
-test("legacy Web UI fallback requests one exact summary turn only after item paging is unsupported", async () => {
+test("native Web UI paging never falls back to lossy summaries", async () => {
   const views: string[] = [];
   const page = await readReadyWorkerTurns({
     withReadyWorkLease: async (_endpoint, run) => run({ endpointId: "legacy", endpointGeneration: 1, leaseId: "lease" } as never),
     request: async (_endpoint, method, params) => {
-      if (method === "thread/items/list") throw new JsonRpcResponseError(-32601, "thread/items/list is not supported yet");
+      assert.equal(method, "thread/turns/list");
       const view = String((params as any).itemsView);
       views.push(view);
       return {
         data: [{
           id: "turn", status: "completed", itemsView: view,
-          items: view === "summary" ? [{ type: "userMessage", id: "user", clientId: "client", content: [{ type: "text", text: "hello" }] }] : [],
+          items: [
+            { type: "userMessage", id: "user", clientId: "client", content: [{ type: "text", text: "hello" }] },
+            { type: "agentMessage", id: "progress", text: "working", phase: "commentary" },
+          ],
         }],
         nextCursor: null,
         backwardsCursor: null,
@@ -144,8 +149,8 @@ test("legacy Web UI fallback requests one exact summary turn only after item pag
     },
   }, "legacy", "thread", 20, undefined, new AbortController().signal);
 
-  assert.deepEqual(views, ["notLoaded", "summary"]);
-  assert.deepEqual((page.turns[0] as any).items.map((item: any) => item.id), ["user"]);
+  assert.deepEqual(views, ["full"]);
+  assert.deepEqual(page.messages.map((message) => message.body), ["hello", "working"]);
 });
 
 test("history pages prove terminal turns and preserve native read failures", async () => {
@@ -160,7 +165,7 @@ test("history pages prove terminal turns and preserve native read failures", asy
   const next = subscribe(bus, fakeSocket());
   const reader = createWorkerHistoryReader({
     bus, resolveSession: resolveWorker(),
-    readTurns: async () => ({ turns: [turn()] }),
+    readTurns: async () => nativePage(),
   });
   const page = await reader.read(next.subscriptionId, "worker", 20);
   assert.deepEqual(page.terminalTurnIds, ["turn"]);

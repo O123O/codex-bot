@@ -9,9 +9,9 @@ export interface WebReadsDeps {
   assistantSession(): WebSessionSummary;
   nativeSession(endpointId: string, threadId: string, mappingId: string): NativeSessionView | undefined;
   onSessionsChanged?(listener: () => void): () => void;
-  // Raw native turns for the active Web UI subscription. Production must acquire an already-ready
-  // endpoint lease and pass the AbortSignal through; mapping happens only after identity revalidation.
-  readWorkerTurns(endpointId: string, threadId: string, limit: number, cursor: string | undefined, signal: AbortSignal): Promise<WorkerNativeHistoryPage>;
+  // Bounded durable history for the active Web UI subscription. The mapping identity is validated
+  // before and after the read; inactive workers are never scanned or tracked.
+  readWorkerTurns(endpointId: string, threadId: string, mappingId: string, limit: number, cursor: string | undefined, signal: AbortSignal): Promise<WorkerNativeHistoryPage>;
   // The owner↔QiYan conversation (your chat + everything the owner was sent — replies, [worker]
   // relays, notices), oldest → newest.
   listOwnerConversation(before: number | undefined, limit: number): OwnerConversationMessage[];

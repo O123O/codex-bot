@@ -82,8 +82,18 @@ test("production offers fenced project notifications to the Web UI observer with
   assert.ok(fence >= 0 && offer > fence && core > offer);
 });
 
+test("production marks active worker streams discontinuous at endpoint availability boundaries", async () => {
+  const source = await readFile(new URL("../../src/production-app.ts", import.meta.url), "utf8");
+  assert.match(source, /target\.onReady\(\(\) => \{[\s\S]{0,160}offerWorkerDiscontinuity\(webWorkerStream, target\.id\)/u);
+  assert.match(source, /target\.onUnavailable\(\(kind\) => \{[\s\S]{0,160}offerWorkerDiscontinuity\(webWorkerStream, target\.id\)/u);
+  assert.match(source, /assistantEndpoint\.onReady\(\(\) => \{[\s\S]{0,120}offerWorkerDiscontinuity\(webWorkerStream, assistantEndpoint\.id\)/u);
+});
+
 test("a failing Web UI observer cannot prevent later core notification routing", () => {
-  const stream: WorkerStream = { handleNotification() { throw new Error("web observer failed"); } };
+  const stream: WorkerStream = {
+    handleNotification() { throw new Error("web observer failed"); },
+    handleDiscontinuity() { throw new Error("web observer failed"); },
+  };
   let coreReached = false;
   assert.doesNotThrow(() => {
     offerWorkerNotification(stream, "local", "turn/completed", {});

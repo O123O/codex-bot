@@ -5,6 +5,7 @@ export type WorkerChatItem =
   | { type: "agent-message"; id: string; text: string; phase?: string };
 
 export type WorkerChatEvent =
+  | { kind: "stream-discontinuity" }
   | { kind: "turn-started"; turnId: string; status?: string }
   | { kind: "turn-completed"; turnId: string; status?: string }
   | { kind: "item-started" | "item-completed"; turnId: string; item: WorkerChatItem; atMs?: number }
@@ -61,12 +62,18 @@ function normalize(method: string, params: Record<string, unknown>): WorkerChatE
 
 export interface WorkerStream {
   handleNotification(endpointId: string, method: string, params: unknown): void;
+  handleDiscontinuity(endpointId: string): void;
 }
 
 // The Web UI is a non-owning observer. Its failure must never consume or block the core notification
 // path (session observation, final relay, and every chat adapter continue independently).
 export function offerWorkerNotification(stream: WorkerStream, endpointId: string, method: string, params: unknown): void {
   try { stream.handleNotification(endpointId, method, params); }
+  catch { /* detailed Web UI flow is best-effort and never owns routing */ }
+}
+
+export function offerWorkerDiscontinuity(stream: WorkerStream, endpointId: string): void {
+  try { stream.handleDiscontinuity(endpointId); }
   catch { /* detailed Web UI flow is best-effort and never owns routing */ }
 }
 
@@ -78,6 +85,9 @@ export interface StreamSessionIdentity {
 
 export function createWorkerStream(deps: { bus: WebBus; resolveSession(nickname: string): StreamSessionIdentity | undefined }): WorkerStream {
   return {
+    handleDiscontinuity(endpointId) {
+      deps.bus.publishWorkerDiscontinuity(endpointId);
+    },
     handleNotification(endpointId, method, rawParams) {
       if (!METHODS.has(method)) return;
       const params = record(rawParams);

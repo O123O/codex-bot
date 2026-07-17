@@ -19,7 +19,10 @@ import {
 } from "../../webui-client/src/worker-chat-stream.ts";
 
 const ids = { nickname: "worker", requestId: "11111111-1111-4111-8111-111111111111", subscriptionId: "22222222-2222-4222-8222-222222222222" };
-const envelope = (event: WorkerEventEnvelope["event"], override: Partial<WorkerEventEnvelope> = {}): WorkerEventEnvelope => ({ type: "worker/event", ...ids, event, ...override });
+let sequence = 0;
+const envelope = (event: WorkerEventEnvelope["event"], override: Partial<WorkerEventEnvelope> = {}): WorkerEventEnvelope => ({
+  type: "worker/event", ...ids, streamId: override.subscriptionId ?? ids.subscriptionId, seq: ++sequence, event, ...override,
+});
 
 test("native user item replaces the correlated optimistic bubble", () => {
   let state = acknowledgeWorkerSubscription(beginWorkerSubscription("worker", "codex", ids.requestId), ids.subscriptionId);
@@ -155,7 +158,7 @@ test("inactive worker drafts use a byte-bounded four-worker LRU", () => {
   assert.deepEqual(takeWorkerDraftMessages(cache, "large-0", ""), []);
 });
 
-test("snapshot merge trusts terminal items and recovers only a true mid-turn join", () => {
+test("snapshot merge identifies a mid-turn join while every completion reconciles", () => {
   let state = acknowledgeWorkerSubscription(beginWorkerSubscription("worker", "codex", ids.requestId), ids.subscriptionId);
   state = beginWorkerHistory(state, true).state;
   state = receiveWorkerEvent(state, envelope({ kind: "turn-started", turnId: "observed" }));
@@ -181,9 +184,9 @@ test("snapshot merge trusts terminal items and recovers only a true mid-turn joi
   assert.deepEqual(state.recoveryTurnIds, ["joined"]);
 
   state = receiveWorkerEvent(state, envelope({ kind: "turn-completed", turnId: "observed" }));
-  assert.deepEqual(state.pendingRecoveryTurnIds, []);
+  assert.deepEqual(state.pendingRecoveryTurnIds, ["observed"]);
   state = receiveWorkerEvent(state, envelope({ kind: "turn-completed", turnId: "joined" }));
-  assert.deepEqual(state.pendingRecoveryTurnIds, ["joined"]);
+  assert.deepEqual(state.pendingRecoveryTurnIds, ["observed", "joined"]);
 });
 
 test("initial snapshot shows items from a turn that started before the panel subscribed", () => {
@@ -224,6 +227,43 @@ test("open snapshot reconciles by item identity instead of message text", () => 
   ]);
 });
 
+test("a stale history response cannot erase a same-item live delta received during the read", () => {
+  let state = acknowledgeWorkerSubscription(beginWorkerSubscription("worker", "codex", ids.requestId), ids.subscriptionId);
+  state = beginWorkerHistory(state, true).state;
+  state = receiveWorkerEvent(state, envelope({ kind: "agent-message-delta", turnId: "turn", itemId: "a1", delta: "ing" }));
+  state = applyWorkerSnapshot(state, {
+    messages: [{ id: "a:turn:a1", turnId: "turn", body: "work", completedAt: 1, terminalStatus: "inProgress", turnOrder: 0, itemOrder: 0 }],
+    hasOlder: false, terminalTurnIds: [], openTurnIds: ["turn"],
+  });
+
+  assert.deepEqual(state.messages.map((message) => [message.body, message.streaming]), [["working", true]]);
+});
+
+test("a terminal snapshot replaces a partial draft after turn completion", () => {
+  let state = acknowledgeWorkerSubscription(beginWorkerSubscription("worker", "codex", ids.requestId), ids.subscriptionId);
+  state = receiveWorkerEvent(state, envelope({ kind: "agent-message-delta", turnId: "turn", itemId: "a1", delta: "partial" }));
+  state = receiveWorkerEvent(state, envelope({ kind: "turn-completed", turnId: "turn", status: "completed" }));
+  state = beginWorkerHistory(state, true).state;
+  state = applyWorkerSnapshot(state, {
+    messages: [{ id: "a:turn:a1", turnId: "turn", body: "complete authoritative body", completedAt: 2, terminalStatus: "completed", turnOrder: 0, itemOrder: 0 }],
+    hasOlder: false, terminalTurnIds: ["turn"], openTurnIds: [],
+  }, "turn");
+
+  assert.deepEqual(state.messages.map((message) => [message.body, message.streaming]), [["complete authoritative body", false]]);
+});
+
+test("an oversized live delta retains one bounded streaming row", () => {
+  let state = acknowledgeWorkerSubscription(beginWorkerSubscription("worker", "codex", ids.requestId), ids.subscriptionId);
+  state = receiveWorkerEvent(state, envelope({ kind: "agent-message-delta", turnId: "turn", itemId: "a1", delta: "x".repeat(5 * 1024 * 1024) }));
+  state = receiveWorkerEvent(state, envelope({ kind: "agent-message-delta", turnId: "turn", itemId: "a1", delta: "tail" }));
+
+  assert.equal(state.messages.length, 1);
+  assert.equal(state.messages[0]?.streaming, true);
+  assert.match(state.messages[0]!.body, /^\[earlier live output truncated by Web UI\]/u);
+  assert.match(state.messages[0]!.body, /tail$/u);
+  assert.ok(new TextEncoder().encode(JSON.stringify(state.messages[0])).byteLength < 1024 * 1024);
+});
+
 test("paging does not classify an open turn as a mid-turn join", () => {
   let state = acknowledgeWorkerSubscription(beginWorkerSubscription("worker", "codex", ids.requestId), ids.subscriptionId);
   state = beginWorkerHistory(state, false).state;
@@ -250,17 +290,16 @@ test("a stale older page cannot downgrade a live terminal turn", () => {
   ]);
 });
 
-test("a failed initial snapshot releases buffered live events instead of stranding them", () => {
+test("a failed initial history read leaves the live overlay visible", () => {
   let state = acknowledgeWorkerSubscription(beginWorkerSubscription("worker", "codex", ids.requestId), ids.subscriptionId);
   state = beginWorkerHistory(state, true).state;
   state = receiveWorkerEvent(state, envelope({ kind: "agent-message-delta", turnId: "live", itemId: "a", delta: "still visible" }));
   state = failWorkerHistory(state);
-  assert.equal(state.snapshotPending, false);
+  assert.equal(state.initialHistoryPending, false);
   assert.deepEqual(state.messages.map((message) => message.body), ["still visible"]);
-  assert.deepEqual(state.bufferedEvents, []);
 });
 
-test("completion recovery queues behind paging for Claude and joined Codex turns", () => {
+test("completion recovery queues behind paging for every provider", () => {
   let claude = acknowledgeWorkerSubscription(beginWorkerSubscription("worker", "claude", ids.requestId), ids.subscriptionId);
   claude = beginWorkerHistory(claude, false).state;
   claude = receiveWorkerEvent(claude, envelope({ kind: "turn-completed", turnId: "fast" }));
@@ -269,10 +308,34 @@ test("completion recovery queues behind paging for Claude and joined Codex turns
   assert.equal(dequeueWorkerRecovery({ ...claude, historyInFlight: false }).turnId, "fast");
 
   let codex = acknowledgeWorkerSubscription(beginWorkerSubscription("worker", "codex", ids.requestId), ids.subscriptionId);
-  codex = { ...codex, recoveryTurnIds: ["joined"] };
   codex = beginWorkerHistory(codex, false).state;
-  codex = receiveWorkerEvent(codex, envelope({ kind: "turn-completed", turnId: "joined" }));
-  assert.equal(dequeueWorkerRecovery({ ...codex, historyInFlight: false }).turnId, "joined");
+  codex = receiveWorkerEvent(codex, envelope({ kind: "turn-completed", turnId: "ordinary" }));
+  assert.equal(dequeueWorkerRecovery({ ...codex, historyInFlight: false }).turnId, "ordinary");
+});
+
+test("a stream discontinuity requests one durable latest-page reconciliation", () => {
+  let state = acknowledgeWorkerSubscription(beginWorkerSubscription("worker", "codex", ids.requestId), ids.subscriptionId);
+  state = receiveWorkerEvent(state, envelope({ kind: "stream-discontinuity" }));
+  assert.equal(state.reconcilePending, true);
+  const queued = dequeueWorkerRecovery(state);
+  assert.equal(queued.reconcileLatest, true);
+  assert.equal(queued.state.reconcilePending, false);
+});
+
+test("a discontinuity received during a snapshot is reconciled after that snapshot", () => {
+  let state = acknowledgeWorkerSubscription(beginWorkerSubscription("worker", "codex", ids.requestId), ids.subscriptionId);
+  state = beginWorkerHistory(state, true).state;
+  state = receiveWorkerEvent(state, envelope({ kind: "stream-discontinuity" }));
+  state = applyWorkerSnapshot(state, { messages: [], hasOlder: false, terminalTurnIds: [], openTurnIds: [] });
+
+  assert.equal(state.reconcilePending, true);
+  assert.equal(dequeueWorkerRecovery(state).reconcileLatest, true);
+});
+
+test("the Web UI queues a delayed completion reload when a history request is busy", async () => {
+  const source = await readFile(new URL("../../webui-client/src/App.tsx", import.meta.url), "utf8");
+  assert.match(source, /workerPageLoaderRef\.current\?\.\(nickname, subscriptionId, false\)\s*\.then\(\(started\)/u);
+  assert.match(source, /!started[\s\S]{0,500}reconcilePending:\s*true/u);
 });
 
 test("exhausting one recovery attempt drains the next queued completed turn", () => {
@@ -352,13 +415,15 @@ test("buffer replay cannot downgrade terminal items and recovered items keep nat
   ]);
 });
 
-test("stale events are ignored and the pre-snapshot buffer is bounded", () => {
+test("stale and duplicate sequences are ignored while a sequence gap requests reconciliation", () => {
   let state = acknowledgeWorkerSubscription(beginWorkerSubscription("worker", "codex", ids.requestId), ids.subscriptionId);
   state = beginWorkerHistory(state, true).state;
   const stale = receiveWorkerEvent(state, envelope({ kind: "agent-message-delta", turnId: "t", itemId: "a", delta: "bad" }, { subscriptionId: crypto.randomUUID() }));
   assert.deepEqual(stale, state);
-  const huge = "x".repeat(1024 * 1024 + 1);
-  state = receiveWorkerEvent(state, envelope({ kind: "agent-message-delta", turnId: "t", itemId: "a", delta: huge }));
-  assert.equal(state.overflow, true);
-  assert.deepEqual(state.bufferedEvents, []);
+  state = receiveWorkerEvent(state, envelope({ kind: "agent-message-delta", turnId: "t", itemId: "a", delta: "kept" }, { seq: 1 }));
+  const first = envelope({ kind: "agent-message-delta", turnId: "t", itemId: "a", delta: " after gap" }, { seq: 3 });
+  state = receiveWorkerEvent(state, first);
+  assert.equal(state.messages[0]?.body, "kept after gap");
+  assert.equal(state.reconcilePending, true);
+  assert.equal(receiveWorkerEvent(state, first), state);
 });

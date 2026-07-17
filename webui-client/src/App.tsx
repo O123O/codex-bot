@@ -30,6 +30,7 @@ import {
   addOptimisticWorkerMessage,
   applyWorkerSnapshot,
   beginWorkerHistory,
+  beginWorkerReconnect,
   beginWorkerSubscription,
   dequeueWorkerRecovery,
   drainWorkerRecoveryAfterAttempt,
@@ -60,7 +61,7 @@ const PAGE = 20;             // messages fetched per page
 const RENDER_CAP = 30;       // messages rendered initially per tab
 const REVEAL_STEP = 20;      // reveal step when scrolling into in-memory history
 const TOP_PX = 120, BOTTOM_PX = 80;
-const RECOVERY_RETRY_MS = [500, 1_500, 4_000] as const;
+const RECOVERY_RETRY_MS = [500, 1_500, 3_000] as const;
 
 interface Session { nickname: string; mappingId: string; endpoint: string; provider: string; projectDir: string; lifecycleState: string; nativeStatus: string | null; activeTurnId: string | null; model: string | null; effort: string | null; host: string; goal: WorkerGoal | null; }
 interface Msg { id?: string; body: string; completedAt?: number; terminalStatus?: string; role?: "you" | "assistant" | "worker"; at?: number; worker?: string; origin?: string; phase?: string; streaming?: boolean; turnOrder?: number; itemOrder?: number; }
@@ -194,8 +195,11 @@ export function App() {
   const workerDraftsRef = useRef<WorkerDraftCache>(new Map());
   const wsRef = useRef<WebSocket | null>(null);
   const workerSubscriptionTargetRef = useRef<WorkerSubscriptionTarget | null>(null);
-  const workerPageLoaderRef = useRef<((nickname: string, subscriptionId: string, snapshotPending: boolean, before?: string, recoveredTurnId?: string) => Promise<boolean>) | null>(null);
+  const workerPageLoaderRef = useRef<((nickname: string, subscriptionId: string, snapshotPending: boolean, before?: string, recoveredTurnId?: string, reconcileLatest?: boolean) => Promise<boolean>) | null>(null);
+  const workerHistoryAbortRef = useRef<AbortController | null>(null);
   const recoveryRetriesRef = useRef(new Map<string, { attempt: number; timer: number }>());
+  const completionReloadsRef = useRef(new Map<string, number[]>());
+  const reconciliationRetryRef = useRef<{ subscriptionId: string; attempt: number; timer: number } | null>(null);
   const workerHistoryAutoFillsRef = useRef(new Map<string, WorkerHistoryAutoFillState>());
   const workerTailRevisionRef = useRef("");
   const workerTailScrollFrameRef = useRef<number | null>(null);
@@ -204,6 +208,10 @@ export function App() {
   const clearRecoveryRetries = useCallback(() => {
     for (const retry of recoveryRetriesRef.current.values()) window.clearTimeout(retry.timer);
     recoveryRetriesRef.current.clear();
+    for (const timers of completionReloadsRef.current.values()) for (const timer of timers) window.clearTimeout(timer);
+    completionReloadsRef.current.clear();
+    if (reconciliationRetryRef.current) window.clearTimeout(reconciliationRetryRef.current.timer);
+    reconciliationRetryRef.current = null;
   }, []);
   const scheduleRecoveryRetry = useCallback((nickname: string, subscriptionId: string, turnId: string): boolean => {
     const key = `${subscriptionId}:${turnId}`;
@@ -224,6 +232,43 @@ export function App() {
     recoveryRetriesRef.current.set(key, { attempt: attempt + 1, timer });
     return true;
   }, [replaceWorker]);
+  const scheduleCompletionReloads = useCallback((nickname: string, subscriptionId: string, turnId: string): void => {
+    const key = `${subscriptionId}:${turnId}`;
+    for (const timer of completionReloadsRef.current.get(key) ?? []) window.clearTimeout(timer);
+    const timers = RECOVERY_RETRY_MS.map((delay, index) => window.setTimeout(() => {
+      const current = workerRef.current;
+      if (current?.nickname === nickname && current.subscriptionId === subscriptionId) {
+        void workerPageLoaderRef.current?.(nickname, subscriptionId, false).then((started) => {
+          const latest = workerRef.current;
+          if (!started && latest?.nickname === nickname && latest.subscriptionId === subscriptionId && latest.historyInFlight) {
+            replaceWorker({ ...latest, reconcilePending: true });
+          }
+        });
+      }
+      if (index === RECOVERY_RETRY_MS.length - 1) completionReloadsRef.current.delete(key);
+    }, delay));
+    completionReloadsRef.current.set(key, timers);
+  }, [replaceWorker]);
+  const scheduleReconciliationRetry = useCallback((nickname: string, subscriptionId: string): boolean => {
+    const previous = reconciliationRetryRef.current?.subscriptionId === subscriptionId
+      ? reconciliationRetryRef.current
+      : null;
+    const attempt = previous?.attempt ?? 0;
+    if (attempt >= RECOVERY_RETRY_MS.length) {
+      reconciliationRetryRef.current = null;
+      return false;
+    }
+    if (previous) window.clearTimeout(previous.timer);
+    const timer = window.setTimeout(() => {
+      const current = workerRef.current;
+      if (!current || current.nickname !== nickname || current.subscriptionId !== subscriptionId
+        || current.historyInFlight || !current.reconcilePending) return;
+      replaceWorker({ ...current, reconcilePending: false });
+      void workerPageLoaderRef.current?.(nickname, subscriptionId, true, undefined, undefined, true);
+    }, RECOVERY_RETRY_MS[attempt]);
+    reconciliationRetryRef.current = { subscriptionId, attempt: attempt + 1, timer };
+    return true;
+  }, [replaceWorker]);
 
   useEffect(() => { document.documentElement.dataset.theme = theme; localStorage.setItem("qiyan-theme", theme); }, [theme]);
 
@@ -237,19 +282,25 @@ export function App() {
     try { const p = await api<{ messages: Msg[]; hasOlder: boolean }>(`/api/assistant/messages?limit=${PAGE}`); setHistory(p.messages); setHasOlder((h) => ({ ...h, [ASSIST]: p.hasOlder })); }
     catch { /* transient */ }
   }, []);
-  const loadWorkerPage = useCallback(async (nickname: string, subscriptionId: string, snapshotPending: boolean, before?: string, recoveredTurnId?: string): Promise<boolean> => {
+  const loadWorkerPage = useCallback(async (nickname: string, subscriptionId: string, snapshotPending: boolean, before?: string, recoveredTurnId?: string, reconcileLatest = false): Promise<boolean> => {
     const current = workerRef.current;
     if (!current || current.nickname !== nickname || current.subscriptionId !== subscriptionId) return false;
     const started = beginWorkerHistory(current, snapshotPending);
     if (!started.started) return false;
     replaceWorker(started.state);
+    const abort = new AbortController();
+    workerHistoryAbortRef.current = abort;
     try {
       const cursor = before === undefined ? "" : `&before=${encodeURIComponent(before)}`;
-      const page = await api<WorkerSnapshot>(`/api/sessions/${nickname}/messages?limit=${PAGE}${cursor}&subscriptionId=${encodeURIComponent(subscriptionId)}`);
+      const page = await api<WorkerSnapshot>(`/api/sessions/${nickname}/messages?limit=${PAGE}${cursor}&subscriptionId=${encodeURIComponent(subscriptionId)}`, { signal: abort.signal });
       const latest = workerRef.current;
       if (!latest || latest.nickname !== nickname || latest.subscriptionId !== subscriptionId) return true;
-      const merged = applyWorkerSnapshot(latest, page, recoveredTurnId);
+      const merged = applyWorkerSnapshot(latest, page, recoveredTurnId, before === undefined && latest.historyLoaded);
       replaceWorker(merged);
+      if (reconcileLatest && reconciliationRetryRef.current?.subscriptionId === subscriptionId) {
+        window.clearTimeout(reconciliationRetryRef.current.timer);
+        reconciliationRetryRef.current = null;
+      }
       setHasOlder((value) => ({ ...value, [nickname]: merged.hasOlder }));
       if (recoveredTurnId && merged.recoveredTurnIds.includes(recoveredTurnId)) {
         const key = `${subscriptionId}:${recoveredTurnId}`;
@@ -260,26 +311,38 @@ export function App() {
     } catch (error) {
       const latest = workerRef.current;
       if (latest?.nickname === nickname && latest.subscriptionId === subscriptionId) {
-        let failed = latest.snapshotPending ? failWorkerHistory(latest) : finishWorkerHistory(latest);
+        let failed = latest.initialHistoryPending ? failWorkerHistory(latest) : finishWorkerHistory(latest);
         if (recoveredTurnId) failed = requeueWorkerRecovery(failed, recoveredTurnId);
+        if (reconcileLatest) failed = { ...failed, reconcilePending: true };
         replaceWorker(failed);
         push(nickname, { role: "assistant", body: `Error: ${(error as { error?: string }).error ?? error}`, at: Date.now() });
       }
     } finally {
+      if (workerHistoryAbortRef.current === abort) workerHistoryAbortRef.current = null;
       const latest = workerRef.current;
       if (latest && latest.nickname === nickname && latest.subscriptionId === subscriptionId) {
+        const reconcileRetryScheduled = reconcileLatest && latest.reconcilePending
+          ? scheduleReconciliationRetry(nickname, subscriptionId)
+          : false;
         const retryScheduled = recoveredTurnId !== undefined && latest.pendingRecoveryTurnIds.includes(recoveredTurnId)
           ? scheduleRecoveryRetry(nickname, subscriptionId, recoveredTurnId)
           : false;
-        const queued = drainWorkerRecoveryAfterAttempt(latest, recoveredTurnId, retryScheduled);
+        const retryState = reconcileLatest && latest.reconcilePending && !reconcileRetryScheduled
+          ? { ...latest, reconcilePending: false }
+          : latest;
+        const queued = reconcileRetryScheduled
+          ? { state: retryState }
+          : drainWorkerRecoveryAfterAttempt(retryState, recoveredTurnId, retryScheduled);
         if (queued.state !== latest) replaceWorker(queued.state);
-        if (queued.turnId) {
+        if (queued.reconcileLatest) {
+          queueMicrotask(() => { void workerPageLoaderRef.current?.(nickname, subscriptionId, true, undefined, undefined, true); });
+        } else if (queued.turnId) {
           queueMicrotask(() => { void workerPageLoaderRef.current?.(nickname, subscriptionId, true, undefined, queued.turnId); });
         }
       }
     }
     return true;
-  }, [replaceWorker, scheduleRecoveryRetry]);
+  }, [replaceWorker, scheduleReconciliationRetry, scheduleRecoveryRetry]);
   workerPageLoaderRef.current = loadWorkerPage;
   const loadDir = useCallback(async (nickname: string, path: string) => {
     try { const r = await api<FileResult>(`/api/files/${nickname}?path=${encodeURIComponent(path)}`);
@@ -303,6 +366,8 @@ export function App() {
     const target = session ? { socket, nickname: streamNickname, mappingId } : null;
     if (target && sameWorkerSubscriptionTarget(workerSubscriptionTargetRef.current, target)
       && previous?.nickname === streamNickname && previous.mappingId === mappingId) return;
+    workerHistoryAbortRef.current?.abort();
+    workerHistoryAbortRef.current = null;
     clearRecoveryRetries();
     workerHistoryAutoFillsRef.current.clear();
     const sameWorker = previous?.nickname === streamNickname && previous.mappingId === mappingId;
@@ -317,15 +382,22 @@ export function App() {
     }
     workerSubscriptionTargetRef.current = target;
     const requestId = createBrowserUuid();
+    const resume = sameWorker && previous?.subscriptionId
+      ? { subscriptionId: previous.subscriptionId, afterSeq: previous.lastSeq }
+      : undefined;
     const retained = sameWorker && previous
       ? retainWorkerDraftMessages(previous)
       : takeWorkerDraftMessages(workerDraftsRef.current, streamNickname, mappingId);
-    const next = beginWorkerSubscription(streamNickname, session.provider ?? "codex", requestId, retained, mappingId);
+    const next = resume && previous
+      ? beginWorkerReconnect(previous, requestId)
+      : beginWorkerSubscription(streamNickname, session.provider ?? "codex", requestId, retained, mappingId);
     replaceWorker(next);
-    socket.send(JSON.stringify({ type: "worker/subscribe", nickname: streamNickname, requestId }));
+    socket.send(JSON.stringify({ type: "worker/subscribe", nickname: streamNickname, requestId,
+      ...(resume ? { resumeSubscriptionId: resume.subscriptionId, afterSeq: resume.afterSeq } : {}) }));
   }, [clearRecoveryRetries, replaceWorker]);
 
   useEffect(() => () => clearRecoveryRetries(), [clearRecoveryRetries]);
+  useEffect(() => () => workerHistoryAbortRef.current?.abort(), []);
   useEffect(() => () => {
     if (workerTailScrollFrameRef.current !== null) window.cancelAnimationFrame(workerTailScrollFrameRef.current);
   }, []);
@@ -353,21 +425,28 @@ export function App() {
         else if (m.type === "worker/subscribed") {
           const current = workerRef.current;
           if (!current || current.nickname !== m.nickname || current.requestId !== m.requestId || typeof m.subscriptionId !== "string") return;
-          const acknowledged = acknowledgeWorkerSubscription(current, m.subscriptionId, typeof m.mappingId === "string" ? m.mappingId : "");
+          const acknowledged = acknowledgeWorkerSubscription(current, m.subscriptionId, typeof m.mappingId === "string" ? m.mappingId : "", {
+            resumed: m.resumed === true, replayGap: m.replayGap === true,
+            latestSeq: Number.isSafeInteger(m.latestSeq) ? m.latestSeq : undefined,
+          });
           replaceWorker(acknowledged);
-          void workerPageLoaderRef.current?.(m.nickname, m.subscriptionId, true);
+          if (m.resumed !== true || m.replayGap === true) {
+            void workerPageLoaderRef.current?.(m.nickname, m.subscriptionId, true, undefined, undefined, true);
+          }
         } else if (m.type === "worker/event") {
           const current = workerRef.current;
           if (!current) return;
           const next = receiveWorkerEvent(current, m as WorkerEventEnvelope);
           if (next === current) return;
           replaceWorker(next);
-          if (next.overflow) { try { ws.close(1013, "worker stream buffer exceeded"); } catch { /* reconnect repairs */ } return; }
+          if (m.event?.kind === "turn-completed") scheduleCompletionReloads(next.nickname, next.subscriptionId!, m.event.turnId);
           if (!stickRef.current) setVisible((value) => value + 1);
           const queued = dequeueWorkerRecovery(next);
-          if (queued.turnId && queued.state.subscriptionId) {
+          if ((queued.reconcileLatest || queued.turnId) && queued.state.subscriptionId) {
             replaceWorker(queued.state);
-            void workerPageLoaderRef.current?.(queued.state.nickname, queued.state.subscriptionId, true, undefined, queued.turnId);
+            void workerPageLoaderRef.current?.(
+              queued.state.nickname, queued.state.subscriptionId, true, undefined, queued.turnId, queued.reconcileLatest,
+            );
           }
         } else if (m.type === "worker/subscription-error") {
           const current = workerRef.current;
@@ -379,7 +458,7 @@ export function App() {
     };
     connect();
     return () => { stop = true; try { ws.close(); } catch { /* closing */ } };
-  }, [replaceWorker, subscribeWorker]);
+  }, [replaceWorker, scheduleCompletionReloads, subscribeWorker]);
 
   // On tab switch: reset the render window, pin to bottom, and lazily load the transcript + file root.
   useEffect(() => {

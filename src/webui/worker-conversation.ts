@@ -1,7 +1,7 @@
 import { Buffer } from "node:buffer";
 
-// Web-UI-only mapping of a worker's native Codex/Claude thread/read response. Codex remains the
-// durable owner of this history; QiYan maps one requested page and does not persist the timeline.
+// Web-UI-only mapping of provider-native turn rows. The provider transcript remains the durable
+// owner of this history; QiYan maps one requested page and does not persist the timeline.
 
 export interface WorkerConvoRow {
   id: string;
@@ -87,6 +87,20 @@ function decodeCursor(cursor: string): CursorKey {
 }
 
 export function pageWorkerConversation(turns: readonly unknown[], count: number, before?: string): WorkerConvoPage {
+  const rows = workerConversationRows(turns);
+  const boundary = before === undefined ? undefined : decodeCursor(before);
+  const eligible = boundary ? rows.filter((row) => compareKey(row, boundary) < 0) : rows;
+  const pageSize = Math.max(1, Math.min(50, Math.trunc(count) || 20));
+  const start = Math.max(0, eligible.length - pageSize);
+  const messages = eligible.slice(start);
+  return {
+    messages,
+    hasOlder: start > 0,
+    ...(start > 0 && messages[0] ? { nextCursor: encodeCursor(messages[0]) } : {}),
+  };
+}
+
+export function workerConversationRows(turns: readonly unknown[]): WorkerConvoRow[] {
   const rows: WorkerConvoRow[] = [];
   turns.forEach((raw, turnOrder) => {
     const turn = (raw ?? {}) as NativeTurn;
@@ -112,14 +126,5 @@ export function pageWorkerConversation(turns: readonly unknown[], count: number,
     });
   });
   rows.sort(compareKey);
-  const boundary = before === undefined ? undefined : decodeCursor(before);
-  const eligible = boundary ? rows.filter((row) => compareKey(row, boundary) < 0) : rows;
-  const pageSize = Math.max(1, Math.min(50, Math.trunc(count) || 20));
-  const start = Math.max(0, eligible.length - pageSize);
-  const messages = eligible.slice(start);
-  return {
-    messages,
-    hasOlder: start > 0,
-    ...(start > 0 && messages[0] ? { nextCursor: encodeCursor(messages[0]) } : {}),
-  };
+  return rows;
 }

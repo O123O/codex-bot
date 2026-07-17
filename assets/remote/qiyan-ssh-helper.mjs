@@ -13,11 +13,19 @@ const DECIMAL = /^\d+$/u;
 // QiYan's per-turn ownership marker in a Claude message body (see claude-transcript.ts).
 // Declared with the other top-level consts so it is initialized before the entry `try`.
 const CLAUDE_CLIENT_MARKER = /<!--\s*qiyan-cid:([A-Za-z0-9:_.-]{1,256})\s*-->/u;
-const MAX_ARGUMENT_BYTES = 64 * 1024;
+const MAX_ARGUMENT_BYTES = 96 * 1024;
 const MAX_UNIX_SOCKET_PATH_BYTES = 107;
 const NFS_SUPER_MAGIC = 0x6969;
 const RESPONSE_PREFIX = "qiyan-helper-v1:";
 const APP_SERVER_PROXY_READY = "qiyan-app-server-proxy-v1-ready\n";
+const HISTORY_SCAN_BYTES = 4 * 1024 * 1024;
+const HISTORY_SCAN_RECORDS = 20_000;
+const HISTORY_PARSE_LINE_BYTES = 2 * 1024 * 1024;
+const HISTORY_PENDING_BYTES = 4 * 1024 * 1024;
+const HISTORY_PAGE_JSON_BYTES = 700 * 1024;
+const HISTORY_FRAME_BYTES = 768 * 1024;
+const HISTORY_CURSOR_BYTES = 4096;
+const HISTORY_CURSOR_TERMINALS = 16;
 
 const operation = process.argv[2];
 const encoded = process.argv.slice(3);
@@ -29,7 +37,7 @@ try {
     let result;
     switch (operation) {
       case "preflight": result = preflight(); break;
-      case "bootstrap": result = await bootstrap(decodeJson(encoded, 1)); break;
+      case "bootstrap": result = await bootstrap(encoded.length === 0 ? await decodeStdinJson(256 * 1024) : decodeJson(encoded, 1)); break;
       case "inspect": result = await inspect(decodeJson(encoded, 1)); break;
       case "start": result = await start(decodeJson(encoded, 1)); break;
       case "stop": result = await stop(decodeJson(encoded, 1)); break;
@@ -37,6 +45,7 @@ try {
       case "write-file": result = await writeFileDescriptor(decodeJson(encoded, 1)); break;
       case "rollout-scan": result = await scanRollouts(decodeJson(encoded, 1)); break;
       case "claude-rollout-scan": result = await scanClaudeTranscripts(decodeJson(encoded, 1)); break;
+      case "codex-history": result = await codexHistory(decodeJson(encoded, 1)); break;
       case "workspace": result = await workspace(decodeJson(encoded, 1)); break;
       default: throw new Error("unsupported helper operation");
     }
@@ -52,6 +61,19 @@ function decodeJson(values, count) {
   const bytes = Buffer.from(values[0], "base64url");
   if (bytes.byteLength === 0 || bytes.byteLength > MAX_ARGUMENT_BYTES) throw new Error("invalid helper arguments");
   return JSON.parse(bytes.toString("utf8"));
+}
+
+async function decodeStdinJson(maxBytes) {
+  const chunks = [];
+  let size = 0;
+  for await (const value of process.stdin) {
+    const chunk = Buffer.from(value);
+    size += chunk.byteLength;
+    if (size < 1 || size > maxBytes) throw new Error("invalid helper input");
+    chunks.push(chunk);
+  }
+  if (size === 0) throw new Error("invalid helper input");
+  return JSON.parse(Buffer.concat(chunks, size).toString("utf8"));
 }
 
 function preflight() {
@@ -348,6 +370,327 @@ function publicRolloutStart(turn) {
     ...(turn.clientId ? { clientId: turn.clientId } : {}),
     ...(turn.sawUserMessage ? { hasUserMessage: true } : {}),
   };
+}
+
+// Bounded, on-demand Web UI history. Keep this algorithm in parity with
+// src/webui/codex-rollout-history.ts; the tests run identical fixtures through both copies.
+async function codexHistory(value) {
+  const path = value?.path;
+  const threadId = value?.threadId;
+  const name = typeof path === "string" ? basename(path) : "";
+  if (typeof path !== "string" || !isAbsolute(path) || typeof threadId !== "string"
+    || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u.test(threadId)
+    || !name.startsWith("rollout-") || !name.endsWith(`-${threadId}.jsonl`)
+    || !Number.isSafeInteger(value?.limit) || value.limit < 1 || value.limit > 50) throw new Error("invalid Codex history request");
+  const cursor = decodeHistoryCursor(value.cursor);
+  const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const state = await file.stat({ bigint: true });
+    const uid = process.getuid?.();
+    if (!state.isFile() || state.size > BigInt(Number.MAX_SAFE_INTEGER)
+      || (uid !== undefined && state.uid !== BigInt(uid))) throw new Error("invalid Codex rollout file");
+    const device = state.dev.toString(10);
+    const inode = state.ino.toString(10);
+    if (cursor && (cursor.device !== device || cursor.inode !== inode || BigInt(cursor.before) > state.size)) throw new Error("stale Codex history cursor");
+    if (cursor?.pending.some((entry) => BigInt(entry.end) > state.size || entry.start < cursor.before)) throw new Error("stale Codex history cursor");
+    const before = cursor?.before ?? Number(state.size);
+    let pending = cursor?.pending ?? [];
+    let pendingBytes = pendingHistoryLength(pending);
+    let pendingSkipped = cursor?.pendingSkipped ?? false;
+    const terminal = new Map((cursor?.terminals ?? []).map((entry) => [entry.turnId, { status: entry.status, at: entry.at }]));
+    const messages = [];
+    const openTurnIds = [];
+    const terminalTurnIds = [];
+    const parsedVisible = new Map();
+    let pageJsonBytes = 128;
+    let oldestSelectedOffset;
+    let pageFilled = false;
+    let pageBoundaryOffset;
+    let carryTerminal;
+    let resolvedCursor;
+
+    if (cursor?.resolved) {
+      const materialized = await materializeHistoryPending(file, pending, cursor.resolved, parsedVisible, messages, value.limit, pageJsonBytes);
+      pageJsonBytes = materialized.pageJsonBytes;
+      oldestSelectedOffset = materialized.oldestSelectedOffset;
+      pending = pending.slice(materialized.consumed);
+      pendingBytes = pendingHistoryLength(pending);
+      rememberHistoryPresentation(cursor.resolved, materialized.emitted, openTurnIds, terminalTurnIds);
+      if (pending.length > 0) {
+        resolvedCursor = {
+          device, inode, before, pending, terminals: cursor.terminals, skipPartial: false,
+          pendingSkipped: false, resolved: cursor.resolved,
+        };
+        return finishHistoryPage(messages, openTurnIds, terminalTurnIds, encodeHistoryCursor(resolvedCursor));
+      }
+      if (messages.length >= value.limit || materialized.filled) {
+        const nextCursor = before > 0
+          ? encodeHistoryCursor({ device, inode, before, pending: [], terminals: [], skipPartial: false, pendingSkipped: false })
+          : undefined;
+        return finishHistoryPage(messages, openTurnIds, terminalTurnIds, nextCursor);
+      }
+    }
+
+    const window = await readReverseHistoryWindow(file, before, cursor?.skipPartial ?? false);
+
+    for (const line of window.lines) {
+      if (!line.bytes) continue;
+      const record = parseHistoryRecord(line.bytes);
+      if (!record) continue;
+      const payload = objectRecord(record.payload);
+      const at = historyTimestamp(record.timestamp);
+      if (record.type === "event_msg" && payload) {
+        const eventType = nonEmptyText(payload.type);
+        const turnId = nonEmptyText(payload.turn_id);
+        const status = historyTerminalStatus(eventType);
+        if (status && turnId) { rememberHistoryTerminal(terminal, turnId, { status, at }); continue; }
+        if ((eventType === "task_started" || eventType === "turn_started") && turnId) {
+          const proof = terminal.get(turnId);
+          const turnStatus = proof?.status ?? "inProgress";
+          const resolved = { turnId, status: turnStatus, at: proof?.at ?? -1, turnOrder: line.start };
+          const materialized = await materializeHistoryPending(file, pending, resolved, parsedVisible, messages, value.limit, pageJsonBytes);
+          pageJsonBytes = materialized.pageJsonBytes;
+          oldestSelectedOffset = materialized.oldestSelectedOffset ?? oldestSelectedOffset;
+          const remaining = pending.slice(materialized.consumed);
+          rememberHistoryPresentation(resolved, materialized.emitted, openTurnIds, terminalTurnIds);
+          if (remaining.length > 0) {
+            resolvedCursor = {
+              device, inode, before: line.start, pending: remaining, terminals: [], skipPartial: false,
+              pendingSkipped: false, resolved,
+            };
+            pageFilled = true;
+            break;
+          }
+          if (pendingSkipped && proof) carryTerminal = { turnId, status: turnStatus, at: proof.at };
+          pending = [];
+          pendingBytes = 0;
+          terminal.delete(turnId);
+          if (pendingSkipped || messages.length >= value.limit || materialized.filled) {
+            pageFilled = true; pageBoundaryOffset = line.start; break;
+          }
+          pendingSkipped = false;
+          continue;
+        }
+        if (eventType === "user_message" && typeof payload.message === "string") {
+          const item = visibleHistoryUser(line.start, payload, at);
+          const descriptor = { start: line.start, end: line.end };
+          if (item && canRetainHistoryPending(pending, pendingBytes, descriptor, messages.length, value.limit)) {
+            pending.push(descriptor); pendingBytes += line.end - line.start; parsedVisible.set(line.start, item);
+          } else if (item) pendingSkipped = true;
+        }
+        continue;
+      }
+      if (record.type !== "response_item" || !payload || payload.type !== "message" || payload.role !== "assistant") continue;
+      const item = visibleHistoryAssistant(line.start, payload, at);
+      const descriptor = { start: line.start, end: line.end };
+      if (item && canRetainHistoryPending(pending, pendingBytes, descriptor, messages.length, value.limit)) {
+        pending.push(descriptor); pendingBytes += line.end - line.start; parsedVisible.set(line.start, item);
+      } else if (item) pendingSkipped = true;
+    }
+
+    let nextCursor;
+    if (resolvedCursor) {
+      nextCursor = encodeHistoryCursor(resolvedCursor);
+    } else if (pageFilled && pendingSkipped && oldestSelectedOffset !== undefined && oldestSelectedOffset > 0) {
+      nextCursor = encodeHistoryCursor({
+        device, inode, before: oldestSelectedOffset, pending: [],
+        terminals: carryTerminal ? [carryTerminal] : [], skipPartial: false, pendingSkipped: false,
+      });
+    } else if (pageFilled && (pageBoundaryOffset ?? 0) > 0) {
+      nextCursor = encodeHistoryCursor({ device, inode, before: pageBoundaryOffset, pending: [], terminals: [], skipPartial: false, pendingSkipped: false });
+    } else if (window.hasMore) {
+      nextCursor = encodeHistoryCursor({
+        device, inode, before: window.nextBefore, pending,
+        terminals: [...terminal].slice(-HISTORY_CURSOR_TERMINALS).map(([pendingTurnId, proof]) => ({ turnId: pendingTurnId, ...proof })),
+        skipPartial: window.skipPartial, pendingSkipped,
+      });
+    }
+    return finishHistoryPage(messages, openTurnIds, terminalTurnIds, nextCursor);
+  } finally { await file.close(); }
+}
+
+async function materializeHistoryPending(file, pending, resolved, parsedVisible, messages, pageSize, initialPageJsonBytes) {
+  let pageJsonBytes = initialPageJsonBytes;
+  let emitted = 0;
+  let oldestSelectedOffset;
+  for (let index = 0; index < pending.length; index += 1) {
+    if (messages.length >= pageSize) return { consumed: index, emitted, pageJsonBytes, oldestSelectedOffset, filled: true };
+    const descriptor = pending[index];
+    const item = parsedVisible.get(descriptor.start) ?? await readPendingHistoryMessage(file, descriptor);
+    if (!item) continue;
+    const nativeId = item.nativeId ?? item.clientId ?? `rollout-${item.lineStart}`;
+    const message = {
+      id: `${item.role === "you" ? "u" : "a"}:${resolved.turnId}:${nativeId}`,
+      turnId: resolved.turnId, body: item.body, completedAt: resolved.at >= 0 ? resolved.at : item.at,
+      terminalStatus: resolved.status, turnOrder: resolved.turnOrder, itemOrder: item.lineStart,
+      ...(item.role === "you" ? { role: "you" } : {}),
+      ...(item.clientId ? { clientId: item.clientId } : {}),
+      ...(item.phase ? { phase: item.phase } : {}),
+    };
+    const bytes = Buffer.byteLength(JSON.stringify(message), "utf8") + 1;
+    if (pageJsonBytes + bytes > HISTORY_PAGE_JSON_BYTES) return { consumed: index, emitted, pageJsonBytes, oldestSelectedOffset, filled: true };
+    messages.push(message); emitted += 1; pageJsonBytes += bytes; oldestSelectedOffset = descriptor.start;
+  }
+  return { consumed: pending.length, emitted, pageJsonBytes, oldestSelectedOffset, filled: false };
+}
+
+function canRetainHistoryPending(pending, pendingBytes, descriptor, emittedMessages, pageSize) {
+  return pending.length + emittedMessages < pageSize
+    && pendingBytes + descriptor.end - descriptor.start <= HISTORY_PENDING_BYTES;
+}
+function pendingHistoryLength(pending) { return pending.reduce((total, descriptor) => total + descriptor.end - descriptor.start, 0); }
+function rememberHistoryPresentation(resolved, emitted, openTurnIds, terminalTurnIds) {
+  if (emitted === 0) return;
+  if (["completed", "failed", "interrupted"].includes(resolved.status)) terminalTurnIds.push(resolved.turnId);
+  else openTurnIds.push(resolved.turnId);
+}
+function finishHistoryPage(messages, openTurnIds, terminalTurnIds, nextCursor) {
+  messages.sort((left, right) => left.itemOrder - right.itemOrder);
+  const page = {
+    messages, hasOlder: nextCursor !== undefined, ...(nextCursor ? { nextCursor } : {}),
+    openTurnIds: [...new Set(openTurnIds)], terminalTurnIds: [...new Set(terminalTurnIds)].slice(-50),
+  };
+  if (Buffer.byteLength(JSON.stringify(page), "utf8") > HISTORY_FRAME_BYTES) throw new Error("Codex history page exceeds the Web UI frame budget");
+  return page;
+}
+
+async function readReverseHistoryWindow(file, end, skipPartial) {
+  const start = Math.max(0, end - HISTORY_SCAN_BYTES);
+  const bytes = Buffer.allocUnsafe(end - start);
+  const { bytesRead } = await file.read(bytes, 0, bytes.byteLength, start);
+  if (bytesRead !== bytes.byteLength) throw new Error("Codex rollout changed during history read");
+  const lines = [];
+  let boundary = bytes.byteLength;
+  let skipped = !skipPartial;
+  let resolvedPartialBefore;
+  let recordLimited = false;
+  for (let index = bytes.byteLength - 1; index >= 0; index -= 1) {
+    if (bytes[index] !== 0x0a) continue;
+    if (boundary > index + 1) {
+      const lineStart = start + index + 1;
+      const lineEnd = start + boundary;
+      if (skipped) {
+        const length = boundary - index - 1;
+        lines.push({ start: lineStart, end: lineEnd, ...(length <= HISTORY_PARSE_LINE_BYTES ? { bytes: bytes.subarray(index + 1, boundary) } : {}) });
+        if (lines.length >= HISTORY_SCAN_RECORDS) { recordLimited = true; break; }
+      } else { skipped = true; resolvedPartialBefore = lineStart; }
+    }
+    boundary = index;
+  }
+  if (!recordLimited && start === 0 && boundary > 0 && skipped) {
+    lines.push({ start: 0, end: boundary, ...(boundary <= HISTORY_PARSE_LINE_BYTES ? { bytes: bytes.subarray(0, boundary) } : {}) });
+  }
+  const nextBefore = lines.at(-1)?.start ?? resolvedPartialBefore ?? start;
+  return {
+    lines, nextBefore, hasMore: recordLimited || start > 0 || nextBefore > 0,
+    skipPartial: !recordLimited && start > 0 && lines.length === 0 && resolvedPartialBefore === undefined,
+  };
+}
+
+async function readPendingHistoryMessage(file, descriptor) {
+  const length = descriptor.end - descriptor.start;
+  if (length <= 0 || length > HISTORY_PARSE_LINE_BYTES) return undefined;
+  const bytes = Buffer.allocUnsafe(length);
+  const { bytesRead } = await file.read(bytes, 0, length, descriptor.start);
+  if (bytesRead !== length) throw new Error("Codex rollout changed during history read");
+  const record = parseHistoryRecord(bytes);
+  const payload = objectRecord(record?.payload);
+  const at = historyTimestamp(record?.timestamp);
+  if (record?.type === "event_msg" && payload?.type === "user_message" && typeof payload.message === "string") return visibleHistoryUser(descriptor.start, payload, at);
+  if (record?.type === "response_item" && payload?.type === "message" && payload.role === "assistant") return visibleHistoryAssistant(descriptor.start, payload, at);
+  return undefined;
+}
+
+function visibleHistoryUser(lineStart, payload, at) {
+  const body = truncateHistoryBody(stripHistorySetup(String(payload.message)));
+  return body ? { lineStart, role: "you", body, at, ...(nonEmptyText(payload.client_id) ? { clientId: payload.client_id } : {}) } : undefined;
+}
+function visibleHistoryAssistant(lineStart, payload, at) {
+  const body = truncateHistoryBody(historyOutputText(payload.content));
+  return body ? {
+    lineStart, role: "worker", body, at,
+    ...(nonEmptyText(payload.id) ? { nativeId: payload.id } : {}),
+    ...(nonEmptyText(payload.phase) ? { phase: payload.phase } : {}),
+  } : undefined;
+}
+
+function parseHistoryRecord(bytes) {
+  if (bytes.byteLength === 0) return undefined;
+  try { return objectRecord(JSON.parse(bytes.toString("utf8"))); } catch { return undefined; }
+}
+function objectRecord(value) { return value && typeof value === "object" && !Array.isArray(value) ? value : undefined; }
+function nonEmptyText(value) { return typeof value === "string" && value.length > 0 ? value : undefined; }
+function historyOutputText(content) {
+  return Array.isArray(content) ? content.flatMap((entry) => entry?.type === "output_text" && typeof entry.text === "string" ? [entry.text] : []).join("").trim() : "";
+}
+function stripHistorySetup(value) { return value.replace(/^\s*<environment_context>[\s\S]*?<\/environment_context>\s*/iu, "").trim(); }
+function truncateHistoryBody(body) {
+  const bytes = Buffer.from(body, "utf8");
+  if (bytes.byteLength <= 64 * 1024) return body;
+  let end = 64 * 1024;
+  while (end > 0 && (bytes[end] & 0xc0) === 0x80) end -= 1;
+  return `${bytes.subarray(0, end).toString("utf8")}\n\n[message truncated by Web UI]`;
+}
+function historyTimestamp(value) { const parsed = typeof value === "string" ? Date.parse(value) : 0; return Number.isFinite(parsed) ? parsed : 0; }
+function historyTerminalStatus(type) {
+  if (type === "task_complete" || type === "turn_complete") return "completed";
+  if (type === "task_failed" || type === "turn_failed") return "failed";
+  if (type === "turn_aborted" || type === "task_aborted") return "interrupted";
+  return undefined;
+}
+function rememberHistoryTerminal(terminal, turnId, proof) {
+  terminal.delete(turnId); terminal.set(turnId, proof);
+  while (terminal.size > HISTORY_CURSOR_TERMINALS) terminal.delete(terminal.keys().next().value);
+}
+function encodeHistoryCursor(cursor) {
+  const encoded = Buffer.from(JSON.stringify({ v: 2, ...cursor }), "utf8").toString("base64url");
+  if (encoded.length > HISTORY_CURSOR_BYTES) throw new Error("Codex history cursor exceeds its budget");
+  return encoded;
+}
+function decodeHistoryCursor(value) {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string" || !value || value.length > HISTORY_CURSOR_BYTES || !/^[A-Za-z0-9_-]+$/u.test(value)) throw new Error("invalid Codex history cursor");
+  let cursor;
+  try { cursor = JSON.parse(Buffer.from(value, "base64url").toString("utf8")); } catch { throw new Error("invalid Codex history cursor"); }
+  if ((cursor?.v !== 1 && cursor?.v !== 2) || !DECIMAL.test(cursor.device ?? "") || !DECIMAL.test(cursor.inode ?? "")
+    || !Number.isSafeInteger(cursor.before) || cursor.before < 0) throw new Error("invalid Codex history cursor");
+  if (cursor.v === 1) return {
+    device: cursor.device, inode: cursor.inode, before: cursor.before,
+    pending: [], terminals: [], skipPartial: false, pendingSkipped: false,
+  };
+  const pending = Array.isArray(cursor.pending) ? cursor.pending : [];
+  const terminals = Array.isArray(cursor.terminals) ? cursor.terminals : [];
+  const resolved = objectRecord(cursor.resolved);
+  if (pending.length > 50 || terminals.length > HISTORY_CURSOR_TERMINALS
+    || !validHistoryPending(pending)
+    || !terminals.every((entry) => objectRecord(entry) && typeof entry.turnId === "string" && entry.turnId.length <= 256
+      && ["completed", "failed", "interrupted"].includes(entry.status) && Number.isSafeInteger(entry.at))
+    || (cursor.skipPartial !== undefined && typeof cursor.skipPartial !== "boolean")
+    || (cursor.pendingSkipped !== undefined && typeof cursor.pendingSkipped !== "boolean")
+    || (cursor.resolved !== undefined && (!resolved || pending.length === 0 || cursor.pendingSkipped === true
+      || typeof resolved.turnId !== "string" || resolved.turnId.length < 1 || resolved.turnId.length > 256
+      || !["completed", "failed", "interrupted", "inProgress"].includes(resolved.status)
+      || !Number.isSafeInteger(resolved.at) || resolved.turnOrder !== cursor.before))) {
+    throw new Error("invalid Codex history cursor");
+  }
+  return {
+    device: cursor.device, inode: cursor.inode, before: cursor.before, pending, terminals,
+    skipPartial: cursor.skipPartial === true, pendingSkipped: cursor.pendingSkipped === true,
+    ...(resolved ? { resolved } : {}),
+  };
+}
+function validHistoryPending(values) {
+  let bytes = 0;
+  let previousStart = Number.MAX_SAFE_INTEGER;
+  for (const entry of values) {
+    if (!objectRecord(entry) || !Number.isSafeInteger(entry.start) || !Number.isSafeInteger(entry.end)
+      || entry.start < 0 || entry.end <= entry.start || entry.end > previousStart
+      || entry.end - entry.start > HISTORY_PARSE_LINE_BYTES) return false;
+    bytes += entry.end - entry.start;
+    if (bytes > HISTORY_PENDING_BYTES) return false;
+    previousStart = entry.start;
+  }
+  return true;
 }
 
 // ---------------------------------------------------------------------------------------
