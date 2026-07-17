@@ -73,7 +73,7 @@ export const TOOL_DESCRIPTIONS: Partial<Record<AssistantToolName, string>> = {
   archive_session: "Release a session and mark its native thread archived (still returned by discover_sessions, flagged archived; unadopt leaves it unarchived).",
   send_to_session: "Send a message to a worker as a new turn (start) or onto the active turn (steer). Used by /pass.",
   read_worker_message: "Read one worker message's full body by id (notifications are metadata-only until read).",
-  inspect_worker_conversation: "Inspect a bounded page of the latest native conversation on demand, including both user and worker messages and commentary already recorded in an active turn. No message id is required; use before to page backward. QiYan creates no operation/receipt record; the native assistant rollout still records the tool result.",
+  inspect_worker_conversation: "Inspect a bounded page of the latest native conversation on demand, including both user and worker messages and commentary already recorded in an active turn. No message id is required; use before to page backward. Large pages return an owner-only temporary JSON path instead of message bodies. QiYan creates no operation/receipt record; the native assistant rollout still records the tool result.",
   collect_messages: "Deliver the worker's last N final message bodies into chat. Used by /collect.",
   interrupt_session: "Interrupt the worker's active turn.",
   compact_session: "Compact a managed Codex session.",

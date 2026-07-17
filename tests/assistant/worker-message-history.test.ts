@@ -9,6 +9,7 @@ test("worker message reads delegate one bounded page and project native rows", a
   const calls: unknown[][] = [];
   const result = await readWorkerMessages({
     resolveSession: (nickname) => nickname === "worker" ? mapping : undefined,
+    writeResultFile: async () => { throw new Error("small result must stay inline"); },
     readTurns: async (...args) => {
       calls.push(args);
       return {
@@ -37,6 +38,7 @@ test("worker message reads reject unknown and remapped nicknames", async () => {
   const pending = new Promise<any>((resolve) => { resolveRead = resolve; });
   const deps = {
     resolveSession: (nickname: string) => nickname === "worker" ? current : undefined,
+    writeResultFile: async () => { throw new Error("must not write"); },
     readTurns: async () => pending,
   };
 
@@ -45,4 +47,49 @@ test("worker message reads reject unknown and remapped nicknames", async () => {
   current = { ...mapping, mapping_id: "replacement" };
   resolveRead({ messages: [], hasOlder: false, openTurnIds: [], terminalTurnIds: [] });
   await assert.rejects(read, (error: any) => error?.code === "OPERATION_CONFLICT");
+});
+
+test("large worker conversations spill without returning message bodies", async () => {
+  const longBody = Array.from({ length: 1_001 }, (_, index) => `word${index}`).join(" ");
+  let stored: unknown;
+  const result = await readWorkerMessages({
+    resolveSession: () => mapping,
+    readTurns: async () => ({
+      messages: [{ id: "a1", turnId: "turn", body: longBody, completedAt: 2, terminalStatus: "inProgress", turnOrder: 1, itemOrder: 1 }],
+      hasOlder: true, nextCursor: "next", openTurnIds: ["turn"], terminalTurnIds: [],
+    }),
+    writeResultFile: async (value) => { stored = value; return "/private/worker-conversation.json"; },
+  }, { nickname: "worker", count: 20 }, new AbortController().signal);
+
+  assert.equal((stored as any).messages[0].body, longBody);
+  assert.deepEqual(result, {
+    storage: "file",
+    path: "/private/worker-conversation.json",
+    format: "json",
+    messageCount: 1,
+    wordCount: 1_001,
+    inlineByteCount: Buffer.byteLength(JSON.stringify(stored), "utf8"),
+    hasOlder: true,
+    nextCursor: "next",
+    openTurnIds: ["turn"],
+    terminalTurnIds: [],
+  });
+  assert.doesNotMatch(JSON.stringify(result), /word1000/u);
+});
+
+test("a large unbroken body spills even below the word threshold", async () => {
+  let writes = 0;
+  const result = await readWorkerMessages({
+    resolveSession: () => mapping,
+    readTurns: async () => ({
+      messages: [{ id: "a1", turnId: "turn", body: "x".repeat(20_000), completedAt: 2, terminalStatus: "completed", turnOrder: 1, itemOrder: 1 }],
+      hasOlder: false, openTurnIds: [], terminalTurnIds: ["turn"],
+    }),
+    writeResultFile: async () => { writes += 1; return "/private/large-code.json"; },
+  }, { nickname: "worker", count: 20 }, new AbortController().signal);
+
+  assert.equal(writes, 1);
+  assert.equal((result as any).storage, "file");
+  assert.equal((result as any).wordCount, 1);
+  assert.ok((result as any).inlineByteCount > 16_384);
 });

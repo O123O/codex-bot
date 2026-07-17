@@ -57,7 +57,7 @@ test("packaged assistant policy is concise and reserves examples for exact direc
 
   assert.match(policy, /worker final messages are automatically delivered/iu);
   assert.match(policy, /do not repeat, paraphrase, acknowledge, or announce an automatically delivered result/iu);
-  assert.match(policy, /prefer exact ids.*`inspect_worker_conversation` only when supervision needs context/iu);
+  assert.match(policy, /prefer exact ids.*`inspect_worker_conversation` for context.*large pages return a temp JSON path/iu);
   assert.match(policy, /for monitoring.*follow up until the requested outcome is genuinely resolved/isu);
   assert.match(policy, /worker notification wakes you.*does not itself justify another user message/isu);
   assert.match(policy, /external_worker_turn_detected.*release.*pending/isu);
@@ -68,7 +68,7 @@ test("packaged assistant policy is concise and reserves examples for exact direc
   assert.match(policy, /state change happened only when its tool receipt proves it/iu);
   assert.match(policy, /interrupt only on explicit user intent or an already-authorized supervision objective/iu);
   assert.match(policy, /permission blocks.*worker failures are real states.*never fabricate/isu);
-  assert.match(policy, /notifications omit worker bodies/iu);
+  assert.match(policy, /notifications omit bodies/iu);
   assert.match(policy, /model and effort changes are pending.*next new turn.*steer/isu);
   assert.match(policy, /use `assistant`.*own status\/model\/effort\/compaction/iu);
   assert.match(policy, /self results return internally as `\[system\]`.*all results notify the user.*never reply to or repeat/iu);

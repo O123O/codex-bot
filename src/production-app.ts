@@ -69,6 +69,7 @@ import { AttemptScope } from "./assistant/attempt-scope.ts";
 import { SessionObservationProcessor } from "./assistant/session-observer.ts";
 import { createAssistantTools, type AssistantToolName, type ToolHandler } from "./assistant/tools.ts";
 import { readWorkerMessages } from "./assistant/worker-message-history.ts";
+import { TransientJsonStore } from "./assistant/transient-json-store.ts";
 import { prepareAssistantWorkspace } from "./assistant/workspace.ts";
 import { EventRelay } from "./events/relay.ts";
 import { persistDeliveryStateEvent, reconcileDeliveryStateEvents } from "./events/delivery-status.ts";
@@ -2115,6 +2116,7 @@ export async function buildProductionApp(
   let registryPath = config.sessionRegistryPath;
   let dashboardPath = join(assistantDir, "session-status.json");
   let assistantWarnings: string[] = [];
+  const assistantToolResults = new TransientJsonStore();
   let assistantProfile!: PreparedAssistantProfile;
   let db!: Database;
   let databaseLease: DatabaseLease | undefined;
@@ -2388,6 +2390,11 @@ export async function buildProductionApp(
       name: "assistant-working-directory",
       start: async () => { (options.chdir ?? ((path: string) => process.chdir(path)))(assistantDir); },
       stop: async () => undefined,
+    },
+    {
+      name: "assistant-tool-results",
+      start: async () => { await assistantToolResults.start(); },
+      stop: async () => { await assistantToolResults.stop(); },
     },
     {
       name: "storage",
@@ -3735,6 +3742,7 @@ export async function buildProductionApp(
         return readWorkerMessages({
           resolveSession: (nickname) => registry.get(nickname),
           readTurns: readWorkerTurns,
+          writeResultFile: (value) => assistantToolResults.write(value),
         }, args, signal);
       },
       collect_messages: async (args, context) => args.direct
