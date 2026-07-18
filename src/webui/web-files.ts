@@ -122,10 +122,17 @@ export async function browseReadablePath(home: string, requestedPath: string, ma
   if (!info.isDirectory()) return readConfinedFile(target, target, maxFileBytes);
   try {
     const dirents = await readdir(target, { withFileTypes: true });
-    const entries = dirents.map((entry) => ({
-      name: entry.name,
-      type: entry.isDirectory() ? "dir" as const : entry.isFile() ? "file" as const : "other" as const,
-    })).sort((a, b) => (a.type === b.type ? a.name.localeCompare(b.name) : a.type === "dir" ? -1 : 1));
+    const entries = (await Promise.all(dirents.map(async (entry) => {
+      const linkedInfo = entry.isSymbolicLink()
+        ? await stat(join(target, entry.name)).catch(() => undefined)
+        : undefined;
+      return {
+        name: entry.name,
+        type: entry.isDirectory() || linkedInfo?.isDirectory()
+          ? "dir" as const
+          : entry.isFile() || linkedInfo?.isFile() ? "file" as const : "other" as const,
+      };
+    }))).sort((a, b) => (a.type === b.type ? a.name.localeCompare(b.name) : a.type === "dir" ? -1 : 1));
     return { kind: "dir", path: target, entries };
   } catch {
     return { error: "not readable" };

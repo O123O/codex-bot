@@ -88,13 +88,17 @@ test("the owner filesystem browser defaults to home and accepts any readable abs
   const outside = join(base, "outside");
   await mkdir(join(home, "notes"), { recursive: true });
   await mkdir(outside);
+  await symlink(join(home, "notes"), join(home, "linked-notes"));
   await writeFile(join(home, "notes", "home.txt"), "home\n");
   await writeFile(join(outside, "outside.txt"), "outside\n");
 
   const initial = await browseReadablePath(home, "", 1024);
   assert.ok("kind" in initial && initial.kind === "dir");
   assert.equal(initial.path, home);
-  assert.deepEqual(initial.entries.map((entry) => entry.name), ["notes"]);
+  assert.deepEqual(initial.entries, [
+    { name: "linked-notes", type: "dir" },
+    { name: "notes", type: "dir" },
+  ]);
 
   const tilde = await browseReadablePath(home, "~/notes", 1024);
   assert.ok("kind" in tilde && tilde.kind === "dir");
