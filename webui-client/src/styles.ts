@@ -29,7 +29,7 @@ body { margin:0; }
 .files { flex:0 0 auto; border-right:1px solid var(--line); background:var(--panel); display:flex; flex-direction:column; min-height:0; overflow:hidden; }
 .resizer { flex:0 0 5px; cursor:col-resize; background:transparent; } .resizer:hover { background:var(--accent); }
 .tw { display:inline-block; width:1.1em; color:var(--muted); }
-.tabs2 { display:flex; gap:4px; } .tabs2 button { background:transparent; border:0; color:var(--muted); cursor:pointer; padding:2px 8px; border-radius:6px; font-weight:600; } .tabs2 button.on { color:var(--text); background:var(--panel2); }
+.tabs2 { display:flex; gap:4px; } .tabs2 button { background:transparent; border:0; color:var(--muted); cursor:pointer; padding:2px 8px; border-radius:6px; font-weight:600; } .tabs2 button.on { color:var(--text); background:var(--panel2); } .tabs2 button:disabled { opacity:.45; cursor:default; }
 .git-toolbar { display:flex; gap:6px; padding:6px 8px; }
 .discover { border:1px solid var(--line); border-radius:8px; margin:0 8px 8px; padding:4px; }
 .grepo { border:1px solid var(--line); border-radius:8px; margin:0 8px 8px; overflow:hidden; }
@@ -40,6 +40,8 @@ body { margin:0; }
 .commit textarea { background:var(--bg); color:var(--text); border:1px solid var(--line); border-radius:8px; padding:6px 8px; resize:none; font:inherit; }
 .commit button { background:var(--accent); color:var(--accent-fg); border:0; border-radius:8px; padding:6px; cursor:pointer; font-weight:600; } .commit button:disabled { opacity:.45; cursor:default; }
 .files-head { padding:8px 14px; border-bottom:1px solid var(--line); font-weight:600; display:flex; align-items:center; justify-content:space-between; }
+.filesystem-nav { display:flex; gap:5px; padding:7px 8px; border-bottom:1px solid var(--line); }
+.filesystem-nav input { min-width:0; flex:1; padding:5px 7px; border:1px solid var(--line); border-radius:5px; background:var(--bg); color:var(--text); font:inherit; }
 .ghost.sm { padding:2px 8px; font-size:15px; line-height:1; }
 .older { align-self:center; background:transparent; border:0; color:var(--muted); cursor:pointer; font:inherit; font-size:12px; margin:0; padding:6px 10px 10px; }
 .older:hover:not(:disabled) { color:var(--text); text-decoration:underline; }

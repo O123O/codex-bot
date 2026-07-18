@@ -8,7 +8,7 @@ import type { OperationalEvent } from "../core/operational-log.ts";
 import type { WebBus } from "./web-bus.ts";
 import { assistantTranscript, sessionSnapshot, type WebReadsDeps } from "./web-reads.ts";
 import { WorkerHistoryError, createWorkerHistoryReader, type WorkerHistoryReader } from "./worker-history-reader.ts";
-import { browse, confine, createEntry, resolvePath, type FileTarget, type WebFilesDeps } from "./web-files.ts";
+import { browse, browseReadablePath, confine, createEntry, resolvePath, type FileTarget, type WebFilesDeps } from "./web-files.ts";
 import { cleanupUploads, storeUpload, type WebUploadsConfig } from "./web-uploads.ts";
 import { runCommand } from "./web-exec.ts";
 import { discoverRepos, gitCommit, gitDiff, gitStage, gitStatus, gitUnstage } from "./web-git.ts";
@@ -282,6 +282,14 @@ export function createWebServer(options: WebServerOptions): WebServer {
       if (!input) { json(response, 400, { error: "invalid goal command" }); return; }
       const result = await options.controlGoal(input);
       json(response, result.ok ? 200 : 400, result);
+      return;
+    }
+    // Read-only owner filesystem tree. The OS user's read permissions are the boundary; worker
+    // browse/write/git routes below retain their project confinement.
+    if (request.method === "GET" && url.pathname === "/api/filesystem") {
+      if (!options.files.userHome) { json(response, 404, { error: "filesystem browser unavailable" }); return; }
+      const result = await browseReadablePath(options.files.userHome, url.searchParams.get("path") ?? "", options.files.maxFileBytes);
+      json(response, "error" in result ? 400 : 200, result);
       return;
     }
     // File tree, confined to the session's project — local via fs, remote via ssh.

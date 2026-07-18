@@ -13,6 +13,8 @@ export interface WebFilesDeps {
   projectDir(nickname: string): string | undefined;
   // Transport + project dir + ssh host for a session (local or remote), or undefined if not browsable.
   fileTarget(nickname: string): FileTarget | undefined;
+  // Home of the OS user running QiYan. Enables the owner-only, read-only filesystem browser.
+  userHome?: string;
   maxFileBytes: number;
 }
 
@@ -102,4 +104,30 @@ export async function browse(deps: WebFilesDeps, nickname: string, relPath: stri
     return { kind: "dir", path: relPath, entries };
   }
   return readConfinedFile(target, relPath, deps.maxFileBytes);
+}
+
+// Browse any path readable by the OS user running QiYan. This is intentionally separate from the
+// project-confined worker browser: the token-gated QiYan tab is read-only and defaults to `home`,
+// while file creation, command execution, and Git operations remain session-scoped.
+export async function browseReadablePath(home: string, requestedPath: string, maxFileBytes: number): Promise<WebFilesResult> {
+  const candidate = requestedPath === "" || requestedPath === "~"
+    ? home
+    : requestedPath.startsWith("~/")
+      ? resolve(home, requestedPath.slice(2))
+      : isAbsolute(requestedPath) ? requestedPath : resolve(home, requestedPath);
+  const target = await realpath(candidate).catch(() => undefined);
+  if (target === undefined) return { error: "not found" };
+  const info = await stat(target).catch(() => undefined);
+  if (info === undefined) return { error: "not readable" };
+  if (!info.isDirectory()) return readConfinedFile(target, target, maxFileBytes);
+  try {
+    const dirents = await readdir(target, { withFileTypes: true });
+    const entries = dirents.map((entry) => ({
+      name: entry.name,
+      type: entry.isDirectory() ? "dir" as const : entry.isFile() ? "file" as const : "other" as const,
+    })).sort((a, b) => (a.type === b.type ? a.name.localeCompare(b.name) : a.type === "dir" ? -1 : 1));
+    return { kind: "dir", path: target, entries };
+  } catch {
+    return { error: "not readable" };
+  }
 }

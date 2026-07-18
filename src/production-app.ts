@@ -3,7 +3,7 @@ import { spawn } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, posix, resolve } from "node:path";
-import { hostname } from "node:os";
+import { homedir, hostname } from "node:os";
 import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 import { AttachmentStore, type FileHandleId } from "./attachments/store.ts";
@@ -3515,6 +3515,7 @@ export async function buildProductionApp(
       // sessions expose files here; a remote (ssh) session's project dir is on another host, so it
       // is intentionally not browsable yet (remote file browsing is a later phase).
       files: {
+        userHome: homedir(),
         projectDir: (nickname) => {
           const session = registry.snapshot().sessions[nickname];
           return session && isLocalEndpointId(session.endpoint, localClaudeEndpointId) ? session.project_dir : undefined;

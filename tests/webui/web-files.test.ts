@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { browse, createEntry, resolvePath, type WebFilesDeps } from "../../src/webui/web-files.ts";
+import { browse, browseReadablePath, createEntry, resolvePath, type WebFilesDeps } from "../../src/webui/web-files.ts";
 import { stat } from "node:fs/promises";
 
 async function fixture(): Promise<{ deps: WebFilesDeps; root: string; outside: string }> {
@@ -80,4 +80,28 @@ test("resolvePath returns absolute paths as-is (owner-only preview) and relative
   // relative paths join under the session root
   assert.equal(resolvePath(root, "src/app.ts"), join(root, "src/app.ts"));
   assert.equal(resolvePath(undefined, "src/app.ts"), undefined); // relative with no session → unresolved
+});
+
+test("the owner filesystem browser defaults to home and accepts any readable absolute path", async () => {
+  const base = await mkdtemp(join(tmpdir(), "qiyan-owner-files-"));
+  const home = join(base, "home");
+  const outside = join(base, "outside");
+  await mkdir(join(home, "notes"), { recursive: true });
+  await mkdir(outside);
+  await writeFile(join(home, "notes", "home.txt"), "home\n");
+  await writeFile(join(outside, "outside.txt"), "outside\n");
+
+  const initial = await browseReadablePath(home, "", 1024);
+  assert.ok("kind" in initial && initial.kind === "dir");
+  assert.equal(initial.path, home);
+  assert.deepEqual(initial.entries.map((entry) => entry.name), ["notes"]);
+
+  const tilde = await browseReadablePath(home, "~/notes", 1024);
+  assert.ok("kind" in tilde && tilde.kind === "dir");
+  assert.equal(tilde.path, join(home, "notes"));
+
+  const external = await browseReadablePath(home, outside, 1024);
+  assert.ok("kind" in external && external.kind === "dir");
+  assert.equal(external.path, outside);
+  assert.deepEqual(external.entries.map((entry) => entry.name), ["outside.txt"]);
 });

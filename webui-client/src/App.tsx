@@ -9,6 +9,7 @@ import "katex/dist/katex.min.css";
 import { formatGoalStatus, selectedWorkerGoal, type WorkerGoal } from "./goal-presentation";
 import { createBrowserUuid } from "./browser-uuid";
 import { assistantMessagePresentation } from "./chat-provenance";
+import { joinFilesystemPath, parentFilesystemPath } from "./filesystem-path";
 import { mergeAssistantConversation } from "./assistant-chat-stream";
 import { STYLES } from "./styles";
 import { parseWorkerCommand, WORKER_GOAL_HELP, type WorkerCommand } from "./worker-commands";
@@ -173,6 +174,8 @@ export function App() {
   const [srcMode, setSrcMode] = useState(false); // for markdown previews: rendered (false) vs raw source
   const [dirs, setDirs] = useState<Record<string, Array<{ name: string; type: string }> | { error: string }>>({}); // tree: entries by dir path ("" = root)
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const [filesystemRoot, setFilesystemRoot] = useState("~");
+  const [filesystemPath, setFilesystemPath] = useState("~");
   const [filesWidth, setFilesWidth] = useState<number>(() => Number(localStorage.getItem("qiyan-files-w")) || 300);
   const [sidebarTab, setSidebarTab] = useState<"files" | "git">("files");
   const [trackedRepos, setTrackedRepos] = useState<string[]>([]);            // repos tracked for this worker (localStorage)
@@ -344,12 +347,36 @@ export function App() {
     return true;
   }, [replaceWorker, scheduleReconciliationRetry, scheduleRecoveryRetry]);
   workerPageLoaderRef.current = loadWorkerPage;
-  const loadDir = useCallback(async (nickname: string, path: string) => {
-    try { const r = await api<FileResult>(`/api/files/${nickname}?path=${encodeURIComponent(path)}`);
-      setDirs((d) => ({ ...d, [path]: "kind" in r && r.kind === "dir" ? r.entries : { error: "not a directory" } })); }
-    catch (e) { setDirs((d) => ({ ...d, [path]: { error: (e as { error?: string }).error ?? "unavailable" } })); }
+  const openPreview = useCallback((path: string, session: string | null) => {
+    setSrcMode(false);
+    const url = rawUrl(path, session);
+    if (IMG_EXT.test(path)) { setPreview({ kind: "image", title: path, url }); return; }
+    if (TAB_EXT.test(path)) { window.open(url, "_blank", "noopener"); return; }
+    setPreview({ kind: "loading", title: path });
+    void readTextStream(url).then(({ text, truncated }) => setPreview({ kind: "text", title: path, text, truncated }))
+      .catch((e) => setPreview({ kind: "error", title: path, error: (e as { error?: string }).error ?? "unavailable" }));
   }, []);
-  const toggleDir = (nickname: string, path: string) => setExpanded((prev) => {
+  const loadDir = useCallback(async (nickname: string | null, path: string, replaceRoot = false) => {
+    const route = nickname === null
+      ? `/api/filesystem?path=${encodeURIComponent(path)}`
+      : `/api/files/${nickname}?path=${encodeURIComponent(path)}`;
+    try {
+      const r = await api<FileResult>(route);
+      if ("kind" in r && r.kind === "dir") {
+        const key = nickname === null && replaceRoot ? r.path : path;
+        if (nickname === null && replaceRoot) {
+          setFilesystemRoot(r.path); setFilesystemPath(r.path); setExpanded(new Set()); setDirs({ [key]: r.entries });
+        } else setDirs((d) => ({ ...d, [key]: r.entries }));
+      } else if (nickname === null && replaceRoot && "kind" in r && r.kind === "file") {
+        setFilesystemPath(r.path); openPreview(r.path, null);
+      } else setDirs((d) => ({ ...d, [path]: { error: "not a directory" } }));
+    } catch (e) {
+      const error = { error: (e as { error?: string }).error ?? "unavailable" };
+      if (nickname === null && replaceRoot) { setFilesystemRoot(path); setDirs({ [path]: error }); }
+      else setDirs((d) => ({ ...d, [path]: error }));
+    }
+  }, [openPreview]);
+  const toggleDir = (nickname: string | null, path: string) => setExpanded((prev) => {
     const next = new Set(prev);
     if (next.has(path)) next.delete(path); else { next.add(path); if (!dirs[path]) void loadDir(nickname, path); }
     return next;
@@ -464,7 +491,9 @@ export function App() {
   useEffect(() => {
     setVisible(RENDER_CAP); stickRef.current = true; preserveRef.current = null;
     subscribeWorker(wsRef.current, selected);
-    if (selected) { setDirs({}); setExpanded(new Set()); void loadDir(selected, ""); }
+    setDirs({}); setExpanded(new Set());
+    if (selected) void loadDir(selected, "");
+    else { setSidebarTab("files"); void loadDir(null, "~", true); }
   }, [selected, selectedMappingId, subscribeWorker, loadDir]);
   useEffect(() => {
     if (selected && sidebarTab === "git") {
@@ -710,6 +739,7 @@ export function App() {
   };
   const download = (path: string) => window.open(`${rawUrl(path, selected)}&download=1`, "_blank");
   const insertPath = (path: string) => { const proj = sessions.find((s) => s.nickname === selected)?.projectDir; setText((t) => `${t ? t.replace(/\s*$/, " ") : ""}${proj ? `${proj}/${path}` : path} `); };
+  const openFilesystemPath = (path: string) => { void loadDir(null, path.trim() || "~", true); };
 
   // Recursive file tree: folders expand in place (lazy-loaded); files open the preview popup; hover
   // reveals per-row actions (new file/folder in a dir; download / insert-path for a file).
@@ -719,16 +749,16 @@ export function App() {
     if ("error" in node) return <div className="hint" style={{ paddingLeft: 8 + depth * 14 }}>{node.error}</div>;
     if (!node.length) return <div className="hint" style={{ paddingLeft: 8 + depth * 14 }}>empty</div>;
     return node.map((e) => {
-      const full = path ? `${path}/${e.name}` : e.name;
+      const full = selected === null ? joinFilesystemPath(path, e.name) : path ? `${path}/${e.name}` : e.name;
       if (e.type === "dir") {
         const open = expanded.has(full);
         return <div key={full}>
-          <div className="frow dir" style={{ paddingLeft: 6 + depth * 14 }} onClick={() => toggleDir(selected!, full)}>
+          <div className="frow dir" style={{ paddingLeft: 6 + depth * 14 }} onClick={() => toggleDir(selected, full)}>
             <span className="tw">{open ? "▾" : "▸"}</span>📁 <span className="fname">{e.name}</span>
-            <span className="actions" onClick={(ev) => ev.stopPropagation()}>
+            {selected && <span className="actions" onClick={(ev) => ev.stopPropagation()}>
               <button title="New file" onClick={() => newEntry("mkfile", full)}>＋📄</button>
               <button title="New folder" onClick={() => newEntry("mkdir", full)}>＋📁</button>
-            </span>
+            </span>}
           </div>
           {open && renderDir(full, depth + 1)}
         </div>;
@@ -824,18 +854,8 @@ export function App() {
     </div>
   );
 
-  // Open a file in the popup. Text is STREAMED into the panel (not preloaded); images render inline;
-  // pdf/html open in a new tab. The server resolves the path (any root for absolute, ?session=’s
-  // project for relative), so the client never guesses which root a path lives in.
-  const openPreview = (path: string, session: string | null) => {
-    setSrcMode(false); // default markdown to the rendered view
-    const url = rawUrl(path, session);
-    if (IMG_EXT.test(path)) { setPreview({ kind: "image", title: path, url }); return; }
-    if (TAB_EXT.test(path)) { window.open(url, "_blank", "noopener"); return; }
-    setPreview({ kind: "loading", title: path });
-    void readTextStream(url).then(({ text, truncated }) => setPreview({ kind: "text", title: path, text, truncated }))
-      .catch((e) => setPreview({ kind: "error", title: path, error: (e as { error?: string })?.error ?? "unavailable" }));
-  };
+  // Open a mentioned file in the popup. The server resolves absolute paths directly and worker
+  // relative paths under their project, so the client never guesses which root a path lives in.
   // `session` decides which host a path resolves against: the current worker tab, or (in the QiYan tab)
   // the relayed message's origin worker — so a REMOTE worker's path streams from its host.
   const openMentioned = (mention: string, session: string | null) =>
@@ -882,7 +902,7 @@ export function App() {
           <div className="files-head">
             <span className="tabs2">
               <button className={sidebarTab === "files" ? "on" : ""} onClick={() => setSidebarTab("files")}>Files</button>
-              <button className={sidebarTab === "git" ? "on" : ""} onClick={() => setSidebarTab("git")}>Git</button>
+              <button className={sidebarTab === "git" ? "on" : ""} disabled={selected === null} onClick={() => setSidebarTab("git")}>Git</button>
             </span>
             {selected && sidebarTab === "files" && <span className="head-actions">
               <button className="ghost sm" title="New file at root" onClick={() => newEntry("mkfile", "")}>＋📄</button>
@@ -890,7 +910,13 @@ export function App() {
               <button className="ghost sm" title="Refresh (no live watcher)" onClick={() => { [...new Set(["", ...Object.keys(dirs)])].forEach((p) => void loadDir(selected, p)); void loadSessions(); }}>⟳</button>
             </span>}
           </div>
-          {selected === null ? <div className="hint">Select a worker to browse its files / git.</div> : sidebarTab === "files" ? <div className="tree">{renderDir("", 0)}</div> : renderGit()}
+          {selected === null && <form className="filesystem-nav" onSubmit={(event) => { event.preventDefault(); openFilesystemPath(filesystemPath); }}>
+            <button type="button" className="ghost sm" title="Parent folder" onClick={() => openFilesystemPath(parentFilesystemPath(filesystemRoot))}>↑</button>
+            <input value={filesystemPath} onChange={(event) => setFilesystemPath(event.target.value)} placeholder="~/ or absolute path" aria-label="Filesystem path" />
+            <button type="submit" className="ghost sm">Go</button>
+            <button type="button" className="ghost sm" title="Refresh" onClick={() => openFilesystemPath(filesystemRoot)}>⟳</button>
+          </form>}
+          {sidebarTab === "files" ? <div className="tree">{renderDir(selected === null ? filesystemRoot : "", 0)}</div> : renderGit()}
         </aside>
         <div className="resizer" onMouseDown={startResize} title="Drag to resize" />
 

@@ -62,7 +62,7 @@ async function withServer(
   const uploadsDir = await mkdtemp(join(tmpdir(), "qiyan-webui-up-"));
   const server = createWebServer({
     host: "127.0.0.1", port: 0, token: TOKEN, staticDir, bus, reads: readsOverride,
-    files: { projectDir: () => undefined, fileTarget: () => undefined, maxFileBytes: 1024 },
+    files: { projectDir: () => undefined, fileTarget: () => undefined, userHome: uploadsDir, maxFileBytes: 1024 },
     uploads: { dir: uploadsDir, maxBytes: 1024, ttlMs: 1e9 },
     submitInput: async (text, target, clientInputId) => { calls.inputs.push({ text, ...(target ? { target } : {}), ...(clientInputId ? { clientInputId } : {}) }); return { ok: true, ...(clientInputId ? { clientUserMessageId: `to:web:${clientInputId}` } : {}) }; },
     controlGoal: async (input) => { calls.goals.push(input); return { ok: true }; },
@@ -313,6 +313,22 @@ test("streams any readable raw file with a browser Content-Type; 404s a nonexist
     assert.equal(crlf.status, 200);
     assert.doesNotMatch(crlf.headers.get("content-disposition") ?? "", /[\r\n]/);
     assert.equal((await fetch(`${base}/api/raw?path=${abs}`)).status, 401); // still token-gated
+  });
+});
+
+test("browses the service user's filesystem from home or an absolute path", async () => {
+  await withServer(async (base, _calls, _bus, home) => {
+    await writeFile(join(home, "home.txt"), "home\n");
+    const initial = await (await fetch(`${base}/api/filesystem?token=${TOKEN}`)).json();
+    assert.equal(initial.kind, "dir");
+    assert.equal(initial.path, home);
+    assert.ok(initial.entries.some((entry: { name: string }) => entry.name === "home.txt"));
+
+    const outside = await mkdtemp(join(tmpdir(), "qiyan-owner-outside-"));
+    await writeFile(join(outside, "outside.txt"), "outside\n");
+    const absolute = await (await fetch(`${base}/api/filesystem?path=${encodeURIComponent(outside)}&token=${TOKEN}`)).json();
+    assert.equal(absolute.path, outside);
+    assert.deepEqual(absolute.entries.map((entry: { name: string }) => entry.name), ["outside.txt"]);
   });
 });
 
