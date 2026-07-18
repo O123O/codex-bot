@@ -1,5 +1,7 @@
 # App-Server-authoritative lifecycle redesign
 
+> Historical note: rollout ownership inference and automatic unadoption described here were removed in July 2026. Registry membership is the management policy; App Server state and native history are the runtime source of truth.
+
 ## 1. Decision
 
 QiYan will treat the connected provider runtime as the only authority for native

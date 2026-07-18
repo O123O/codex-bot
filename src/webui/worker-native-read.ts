@@ -53,9 +53,8 @@ function readyPageKey(turns: readonly unknown[]): string {
   return createHash("sha256").update(JSON.stringify(structural)).digest("base64url");
 }
 
-// Claude's runtime implements the same native turn page contract. Codex history uses its bounded
-// rollout reader instead, because legacy Codex does not expose item pagination and a full turn can
-// exceed the remote App Server WebSocket frame.
+// Both providers expose this native turn-page contract. History stays behind the endpoint runtime;
+// the Web UI requests only the foreground page it needs.
 export async function readReadyWorkerTurns(
   deps: ReadyWorkerReadDeps,
   endpointId: string,

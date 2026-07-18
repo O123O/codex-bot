@@ -20,7 +20,7 @@ import {
 } from "./ssh-process.ts";
 import { parseRuntimeIdentity, type EndpointLossKind, type RuntimeIdentity } from "./types.ts";
 
-export const REMOTE_HELPER_SHA256 = "d9b4b40c9fb0deb2b2f8dfa95c1000ccb0a8cbc803e5d6189fdd5adf3700ef42";
+export const REMOTE_HELPER_SHA256 = "461b7384cd61b070ee37d6d81c51b448f51035cf05bbe74dfbe1230eb4f8ecac";
 export const REMOTE_LAUNCHER_SHA256 = "643dd9424f3d7fb5cca8d9f7cbd835fb40a57e8a7e728ed1529259e92fa793c5";
 export const REMOTE_APP_SERVER_PROXY_READY = Buffer.from("qiyan-app-server-proxy-v1-ready\n");
 
@@ -29,7 +29,7 @@ const MAX_UNIX_SOCKET_PATH_BYTES = 107;
 const SAFE_REMOTE_PATH = /^\/[A-Za-z0-9_./+-]+$/u;
 const REMOTE_HELPER_RESPONSE_PREFIX = "qiyan-helper-v1:";
 const REMOTE_HELPER_TIMEOUT_MS = 300_000;
-const helperOperations = new Set(["preflight", "bootstrap", "inspect", "start", "stop", "read-file", "write-file", "rollout-scan", "rollout-boundary", "claude-rollout-scan", "codex-history", "workspace"]);
+const helperOperations = new Set(["preflight", "bootstrap", "inspect", "start", "stop", "read-file", "write-file", "workspace"]);
 const preflightSchema = z.object({
   uid: z.number().int().positive(),
   home: z.string().startsWith("/"),
@@ -121,7 +121,7 @@ export interface SshRuntimeController {
 }
 
 // The provider-neutral host facts a remote endpoint's consumers need (workspace router,
-// worker file bridge, ownership scan). A Codex remote satisfies this via SshRuntime; a
+// worker file bridge). A Codex remote satisfies this via SshRuntime; a
 // Claude remote (no app-server) builds a lean one over the same bootstrapped helper.
 export interface RemoteHost {
   readonly remoteUid: number;
@@ -133,7 +133,7 @@ export interface RemoteHost {
 
 // Runs the provider-neutral host bootstrap (preflight → install helper) and returns the
 // derived host facts. Both SshRuntime (Codex) and the remote Claude endpoint use this so
-// the helper lands at the SAME uid-scoped path on both providers — ownership scans and
+// the helper lands at the SAME uid-scoped path on both providers — file access and
 // workspace ops resolve the identical `qiyan-ssh-helper.mjs`.
 export async function prepareRemoteHost(options: {
   endpointId: string;

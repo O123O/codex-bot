@@ -127,7 +127,7 @@ test("the exact production MCP map succeeds for every local and remote manager a
     assistantSandboxMode: "read-only",
     webUi: { host: "127.0.0.1", port: 0 },
     // The local Claude endpoint (`claude-local`) is declared in endpoints.json above, so the
-    // Claude lifecycle runs through the same real manager/service/ownership stack as Codex.
+    // Claude lifecycle runs through the same real manager/service stack as Codex.
   };
   const adapter = new AcceptanceAdapter();
   let tools: Readonly<Record<AssistantToolName, ToolHandler>> | undefined;
@@ -342,11 +342,6 @@ test("the exact production MCP map succeeds for every local and remote manager a
 
   for (const fixture of fixtures) {
     const session = sessions.get(fixture.nickname)!;
-    const ownedTurns = db.prepare(`SELECT COUNT(*) AS count FROM session_rollout_owned_turns
-      WHERE endpoint_id = ? AND thread_id = ? AND mapping_id = ?`);
-    const ownedTurnCount = (): number => (ownedTurns.get(
-      fixture.endpoint, session.thread_id, session.mapping_id,
-    ) as { count: number }).count;
     const discovered = await call("discover_sessions", { endpoint: fixture.endpoint, cwd: session.project_dir, limit: 10 }, fixture.endpoint);
     assert.ok(Array.isArray(discovered.sessions));
     const status = await call("get_session_status", { nickname: fixture.nickname }, fixture.endpoint);
@@ -414,16 +409,12 @@ test("the exact production MCP map succeeds for every local and remote manager a
     assert.equal(configuredStatus.auto_session_info.reasoning_effort.current, effort);
     assert.equal(configuredStatus.manager_notes.project_summary, "MCP acceptance fixture");
 
-    const ownedBeforeGoal = ownedTurnCount();
     await call("set_goal", { nickname: fixture.nickname, objective: "MCP acceptance goal" }, fixture.endpoint);
-    await waitFor(() => ownedTurnCount() > ownedBeforeGoal, workerTimeoutMs, `${fixture.nickname} autonomous goal turn ownership`);
     const goal = await call("get_goal", { nickname: fixture.nickname }, fixture.endpoint);
     assert.equal(goal.goal.objective, "MCP acceptance goal");
     await call("pause_goal", { nickname: fixture.nickname }, fixture.endpoint);
     await call("interrupt_session", { nickname: fixture.nickname }, fixture.endpoint);
-    const ownedBeforeResume = ownedTurnCount();
     await call("resume_goal", { nickname: fixture.nickname }, fixture.endpoint);
-    await waitFor(() => ownedTurnCount() > ownedBeforeResume, workerTimeoutMs, `${fixture.nickname} resumed goal turn ownership`);
     await call("cancel_goal", { nickname: fixture.nickname, interrupt_active_turn: true }, fixture.endpoint);
     await call("compact_session", { nickname: fixture.nickname }, fixture.endpoint);
 
@@ -475,7 +466,7 @@ test("the exact production MCP map succeeds for every local and remote manager a
 
   // ---- Claude endpoint lifecycle: the coverage gap (local claude-local + optional remote) ----
   // Drives the exact path that shipped bugs live: create (workspace routing) → send (unstarted
-  // first-turn dispatch) → deliver (ownership commits the Claude <id>.jsonl path) → collect →
+  // first-turn dispatch) → deliver → collect →
   // unadopt → adopt → archive, plus a never-materialized archive and a daemonless restart.
   const claudeFixtures = [
     { endpoint: "claude-local", nickname: `mcp-claude-local-${suffix}` },
@@ -527,10 +518,6 @@ test("the exact production MCP map succeeds for every local and remote manager a
     assert.ok(history.messages.some((message: any) => message.role === "worker" && new RegExp(marker, "u").test(message.body)));
     const collected = await call("collect_messages", { nickname: fixture.nickname, count: 1 }, fixture.endpoint);
     assert.equal(collected.length, 1);
-    // the QiYan-driven turn must commit as OWNED (Claude <id>.jsonl path accepted, not external)
-    const ownRow = db.prepare(`SELECT external_turn_id FROM session_rollout_ownership WHERE endpoint_id = ? AND thread_id = ? AND mapping_id = ?`)
-      .get(fixture.endpoint, session.thread_id, session.mapping_id) as { external_turn_id: string | null } | undefined;
-    assert.ok(ownRow && !ownRow.external_turn_id, `${fixture.nickname} first turn was misclassified external`);
     await call("get_session_status", { nickname: fixture.nickname }, fixture.endpoint);
 
     const deliverTurn = (turnId: string, label: string): Promise<{ id: string }> => waitForValue(() => db.prepare(`SELECT id FROM logical_final_messages

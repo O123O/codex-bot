@@ -13,7 +13,6 @@ import { FinalMessageStore } from "../../src/sessions/final-messages.ts";
 import { SessionService } from "../../src/sessions/service.ts";
 import { SessionLifecycle } from "../../src/sessions/lifecycle.ts";
 import { NativeSessionState } from "../../src/sessions/native-session-state.ts";
-import type { OwnershipInspection } from "../../src/sessions/rollout-ownership.ts";
 import { ThreadGate } from "../../src/sessions/thread-gate.ts";
 import { createTestDatabase } from "../../src/storage/database.ts";
 import { DeliveryStore } from "../../src/storage/delivery-store.ts";
@@ -68,6 +67,7 @@ class ServiceEndpoint implements AppServerEndpoint {
       if (this.failNextStart) { this.failNextStart = false; throw new Error("start failed"); }
       this.onTurnStart?.();
       this.lastClientId = params.clientUserMessageId;
+      this.status = "active";
       return { turn: { id: "started-1", ...(this.historyTurnStatus ? { status: this.historyTurnStatus } : {}) } } as T;
     }
     if (method === "turn/steer") return { turnId: params.expectedTurnId } as T;
@@ -135,10 +135,7 @@ class ServiceEndpoint implements AppServerEndpoint {
   }
 }
 
-async function fixture(ownership?: {
-  inspect(identity: { endpoint: string; thread_id: string; mapping_id: string }): Promise<OwnershipInspection>;
-  authorizeTurn?(identity: { endpoint: string; thread_id: string; mapping_id: string }, turnId: string): void;
-}, options: { coldEndpoint?: boolean } = {}) {
+async function fixture(options: { coldEndpoint?: boolean } = {}) {
   const dir = await realpath(await mkdtemp(join(tmpdir(), "qiyan-bot-service-")));
   const endpointId = options.coldEndpoint ? "prenyx" : "local";
   const registry = await SessionRegistry.open(join(dir, "sessions.json"), {
@@ -186,9 +183,11 @@ async function fixture(ownership?: {
     },
   } satisfies Pick<EndpointManager, "withWorkLease" | "runWithWorkLease"> : undefined;
   if (endpoints) pool.setWorkLeaseProvider((id, lease, run) => endpoints.runWithWorkLease(id, lease, run));
-  const service = new SessionService(pool, registry, native, controls, finals, deliveries, workspaces, gate, endpoints, ownership);
+  const service = new SessionService(pool, registry, native, controls, finals, deliveries, workspaces, gate, endpoints);
   const observeNative = (status: "idle" | "active", turnId?: string) => {
+    endpoint.status = status;
     if (status === "active" && turnId) {
+      endpoint.threadTurns = [{ id: turnId, status: "inProgress", items: [] }];
       native.observe("local", nativeGeneration, "turn/started", { threadId: "thread", turn: { id: turnId, status: "inProgress" } });
     } else {
       native.observe("local", nativeGeneration, "thread/status/changed", { threadId: "thread", status: { type: status } });
@@ -237,10 +236,9 @@ test("an id-less active event refreshes once and fails closed instead of startin
   assert.equal(value.endpoint.calls.some((call) => call.method === "turn/start"), false);
 });
 
-test("native error state cannot admit a new turn", async () => {
+test("a fresh native error state cannot admit a new turn", async () => {
   const value = await fixture();
-  const identity = { endpointId: "local", threadId: "thread", mappingId };
-  value.native.applyRefresh(value.native.captureRefresh(identity, value.nativeGeneration), { status: "error" });
+  value.endpoint.status = "systemError";
 
   await assert.rejects(value.service.send("payments", "must not start"), (error: unknown) => (
     error instanceof AppError && error.code === "ENDPOINT_UNAVAILABLE"
@@ -278,53 +276,8 @@ test("execution performs a fresh native cwd and project check before every mutat
   assert.equal(endpoint.calls.some((call) => call.method === "turn/start" || call.method === "turn/steer"), false);
 });
 
-test("execution checks rollout ownership before reading or mutating the native thread", async () => {
-  const checked: string[] = [];
-  const value = await fixture({
-    inspect: async (identity) => {
-      checked.push(identity.mapping_id);
-      throw new AppError("SESSION_DETACHED", "external turn detected");
-    },
-  });
-
-  await assert.rejects(value.service.send("payments", "must not run"), (error: unknown) => error instanceof AppError && error.code === "SESSION_DETACHED");
-  assert.deepEqual(checked, [mappingId]);
-  assert.deepEqual(value.endpoint.calls, []);
-});
-
-test("execution waits for a pathless rollout before native dispatch", async () => {
-  const value = await fixture({ inspect: async () => ({ state: "pending" }) });
-
-  await assert.rejects(value.service.send("payments", "must not run"), (error: unknown) => (
-    error instanceof AppError && error.code === "SESSION_BUSY"
-  ));
-
-  assert.deepEqual(value.endpoint.calls, []);
-});
-
-test("execution rechecks rollout ownership after input preparation and immediately before dispatch", async () => {
-  let external = false;
-  let checks = 0;
-  const value = await fixture({
-    inspect: async () => {
-      checks += 1;
-      return external ? { state: "external", turnId: "outside" } : { state: "owned" };
-    },
-  });
-
-  await assert.rejects(value.service.send("payments", "must not run", {
-    prepareInput: async () => {
-      external = true;
-      return [{ type: "text", text: "prepared", text_elements: [] }];
-    },
-  }), (error: unknown) => error instanceof AppError && error.code === "SESSION_DETACHED");
-
-  assert.equal(checks, 2);
-  assert.equal(value.endpoint.calls.some((call) => call.method === "turn/start" || call.method === "turn/steer"), false);
-});
-
 test("a poisoned persisted active turn cannot authorize interrupt", async () => {
-  const value = await fixture({ inspect: async () => ({ state: "external", turnId: "outside" }) });
+  const value = await fixture();
   assert.equal(value.db.prepare("SELECT name FROM sqlite_master WHERE name = 'session_runtime'").get(), undefined);
 
   await assert.rejects(value.service.interrupt("payments", "outside"), (error: unknown) => {
@@ -336,7 +289,7 @@ test("a poisoned persisted active turn cannot authorize interrupt", async () => 
 });
 
 test("interrupt recovery resumes the exact native active turn when runtime cache is empty", async () => {
-  const value = await fixture({ inspect: async () => ({ state: "owned" }) });
+  const value = await fixture();
   value.endpoint.status = "active";
   value.endpoint.threadTurns = [{ id: "recovered-active", status: "inProgress", items: [] }];
 
@@ -347,7 +300,7 @@ test("interrupt recovery resumes the exact native active turn when runtime cache
 });
 
 test("an unavailable live view is refreshed and interrupted without persisted restore state", async () => {
-  const value = await fixture({ inspect: async () => ({ state: "owned" }) });
+  const value = await fixture();
   value.native.invalidateEndpoint("local", value.nativeGeneration);
   value.endpoint.status = "active";
   value.endpoint.threadTurns = [{ id: "remote-active", status: "inProgress", itemsView: "full", items: [] }];
@@ -359,7 +312,7 @@ test("an unavailable live view is refreshed and interrupted without persisted re
 });
 
 test("registry-managed interrupt has no persisted management mirror to poison", async () => {
-  const value = await fixture({ inspect: async () => ({ state: "owned" }) });
+  const value = await fixture();
   assert.equal(value.db.prepare("SELECT name FROM sqlite_master WHERE name = 'session_runtime'").get(), undefined);
   value.endpoint.status = "active";
   value.endpoint.threadTurns = [{ id: "remote-active", status: "inProgress", itemsView: "full", items: [] }];
@@ -370,7 +323,7 @@ test("registry-managed interrupt has no persisted management mirror to poison", 
 });
 
 test("compaction requires an idle managed worker and observes a new native compaction item", async () => {
-  const value = await fixture({ inspect: async () => ({ state: "owned" }) });
+  const value = await fixture();
   value.endpoint.threadTurns = [{ id: "finished", status: "completed", itemsView: "full", items: [] }];
   let checkpoint: unknown;
 
@@ -395,7 +348,7 @@ test("compaction requires an idle managed worker and observes a new native compa
 });
 
 test("compaction waits for native completion after the start response", async () => {
-  const value = await fixture({ inspect: async () => ({ state: "owned" }) });
+  const value = await fixture();
   value.endpoint.threadTurns = [{ id: "finished", status: "completed", itemsView: "full", items: [] }];
   value.endpoint.compactDelayMs = 20;
 
@@ -422,7 +375,7 @@ test("all turn-starting mutations fail closed when the authoritative native stat
 });
 
 test("compaction falls back to bounded turn summaries when exact item paging is unsupported", async () => {
-  const value = await fixture({ inspect: async () => ({ state: "owned" }) });
+  const value = await fixture();
   value.endpoint.threadTurns = [{ id: "finished", status: "completed", itemsView: "full", items: [] }];
   value.endpoint.legacyItemsUnsupported = true;
 
@@ -435,27 +388,27 @@ test("compaction falls back to bounded turn summaries when exact item paging is 
   )), true);
 });
 
-test("active goal transition snapshots exact native turn ownership before marker revocation", async () => {
-  const authorized: string[] = [];
-  const value = await fixture({
-    inspect: async () => ({ state: "owned" }),
-    authorizeTurn: (_identity, turnId) => { authorized.push(turnId); },
-  });
-  value.endpoint.status = "active";
-  value.endpoint.threadTurns = [{ id: "goal-active", status: "inProgress", items: [] }];
-
-  assert.equal(await value.service.authorizeActiveTurn("payments"), "goal-active");
-  assert.deepEqual(authorized, ["goal-active"]);
-});
-
-test("an unclassified live active turn cannot be steered or interrupted", async () => {
-  const value = await fixture({ inspect: async () => ({ state: "unclassified", turnId: "boundary-turn" }) });
+test("native active state is sufficient to steer and interrupt a managed session", async () => {
+  const value = await fixture();
   value.observeNative("active", "boundary-turn");
 
-  await assert.rejects(value.service.send("payments", "do not steer"), (error: unknown) => error instanceof AppError && error.code === "SESSION_BUSY");
-  await assert.rejects(value.service.interrupt("payments", "boundary-turn"), (error: unknown) => error instanceof AppError && error.code === "SESSION_BUSY");
+  assert.equal((await value.service.send("payments", "steer it")).mode, "steer");
+  await value.service.interrupt("payments", "boundary-turn");
 
-  assert.equal(value.endpoint.calls.some((call) => call.method === "turn/steer" || call.method === "turn/interrupt"), false);
+  assert.equal(value.endpoint.calls.some((call) => call.method === "turn/steer"), true);
+  assert.equal(value.endpoint.calls.some((call) => call.method === "turn/interrupt"), true);
+});
+
+test("a fresh native read overrides a stale idle projection before auto dispatch", async () => {
+  const value = await fixture();
+  value.endpoint.status = "active";
+  value.endpoint.threadTurns = [{ id: "native-active", status: "inProgress", items: [] }];
+
+  const result = await value.service.send("payments", "follow up");
+
+  assert.deepEqual(result, { mode: "steer", turnId: "native-active" });
+  assert.equal(value.endpoint.calls.some((call) => call.method === "turn/steer"), true);
+  assert.equal(value.endpoint.calls.some((call) => call.method === "turn/start"), false);
 });
 
 test("native cwd drift and mapping generation replacement block execution inside the gate", async () => {
@@ -545,7 +498,7 @@ test("status composes registry, live native state, and goal", async () => {
 });
 
 test("status activates a cold managed endpoint before reading its native generation", async () => {
-  const { endpoint, leaseAcquisitions, service } = await fixture(undefined, { coldEndpoint: true });
+  const { endpoint, leaseAcquisitions, service } = await fixture({ coldEndpoint: true });
 
   const status = await service.status("payments") as any;
 
@@ -686,14 +639,9 @@ test("goal operations replace, pause, resume and cancel without exposing complet
   assert.equal("completeGoal" in service, false);
 });
 
-test("goal activation arms ownership after preflight and before native dispatch", async () => {
+test("goal activation arms goal control before native dispatch", async () => {
   let controlled = false;
-  const value = await fixture({
-    inspect: async () => {
-      assert.equal(controlled, false, "goal control must not weaken the external-turn preflight");
-      return { state: "owned" };
-    },
-  });
+  const value = await fixture();
   value.endpoint.onGoalSetRequest = () => {
     assert.equal(controlled, true, "goal control must be armed before the App Server can emit turn/started");
   };
@@ -722,7 +670,7 @@ test("a lost goal response is reconciled against native goal state", async () =>
   assert.equal(endpoint.calls.filter((call) => call.method === "thread/goal/set").length, 1);
 });
 
-test("a proven goal activation mismatch disarms ownership while an unreadable result remains armed", async () => {
+test("a proven goal activation mismatch disarms goal control while an unreadable result remains armed", async () => {
   const mismatch = await fixture();
   let controlled = false;
   mismatch.endpoint.rejectNextGoalSetBeforeEffect = true;
@@ -749,7 +697,7 @@ test("a proven goal activation mismatch disarms ownership while an unreadable re
   assert.equal(controlled, true);
 });
 
-test("a proven goal resume mismatch disarms ownership", async () => {
+test("a proven goal resume mismatch disarms goal control", async () => {
   const value = await fixture();
   value.endpoint.goal = { objective: "ship it", status: "paused" };
   value.endpoint.rejectNextGoalSetBeforeEffect = true;
@@ -764,12 +712,9 @@ test("a proven goal resume mismatch disarms ownership", async () => {
   assert.equal(controlled, false);
 });
 
-test("goal mismatch authorizes the native active turn inside the existing execution gate", async () => {
+test("goal mismatch callback runs inside the existing execution gate", async () => {
   const events: string[] = [];
-  const value = await fixture({
-    inspect: async () => ({ state: "owned" }),
-    authorizeTurn: (_identity, turnId) => { events.push(`authorize:${turnId}`); },
-  });
+  const value = await fixture();
   value.endpoint.status = "active";
   value.endpoint.threadTurns = [{ id: "goal-race", status: "inProgress", items: [] }];
   value.endpoint.rejectNextGoalSetBeforeEffect = true;
@@ -782,7 +727,7 @@ test("goal mismatch authorizes the native active turn inside the existing execut
     () => { events.push("mismatch"); },
   ), /goal set failed/u);
 
-  assert.deepEqual(events, ["authorize:goal-race", "mismatch"]);
+  assert.deepEqual(events, ["mismatch"]);
 });
 
 test("consumeSettingsIfNative clears pending settings for a native (Codex) endpoint but keeps them sticky for Claude", () => {
@@ -797,7 +742,7 @@ test("consumeSettingsIfNative clears pending settings for a native (Codex) endpo
   }
   const service = new SessionService(
     undefined as never, undefined as never, native, controls, undefined as never, undefined as never,
-    undefined as never, undefined as never, undefined, undefined,
+    undefined as never, undefined as never, undefined,
     (id: string) => id !== "claude-local", // Codex persists natively; Claude does not
   );
 

@@ -4,6 +4,8 @@
 
 Revision 5, updated for local-filesystem ControlMaster-backed forwarding.
 
+Worker ownership inference, rollout scanning, and automatic unadoption described below were removed in July 2026. Managed membership is now explicit; native App Server state and history are authoritative, and users must unadopt before manual work. The remaining endpoint-runtime discussion is historical context.
+
 The stream-local forwarding details in this historical design were superseded by the
 [SSH user-space App Server proxy design](development/ssh-user-app-server-proxy-design.md).
 

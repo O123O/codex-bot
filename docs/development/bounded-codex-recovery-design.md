@@ -1,5 +1,7 @@
 # Bounded Codex Recovery
 
+> Historical note: ownership initialization described here was removed in July 2026. Bounded native App Server history remains in use for recovery and Web UI paging.
+
 ## Problem
 
 Codex `thread/resume` traditionally returns every reconstructed turn in one JSON-RPC response. QiYan's remote App Server transport intentionally limits WebSocket frames to 1 MiB, so a long-lived worker can close the connection during recovery. Raising the frame limit only postpones the failure and increases resource exposure.

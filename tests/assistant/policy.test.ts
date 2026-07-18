@@ -60,9 +60,8 @@ test("packaged assistant policy is concise and reserves examples for exact direc
   assert.match(policy, /prefer exact ids.*`inspect_worker_conversation` for context.*large pages return a temp JSON path/iu);
   assert.match(policy, /for monitoring.*follow up until the requested outcome is genuinely resolved/isu);
   assert.match(policy, /worker notification wakes you.*does not itself justify another user message/isu);
-  assert.match(policy, /external_worker_turn_detected.*release.*pending/isu);
-  assert.match(policy, /external_worker_session_released.*confirms.*unadopt/isu);
-  assert.match(policy, /backend.*user warning.*do not.*duplicate/isu);
+  assert.match(policy, /before the user drives a managed session manually.*`unadopt_session`/isu);
+  assert.match(policy, /adopt it again only when asked/isu);
   assert.match(policy, /ask when more than one target remains plausible/iu);
   assert.match(policy, /never silently repoint a nickname/iu);
   assert.match(policy, /state change happened only when its tool receipt proves it/iu);

@@ -278,6 +278,27 @@ test("an existing QiYan database reopens normally", async () => {
   reopened.close();
 });
 
+test("the ownership-inference removal migration drops its durable classifier state", () => {
+  const removal = migrations.at(-1);
+  assert.equal(typeof removal, "string");
+  assert.match(removal as string, /DROP TABLE IF EXISTS session_rollout_ownership/u);
+  const db = new DatabaseSync(":memory:");
+  for (const migration of migrations.slice(0, -1)) {
+    if (typeof migration === "function") migration(db);
+    else db.exec(migration);
+  }
+  for (const table of ["direct_send_turns", "session_rollout_owned_turns", "session_rollout_ownership"]) {
+    assert.ok(db.prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?").get(table));
+  }
+
+  db.exec(removal as string);
+
+  for (const table of ["direct_send_turns", "session_rollout_owned_turns", "session_rollout_ownership"]) {
+    assert.equal(db.prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?").get(table), undefined);
+  }
+  db.close();
+});
+
 test("operation recovery protocol migration marks old rows legacy and new rows current", () => {
   const protocolMigrationIndex = migrations.findIndex((migration) =>
     typeof migration === "function" && migration.toString().includes("recovery_protocol"));
@@ -302,7 +323,7 @@ test("operation recovery protocol migration marks old rows legacy and new rows c
   db.close();
 });
 
-test("goal ownership migration marks legacy mappings as not yet observed", () => {
+test("goal-control migration marks legacy mappings as not yet observed", () => {
   const knownMigrationIndex = migrations.findIndex((migration) =>
     typeof migration === "function" && migration.toString().includes("goal_control_known"));
   assert.ok(knownMigrationIndex > 0);

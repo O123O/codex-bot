@@ -21,7 +21,6 @@ function fixture(options: {
     clearTimeout(handle: any): void;
   };
   onError?: (error: unknown) => void;
-  onGoalTurnStarted?: (event: { endpointId: string; threadId: string; mappingId: string; turnId: string }) => void;
 } = {}) {
   const db = createTestDatabase();
   const store = new SessionDashboardStore(db);
@@ -42,7 +41,6 @@ function fixture(options: {
       errors.push(error);
       options.onError?.(error);
     },
-    ...(options.onGoalTurnStarted ? { onGoalTurnStarted: options.onGoalTurnStarted } : {}),
     ...(options.classifyFailure ? { classifyFailure: options.classifyFailure } : {}),
     ...(options.retryMs === undefined ? {} : { retryMs: options.retryMs }),
     ...(options.timers ? { timers: options.timers } : {}),
@@ -111,31 +109,8 @@ test("accepts body-free fact observations durably and ignores lifecycle status",
   assert.ok(value.changes() >= 1);
 });
 
-test("only an exact active-goal notification authorizes its turn before a later pause", async () => {
-  const started: Array<{ endpointId: string; threadId: string; mappingId: string; turnId: string }> = [];
-  const value = fixture({ onGoalTurnStarted: (event) => { started.push(event); } });
-  value.controls.setGoalControlled("local", "thread-1", mappingId, true, value.store.allocateObservationSequence());
-  value.processor.accept("local", "turn/started", { threadId: "thread-1", turn: { id: "goal-turn", startedAt: 1 } });
-  await value.processor.idle();
-  assert.equal(started.length, 0);
-
-  value.processor.accept("local", "thread/goal/updated", {
-    threadId: "thread-1",
-    turnId: "goal-turn",
-    goal: { objective: "finish", status: "active", tokenBudget: null, updatedAt: 2 },
-  });
-  value.controls.setGoalControlled("local", "thread-1", mappingId, false);
-
-  await value.processor.idle();
-
-  assert.ok(started.length >= 1);
-  assert.equal(started.every((event) => event.endpointId === "local" && event.threadId === "thread-1"
-    && event.mappingId === mappingId && event.turnId === "goal-turn"), true);
-});
-
-test("an exact terminal goal notification authorizes its turn before revoking goal control", async () => {
-  const observed: Array<{ endpointId: string; threadId: string; mappingId: string; turnId: string }> = [];
-  const value = fixture({ onGoalTurnStarted: (event) => { observed.push(event); } });
+test("an exact terminal goal notification revokes goal control", async () => {
+  const value = fixture();
   value.controls.setGoalControlled("local", "thread-1", mappingId, true, value.store.allocateObservationSequence());
 
   value.processor.accept("local", "thread/goal/updated", {
@@ -145,8 +120,6 @@ test("an exact terminal goal notification authorizes its turn before revoking go
   });
   await value.processor.idle();
 
-  assert.ok(observed.length >= 1);
-  assert.equal(observed.every((event) => event.turnId === "completed-goal-turn"), true);
   assert.equal(value.controls.goalControlled("local", "thread-1", mappingId), false);
 });
 
@@ -182,7 +155,7 @@ test("a stale non-active goal update cannot clear a newer activation", async () 
   assert.equal(value.controls.goalControlled("local", "thread-1", mappingId), true);
 });
 
-test("an unknown goal status cannot revoke controlled-goal ownership", async () => {
+test("an unknown goal status cannot revoke controlled-goal state", async () => {
   const value = fixture();
   value.controls.setGoalControlled("local", "thread-1", mappingId, true, value.store.allocateObservationSequence());
 
@@ -194,45 +167,6 @@ test("an unknown goal status cannot revoke controlled-goal ownership", async () 
   await value.processor.idle();
 
   assert.equal(value.controls.goalControlled("local", "thread-1", mappingId), true);
-});
-
-test("a goal turn is authorized from durable control intent without consulting cached availability", async () => {
-  const started: Array<{ endpointId: string; threadId: string; mappingId: string; turnId: string }> = [];
-  const value = fixture({ onGoalTurnStarted: (event) => { started.push(event); } });
-  value.controls.setGoalControlled("local", "thread-1", mappingId, true, value.store.allocateObservationSequence());
-  assert.equal(value.processor.accept("local", "thread/goal/updated", {
-    threadId: "thread-1",
-    turnId: "deferred-goal-turn",
-    goal: { objective: "finish", status: "active", tokenBudget: null, updatedAt: 2 },
-  }), true);
-  await value.processor.idle();
-  assert.ok(started.length >= 1);
-  assert.equal(started.every((event) => event.endpointId === "local" && event.threadId === "thread-1"
-    && event.mappingId === mappingId && event.turnId === "deferred-goal-turn"), true);
-
-  await value.processor.endpointReady("local");
-  assert.equal(started.every((event) => event.turnId === "deferred-goal-turn"), true);
-});
-
-test("goal authorization failure cannot prevent the durable observation from being queued", async () => {
-  let attempts = 0;
-  const value = fixture({
-    onGoalTurnStarted: () => {
-      attempts += 1;
-      if (attempts === 1) throw new Error("ownership guard is not ready");
-    },
-  });
-  value.controls.setGoalControlled("local", "thread-1", mappingId, true, value.store.allocateObservationSequence());
-
-  assert.doesNotThrow(() => value.processor.accept("local", "thread/goal/updated", {
-    threadId: "thread-1",
-    turnId: "retry-goal-turn",
-    goal: { objective: "finish", status: "active", tokenBudget: null, updatedAt: 2 },
-  }));
-  await value.processor.idle();
-
-  assert.equal(attempts, 2);
-  assert.equal(value.store.pendingNotifications().length, 0);
 });
 
 test("replays a token notification accepted before a crash", async () => {

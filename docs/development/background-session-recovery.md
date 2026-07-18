@@ -1,5 +1,7 @@
 # Background session recovery (startup must not wait for recovery)
 
+> Historical note: rollout ownership state and its watcher described here were removed in July 2026. Recovery now uses registry membership plus native endpoint state/history.
+
 ## Problem
 
 Startup blocked on `resumeStartupManagedSessions` — re-verifying each managed session against the

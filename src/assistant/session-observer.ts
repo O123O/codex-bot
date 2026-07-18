@@ -15,7 +15,6 @@ interface ObserverOptions {
   readGoal(endpointId: string, threadId: string): Promise<unknown>;
   onChanged(): void;
   onError(error: unknown): void;
-  onGoalTurnStarted?(event: { endpointId: string; threadId: string; mappingId: string; turnId: string }): void;
   classifyFailure?(error: unknown): "retry" | "endpoint" | "sleep";
   retryMs?: number;
   timers?: ObservationTimers;
@@ -59,23 +58,7 @@ export class SessionObservationProcessor {
     if (!supportedMethods.has(method)) return false;
     const normalized = normalizeNotification(method, params);
     if (!normalized) return false;
-    if (method === "thread/goal/updated" && normalized.turnId !== null) {
-      const target = this.observationTarget(endpointId, String(normalized.threadId));
-      if (target.kind !== "discarded" && this.controls.goalControlled(endpointId, target.identity.threadId, target.mappingId)) {
-        normalized.goalControlMappingId = target.mappingId;
-      }
-    }
     this.store.acceptNotification(endpointId, method, normalized, this.options.now());
-    if (method === "thread/goal/updated" && typeof normalized.goalControlMappingId === "string") {
-      try {
-        this.options.onGoalTurnStarted?.({
-          endpointId,
-          threadId: String(normalized.threadId),
-          mappingId: normalized.goalControlMappingId,
-          turnId: String(normalized.turnId),
-        });
-      } catch { /* Durable replay retries authorization after the ownership guard is ready. */ }
-    }
     void this.enqueue(endpointId);
     return true;
   }
@@ -167,7 +150,7 @@ export class SessionObservationProcessor {
     }, (error) => {
       if (!this.runIsCurrent(endpointId, epoch)) return;
       try { this.options.onError(error); }
-      catch { /* operational reporting must not change retry ownership */ }
+      catch { /* operational reporting must not change retry behavior */ }
       let disposition: "retry" | "endpoint" | "sleep" = "sleep";
       try { disposition = this.options.classifyFailure?.(error) ?? "sleep"; }
       catch { /* a classifier failure must leave durable work asleep */ }
@@ -256,15 +239,6 @@ export class SessionObservationProcessor {
       return this.store.observeTokenUsage(identity, params.turnId, tokenUsage, ordinal, notification.sequence);
     }
     if (notification.method === "thread/goal/updated") {
-      if (params.goalControlMappingId === mappingId && typeof params.turnId === "string") {
-        this.options.onGoalTurnStarted?.({
-          endpointId: notification.endpointId,
-          threadId: identity.threadId,
-          mappingId,
-          turnId: params.turnId,
-        });
-        if (!this.runIsCurrent(notification.endpointId, epoch)) return "stale";
-      }
       const normalized = normalizeGoal(params.goal);
       const sourceTime = normalizeProtocolTime(params.goal.updatedAt, notification.receivedAt);
       const changed = this.store.observeGoal(identity, normalized, sourceTime, notification.sequence, sourceTime);

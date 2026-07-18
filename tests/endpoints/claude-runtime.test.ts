@@ -280,7 +280,7 @@ test("cold recovery reads cwd from bounded head metadata when the final transcri
   assert.equal(Math.max(...runner.transcriptChunkLengths), 256 * 1024);
 });
 
-test("a cold incomplete transcript is terminal because no owned claude child is running", async () => {
+test("a cold incomplete transcript is terminal because no tracked Claude child is running", async () => {
   const runner = new FakeRunner();
   const a = makeRuntime(runner);
   await a.start();

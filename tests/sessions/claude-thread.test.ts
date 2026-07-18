@@ -34,7 +34,7 @@ test("a tool-use turn is one completed turn with a delivered final_answer", () =
   assert.equal(finalAnswers(v).length >= 1, true);
 });
 
-test("a cold incomplete transcript is interrupted because no owned Claude child is running", () => {
+test("a cold incomplete transcript is interrupted because no tracked Claude child is running", () => {
   const v = view("interrupted");
   assert.equal(v.turns.length, 1);
   assert.equal(v.turns[0]?.status, "interrupted");
@@ -43,7 +43,7 @@ test("a cold incomplete transcript is interrupted because no owned Claude child 
   assert.equal(v.turns[0]?.items[0]?.type, "userMessage");
 });
 
-test("an incomplete transcript is active only while its exact owned Claude child is running", () => {
+test("an incomplete transcript is active only while its exact tracked Claude child is running", () => {
   const raw = records("interrupted");
   const turnStart = raw.find((record): record is Record<string, unknown> => !!record && typeof record === "object"
     && (record as Record<string, unknown>).type === "user" && typeof (record as Record<string, unknown>).promptSource === "string");

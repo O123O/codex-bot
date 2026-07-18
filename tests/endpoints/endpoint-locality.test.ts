@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { isLocalEndpointId } from "../../src/production-app.ts";
 
-// The shared predicate behind the workspace router, rollout-access, and worker file bridge.
+// The shared predicate behind the workspace router and worker file bridge.
 // Regression guard for "SSH workspace host is unavailable: claude-local": the local Claude
 // endpoint must count as local so it is never routed through the ssh path.
 test("isLocalEndpointId treats the Codex local and the configured local Claude endpoint as local", () => {

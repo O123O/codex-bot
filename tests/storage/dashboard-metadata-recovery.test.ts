@@ -451,12 +451,6 @@ async function recoveryFixture(
   db.prepare(`INSERT INTO session_manager_notes
     (endpoint_id, thread_id, project_summary, supervision_objective, pending_follow_up, updated_at)
     VALUES ('local', 'thread-private', 'private project note', 'private operation result', NULL, 1)`).run();
-  db.prepare(`INSERT INTO session_rollout_ownership
-    (endpoint_id, thread_id, mapping_id, rollout_path, device, inode, byte_offset, external_turn_id, updated_at)
-    VALUES ('local', 'thread-private', 'mapping-private', '/private/rollout', '1', '2', 3, NULL, 1)`).run();
-  db.prepare(`INSERT INTO session_rollout_owned_turns
-    (endpoint_id, thread_id, mapping_id, turn_id, recorded_at)
-    VALUES ('local', 'thread-private', 'mapping-private', 'turn-private', 1)`).run();
   if (watermarks.notification !== undefined) {
     db.prepare(`INSERT INTO session_dashboard_notifications
       (sequence, endpoint_id, method, params_json, state, received_at)

@@ -75,8 +75,8 @@ test("appends the WeChat migration to completed state-version 2 and 3 databases"
     const old = new DatabaseSync(path);
     old.exec(`
       PRAGMA foreign_keys = OFF;
-      DROP TABLE session_rollout_owned_turns;
-      DROP TABLE session_rollout_ownership;
+      DROP TABLE IF EXISTS session_rollout_owned_turns;
+      DROP TABLE IF EXISTS session_rollout_ownership;
       DROP TABLE endpoint_bindings;
       DROP TABLE delivery_attachment_releases;
       DROP TABLE weixin_outbound_steps;

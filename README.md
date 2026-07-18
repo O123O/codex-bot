@@ -16,7 +16,7 @@ QiYan Bot is a single-user, self-hosted, general-purpose personal assistant powe
 
 Each managed project remains an ordinary, resumable session — a Codex thread or a Claude Code session — in its own project directory. You can unadopt it from QiYan, continue it directly with the same CLI, and adopt it again later without creating a separate worker format.
 
-QiYan keeps the assistant and project workers distinct. The assistant has its own HOME, CODEX_HOME, authentication, instructions, and app-server. Workers use your normal HOME, CODEX_HOME, configuration, credentials, skills, and app-server (or your normal `claude` configuration for a Claude worker). If another client starts a turn in a managed thread, QiYan fences its own dispatch, warns you, and automatically unadopts the session once the external turn is idle. For a planned handoff, you can still call `unadopt_session` first to avoid the temporary release-pending window; adopt it again later if QiYan should resume management.
+QiYan keeps the assistant and project workers distinct. The assistant has its own HOME, CODEX_HOME, authentication, instructions, and app-server. Workers use your normal HOME, CODEX_HOME, configuration, credentials, skills, and app-server (or your normal `claude` configuration for a Claude worker). Managed membership is explicit: while a session is adopted, QiYan treats its native App Server state and history as authoritative and does not infer whether another client is using it. Call `unadopt_session` before opening or driving that session manually, then adopt it again when QiYan should resume management.
 
 ## Codex and Claude Code workers
 
@@ -136,7 +136,7 @@ QiYan has one active QiYan conversation globally. A follow-up from the same conv
 
 The backend remembers which adapter and conversation owns the turn and routes replies there automatically. QiYan itself never chooses a chat platform or destination, and output is not broadcast to every configured adapter. `/pass` and `/collect` are ordinary messages that use the same start, `turn/steer`, queue, and recovery paths as any other input; their only special behavior is a backend exactness safeguard when the corresponding worker tool is called.
 
-`adopt_session` preserves an existing session's native cwd. `unadopt_session` removes it from QiYan without deleting or archiving the underlying thread; `archive_session` archives it — native Codex archive, or a durable QiYan tombstone for a Claude session that leaves the transcript on disk — and removes the QiYan mapping.
+`adopt_session` preserves an existing session's native cwd and requires it to be natively idle before registration. `unadopt_session` removes it from QiYan without deleting or archiving the underlying thread; use it before manual CLI work because QiYan does not detect concurrent clients or automatically unadopt. `archive_session` archives it — native Codex archive, or a durable QiYan tombstone for a Claude session that leaves the transcript on disk — and removes the QiYan mapping.
 
 Use the `/pass` exactness safeguard when wording must reach a worker unchanged:
 

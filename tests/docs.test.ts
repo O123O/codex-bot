@@ -11,7 +11,7 @@ test("README links to all focused guides and every local guide target exists", a
   assert.match(readme, /assets\/brand\/qiyan-overview\.svg/iu);
   await access(resolve("assets/brand/qiyan-overview.svg"));
   const overview = await readFile(resolve("assets/brand/qiyan-overview.svg"), "utf8");
-  assert.match(overview, /auto-release on external takeover/iu);
+  assert.match(overview, /explicit manual handoff/iu);
   assert.doesNotMatch(overview, /unadopt when you take over/iu);
   assert.match(readme, /Telegram.*Slack.*WeChat.*run together/iu);
   assert.doesNotMatch(readme, /upgrading-to-v0\.3|fresh v0\.3|versions? before v0\.3/iu);
@@ -143,9 +143,8 @@ test("primary guides document QiYan home precedence, private dotenv setup, and m
   assert.match(setup, /do not use.*EnvironmentFile/iu);
   assert.match(telegram, /cat > "?\$HOME\/\.qiyan-bot\/\.env"?/u);
   assert.doesNotMatch(telegram.split("## 4. Authenticate and start")[1] ?? "", /export\s+TELEGRAM_/u);
-  assert.match(readme, /another client.*automatically unadopts.*external turn.*idle/isu);
-  assert.match(readme, /planned handoff.*unadopt_session/isu);
-  assert.doesNotMatch(readme, /Before opening a managed thread.*run `unadopt_session`/isu);
+  assert.match(readme, /managed membership is explicit.*does not infer.*another client/isu);
+  assert.match(readme, /unadopt_session.*before.*manual/isu);
   assert.match(setup, /config-check.*at least one configured adapter.*assistant-login.*does not need chat credentials/isu);
 });
 

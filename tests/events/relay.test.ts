@@ -77,10 +77,6 @@ function relayResponse<T>(method: string, params: any, turns: any[]): T {
 
 async function fixture(
   onTerminal?: (event: any, lease?: EndpointWorkLease) => void | Promise<void>,
-  ownershipOverride?: {
-    inspect(): Promise<{ state: "owned" | "pending" | "lost" } | { state: "external"; turnId: string } | { state: "unclassified"; turnId: string }>;
-    ownsTurn(identity: unknown, turnId: string): boolean;
-  },
   relayOptions: {
     timers?: RelayTimers;
     onEventCommitted?: () => void | Promise<void>;
@@ -111,10 +107,6 @@ async function fixture(
   const deliveries = new DeliveryStore(db);
   const routes = new OwnerRouteStore(db, binding);
   const conversations = new ConversationStore(db, deliveries);
-  const ownership = ownershipOverride ?? {
-    inspect: async () => ({ state: "owned" as const }),
-    ownsTurn: (_identity: unknown, _turnId: string) => true,
-  };
   const pool = new AppServerPool([endpoint], {
     maxConcurrentTurns: 4,
     ...(relayOptions.poolWorkLeaseProvider ? { workLeaseProvider: relayOptions.poolWorkLeaseProvider } : {}),
@@ -127,7 +119,7 @@ async function fixture(
     ...(onTerminal ? { onTerminal } : {}),
     ...(relayOptions.onEventCommitted ? { onEventCommitted: relayOptions.onEventCommitted } : {}),
     ...(relayOptions.maxRecoveryAttempts === undefined ? {} : { maxRecoveryAttempts: relayOptions.maxRecoveryAttempts }),
-  }, relayOptions.attachments, ownership, new ThreadGate(), relayOptions.timers);
+  }, relayOptions.attachments, new ThreadGate(), relayOptions.timers);
   return { db, endpoint, pool, registry, epochs, progress, deliveries, relay, conversations, routes };
 }
 
@@ -179,7 +171,7 @@ test("a final terminal projection wakes once only after the inserted event is re
     terminalEntered = true;
     await terminalBarrier;
     sequence.push("terminal");
-  }, undefined, {
+  }, {
     attachments: {
       releaseTurn: () => { sequence.push("attachments"); },
     },
@@ -217,7 +209,7 @@ test("a rejected terminal observer leaves no terminal event and does not wake", 
   let wakes = 0;
   const { db, endpoint, relay } = await fixture(async () => {
     throw new Error("observation failed");
-  }, undefined, {
+  }, {
     onEventCommitted: async () => { wakes += 1; },
   });
   endpoint.turns = [terminal("baseline"), terminal()];
@@ -233,7 +225,7 @@ test("permission projection commits delivery before the event wake without persi
   let releaseWake!: () => void;
   const wakeBarrier = new Promise<void>((resolve) => { releaseWake = resolve; });
   let wakeEntered = false;
-  const value = await fixture(undefined, undefined, {
+  const value = await fixture(undefined, {
     onEventCommitted: async () => {
       wakeEntered = true;
       await wakeBarrier;
@@ -257,7 +249,7 @@ test("permission projection commits delivery before the event wake without persi
 
 test("permission projection commits no session-liveness row", async () => {
   let wakes = 0;
-  const value = await fixture(undefined, undefined, {
+  const value = await fixture(undefined, {
     onEventCommitted: async () => { wakes += 1; },
   });
   await value.relay.handlePermissionBlocked(
@@ -305,106 +297,6 @@ test("failed no-final turns warn, transitional turns are excluded, and permissio
   assert.equal((db.prepare("SELECT COUNT(*) AS n FROM events").get() as any).n, 2);
 });
 
-test("durable accepted-turn correlation suppresses external replay and recovers an owned terminal", async () => {
-  const { endpoint, progress, deliveries, relay } = await fixture(undefined, {
-    inspect: async () => ({ state: "external", turnId: "external" }),
-    ownsTurn: (_identity, turnId) => turnId === "owned-active",
-  });
-  endpoint.turns = [terminal("baseline"), terminal("external", "interrupted", ""), terminal("owned-active", "completed", "owned final")];
-
-  await relay.reconcileEndpoint("local");
-  assert.deepEqual(deliveries.listReady().map((delivery) => delivery.body), ["[payments] owned final"]);
-  assert.equal(progress.cursor("local", "worker", mappingId), "owned-active");
-});
-
-test("an external terminal is checked only against durable accepted-turn correlation", async () => {
-  const { endpoint, epochs, progress, deliveries, registry, routes, db } = await fixture();
-  const sequence: string[] = [];
-  endpoint.turns = [terminal("baseline"), terminal("external", "completed", "external body")];
-  endpoint.request = async <T>(method: string, params: any) => {
-    sequence.push("read");
-    return relayResponse<T>(method, params, endpoint.turns);
-  };
-  const ownership = {
-    inspect: async () => { sequence.push("scan"); return { state: "external" as const, turnId: "external" }; },
-    ownsTurn: () => { sequence.push("prove"); return false; },
-  };
-  const relay = new EventRelay(db, new AppServerPool([endpoint], { maxConcurrentTurns: 4 }), registry, epochs, progress, new FinalMessageStore(db), deliveries, {
-    binding: () => routes.current(), clock: { now: () => 100 },
-    withEndpointWorkLease: async (_endpointId, existingLease, run) => run(existingLease ?? workLease),
-  }, undefined, ownership, new ThreadGate());
-
-  await relay.handleNotification("local", "turn/completed", { threadId: "worker", turn: terminal("external", "completed", "") });
-
-  assert.deepEqual(sequence, ["prove"]);
-  assert.deepEqual(deliveries.listReady(), []);
-});
-
-test("terminal delivery never invokes the auto-unadopt ownership scan", async () => {
-  const { endpoint, epochs, progress, deliveries, registry, routes, db } = await fixture();
-  endpoint.turns = [terminal("baseline"), terminal("racing-external", "completed", "must not deliver")];
-  let scans = 0;
-  const ownership = {
-    inspect: async () => {
-      scans += 1;
-      return { state: "external" as const, turnId: "racing-external" };
-    },
-    ownsTurn: () => false,
-  };
-  const relay = new EventRelay(db, new AppServerPool([endpoint], { maxConcurrentTurns: 4 }), registry, epochs, progress, new FinalMessageStore(db), deliveries, {
-    binding: () => routes.current(), clock: { now: () => 100 },
-    withEndpointWorkLease: async (_endpointId, existingLease, run) => run(existingLease ?? workLease),
-  }, undefined, ownership, new ThreadGate());
-
-  await relay.handleNotification("local", "turn/completed", { threadId: "worker", turn: terminal("racing-external", "completed", "") });
-
-  assert.equal(scans, 0);
-  assert.deepEqual(deliveries.listReady(), []);
-});
-
-test("an unclassified auto-unadopt scan cannot block terminal classification", async () => {
-  const { endpoint, deliveries, registry, routes, db, epochs, progress } = await fixture();
-  let reads = 0;
-  endpoint.request = async <T>(method: string, params: any) => {
-    reads += 1;
-    return relayResponse<T>(method, params, endpoint.turns);
-  };
-  const ownership = {
-    inspect: async () => ({ state: "unclassified" as const, turnId: "boundary-turn" }),
-    ownsTurn: () => false,
-  };
-  const relay = new EventRelay(db, new AppServerPool([endpoint], { maxConcurrentTurns: 4 }), registry, epochs, progress, new FinalMessageStore(db), deliveries, {
-    binding: () => routes.current(), clock: { now: () => 100 },
-    withEndpointWorkLease: async (_endpointId, existingLease, run) => run(existingLease ?? workLease),
-  }, undefined, ownership, new ThreadGate());
-
-  await relay.handleNotification("local", "turn/completed", { threadId: "worker", turn: terminal("boundary-turn") });
-
-  assert.equal(reads, 0);
-  assert.deepEqual(deliveries.listReady(), []);
-});
-
-test("a pathless auto-unadopt boundary does not gate terminal recovery", async () => {
-  let reads = 0;
-  const value = await fixture(undefined, {
-    inspect: async () => ({ state: "pending" }),
-    ownsTurn: () => false,
-  });
-  value.endpoint.request = async <T>(method: string, params: any) => {
-    reads += 1;
-    return relayResponse<T>(method, params, value.endpoint.turns);
-  };
-
-  assert.equal(await value.relay.handleNotification(
-    "local", "turn/completed", { threadId: "worker", turn: terminal("pending-turn") }, workLease,
-  ), "conclusively_ignored");
-  await value.relay.reconcileEndpoint("local");
-
-  assert.ok(reads > 0);
-  assert.equal(value.progress.cursor("local", "worker", mappingId), undefined);
-  assert.deepEqual(value.deliveries.listReady(), []);
-});
-
 test("ready reconciliation reads history after baseline and advances a durable cursor", async () => {
   const { endpoint, deliveries, relay } = await fixture();
   endpoint.turns = [terminal("adopted"), terminal("baseline"), terminal("missed")];
@@ -415,7 +307,7 @@ test("ready reconciliation reads history after baseline and advances a durable c
 
 test("an empty first session does not block endpoint-ready reconciliation for later sessions", async () => {
   const timers = new FakeRelayTimers();
-  const { endpoint, registry, epochs, deliveries, relay } = await fixture(undefined, undefined, { timers });
+  const { endpoint, registry, epochs, deliveries, relay } = await fixture(undefined, { timers });
   epochs.end("local", "worker", mappingId, 2);
   epochs.begin("local", "worker", mappingId, undefined, 3);
   await registry.createManaged("later", {
@@ -453,7 +345,7 @@ test("terminal notification with partial items reads the authoritative completed
 
 test("a history scan budget opens one durable mapping incident instead of retrying", async () => {
   const timers = new FakeRelayTimers();
-  const { endpoint, progress, deliveries, relay } = await fixture(undefined, undefined, { timers });
+  const { endpoint, progress, deliveries, relay } = await fixture(undefined, { timers });
   endpoint.request = async <T>(method: string, params: any) => {
     if (method === "thread/turns/list") {
       const index = Number(String(params.cursor ?? "page-0").replace("page-", ""));
@@ -498,14 +390,11 @@ test("replaying an older terminal does not infer lifecycle from later history", 
   assert.deepEqual(deliveries.listReady().map((delivery) => delivery.body), ["[payments] done"]);
 });
 
-test("a delayed terminal without durable accepted-turn correlation is not delivered after re-adoption", async () => {
-  const { endpoint, deliveries, relay } = await fixture(undefined, {
-    inspect: async () => ({ state: "external", turnId: "old" }),
-    ownsTurn: (_identity, turnId) => turnId !== "old",
-  });
+test("a delayed terminal on the current managed mapping is delivered without owner inference", async () => {
+  const { endpoint, deliveries, relay } = await fixture();
   endpoint.turns = [terminal("old"), terminal("baseline")];
   await relay.handleNotification("local", "turn/completed", { threadId: "worker", turn: terminal("old") });
-  assert.deepEqual(deliveries.listReady(), []);
+  assert.deepEqual(deliveries.listReady().map((delivery) => delivery.body), ["[payments] done"]);
 });
 
 test("a mapping generation change during authoritative read suppresses the delayed terminal", async () => {
@@ -605,39 +494,12 @@ test("automatic worker delivery is suppressed for every transitional mapping lif
   }
 });
 
-test("terminal projection exposes exact handled, conclusively ignored, and retry outcomes", async () => {
+test("terminal projection exposes exact handled, epoch-duplicate, and retry outcomes", async () => {
   const handled = await fixture();
   handled.endpoint.turns = [terminal("baseline"), terminal("handled")];
   assert.equal(await handled.relay.handleNotification(
     "local", "turn/completed", { threadId: "worker", turn: terminal("handled", "completed", "projected") }, workLease,
   ), "handled");
-
-  const external = await fixture(undefined, {
-    inspect: async () => ({ state: "external", turnId: "external" }),
-    ownsTurn: () => false,
-  });
-  external.endpoint.turns = [terminal("baseline"), terminal("external")];
-  assert.equal(await external.relay.handleNotification(
-    "local", "turn/completed", { threadId: "worker", turn: terminal("external") }, workLease,
-  ), "conclusively_ignored");
-
-  const unclassified = await fixture(undefined, {
-    inspect: async () => ({ state: "unclassified", turnId: "uncertain" }),
-    ownsTurn: () => false,
-  });
-  unclassified.endpoint.turns = [terminal("baseline"), terminal("uncertain")];
-  assert.equal(await unclassified.relay.handleNotification(
-    "local", "turn/completed", { threadId: "worker", turn: terminal("uncertain") }, workLease,
-  ), "conclusively_ignored");
-
-  const pending = await fixture(undefined, {
-    inspect: async () => ({ state: "pending" }),
-    ownsTurn: () => false,
-  });
-  pending.endpoint.turns = [terminal("baseline"), terminal("pending")];
-  assert.equal(await pending.relay.handleNotification(
-    "local", "turn/completed", { threadId: "worker", turn: terminal("pending") }, workLease,
-  ), "conclusively_ignored");
 
   const baseline = await fixture();
   baseline.endpoint.turns = [terminal("baseline")];
@@ -645,14 +507,11 @@ test("terminal projection exposes exact handled, conclusively ignored, and retry
     "local", "turn/completed", { threadId: "worker", turn: terminal("baseline") }, workLease,
   ), "conclusively_ignored");
 
-  const older = await fixture(undefined, {
-    inspect: async () => ({ state: "external", turnId: "older" }),
-    ownsTurn: (_identity, turnId) => turnId !== "older",
-  });
+  const older = await fixture();
   older.endpoint.turns = [terminal("older"), terminal("baseline")];
   assert.equal(await older.relay.handleNotification(
     "local", "turn/completed", { threadId: "worker", turn: terminal("older") }, workLease,
-  ), "conclusively_ignored");
+  ), "handled");
 
   const absent = await fixture();
   absent.endpoint.turns = [terminal("baseline")];
@@ -671,74 +530,32 @@ test("terminal projection exposes exact handled, conclusively ignored, and retry
   ), "retry");
 });
 
-test("notification item hydration remains inside the ownership fence", async () => {
-  const value = await fixture(undefined, {
-    inspect: async () => ({ state: "owned" }),
-    ownsTurn: () => true,
-  });
-  let external = false;
-  const ownership = {
-    inspect: async () => external
-      ? ({ state: "external" as const, turnId: "racing" })
-      : ({ state: "owned" as const }),
-    ownsTurn: () => !external,
-  };
-  const relay = new EventRelay(
-    value.db,
-    value.pool,
-    value.registry,
-    value.epochs,
-    value.progress,
-    new FinalMessageStore(value.db),
-    value.deliveries,
-    { binding: () => value.routes.current(), clock: { now: () => 100 }, withEndpointWorkLease: async (_id, lease, run) => run(lease ?? workLease) },
-    undefined,
-    ownership,
-    new ThreadGate(),
-  );
+test("notification item hydration projects the managed terminal without an ownership classifier", async () => {
+  const value = await fixture();
   value.endpoint.turns = [terminal("baseline"), terminal("racing")];
-  const request = value.endpoint.request.bind(value.endpoint);
-  value.endpoint.request = async <T>(method: string, params: any) => {
-    const response = await request<T>(method, params);
-    if (method === "thread/items/list") external = true;
-    return response;
-  };
 
-  assert.equal(await relay.handleNotification(
+  assert.equal(await value.relay.handleNotification(
     "local", "turn/completed", {
       threadId: "worker",
       turn: { id: "racing", status: "completed", itemsView: "notLoaded", items: [], completedAt: 10 },
     }, workLease,
-  ), "conclusively_ignored");
-  assert.deepEqual(value.deliveries.listReady(), []);
-  assert.equal(value.progress.cursor("local", "worker", mappingId), undefined);
+  ), "handled");
+  assert.deepEqual(value.deliveries.listReady().map((delivery) => delivery.body), ["[payments] done"]);
 });
 
-test("ready-scan item hydration rechecks durable accepted-turn correlation", async () => {
-  let external = false;
-  const value = await fixture(undefined, {
-    inspect: async () => external
-      ? ({ state: "external" as const, turnId: "missed" })
-      : ({ state: "owned" as const }),
-    ownsTurn: () => !external,
-  });
+test("ready-scan item hydration projects every terminal after the managed baseline", async () => {
+  const value = await fixture();
   value.endpoint.turns = [terminal("baseline"), terminal("missed")];
-  const request = value.endpoint.request.bind(value.endpoint);
-  value.endpoint.request = async <T>(method: string, params: any) => {
-    const response = await request<T>(method, params);
-    if (method === "thread/items/list") external = true;
-    return response;
-  };
 
   await value.relay.endpointReady("local", workLease);
 
-  assert.deepEqual(value.deliveries.listReady(), []);
+  assert.deepEqual(value.deliveries.listReady().map((delivery) => delivery.body), ["[payments] done"]);
   assert.equal(value.progress.cursor("local", "worker", mappingId), "missed");
 });
 
 test("relay retains two exact targets without retaining notification contents", async () => {
   const timers = new FakeRelayTimers();
-  const { endpoint, epochs, relay } = await fixture(undefined, undefined, { timers });
+  const { endpoint, epochs, relay } = await fixture(undefined, { timers });
   endpoint.turns = [terminal("baseline")];
   const epochId = epochs.current("local", "worker", mappingId)!.id;
 
@@ -764,7 +581,7 @@ test("relay retains two exact targets without retaining notification contents", 
 
 test("a stale endpoint lease retains the immutable target for retry", async () => {
   const timers = new FakeRelayTimers();
-  const { relay } = await fixture(undefined, undefined, {
+  const { relay } = await fixture(undefined, {
     timers,
     withEndpointWorkLease: async () => { throw new Error("stale lease"); },
   });
@@ -779,7 +596,7 @@ test("a stale endpoint lease retains the immutable target for retry", async () =
 
 test("endpoint retry backoff opens one durable mapping incident after its finite budget", async () => {
   const timers = new FakeRelayTimers();
-  const { endpoint, progress, deliveries, relay } = await fixture(undefined, undefined, { timers });
+  const { endpoint, progress, deliveries, relay } = await fixture(undefined, { timers });
   endpoint.turns = [terminal("baseline")];
   const partial = terminal("backoff");
   delete (partial as { itemsView?: string }).itemsView;
@@ -808,7 +625,7 @@ test("worker completions use one serialized in-flight tail per endpoint", async 
   const reading = new Promise<void>((resolve) => { entered = resolve; });
   const barrier = new Promise<void>((resolve) => { release = resolve; });
   let acquisitions = 0;
-  const { endpoint, relay } = await fixture(undefined, undefined, {
+  const { endpoint, relay } = await fixture(undefined, {
     withEndpointWorkLease: async (_endpointId, existingLease, run) => {
       acquisitions += 1;
       return run(existingLease ?? workLease);
@@ -872,7 +689,7 @@ test("a blocked endpoint tail retains only exact IDs from later notification wor
 
 test("a failed ready history scan retries even without a prior exact target", async () => {
   const timers = new FakeRelayTimers();
-  const { endpoint, progress, deliveries, relay } = await fixture(undefined, undefined, { timers });
+  const { endpoint, progress, deliveries, relay } = await fixture(undefined, { timers });
   endpoint.turns = [terminal("baseline"), terminal("missed", "completed", "found on retry")];
   let reads = 0;
   endpoint.request = async <T>(method: string, params: any) => {
@@ -898,7 +715,7 @@ test("partial ready projection failure retains the scan and later terminal turns
   const { endpoint, progress, deliveries, relay } = await fixture(() => {
     observations += 1;
     if (observations === 1) throw new Error("transient projection failure");
-  }, undefined, { timers });
+  }, { timers });
   endpoint.turns = [
     terminal("baseline"),
     terminal("first", "completed", "first final"),
@@ -918,7 +735,7 @@ test("partial ready projection failure retains the scan and later terminal turns
 
 test("a replacement mapping conclusively discards but cannot consume an old retained target", async () => {
   const timers = new FakeRelayTimers();
-  const { endpoint, registry, epochs, deliveries, relay } = await fixture(undefined, undefined, { timers });
+  const { endpoint, registry, epochs, deliveries, relay } = await fixture(undefined, { timers });
   endpoint.turns = [terminal("baseline")];
   assert.equal(await relay.handleNotification(
     "local", "turn/completed", { threadId: "worker", turn: partialTerminal("old", "completed", "old body") }, workLease,
@@ -941,7 +758,7 @@ test("a replacement mapping conclusively discards but cannot consume an old reta
 test("endpoint loss cancels its timer, fences stale callbacks, and ready reconciliation resolves the exact target", async () => {
   const timers = new FakeRelayTimers();
   const observed: unknown[] = [];
-  const { endpoint, deliveries, relay } = await fixture((event) => { observed.push(event); }, undefined, { timers });
+  const { endpoint, deliveries, relay } = await fixture((event) => { observed.push(event); }, { timers });
   endpoint.turns = [terminal("baseline")];
   assert.equal(await relay.handleNotification(
     "local", "turn/completed", { threadId: "worker", turn: partialTerminal("later", "completed", "recovered") }, workLease,
@@ -965,7 +782,7 @@ test("endpoint loss cancels its timer, fences stale callbacks, and ready reconci
 
 test("an endpoint generation change during authoritative history read neither projects nor clears the target", async () => {
   const timers = new FakeRelayTimers();
-  const { endpoint, deliveries, relay } = await fixture(undefined, undefined, { timers });
+  const { endpoint, deliveries, relay } = await fixture(undefined, { timers });
   endpoint.turns = [terminal("baseline"), terminal("racing", "completed", "must not project")];
   endpoint.request = async <T>(method: string, params: any) => {
     relay.endpointUnavailable("local");
@@ -983,7 +800,7 @@ test("an endpoint generation change during authoritative history read neither pr
 test("endpoint loss during ready projection advances neither cursor nor retained target", async () => {
   const timers = new FakeRelayTimers();
   let relay!: EventRelay;
-  const value = await fixture(() => { relay.endpointUnavailable("local"); }, undefined, { timers });
+  const value = await fixture(() => { relay.endpointUnavailable("local"); }, { timers });
   relay = value.relay;
   value.endpoint.turns = [terminal("baseline")];
   assert.equal(await relay.handleNotification(
@@ -1001,7 +818,7 @@ test("endpoint loss during ready projection advances neither cursor nor retained
 
 test("final resolution cancels its timer immediately and reconnect resets retry backoff", async () => {
   const timers = new FakeRelayTimers();
-  const { endpoint, relay } = await fixture(undefined, undefined, { timers });
+  const { endpoint, relay } = await fixture(undefined, { timers });
   endpoint.turns = [terminal("baseline")];
   await relay.handleNotification("local", "turn/completed", { threadId: "worker", turn: partialTerminal("resolved") }, workLease);
   const pendingTimer = timers.scheduled[0]!;
@@ -1029,7 +846,7 @@ test("final resolution cancels its timer immediately and reconnect resets retry 
 
 test("ready scan clears a timer armed by stale notification work ahead of it", async () => {
   const timers = new FakeRelayTimers();
-  const { endpoint, relay } = await fixture(undefined, undefined, { timers });
+  const { endpoint, relay } = await fixture(undefined, { timers });
   endpoint.turns = [terminal("baseline"), terminal("ready-wins", "completed", "resolved by ready")];
   let entered!: () => void;
   let release!: () => void;
@@ -1061,7 +878,6 @@ test("terminal ordinal hydration reuses the relay's exact active endpoint lease"
   let processor!: SessionObservationProcessor;
   const value = await fixture(
     (event, lease) => processor.observeTerminal(event, lease),
-    undefined,
     {
       poolWorkLeaseProvider: async (_endpointId, existingLease, run) => {
         seen.push(existingLease);
@@ -1089,7 +905,7 @@ test("terminal ordinal hydration reuses the relay's exact active endpoint lease"
 
 test("relay stop cancels retry timers and awaits active endpoint work", async () => {
   const timers = new FakeRelayTimers();
-  const { endpoint, relay } = await fixture(undefined, undefined, { timers });
+  const { endpoint, relay } = await fixture(undefined, { timers });
   endpoint.turns = [terminal("baseline")];
   await relay.handleNotification("local", "turn/completed", { threadId: "worker", turn: partialTerminal("waiting") }, workLease);
   assert.equal(timers.scheduled.length, 1);

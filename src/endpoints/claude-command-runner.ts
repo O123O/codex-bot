@@ -68,8 +68,7 @@ export interface ClaudeCommandRunner {
   // Reads at most `length` transcript bytes from the worker host. Snapshot pinning makes
   // pagination fail closed if the JSONL is replaced, truncated, or appended between pages.
   readTranscriptChunk(threadId: string, cwd: string, request: ClaudeTranscriptChunkRequest): Promise<ClaudeTranscriptChunk | undefined>;
-  // The transcript file path (used as the ownership "rollout path"), or undefined
-  // before the session is materialized.
+  // The native transcript file path, or undefined before the session is materialized.
   transcriptPath(threadId: string, cwd: string): Promise<string | undefined>;
   // Enumerate discoverable sessions, optionally filtered to a project cwd. Claude has no
   // list API, so this scans the transcript store; only id/cwd/updatedAt/preview leave the host.

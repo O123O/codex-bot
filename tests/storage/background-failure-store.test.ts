@@ -67,32 +67,3 @@ test("a failed event insert rolls back its delivery and remains retryable with a
   reporter.report("example capability", { episode: "example" });
   assert.equal(deliveries.get("background-failure:rollback-run:3"), undefined);
 });
-
-test("external ownership degradation uses one fixed warning and metadata-only event", () => {
-  const db = createTestDatabase();
-  const deliveries = new DeliveryStore(db);
-  const store = new BackgroundFailureStore(db, deliveries);
-  store.recordExternalOwnershipDegraded({
-    id: "background-failure:ownership-run:1",
-    incident: 1,
-    endpointId: "local",
-    threadId: "assistant",
-    binding,
-  });
-
-  const id = "background-failure:ownership-run:1";
-  assert.equal(
-    deliveries.get(id)?.body,
-    "[system] external session ownership detection is degraded; automatic release will retry",
-  );
-  const event = db.prepare("SELECT kind, payload_json FROM events WHERE id = ?").get(id) as {
-    kind: string;
-    payload_json: string;
-  };
-  assert.equal(event.kind, "external_ownership_degraded");
-  assert.deepEqual(JSON.parse(event.payload_json), {
-    event: "external_ownership_degraded",
-    incident: 1,
-  });
-  assert.equal(event.payload_json.includes("automatic release"), false);
-});

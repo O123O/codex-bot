@@ -9,7 +9,6 @@ import type { SessionDeliveryProgressStore } from "../storage/session-delivery-p
 import type { AttachmentStore } from "../attachments/store.ts";
 import type { ConversationBinding } from "../chat-apps/shared/binding.ts";
 import type { EndpointWorkLease } from "../endpoints/types.ts";
-import type { MappingIdentity } from "../registry/session-registry.ts";
 import type { ThreadGate } from "../sessions/thread-gate.ts";
 import {
   createHistoryScanBudget,
@@ -24,10 +23,6 @@ interface TerminalTurn {
   startedAt?: number | null;
   completedAt: number | null;
   items: Array<{ type: string; id: string; text?: string; phase?: string | null }>;
-}
-
-interface TerminalOwnership {
-  ownsTurn(identity: MappingIdentity, turnId: string): boolean;
 }
 
 interface RelayTarget {
@@ -101,7 +96,6 @@ export class EventRelay {
       maxRecoveryAttempts?: number;
     },
     private readonly attachments: Pick<AttachmentStore, "releaseTurn"> | undefined,
-    private readonly ownership: TerminalOwnership | undefined,
     private readonly gate: ThreadGate,
     private readonly timers: RelayTimers = nodeRelayTimers,
   ) {}
@@ -261,7 +255,6 @@ export class EventRelay {
       const current = this.mapping(target.endpointId, target.threadId);
       if (!current || current.session.mapping_id !== target.mappingId) return "conclusively_ignored";
       if (!this.isTerminal(target.fullTurn.status)) return "retry";
-      if (this.ownership && !this.ownership.ownsTurn(current.session, target.turnId)) return "conclusively_ignored";
       if (!this.runIsCurrent(target.endpointId, generation) || this.targetState(target) !== "deliverable") return "retry";
       return this.commitTerminal(target, target.fullTurn, lease);
     }
@@ -296,7 +289,6 @@ export class EventRelay {
     const stateAfter = this.targetState(target);
     if (stateAfter !== "deliverable") return stateAfter === "stale" ? "conclusively_ignored" : "retry";
     if (!this.isTerminal(turn.status)) return "retry";
-    if (this.ownership && !this.ownership.ownsTurn(current.session, turn.id)) return "conclusively_ignored";
     if (!this.runIsCurrent(target.endpointId, generation)) return "retry";
     return this.commitTerminal(target, turn, lease);
   }
@@ -336,19 +328,6 @@ export class EventRelay {
           if (!this.runIsCurrent(endpointId, generation)
             || !this.isDeliverableGeneration(endpointId, session.thread_id, targetGeneration)) return false;
           if (!this.isTerminal(turn.status)) break;
-          if (this.ownership && !this.ownership.ownsTurn(currentAfterItems.session, turn.id)) {
-            if (!this.runIsCurrent(endpointId, generation)) return false;
-            this.progress.setCursor(endpointId, session.thread_id, session.mapping_id, turn.id);
-            if (!this.runIsCurrent(endpointId, generation)) return false;
-            this.retryTargets.delete(relayTargetKey({
-              endpointId,
-              threadId: session.thread_id,
-              turnId: turn.id,
-              mappingId: session.mapping_id,
-              epochId: epoch.id,
-            }));
-            continue;
-          }
           if (!this.runIsCurrent(endpointId, generation)) return false;
           const target: RelayTarget = {
             endpointId,

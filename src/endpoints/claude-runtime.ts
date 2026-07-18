@@ -14,7 +14,7 @@ import { EventEmitter } from "node:events";
 import { AppError } from "../core/errors.ts";
 import { JsonRpcResponseError } from "../app-server/rpc-client.ts";
 import type { PermissionBlockedEvent } from "../app-server/managed-endpoint.ts";
-import { encodeClaudeClientMarker } from "../sessions/claude-transcript.ts";
+import { encodeClaudeClientMarker } from "../sessions/claude-client-marker.ts";
 import { reconstructClaudeThread, type ClaudeThreadView } from "../sessions/claude-thread.ts";
 import type { ClaudeGoalStore } from "../sessions/claude-goals.ts";
 import type { ClaudeArchiveStore } from "../sessions/claude-archives.ts";
@@ -159,8 +159,7 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     const projected = params.includeTurns === true
       ? await this.reconstruct(threadId, state)
       : this.stateOnlyThread(threadId, state);
-    const thread = await this.withPath(threadId, projected);
-    return { thread: params.includeTurns === true ? thread : { ...thread, turns: [] } };
+    return { thread: params.includeTurns === true ? projected : { ...projected, turns: [] } };
   }
 
   private async threadResume(params: Record<string, unknown>): Promise<{ thread: ClaudeThreadView }> {
@@ -171,17 +170,7 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     const projected = params.excludeTurns === true
       ? this.stateOnlyThread(threadId, state)
       : await this.reconstruct(threadId, state);
-    const thread = await this.withPath(threadId, projected);
-    return { thread: params.excludeTurns === true ? { ...thread, turns: [] } : thread };
-  }
-
-  // Attach the transcript path so the ownership path-resolver (which reads
-  // thread.path from thread/read) can materialize a Claude session. Undefined
-  // before the first turn — same "pending" outcome as an unmaterialized Codex thread.
-  private async withPath(threadId: string, view: ClaudeThreadView): Promise<ClaudeThreadView> {
-    const state = this.threads.get(threadId);
-    const path = await this.options.runner.transcriptPath(threadId, state?.cwd ?? "");
-    return path === undefined ? view : { ...view, path };
+    return { thread: params.excludeTurns === true ? { ...projected, turns: [] } : projected };
   }
 
   private async ensureState(threadId: string): Promise<ThreadState> {

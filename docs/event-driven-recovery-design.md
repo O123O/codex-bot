@@ -2,7 +2,7 @@
 
 ## Status
 
-Implemented and verified.
+Historical. The event-driven recovery portions remain implemented, but the external-ownership watcher, rollout scans, and automatic unadoption described below were removed in July 2026. Managed membership is now explicit and users must unadopt before manual work.
 
 ## Problem
 

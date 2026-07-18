@@ -9,11 +9,11 @@
 // `thread/read` view from parsed transcript records; 1.3 wraps it with file I/O and
 // uses the live stream only to detect turn completion.
 //
-// Turn model matches the ownership scanner (`claude-transcript.ts`): a turn starts on
+// A turn starts on
 // a `user` row with non-empty `promptSource`; a null-`promptSource` user row is a
 // tool_result (mid-turn); a turn ends on an assistant row whose `stop_reason` is a
 // concrete value other than `tool_use`.
-import { extractClientMarker } from "./claude-transcript.ts";
+import { extractClaudeClientMarker } from "./claude-client-marker.ts";
 
 export type ClaudeTurnStatus = "completed" | "interrupted" | "failed" | "inProgress";
 export type ClaudeMessagePhase = "final_answer" | "commentary";
@@ -41,7 +41,6 @@ export interface ClaudeThreadView {
   turns: ClaudeThreadTurn[];
   threadSource?: string;
   model?: string;
-  path?: string;
 }
 
 export interface ReconstructClaudeThreadParams {
@@ -72,7 +71,7 @@ export function reconstructClaudeThread(params: ReconstructClaudeThreadParams): 
     if (!accumulator) return;
     if (!accumulator.terminal) {
       // Claude is a headless child process, not a resumable daemon. Only the child
-      // owned by this runtime can make a turn live. A trailing transcript row after
+      // tracked by this runtime can make a turn live. A trailing transcript row after
       // restart means the former process exited without a terminal record.
       accumulator.turn.status = params.runningTurnId === accumulator.turn.id ? "inProgress" : "interrupted";
     }
@@ -89,10 +88,10 @@ export function reconstructClaudeThread(params: ReconstructClaudeThreadParams): 
       const turnId = claudeTurnIdFromRecord(record);
       if (!promptId || !turnId) continue; // tool_result or malformed user row
       finalize(current);
-      const marker = extractClientMarker(record.message);
-      // turn.id is the QiYan clientUserMessageId marker when owned (so it equals the
-      // id `turn/start` returned and `turn/completed` pushes, letting the relay find
-      // the turn), else the Claude promptId for external/human turns.
+      const marker = extractClaudeClientMarker(record.message);
+      // For a QiYan-dispatched turn, turn.id is its clientUserMessageId marker. It
+      // therefore matches the id returned by `turn/start` and pushed by
+      // `turn/completed`; an unmarked transcript turn uses Claude's promptId.
       const userItem: ClaudeThreadItem = {
         type: "userMessage",
         id: idOf(record) ?? `${promptId}:user`,
@@ -158,7 +157,7 @@ export function claudeTurnIdFromRecord(raw: unknown): string | undefined {
   if (record.type !== "user" || typeof record.promptSource !== "string" || record.promptSource.length === 0) return undefined;
   const promptId = turnIdOf(record);
   if (!promptId) return undefined;
-  return extractClientMarker(record.message) ?? promptId;
+  return extractClaudeClientMarker(record.message) ?? promptId;
 }
 
 function turnIdOf(record: Record<string, unknown>): string | undefined {

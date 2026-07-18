@@ -19,18 +19,6 @@ test("an identical operation replay returns its stored receipt", () => {
   assert.deepEqual(replay.receipt, { turnId: "turn-1" });
 });
 
-test("worker ownership matches the durable client identity before dispatch and the native turn after receipt", () => {
-  const store = new OperationStore(createTestDatabase());
-  const operation = store.prepare({ contextId: "ctx", attemptId: "a1", callId: "c1", kind: "send_to_session", args: { nickname: "worker", content: "private" } });
-
-  assert.equal(store.ownsWorkerTurn({ turnId: "pending", clientId: "ctx:c1" }), true);
-  assert.equal(store.ownsWorkerTurn({ turnId: "external", clientId: "other-client" }), false);
-
-  store.markDispatched(operation.id);
-  store.succeed(operation.id, { nickname: "worker", mode: "start", turnId: "turn-1" });
-  assert.equal(store.ownsWorkerTurn({ turnId: "turn-1" }), true);
-});
-
 test("changing arguments for an existing operation is rejected", () => {
   const db = createTestDatabase();
   const store = new OperationStore(db);
