@@ -38,6 +38,7 @@ import {
   failWorkerHistory,
   finishWorkerHistory,
   receiveWorkerEvent,
+  removeOptimisticWorkerMessage,
   requeueWorkerRecovery,
   retainWorkerDraftMessages,
   storeWorkerDraftMessages,
@@ -700,9 +701,14 @@ export function App() {
     } else {
       push(key, { role: "you", body: redirect && redirect !== selected ? `→ @${redirect}  ${body}` : body, at: Date.now() });
     }
+    const removeRejectedOptimisticMessage = () => {
+      if (!target || target !== selected || !clientInputId) return;
+      const current = workerRef.current;
+      if (current?.nickname === target) replaceWorker(removeOptimisticWorkerMessage(current, `to:web:${clientInputId}`));
+    };
     try { const r = await api<{ ok: boolean; error?: string; clientUserMessageId?: string }>("/api/input", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text: body, target, ...(clientInputId ? { clientInputId } : {}) }) });
       if (!r.ok) push(key, { role: "assistant", body: `[send failed: ${r.error ?? ""}]`, at: Date.now() }); }
-    catch (e) { push(key, { role: "assistant", body: `[send error: ${(e as { error?: string }).error ?? e}]`, at: Date.now() }); }
+    catch (e) { removeRejectedOptimisticMessage(); push(key, { role: "assistant", body: `[send error: ${(e as { error?: string }).error ?? e}]`, at: Date.now() }); }
   };
 
   const fileInput = useRef<HTMLInputElement>(null);

@@ -195,6 +195,10 @@ export function addOptimisticWorkerMessage(state: WorkerStreamState, clientId: s
   return { ...state, messages: capMessages(upsert(state.messages.filter((candidate) => candidate.clientId !== clientId), message)) };
 }
 
+export function removeOptimisticWorkerMessage(state: WorkerStreamState, clientId: string): WorkerStreamState {
+  return { ...state, messages: state.messages.filter((message) => !(message.optimistic && message.clientId === clientId)) };
+}
+
 function upsert(messages: WorkerChatMessage[], message: WorkerChatMessage): WorkerChatMessage[] {
   const index = messages.findIndex((candidate) => candidate.id === message.id);
   if (index < 0) return [...messages, message];

@@ -2018,7 +2018,7 @@ export async function buildProductionApp(
     if (directive.kind === "to") {
       // `/to <worker> <text>` is delivered directly to the worker + copied to the assistant as an
       // internal awareness source; it does NOT run a normal assistant reply turn.
-      await deliverDirectTo({
+      const result = await deliverDirectTo({
         alreadyDelivered: (sourceId) => conversations.hasInternalSource("direct_to", sourceId),
         send: (nickname, text, sendOptions) => sessions.send(nickname, text, sendOptions),
         recordAwareness: (input) => { conversations.createInternalSource(input); },
@@ -2026,6 +2026,12 @@ export async function buildProductionApp(
         commitCheckpoint: () => effects.commitNativeCheckpoint?.(),
         report,
       }, source, directive.target, directive.payload);
+      // Chat apps get a QiYan awareness note even when direct delivery fails. The Web worker panel
+      // additionally needs an HTTP failure so it does not present an unadmitted optimistic message
+      // as accepted native history.
+      if (!result.delivered && source.binding.adapterId === WEB_ADAPTER_ID) {
+        throw new AppError("ENDPOINT_UNAVAILABLE", result.error ?? `direct message to ${directive.target} failed`);
+      }
       return;
     }
     await dispatcher.accept(source, effects);

@@ -28,10 +28,10 @@ export async function deliverDirectTo(
   source: CanonicalChatSource,
   target: string,
   payload: string,
-): Promise<void> {
+): Promise<{ delivered: boolean; error?: string }> {
   const sourceId = `direct_to:${source.nativeSourceId}`;
   // Idempotency: on redelivery (the marker exists) do nothing but re-ack the ingress checkpoint.
-  if (deps.alreadyDelivered(sourceId)) { deps.commitCheckpoint(); return; }
+  if (deps.alreadyDelivered(sourceId)) { deps.commitCheckpoint(); return { delivered: true }; }
 
   let failure: string | undefined;
   try {
@@ -52,4 +52,5 @@ export async function deliverDirectTo(
     code: failure ? "direct_to_failed" : "direct_to_delivered",
     adapter: source.binding.adapterId,
   });
+  return failure ? { delivered: false, error: failure } : { delivered: true };
 }

@@ -29,7 +29,7 @@ function harness(opts: { alreadyDelivered?: boolean; sendImpl?: DirectToDeps["se
 
 test("delivers /to directly to the worker and records an INTERNAL awareness source", async () => {
   const { deps, calls } = harness();
-  await deliverDirectTo(deps, source, "payments", "fix the flaky test");
+  const result = await deliverDirectTo(deps, source, "payments", "fix the flaky test");
 
   assert.deepEqual(calls.sends, [{ nickname: "payments", text: "fix the flaky test", options: { mode: "auto", clientUserMessageId: "to:web:owner:42" } }]);
   assert.equal(calls.recorded.length, 1);
@@ -42,6 +42,7 @@ test("delivers /to directly to the worker and records an INTERNAL awareness sour
   assert.equal(calls.checkpoints, 1);                    // ingress ack — no redelivery
   assert.equal(calls.pumps, 1);
   assert.deepEqual(calls.reports, [{ level: "info", code: "direct_to_delivered", adapter: "web" }]);
+  assert.deepEqual(result, { delivered: true });
 });
 
 test("a redelivery of the same message is a no-op except re-acking the ingress checkpoint", async () => {
@@ -57,10 +58,11 @@ test("a redelivery of the same message is a no-op except re-acking the ingress c
 
 test("a failed direct send is non-fatal: still records an informational note, acks, and reports warn", async () => {
   const { deps, calls } = harness({ sendImpl: async () => { throw new Error("unknown or unmanaged session: payments"); } });
-  await deliverDirectTo(deps, source, "payments", "fix the flaky test"); // must not throw
+  const result = await deliverDirectTo(deps, source, "payments", "fix the flaky test"); // must not throw
 
   assert.equal(calls.recorded.length, 1);
   assert.match(calls.recorded[0]!.rawText, /could NOT be delivered to worker "payments" \(unknown or unmanaged session: payments\)/u);
   assert.equal(calls.checkpoints, 1);
   assert.deepEqual(calls.reports, [{ level: "warn", code: "direct_to_failed", adapter: "web" }]);
+  assert.deepEqual(result, { delivered: false, error: "unknown or unmanaged session: payments" });
 });

@@ -10,6 +10,7 @@ import {
   drainWorkerRecoveryAfterAttempt,
   dequeueWorkerRecovery,
   failWorkerHistory,
+  removeOptimisticWorkerMessage,
   requeueWorkerRecovery,
   receiveWorkerEvent,
   retainWorkerDraftMessages,
@@ -29,6 +30,16 @@ test("native user item replaces the correlated optimistic bubble", () => {
   state = addOptimisticWorkerMessage(state, "to:web:input", "hello", 1);
   state = receiveWorkerEvent(state, envelope({ kind: "item-started", turnId: "turn", atMs: 2, item: { type: "user-message", id: "u1", clientId: "to:web:input", text: "hello" } }));
   assert.deepEqual(state.messages.map((message) => [message.id, message.body, message.optimistic]), [["u:turn:u1", "hello", false]]);
+});
+
+test("a rejected worker send removes only its optimistic echo", () => {
+  let state = beginWorkerSubscription("worker", "codex", ids.requestId);
+  state = addOptimisticWorkerMessage(state, "to:web:one", "first", 1);
+  state = addOptimisticWorkerMessage(state, "to:web:two", "second", 2);
+
+  const failed = removeOptimisticWorkerMessage(state, "to:web:two");
+
+  assert.deepEqual(failed.messages.map((message) => message.body), ["first"]);
 });
 
 test("agent deltas accumulate into one draft and item completion replaces it authoritatively", () => {
