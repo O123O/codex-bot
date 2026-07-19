@@ -5,10 +5,11 @@ import { Duplex, type Readable, type Writable } from "node:stream";
 import WebSocket from "ws";
 import type { RpcWire } from "./rpc-client.ts";
 
-// App Server RPC is message-framed JSON. A single bounded turn can legitimately exceed 1 MiB
-// (agent text plus command/tool items), so rejecting at 1 MiB tears down an otherwise healthy shared
-// endpoint. Keep a finite transport ceiling; consumers must still page and project native history.
-const MAX_FRAME_BYTES = 16 * 1024 * 1024;
+// App Server RPC is message-framed JSON. A tool-heavy full turn can exceed 16 MiB after JSON
+// projection; rejecting that response tears down the shared endpoint and interrupts its active
+// turns. Keep the trusted App Server transport generously but finitely bounded. Browser timelines
+// and native history remain independently paged/capped, so this is not an in-memory chat cache.
+const MAX_FRAME_BYTES = 64 * 1024 * 1024;
 
 export interface WebSocketByteStream {
   readonly input: Writable;

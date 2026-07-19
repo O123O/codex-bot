@@ -256,30 +256,17 @@ export class EventRelay {
       if (!current || current.session.mapping_id !== target.mappingId) return "conclusively_ignored";
       if (!this.isTerminal(target.fullTurn.status)) return "retry";
       if (!this.runIsCurrent(target.endpointId, generation) || this.targetState(target) !== "deliverable") return "retry";
-      return this.commitTerminal(target, target.fullTurn, lease);
+      return this.commitCurrentTerminal(target, target.fullTurn, lease, generation);
     }
-    if (!target.fullTurn && this.progress.recoveryIncident(target.endpointId, target.threadId, target.mappingId)) return "needs_attention";
     const reader = this.pool.historyReader(target.endpointId, lease);
     const budget = createHistoryScanBudget();
-    const suffix = epoch.baselineTurnId
-      ? await reader.descendingSuffix(target.threadId, epoch.baselineTurnId, budget)
-      : undefined;
-    if (suffix && !suffix.anchorFound) return "retry";
-    const metadata = suffix
-      ? suffix.turns.find((candidate) => candidate.id === target.turnId)
-      : await reader.findTurn(target.threadId, target.turnId, budget);
+    // A terminal notification captured during the current managed epoch is already an exact live
+    // target. Resolve that turn directly: scanning back to the adoption baseline makes each live
+    // delivery progressively more expensive and lets an old recovery incident poison all future
+    // completions. Endpoint-ready backlog recovery remains separately bounded by its durable cursor.
+    const metadata = await reader.findTurn(target.threadId, target.turnId, budget);
     if (!this.runIsCurrent(target.endpointId, generation)) return "retry";
-
-    if (!metadata) {
-      if (suffix && epoch.baselineTurnId) {
-        const relation = await reader.classifyTurnAgainstAnchor(
-          target.threadId, target.turnId, epoch.baselineTurnId, budget,
-        );
-        if (!this.runIsCurrent(target.endpointId, generation)) return "retry";
-        if (relation === "anchor" || relation === "older") return "conclusively_ignored";
-      }
-      return "retry";
-    }
+    if (!metadata) return "retry";
     const exact = await reader.exactTurnItems(target.threadId, target.turnId, { budget, allowLegacySummary: true });
     const turn = terminalTurn(metadata, exact.summaryTurn, exact.items);
     if (!this.runIsCurrent(target.endpointId, generation)) return "retry";
@@ -290,7 +277,7 @@ export class EventRelay {
     if (stateAfter !== "deliverable") return stateAfter === "stale" ? "conclusively_ignored" : "retry";
     if (!this.isTerminal(turn.status)) return "retry";
     if (!this.runIsCurrent(target.endpointId, generation)) return "retry";
-    return this.commitTerminal(target, turn, lease);
+    return this.commitCurrentTerminal(target, turn, lease, generation);
   }
 
   private async reconcileHistory(endpointId: string, lease: EndpointWorkLease, generation: number): Promise<boolean> {
@@ -306,8 +293,32 @@ export class EventRelay {
         if (!mapping) return true;
         if (mapping.session.mapping_id !== session.mapping_id) return false;
         if (mapping.session.lifecycle_state !== "managed" || !epoch) return true;
-        if (this.progress.recoveryIncident(endpointId, session.thread_id, session.mapping_id)) return true;
         const targetGeneration = { mappingId: session.mapping_id, epochId: epoch.id };
+        if (this.progress.recoveryIncident(endpointId, session.thread_id, session.mapping_id)) {
+          // A bounded historical scan may have left an acknowledged gap, but it must not poison the
+          // mapping forever. Re-establish a delivery boundary from only the latest terminal; the
+          // prior warning remains the durable disclosure that older finals may have been skipped.
+          const latest = await this.pool.historyReader(endpointId, lease).latestTurn(session.thread_id);
+          if (!latest || !this.isTerminal(latest.status)) return true;
+          if (latest.id === epoch.baselineTurnId) {
+            this.progress.setCursor(endpointId, session.thread_id, session.mapping_id, latest.id);
+            return true;
+          }
+          const target: RelayTarget = {
+            endpointId,
+            threadId: session.thread_id,
+            turnId: latest.id,
+            mappingId: session.mapping_id,
+            epochId: epoch.id,
+          };
+          this.retryTargets.set(relayTargetKey(target), target);
+          const outcome = await this.projectTarget(target, lease, generation);
+          if (outcome === "handled" || outcome === "conclusively_ignored") {
+            this.retryTargets.delete(relayTargetKey(target));
+            return true;
+          }
+          return false;
+        }
         const anchorTurnId = this.progress.cursor(endpointId, session.thread_id, session.mapping_id) ?? epoch.baselineTurnId;
         const budget = createHistoryScanBudget();
         const suffix = await this.pool.historyReader(endpointId, lease).descendingSuffix(session.thread_id, anchorTurnId, budget);
@@ -337,12 +348,11 @@ export class EventRelay {
             epochId: epoch.id,
           };
           this.retryTargets.set(relayTargetKey(target), target);
-          const outcome = await this.commitTerminal(target, turn, lease);
+          const outcome = await this.commitCurrentTerminal(target, turn, lease, generation);
           if (!this.runIsCurrent(endpointId, generation)) return false;
           if (outcome !== "handled") return false;
           this.retryTargets.delete(relayTargetKey(target));
           if (!this.runIsCurrent(endpointId, generation)) return false;
-          this.progress.setCursor(endpointId, session.thread_id, session.mapping_id, turn.id);
         }
         return true;
         });
@@ -404,6 +414,23 @@ export class EventRelay {
     });
     if (inserted) await this.options.onEventCommitted?.();
     return "handled";
+  }
+
+  private async commitCurrentTerminal(
+    target: RelayTarget,
+    turn: TerminalTurn,
+    lease: EndpointWorkLease,
+    generation: number,
+  ): Promise<RelayOutcome> {
+    const outcome = await this.commitTerminal(target, turn, lease);
+    if (outcome === "handled" && this.runIsCurrent(target.endpointId, generation)
+      && this.targetState(target) === "deliverable") {
+      // The delivery/event writes are durable before this boundary advances. A current live
+      // terminal also establishes a fresh recovery point, so it clears a prior bounded-scan
+      // incident instead of leaving the mapping unable to deliver future turns.
+      this.progress.setCursor(target.endpointId, target.threadId, target.mappingId, turn.id);
+    }
+    return outcome;
   }
 
   private targetState(target: RelayTarget): "deliverable" | "retry" | "stale" {

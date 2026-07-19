@@ -4,9 +4,11 @@ export class SessionDeliveryProgressStore {
   constructor(private readonly db: Database) {}
 
   setCursor(endpointId: string, threadId: string, mappingId: string, cursor: string): void {
-    this.db.prepare(`INSERT INTO session_delivery_progress(endpoint_id, thread_id, mapping_id, delivery_cursor)
-      VALUES (?, ?, ?, ?)
-      ON CONFLICT(endpoint_id, thread_id, mapping_id) DO UPDATE SET delivery_cursor = excluded.delivery_cursor`)
+    this.db.prepare(`INSERT INTO session_delivery_progress(endpoint_id, thread_id, mapping_id, delivery_cursor, recovery_incident)
+      VALUES (?, ?, ?, ?, NULL)
+      ON CONFLICT(endpoint_id, thread_id, mapping_id) DO UPDATE SET
+        delivery_cursor = excluded.delivery_cursor,
+        recovery_incident = NULL`)
       .run(endpointId, threadId, mappingId, cursor);
   }
 

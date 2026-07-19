@@ -261,11 +261,12 @@ test("permission projection commits no session-liveness row", async () => {
 });
 
 test("managed worker finals create automatic delivery and metadata-only assistant event exactly once", async () => {
-  const { db, endpoint, deliveries, relay } = await fixture();
+  const { db, endpoint, progress, deliveries, relay } = await fixture();
   endpoint.turns = [terminal("baseline"), terminal()];
   await relay.handleNotification("local", "turn/completed", { threadId: "worker", turn: terminal() });
   await relay.handleNotification("local", "turn/completed", { threadId: "worker", turn: terminal() });
   assert.deepEqual(deliveries.listReady().map((item) => item.body), ["[payments] done"]);
+  assert.equal(progress.cursor("local", "worker", mappingId), "turn-1");
   const events = db.prepare("SELECT payload_json FROM events").all() as Array<{ payload_json: string }>;
   assert.equal(events.length, 1);
   assert.equal(events[0]?.payload_json.includes("done"), false);
@@ -343,6 +344,39 @@ test("terminal notification with partial items reads the authoritative completed
   assert.deepEqual(deliveries.listReady().map((item) => item.body), ["[payments] from history"]);
 });
 
+test("a current partial terminal heals an old recovery incident without scanning historical backlog", async () => {
+  const { endpoint, progress, deliveries, relay } = await fixture();
+  const current = terminal("current", "completed", "new final");
+  progress.setCursor("local", "worker", mappingId, "old-cursor");
+  progress.markRecoveryIncident("local", "worker", mappingId, "old history gap");
+  const methods: string[] = [];
+  endpoint.request = async <T>(method: string, params: any) => {
+    methods.push(method);
+    if (method === "thread/turns/list") {
+      assert.equal(params.cursor, undefined, "the exact live target must not scan from the stale cursor");
+      return {
+        data: [{ ...current, itemsView: "notLoaded", items: [] }],
+        nextCursor: "older-history",
+        backwardsCursor: "newer-history",
+      } as T;
+    }
+    if (method === "thread/items/list") {
+      assert.equal(params.turnId, "current");
+      return { data: current.items, nextCursor: null, backwardsCursor: "newer-items" } as T;
+    }
+    throw new Error(`unexpected method: ${method}`);
+  };
+  const partial = partialTerminal("current", "completed", "");
+
+  assert.equal(await relay.handleNotification(
+    "local", "turn/completed", { threadId: "worker", turn: partial }, workLease,
+  ), "handled");
+  assert.deepEqual(methods, ["thread/turns/list", "thread/items/list"]);
+  assert.deepEqual(deliveries.listReady().map((item) => item.body), ["[payments] new final"]);
+  assert.equal(progress.cursor("local", "worker", mappingId), "current");
+  assert.equal(progress.recoveryIncident("local", "worker", mappingId), undefined);
+});
+
 test("a history scan budget opens one durable mapping incident instead of retrying", async () => {
   const timers = new FakeRelayTimers();
   const { endpoint, progress, deliveries, relay } = await fixture(undefined, { timers });
@@ -370,6 +404,19 @@ test("a history scan budget opens one durable mapping incident instead of retryi
   assert.deepEqual(deliveries.listReady().map((delivery) => delivery.body), [
     "[payments] message recovery needs attention; native history scan budget was exhausted",
   ]);
+});
+
+test("endpoint-ready recovery re-establishes an incident mapping from only its latest terminal", async () => {
+  const { endpoint, progress, deliveries, relay } = await fixture();
+  progress.setCursor("local", "worker", mappingId, "old-cursor");
+  progress.markRecoveryIncident("local", "worker", mappingId, "old history gap");
+  endpoint.turns = [terminal("baseline"), terminal("latest", "completed", "latest final")];
+
+  await relay.endpointReady("local", workLease);
+
+  assert.deepEqual(deliveries.listReady().map((delivery) => delivery.body), ["[payments] latest final"]);
+  assert.equal(progress.cursor("local", "worker", mappingId), "latest");
+  assert.equal(progress.recoveryIncident("local", "worker", mappingId), undefined);
 });
 
 test("reconciliation stops at an in-progress turn without advancing past it", async () => {
