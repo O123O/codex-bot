@@ -12,7 +12,7 @@ import {
   type ClaudeTurnStatus,
 } from "../../src/endpoints/claude-command-runner.ts";
 import { JsonRpcResponseError } from "../../src/app-server/rpc-client.ts";
-import { ThreadHistoryReader } from "../../src/app-server/thread-history.ts";
+import { createHistoryScanBudget, ThreadHistoryReader } from "../../src/app-server/thread-history.ts";
 import { ClaudeGoalStore } from "../../src/sessions/claude-goals.ts";
 import { createTestDatabase } from "../../src/storage/database.ts";
 
@@ -144,29 +144,31 @@ test("Claude paging uses bounded native transcript windows without backend reten
   assert.deepEqual(older.data.map((turn: any) => turn.id), ["ctx:one"]);
   assert.equal(older.nextCursor, null);
 
-  const firstItems = await history.itemsPage(thread.id, {
-    turnId: "ctx:two", limit: 1, sortDirection: "asc",
+  const exact = await history.exactTurnItems(thread.id, "ctx:two", {
+    budget: createHistoryScanBudget(),
   });
-  assert.equal(firstItems.data[0]?.type, "userMessage");
-  assert.equal(firstItems.data[0]?.clientId, "ctx:two");
-  assert.equal(typeof firstItems.nextCursor, "string");
-  assert.equal(runner.transcriptReadCount, 3);
+  assert.equal(exact.items[0]?.type, "userMessage");
+  assert.equal(exact.items[0]?.clientId, "ctx:two");
+  assert.equal(exact.turn.itemsView, "full");
+  assert.equal(runner.transcriptReadCount, 4);
   assert.ok(runner.transcriptChunkLengths.every((length) => length <= 4 * 1024 * 1024));
 
   const metadata = await rt.request<any>("thread/read", { threadId: thread.id, includeTurns: false });
   assert.deepEqual(metadata.thread.turns, []);
   assert.deepEqual((await rt.request<any>("thread/read", { threadId: thread.id })).thread.turns, []);
   assert.equal(metadata.thread.status.type, "idle");
-  assert.equal(runner.transcriptReadCount, 3);
+  assert.equal(runner.transcriptReadCount, 4);
   const resumed = await rt.request<any>("thread/resume", { threadId: thread.id, excludeTurns: true });
   assert.deepEqual(resumed.thread.turns, []);
-  assert.equal(runner.transcriptReadCount, 3);
+  assert.equal(runner.transcriptReadCount, 4);
   const afterResume = new ThreadHistoryReader((method, params) => rt.request(method, params));
   const stillPersisted = await afterResume.turnsPage(thread.id, { limit: 10, sortDirection: "asc", itemsView: "notLoaded" });
   assert.deepEqual(stillPersisted.data.map((turn: any) => turn.id), ["ctx:one", "ctx:two"]);
-  const defaultItems = await afterResume.itemsPage(thread.id, { turnId: "ctx:two", limit: 50, sortDirection: "asc" });
-  assert.equal(defaultItems.data[0]?.type, "userMessage");
-  assert.equal(runner.transcriptReadCount, 5);
+  const persisted = await afterResume.exactTurnItems(thread.id, "ctx:two", {
+    budget: createHistoryScanBudget(),
+  });
+  assert.equal(persisted.items[0]?.type, "userMessage");
+  assert.equal(runner.transcriptReadCount, 7);
 });
 
 test("descending Claude paging preserves a turn exactly aligned with the prior window boundary", async () => {

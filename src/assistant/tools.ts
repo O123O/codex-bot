@@ -104,6 +104,8 @@ export const READ_ONLY_TOOLS = new Set<AssistantToolName>([
   "list_managed_sessions", "discover_sessions", "get_session_status", "read_worker_message", "inspect_worker_conversation", "list_models", "get_goal", "get_chat_history", "search_slack", "get_slack_mentions",
 ]);
 
+const WAIT_FOR_DURABLE_RECOVERY_TOOLS = new Set<AssistantToolName>(["create_session", "compact_session"]);
+
 export function createAssistantTools(
   operations: OperationStore,
   actions: Partial<Record<AssistantToolName, Action>>,
@@ -165,7 +167,7 @@ export function createAssistantTools(
       operation ??= operations.prepare({ contextId: effectiveSourceContextId, attemptId: context.attemptId, callId: context.callId, kind: name, args, effectClass, ...(context.toolFence === undefined ? {} : { toolFence: context.toolFence }) });
       if (operation.state === "succeeded") return operation.receipt;
       if (operation.state === "dispatched" || operation.state === "uncertain") {
-        if (operation.state === "uncertain" && name === "create_session" && options.waitForTerminal) {
+        if (operation.state === "uncertain" && WAIT_FOR_DURABLE_RECOVERY_TOOLS.has(name) && options.waitForTerminal) {
           return waitForCertainResult(operations, operation.id, name, options.waitForTerminal, context.signal);
         }
         throw new AppError("OPERATION_UNCERTAIN", `${name} may already have taken effect`);
@@ -205,7 +207,7 @@ export function createAssistantTools(
         const failure = { message: error instanceof Error ? error.message : String(error) };
         if (uncertain) {
           operations.fail(operation.id, failure, true, context.toolFence);
-          if (name === "create_session" && options.waitForTerminal) {
+          if (WAIT_FOR_DURABLE_RECOVERY_TOOLS.has(name) && options.waitForTerminal) {
             return waitForCertainResult(operations, operation.id, name, options.waitForTerminal, context.signal);
           }
           throw new AppError("OPERATION_UNCERTAIN", `${name} may already have taken effect; wait for durable reconciliation before retrying`);

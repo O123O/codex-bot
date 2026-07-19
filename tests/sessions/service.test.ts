@@ -5,7 +5,6 @@ import { join } from "node:path";
 import test from "node:test";
 import type { AppServerEndpoint } from "../../src/app-server/pool.ts";
 import { AppServerPool } from "../../src/app-server/pool.ts";
-import { JsonRpcResponseError } from "../../src/app-server/rpc-client.ts";
 import { SessionObservationProcessor } from "../../src/assistant/session-observer.ts";
 import { AppError } from "../../src/core/errors.ts";
 import { SessionRegistry } from "../../src/registry/session-registry.ts";
@@ -44,7 +43,6 @@ class ServiceEndpoint implements AppServerEndpoint {
   loseNextGoalResponse = false;
   rejectNextGoalSetBeforeEffect = false;
   rejectNextGoalGet = false;
-  legacyItemsUnsupported = false;
   compactDelayMs = 0;
   onTurnStart: (() => void) | undefined;
   constructor(id = "local") { this.id = id; }
@@ -78,28 +76,21 @@ class ServiceEndpoint implements AppServerEndpoint {
     }
     if (method === "thread/turns/list") {
       const source = params.sortDirection === "desc" ? [...this.historyTurns()].reverse() : this.historyTurns();
+      const offset = params.cursor === undefined ? 0 : Number(params.cursor);
+      const limit = Number(params.limit);
+      const selected = source.slice(offset, offset + limit);
       return {
-        data: source.map((turn) => ({
+        data: selected.map((turn) => ({
           ...turn,
           status: turn.status ?? "completed",
           itemsView: params.itemsView,
-          items: params.itemsView === "notLoaded" ? [] : this.historyItems(turn),
+          items: params.itemsView === "notLoaded" ? []
+            : params.itemsView === "summary"
+              ? this.historyItems(turn).filter((item) => item.type === "userMessage" || item.type === "agentMessage")
+              : this.historyItems(turn),
         })),
-        nextCursor: null,
-        backwardsCursor: null,
-      } as T;
-    }
-    if (method === "thread/items/list") {
-      if (this.legacyItemsUnsupported) {
-        throw new JsonRpcResponseError(-32601, "thread/items/list is not supported yet");
-      }
-      const turns = params.turnId === undefined
-        ? this.historyTurns()
-        : this.historyTurns().filter((candidate) => candidate.id === params.turnId);
-      return {
-        data: turns.flatMap((turn) => this.historyItems(turn)),
-        nextCursor: null,
-        backwardsCursor: null,
+        nextCursor: offset + selected.length < source.length ? String(offset + selected.length) : null,
+        backwardsCursor: offset > 0 ? String(Math.max(0, offset - limit)) : null,
       } as T;
     }
     if (method === "thread/compact/start") {
@@ -336,9 +327,13 @@ test("compaction requires an idle managed worker and observes a new native compa
   });
   assert.deepEqual(result, { compactionItemId: "compact-1", baselineCompactionItemIds: [] });
   assert.ok(value.endpoint.calls.some((call) => call.method === "thread/compact/start" && call.params.threadId === "thread"));
-  const itemReads = value.endpoint.calls.filter((call) => call.method === "thread/items/list");
-  assert.equal(itemReads.length, 1);
-  assert.deepEqual(itemReads.map((call) => call.params.turnId), ["compact-turn-2"]);
+  const fullTurnReads = value.endpoint.calls.filter((call) => (
+    call.method === "thread/turns/list" && call.params.itemsView === "full"
+  ));
+  assert.equal(fullTurnReads.length, 1);
+  assert.deepEqual(fullTurnReads.map((call) => ({ limit: call.params.limit, cursor: call.params.cursor })), [
+    { limit: 1, cursor: undefined },
+  ]);
 
   value.endpoint.status = "active";
   value.endpoint.threadTurns.push({ id: "active", status: "inProgress", itemsView: "full", items: [] });
@@ -374,17 +369,17 @@ test("all turn-starting mutations fail closed when the authoritative native stat
   assert.equal(value.endpoint.calls.some((call) => call.method === "thread/goal/set"), false);
 });
 
-test("compaction falls back to bounded turn summaries when exact item paging is unsupported", async () => {
+test("compaction reads the exact compact turn without unsupported item paging", async () => {
   const value = await fixture();
   value.endpoint.threadTurns = [{ id: "finished", status: "completed", itemsView: "full", items: [] }];
-  value.endpoint.legacyItemsUnsupported = true;
 
   assert.deepEqual(await value.service.compact("payments"), {
     compactionItemId: "compact-1", baselineCompactionItemIds: [],
   });
   assert.equal(value.endpoint.calls.some((call) => call.method === "thread/compact/start"), true);
+  assert.equal(value.endpoint.calls.some((call) => call.method === "thread/items/list"), false);
   assert.equal(value.endpoint.calls.some((call) => (
-    call.method === "thread/turns/list" && call.params.itemsView === "summary"
+    call.method === "thread/turns/list" && call.params.itemsView === "full" && call.params.limit === 1
   )), true);
 });
 

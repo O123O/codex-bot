@@ -275,6 +275,38 @@ test("create_session waits for exact durable reconciliation instead of returning
   assert.equal(waits, 1, "the recovered receipt replays without another wait");
 });
 
+test("compact_session waits for exact durable reconciliation instead of returning transient uncertainty", async () => {
+  const db = createTestDatabase();
+  const operations = new OperationStore(db);
+  operations.createSourceContext({ id: "ctx", kind: "telegram", sourceId: "wait-compact", rawText: "compact it", attachmentIds: [] });
+  let calls = 0;
+  let waits = 0;
+  const tools = createAssistantTools(operations, {
+    compact_session: async (_args, context) => {
+      calls += 1;
+      context.checkpoint({ endpointId: "devbox", threadId: "thread-1", mappingId: "mapping-1", baselineTurnId: "turn-1", baselineCompactionItemIds: [] });
+      throw new AppError("OPERATION_UNCERTAIN", "compaction completion is not yet visible");
+    },
+  }, {
+    maxCollectCount: 20,
+    waitForTerminal: async (operationId) => {
+      waits += 1;
+      assert.equal(operations.get(operationId)?.state, "uncertain");
+      operations.succeed(operationId, { nickname: "docs", compactionItemId: "compact-1", baselineCompactionItemIds: [] });
+    },
+  });
+  const context = { sourceContextId: "ctx", attemptId: "a", turnId: "t", callId: "compact" };
+
+  assert.deepEqual(await tools.compact_session(context, { nickname: "docs" }), {
+    nickname: "docs", compactionItemId: "compact-1", baselineCompactionItemIds: [],
+  });
+  assert.deepEqual(await tools.compact_session(context, { nickname: "docs" }), {
+    nickname: "docs", compactionItemId: "compact-1", baselineCompactionItemIds: [],
+  });
+  assert.equal(calls, 1, "terminal waiting never redispatches compaction");
+  assert.equal(waits, 1, "the recovered receipt replays without another wait");
+});
+
 test("create_session reports a reconciled failure as definite", async () => {
   const db = createTestDatabase();
   const operations = new OperationStore(db);

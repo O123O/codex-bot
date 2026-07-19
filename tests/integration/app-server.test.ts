@@ -105,7 +105,7 @@ test("pinned app-server supports multiple threads, discovery, goals, turns, and 
   });
   assert.ok(resumedTurns.data.some((turn: any) => turn.id === started.turn.id));
   const resumedItems = await pool.historyReader(endpoint.id).exactTurnItems(
-    first.thread.id, started.turn.id, { budget: createHistoryScanBudget(), allowLegacySummary: true },
+    first.thread.id, started.turn.id, { budget: createHistoryScanBudget() },
   );
   assert.ok(resumedItems.items.some((item: any) => item.type === "userMessage" && item.clientId === "qiyan-bot-integration-1"));
   assert.ok(resumedItems.items.some((item: any) => item.type === "agentMessage" && item.text.includes("INTEGRATION_OK")));

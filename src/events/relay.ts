@@ -267,8 +267,8 @@ export class EventRelay {
     const metadata = await reader.findTurn(target.threadId, target.turnId, budget);
     if (!this.runIsCurrent(target.endpointId, generation)) return "retry";
     if (!metadata) return "retry";
-    const exact = await reader.exactTurnItems(target.threadId, target.turnId, { budget, allowLegacySummary: true });
-    const turn = terminalTurn(metadata, exact.summaryTurn, exact.items);
+    const exact = await reader.exactTurnItems(target.threadId, target.turnId, { budget });
+    const turn = terminalTurn(metadata, exact.turn, exact.items);
     if (!this.runIsCurrent(target.endpointId, generation)) return "retry";
 
     const current = this.mapping(target.endpointId, target.threadId);
@@ -331,8 +331,8 @@ export class EventRelay {
         if (!suffix.anchorFound) return false;
         const reader = this.pool.historyReader(endpointId, lease);
         for (const metadata of [...suffix.turns].reverse()) {
-          const exact = await reader.exactTurnItems(session.thread_id, metadata.id, { budget, allowLegacySummary: true });
-          const turn = terminalTurn(metadata, exact.summaryTurn, exact.items);
+          const exact = await reader.exactTurnItems(session.thread_id, metadata.id, { budget });
+          const turn = terminalTurn(metadata, exact.turn, exact.items);
           if (!this.runIsCurrent(endpointId, generation)) return false;
           const currentAfterItems = this.mapping(endpointId, session.thread_id);
           if (!currentAfterItems || currentAfterItems.session.mapping_id !== session.mapping_id) return false;

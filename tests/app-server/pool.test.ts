@@ -44,10 +44,6 @@ function pagedHistory<T>(method: string, params: any, thread: {
       backwardsCursor: offset > 0 ? String(Math.max(0, offset - limit)) : null,
     } as T;
   }
-  if (method === "thread/items/list") {
-    const turn = thread.turns.find((candidate) => candidate.id === params.turnId);
-    return { data: turn?.items ?? [], nextCursor: null, backwardsCursor: turn?.items?.length ? "back" : null } as T;
-  }
   return {} as T;
 }
 
@@ -582,8 +578,12 @@ test("provisional reconciliation hydrates only turns newer than its durable base
   const endpoint: AppServerEndpoint = {
     id: "devbox", state: "ready",
     request: async <T>(method: string, params: any) => {
-      if (method === "thread/items/list") hydrated.push(params.turnId);
-      return pagedHistory<T>(method, params, { status: "active", turns });
+      const response = pagedHistory<T>(method, params, { status: "active", turns });
+      if (method === "thread/turns/list" && params.itemsView === "full") {
+        const turnId = (response as { data?: Array<{ id?: string }> }).data?.[0]?.id;
+        if (turnId) hydrated.push(turnId);
+      }
+      return response;
     },
   };
   const pool = new AppServerPool([endpoint], { maxConcurrentTurns: 1 });
@@ -605,8 +605,9 @@ test("a nonterminal reconciliation candidate is rescanned when its user item mat
         id: "candidate", status: "inProgress",
         items: itemReads > 0 ? [{ type: "userMessage", id: "user", clientId: "message-a" }] : [],
       }];
-      if (method === "thread/items/list") itemReads += 1;
-      return pagedHistory<T>(method, params, { status: "active", turns });
+      const response = pagedHistory<T>(method, params, { status: "active", turns });
+      if (method === "thread/turns/list" && params.itemsView === "full") itemReads += 1;
+      return response;
     },
   };
   const pool = new AppServerPool([endpoint], { maxConcurrentTurns: 1 });
@@ -626,7 +627,7 @@ test("legacy restored provisional claims without a baseline remain unresolved", 
   const endpoint: AppServerEndpoint = {
     id: "devbox", state: "ready",
     request: async <T>(method: string, params: any) => {
-      if (method === "thread/items/list") itemReads += 1;
+      if (method === "thread/turns/list" && params.itemsView === "full") itemReads += 1;
       return pagedHistory<T>(method, params, {
         status: "idle",
         turns: [{ id: "historical", status: "completed", items: [{ type: "userMessage", id: "user", clientId: "message-a" }] }],

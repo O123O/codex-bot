@@ -204,7 +204,7 @@ export async function routeLifecycleNotification(
     // notifications here rather than routing them through the project endpoint manager.
     return method === "turn/completed";
   }
-  if (method !== "turn/completed") return false;
+  if (method !== "turn/completed" && method !== "thread/compacted") return false;
   await handlers.worker(endpointId, method, params);
   return true;
 }
@@ -789,11 +789,19 @@ export function runOperationRecoveryTarget<T>(
 
 export type OperationRecoveryFailureDisposition = "retry" | "wait_for_endpoint" | "sleep";
 
+export class OperationRecoveryPendingError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "OperationRecoveryPendingError";
+  }
+}
+
 export function operationRecoveryFailureDisposition(
   error: unknown,
   target?: OperationRecoveryTarget,
   exactGenerationReady = false,
 ): OperationRecoveryFailureDisposition {
+  if (error instanceof OperationRecoveryPendingError) return "retry";
   if (error instanceof RpcRequestTimeoutError) {
     return target?.policy === "ready_endpoint" && !exactGenerationReady ? "wait_for_endpoint" : "retry";
   }
@@ -1109,7 +1117,7 @@ export async function hydrateSelectedThreadTurns(
   thread: any,
   turnIds: Iterable<string | undefined>,
   reader: Pick<ThreadHistoryReader, "exactTurnItems">,
-  options: { allowLegacySummary?: boolean; retainPartialOnBudgetExhaustion?: boolean } = {},
+  options: { retainPartialOnBudgetExhaustion?: boolean } = {},
 ): Promise<any> {
   const targets = new Set([...turnIds].filter((id): id is string => typeof id === "string" && id.length > 0));
   if (targets.size === 0) return thread;
@@ -1118,13 +1126,10 @@ export async function hydrateSelectedThreadTurns(
   for (const turn of thread.turns ?? []) {
     if (!targets.has(String(turn.id))) continue;
     try {
-      const exact = await reader.exactTurnItems(threadId, String(turn.id), {
-        budget,
-        ...(options.allowLegacySummary === undefined ? {} : { allowLegacySummary: options.allowLegacySummary }),
-      });
+      const exact = await reader.exactTurnItems(threadId, String(turn.id), { budget });
       replacements.set(String(turn.id), {
         ...turn,
-        ...(exact.summaryTurn ?? {}),
+        ...exact.turn,
         id: String(turn.id),
         itemsView: exact.complete ? "full" : "summary",
         items: exact.items,
@@ -3992,7 +3997,6 @@ export async function buildProductionApp(
       const bounded = await readBoundedThreadWithReader(identity.endpoint, identity.thread_id);
       return (await hydrateThreadTurns(
         identity.endpoint, identity.thread_id, bounded.thread, [String(params.turn.id)], {
-          allowLegacySummary: true,
           existingReader: bounded.reader,
         },
       )).turns ?? [];
@@ -4065,7 +4069,6 @@ export async function buildProductionApp(
     turnIds: Iterable<string | undefined>,
     options: {
       lease?: EndpointWorkLease;
-      allowLegacySummary?: boolean;
       existingReader?: ReturnType<AppServerPool["historyReader"]>;
       retainPartialOnBudgetExhaustion?: boolean;
     } = {},
@@ -4103,7 +4106,6 @@ export async function buildProductionApp(
         turns: [...recoveryTurns.values()],
         historyWindow: { ...thread.historyWindow, anchorTurnIds: [...anchorTurnIds] },
       }, targetIds, {
-        allowLegacySummary: true,
         existingReader: bounded.reader,
         retainPartialOnBudgetExhaustion: true,
       },
@@ -4269,7 +4271,6 @@ export async function buildProductionApp(
           const history = { thread: await hydrateThreadTurns(
             session.endpoint, session.thread_id, recoveryThread, targetIds, {
               ...(recoveryLease === undefined ? {} : { lease: recoveryLease }),
-              allowLegacySummary: true,
               existingReader: bounded.reader,
             },
           ) };
@@ -4343,6 +4344,7 @@ export async function buildProductionApp(
                   conversations, deliveries, operation.id, body, systemNoticeForAttempt(operation.attemptId, body),
                 );
               });
+              else throw new OperationRecoveryPendingError("worker compaction completion is not yet visible");
             }
           }
         } else if (operation.kind === "set_session_model" || operation.kind === "set_reasoning_effort") {

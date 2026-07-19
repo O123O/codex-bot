@@ -109,7 +109,6 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
       case "thread/read": return this.threadRead(args) as unknown as T;
       case "thread/resume": return this.threadResume(args) as unknown as T;
       case "thread/turns/list": return await this.threadTurnsList(args) as T;
-      case "thread/items/list": return await this.threadItemsList(args) as T;
       case "turn/start": return await this.turnStart(args) as T;
       case "turn/interrupt": return this.turnInterrupt(args) as T;
       case "thread/list": return await this.threadList(args) as T;
@@ -223,18 +222,6 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
         ? { ...turn, status: "inProgress" }
         : turn),
     };
-  }
-
-  private async threadItemsList(params: Record<string, unknown>): Promise<unknown> {
-    const threadId = requireString(params.threadId, "threadId");
-    const turnId = requireString(params.turnId, "turnId");
-    const state = await this.ensureState(threadId);
-    return this.history.itemsPage(threadId, state.cwd, {
-      turnId,
-      ...(typeof params.cursor === "string" ? { cursor: params.cursor } : {}),
-      limit: requirePositiveInteger(params.limit, "limit"),
-      sortDirection: requireDirection(params.sortDirection),
-    });
   }
 
   private stateOnlyThread(threadId: string, state: ThreadState): ClaudeThreadView {

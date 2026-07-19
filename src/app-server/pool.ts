@@ -331,9 +331,7 @@ export class AppServerPool {
           state.scannedTurnIds ??= new Set<string>();
           for (const candidate of suffix.turns) {
             if (state.scannedTurnIds.has(candidate.id)) continue;
-            const exact = await reader.exactTurnItems(threadId, candidate.id, {
-              budget: historyBudget, allowLegacySummary: true,
-            });
+            const exact = await reader.exactTurnItems(threadId, candidate.id, { budget: historyBudget });
             if (isTerminal(candidate.status)) state.scannedTurnIds.add(candidate.id);
             if (exact.firstUserMessage?.clientId === state.clientUserMessageId) {
               turn = { ...candidate, itemsView: exact.complete ? "full" : "summary", items: exact.items };
@@ -590,7 +588,7 @@ export class AppServerPool {
         anchorFound = suffix.anchorFound;
         for (const candidate of suffix.turns) {
           if (scannedTurnIds.has(candidate.id)) continue;
-          const exact = await reader.exactTurnItems(threadId, candidate.id, { budget, allowLegacySummary: true });
+          const exact = await reader.exactTurnItems(threadId, candidate.id, { budget });
           if (isTerminal(candidate.status)) scannedTurnIds.add(candidate.id);
           if (exact.firstUserMessage?.clientId === clientUserMessageId) {
             actual = { id: candidate.id, items: exact.items };

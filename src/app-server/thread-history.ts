@@ -1,6 +1,6 @@
 import { Buffer } from "node:buffer";
 import { AppError } from "../core/errors.ts";
-import { isExactThreadItemsUnsupported, isExactThreadTurnsNotMaterialized } from "./thread-errors.ts";
+import { isExactThreadTurnsNotMaterialized } from "./thread-errors.ts";
 
 export type ThreadItemsView = "full" | "summary" | "notLoaded";
 
@@ -35,7 +35,7 @@ export interface ExactTurnItems {
   items: ThreadHistoryItem[];
   firstUserMessage?: ThreadHistoryItem;
   complete: boolean;
-  summaryTurn?: ThreadHistoryTurn;
+  turn: ThreadHistoryTurn;
 }
 
 export interface HistoryScanLimits {
@@ -188,68 +188,58 @@ export class ThreadHistoryReader {
   async exactTurnItems(
     threadId: string,
     turnId: string,
-    options: { budget: HistoryScanBudget; allowLegacySummary?: boolean },
+    options: { budget: HistoryScanBudget },
   ): Promise<ExactTurnItems> {
-    try {
-      return exactItems(await this.pagedItems(threadId, turnId, options.budget), true);
-    } catch (error) {
-      if (!isExactThreadItemsUnsupported(error)) throw error;
-      if (!options.allowLegacySummary) {
-        throw uncertain("exact thread items are unavailable for this legacy session");
-      }
-      const summaryTurn = await this.exactSummaryTurn(threadId, turnId, options.budget);
-      if (!summaryTurn) throw uncertain("the exact legacy turn is absent from authoritative history");
-      return { ...exactItems(summaryTurn.items, false), summaryTurn };
-    }
+    const turn = await this.exactFullTurn(threadId, turnId, options.budget);
+    return { ...exactItems(turn.items, true), turn };
   }
 
-  async itemsPage(
-    threadId: string,
-    params: { turnId?: string; cursor?: string; limit: number; sortDirection: "asc" | "desc" },
-  ): Promise<ThreadHistoryPage<ThreadHistoryItem>> {
-    const page = itemPage(await this.request("thread/items/list", { threadId, ...params }));
-    validateSinglePage(page, params.cursor, "item");
-    return page;
-  }
-
-  private async exactSummaryTurn(threadId: string, turnId: string, budget: HistoryScanBudget): Promise<ThreadHistoryTurn | undefined> {
-    let found: ThreadHistoryTurn | undefined;
-    await this.walkTurns(threadId, {
-      sortDirection: "desc",
-      itemsView: "summary",
-      pageLimit: 1,
-      budget,
-      onTurn: (turn) => {
-        if (turn.id !== turnId) return false;
-        found = turn;
-        return true;
-      },
-    });
-    return found;
-  }
-
-  private async pagedItems(threadId: string, turnId: string | undefined, budget: HistoryScanBudget): Promise<ThreadHistoryItem[]> {
-    const items: ThreadHistoryItem[] = [];
-    const seenIds = new Set<string>();
+  private async exactFullTurn(threadId: string, turnId: string, budget: HistoryScanBudget): Promise<ThreadHistoryTurn> {
     const seenCursors = new Set<string>();
     let cursor: string | undefined;
     do {
-      if (cursor !== undefined && !rememberCursor(seenCursors, cursor)) throw uncertain("thread item pagination repeated a cursor");
-      const page = await this.itemsPage(threadId, {
-        ...(turnId === undefined ? {} : { turnId }),
+      if (cursor !== undefined && !rememberCursor(seenCursors, cursor)) throw uncertain("thread turn pagination repeated a cursor");
+      const page = await this.turnsPage(threadId, {
         ...(cursor === undefined ? {} : { cursor }),
-        limit: 16,
-        sortDirection: "asc",
+        limit: 128,
+        sortDirection: "desc",
+        itemsView: "notLoaded",
       });
-      budget.consume("items", page.data);
+      budget.consume("turns", page.data);
       validatePageProgress(page, cursor);
-      for (const item of page.data) {
-        if (!rememberId(seenIds, item.id)) throw uncertain("thread item pagination repeated an item");
-        items.push(item);
+      const index = page.data.findIndex((turn) => turn.id === turnId);
+      if (index >= 0) {
+        let targetCursor = cursor;
+        if (index > 0) {
+          const prefix = await this.turnsPage(threadId, {
+            ...(cursor === undefined ? {} : { cursor }),
+            limit: index,
+            sortDirection: "desc",
+            itemsView: "notLoaded",
+          });
+          budget.consume("turns", prefix.data);
+          if (prefix.data.length !== index || prefix.nextCursor === null
+            || prefix.data.some((turn, position) => turn.id !== page.data[position]?.id)) {
+            throw uncertain("thread history changed while locating the exact turn");
+          }
+          targetCursor = prefix.nextCursor;
+        }
+        const full = await this.turnsPage(threadId, {
+          ...(targetCursor === undefined ? {} : { cursor: targetCursor }),
+          limit: 1,
+          sortDirection: "desc",
+          itemsView: "full",
+        });
+        budget.consume("turns", full.data);
+        const target = full.data[0];
+        if (full.data.length !== 1 || target?.id !== turnId || target.itemsView !== "full") {
+          throw uncertain("thread history changed before the exact turn was loaded");
+        }
+        return target;
       }
       cursor = page.nextCursor ?? undefined;
     } while (cursor !== undefined);
-    return items;
+    throw uncertain("the exact turn is absent from authoritative history");
   }
 
   private async walkTurns(
@@ -286,7 +276,7 @@ export class ThreadHistoryReader {
 
 }
 
-function exactItems(items: ThreadHistoryItem[], complete: boolean): ExactTurnItems {
+function exactItems(items: ThreadHistoryItem[], complete: boolean): Omit<ExactTurnItems, "turn"> {
   const firstUserMessage = items.find((item) => item.type === "userMessage");
   return { items, ...(firstUserMessage ? { firstUserMessage } : {}), complete };
 }
@@ -294,11 +284,6 @@ function exactItems(items: ThreadHistoryItem[], complete: boolean): ExactTurnIte
 function turnPage(value: unknown): ThreadHistoryPage<ThreadHistoryTurn> {
   const page = basePage(value);
   return { ...page, data: page.data.map((turn) => historyTurn(turn)) };
-}
-
-function itemPage(value: unknown): ThreadHistoryPage<ThreadHistoryItem> {
-  const page = basePage(value);
-  return { ...page, data: page.data.map((item) => historyItem(item)) };
 }
 
 function basePage(value: unknown): ThreadHistoryPage<unknown> {

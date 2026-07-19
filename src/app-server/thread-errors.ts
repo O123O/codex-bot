@@ -12,10 +12,6 @@ export function isExactThreadTurnsNotMaterialized(error: unknown, threadId: stri
   return isRpcError(error, `thread ${threadId} is not materialized yet; thread/turns/list is unavailable before first user message`);
 }
 
-export function isExactThreadItemsUnsupported(error: unknown): boolean {
-  return isRpcError(error, "thread/items/list is not supported yet", -32601);
-}
-
 export function isExactThreadNoRollout(error: unknown, threadId: string): boolean {
   return isRpcError(error, `no rollout found for thread id ${threadId}`);
 }

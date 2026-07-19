@@ -57,64 +57,48 @@ test("the exact pre-message turns-list error is an empty history, not a failed w
   assert.deepEqual(await reader.descendingSuffix("empty", undefined, createHistoryScanBudget()), { turns: [], anchorFound: true, exhausted: true });
 });
 
-test("exact item paging preserves multiple finals and scans past non-user leading items", async () => {
-  const reader = new ThreadHistoryReader(async (method, params) => {
-    assert.equal(method, "thread/items/list");
-    if (!(params as any).cursor) return {
-      data: [
-        { type: "reasoning", id: "r", summary: [], content: [] },
-        { type: "userMessage", id: "u", clientId: "client", content: [] },
-      ],
-      nextCursor: "next",
-      backwardsCursor: "back",
-    };
-    return {
-      data: [
-        { type: "agentMessage", id: "a1", text: "one", phase: "final_answer", memoryCitation: null },
-        { type: "agentMessage", id: "a2", text: "two", phase: "final_answer", memoryCitation: null },
-      ],
-      nextCursor: null,
-      backwardsCursor: "back-2",
-    };
-  });
-
-  const items = await reader.exactTurnItems("thread", "turn", { budget: createHistoryScanBudget() });
-  assert.equal(items.complete, true);
-  assert.equal(items.firstUserMessage?.clientId, "client");
-  assert.deepEqual(items.items.filter((item) => item.type === "agentMessage").map((item: any) => item.text), ["one", "two"]);
-
-});
-
-test("legacy item stores degrade only user/agent recovery to one summary turn", async () => {
-  const calls: string[] = [];
-  const reader = new ThreadHistoryReader(async (method) => {
-    calls.push(method);
-    if (method === "thread/items/list") {
-      throw new JsonRpcResponseError(-32601, "thread/items/list is not supported yet");
-    }
-    return {
+test("exact turn reads locate metadata first and load only the target turn", async () => {
+  const calls: Array<{ method: string; params: any }> = [];
+  const reader = new ThreadHistoryReader(async (method, params: any) => {
+    calls.push({ method, params });
+    assert.equal(method, "thread/turns/list");
+    if (params.itemsView === "full") return {
       data: [{
-        id: "turn", status: "completed", itemsView: "summary",
+        id: "target", status: "completed", itemsView: "full",
         items: [
+          { type: "reasoning", id: "r", summary: [], content: [] },
           { type: "userMessage", id: "u", clientId: "client", content: [] },
-          { type: "agentMessage", id: "a", text: "last", phase: "final_answer", memoryCitation: null },
+          { type: "agentMessage", id: "a", text: "done", phase: "final_answer", memoryCitation: null },
         ],
       }],
+      nextCursor: "after-target",
+      backwardsCursor: "before-target",
+    };
+    if (params.limit === 1) return {
+      data: [{ id: "newer", status: "completed", itemsView: "notLoaded", items: [] }],
+      nextCursor: "before-target",
+      backwardsCursor: null,
+    };
+    return {
+      data: [
+        { id: "newer", status: "completed", itemsView: "notLoaded", items: [] },
+        { id: "target", status: "completed", itemsView: "notLoaded", items: [] },
+        { id: "older", status: "completed", itemsView: "notLoaded", items: [] },
+      ],
       nextCursor: null,
-      backwardsCursor: "back",
+      backwardsCursor: null,
     };
   });
 
-  const items = await reader.exactTurnItems("thread", "turn", { budget: createHistoryScanBudget(), allowLegacySummary: true });
-  assert.equal(items.complete, false);
+  const items = await reader.exactTurnItems("thread", "target", { budget: createHistoryScanBudget() });
+  assert.equal(items.complete, true);
   assert.equal(items.firstUserMessage?.clientId, "client");
-  assert.deepEqual(items.items.map((item) => item.id), ["u", "a"]);
-  assert.deepEqual(calls, ["thread/items/list", "thread/turns/list"]);
-
-  await assert.rejects(
-    reader.exactTurnItems("thread", "turn", { budget: createHistoryScanBudget() }),
-    (error: unknown) => error instanceof AppError && error.code === "OPERATION_UNCERTAIN",
-  );
+  assert.deepEqual(items.items.map((item) => item.id), ["r", "u", "a"]);
+  assert.deepEqual(calls.map(({ method, params }) => ({ method, limit: params.limit, cursor: params.cursor, itemsView: params.itemsView })), [
+    { method: "thread/turns/list", limit: 128, cursor: undefined, itemsView: "notLoaded" },
+    { method: "thread/turns/list", limit: 1, cursor: undefined, itemsView: "notLoaded" },
+    { method: "thread/turns/list", limit: 1, cursor: "before-target", itemsView: "full" },
+  ]);
 });
 
 test("turn ordering distinguishes older targets from missing history", async () => {
@@ -142,11 +126,14 @@ test("multi-page scans terminate with an explicit budget-exhausted outcome", asy
 
 test("single pages reject duplicate rows, empty continuations, and non-advancing cursors", async () => {
   const duplicate = new ThreadHistoryReader(async () => ({
-    data: [{ type: "agentMessage", id: "same" }, { type: "agentMessage", id: "same" }],
+    data: [
+      { id: "same", status: "completed", itemsView: "notLoaded", items: [] },
+      { id: "same", status: "completed", itemsView: "notLoaded", items: [] },
+    ],
     nextCursor: null,
     backwardsCursor: null,
   }));
-  await assert.rejects(duplicate.itemsPage("thread", { limit: 2, sortDirection: "asc" }), (error: unknown) => (
+  await assert.rejects(duplicate.turnsPage("thread", { limit: 2, sortDirection: "asc", itemsView: "notLoaded" }), (error: unknown) => (
     error instanceof AppError && error.code === "OPERATION_UNCERTAIN"
   ));
 

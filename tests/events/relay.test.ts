@@ -58,19 +58,18 @@ function relayResponse<T>(method: string, params: any, turns: any[]): T {
   if (method === "thread/read") return { thread: { status: { type: turns.some((turn) => turn.status === "inProgress") ? "active" : "idle" }, turns } } as T;
   if (method === "thread/turns/list") {
     const ordered = params.sortDirection === "asc" ? [...turns] : [...turns].reverse();
+    const offset = params.cursor === undefined ? 0 : Number(params.cursor);
+    const limit = Number(params.limit);
+    const selected = ordered.slice(offset, offset + limit);
     return {
-      data: ordered.map((turn) => ({
+      data: selected.map((turn) => ({
         ...turn,
         itemsView: params.itemsView ?? "summary",
         items: params.itemsView === "notLoaded" ? [] : turn.items ?? [],
       })),
-      nextCursor: null,
-      backwardsCursor: ordered.length > 0 ? "back" : null,
+      nextCursor: offset + selected.length < ordered.length ? String(offset + selected.length) : null,
+      backwardsCursor: offset > 0 ? String(Math.max(0, offset - limit)) : null,
     } as T;
-  }
-  if (method === "thread/items/list") {
-    const turn = turns.find((candidate) => candidate.id === params.turnId);
-    return { data: turn?.items ?? [], nextCursor: null, backwardsCursor: turn?.items?.length ? "back" : null } as T;
   }
   return {} as T;
 }
@@ -329,7 +328,7 @@ test("an empty first session does not block endpoint-ready reconciliation for la
   await relay.endpointReady("local", workLease);
 
   assert.equal(requests.some((params) => params.includeTurns === true), false);
-  assert.deepEqual(requests.map((params) => params.threadId), ["worker", "later-worker", "later-worker"]);
+  assert.deepEqual(requests.map((params) => params.threadId), ["worker", "later-worker", "later-worker", "later-worker"]);
   assert.deepEqual(deliveries.listReady().map((item) => item.body), ["[later] done"]);
   assert.equal((relay as unknown as { scanPendingEndpoints: Set<string> }).scanPendingEndpoints.size, 0);
   assert.equal(timers.scheduled.length, 0);
@@ -355,14 +354,14 @@ test("a current partial terminal heals an old recovery incident without scanning
     if (method === "thread/turns/list") {
       assert.equal(params.cursor, undefined, "the exact live target must not scan from the stale cursor");
       return {
-        data: [{ ...current, itemsView: "notLoaded", items: [] }],
+        data: [{
+          ...current,
+          itemsView: params.itemsView,
+          items: params.itemsView === "full" ? current.items : [],
+        }],
         nextCursor: "older-history",
         backwardsCursor: "newer-history",
       } as T;
-    }
-    if (method === "thread/items/list") {
-      assert.equal(params.turnId, "current");
-      return { data: current.items, nextCursor: null, backwardsCursor: "newer-items" } as T;
     }
     throw new Error(`unexpected method: ${method}`);
   };
@@ -371,7 +370,7 @@ test("a current partial terminal heals an old recovery incident without scanning
   assert.equal(await relay.handleNotification(
     "local", "turn/completed", { threadId: "worker", turn: partial }, workLease,
   ), "handled");
-  assert.deepEqual(methods, ["thread/turns/list", "thread/items/list"]);
+  assert.deepEqual(methods, ["thread/turns/list", "thread/turns/list", "thread/turns/list"]);
   assert.deepEqual(deliveries.listReady().map((item) => item.body), ["[payments] new final"]);
   assert.equal(progress.cursor("local", "worker", mappingId), "current");
   assert.equal(progress.recoveryIncident("local", "worker", mappingId), undefined);

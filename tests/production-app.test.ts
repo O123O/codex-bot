@@ -21,6 +21,7 @@ import {
   managedSessionNeedsRecovery,
   markEndpointOwnersUnavailable,
   operationRecoveryAction,
+  OperationRecoveryPendingError,
   operationRecoveryFailureDisposition,
   operationRecoveryPreflight,
   recoverableCreateHasNoDispatch,
@@ -237,6 +238,15 @@ test("lifecycle routing ignores assistant child threads without suppressing assi
     "local", assistant, "turn/completed",
     { threadId: "worker-thread", turn: { id: "worker-turn" } }), true);
   assert.deepEqual(routed, ["assistant:assistant-thread", "worker:local:worker-thread"]);
+
+  assert.equal(await routeLifecycleNotification(handlers,
+    "local", assistant, "thread/compacted",
+    { threadId: "worker-thread", turnId: "compact-turn" }), true);
+  assert.deepEqual(routed, [
+    "assistant:assistant-thread",
+    "worker:local:worker-thread",
+    "worker:local:worker-thread",
+  ]);
 });
 
 test("every production durable event source forwards only successful inserts to one wake boundary", async () => {
@@ -1069,6 +1079,7 @@ test("operation recovery retries only transport failures", () => {
   assert.equal(operationRecoveryFailureDisposition(new AppError("ENDPOINT_UNAVAILABLE", "offline"), ordinaryTarget), "wait_for_endpoint");
   assert.equal(operationRecoveryFailureDisposition(new AppError("ENDPOINT_UNAVAILABLE", "helper"), ordinaryTarget, true), "retry");
   assert.equal(operationRecoveryFailureDisposition(new AppError("OPERATION_UNCERTAIN", "permanent")), "sleep");
+  assert.equal(operationRecoveryFailureDisposition(new OperationRecoveryPendingError("native completion is pending")), "retry");
   assert.equal(operationRecoveryFailureDisposition(new Error("unknown")), "sleep");
 });
 

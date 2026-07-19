@@ -74,7 +74,7 @@ export class SessionService {
         } catch (error) {
           if (!options.clientUserMessageId) throw error;
           const items = await this.pool.historyReader(session.endpoint, lease).exactTurnItems(
-            session.thread_id, activeTurn, { budget: createHistoryScanBudget(), allowLegacySummary: true },
+            session.thread_id, activeTurn, { budget: createHistoryScanBudget() },
           );
           const proven = items.items.some((item) => item.type === "userMessage" && item.clientId === options.clientUserMessageId);
           if (!proven) throw error;
@@ -185,7 +185,7 @@ export class SessionService {
     }
     const ids: string[] = [];
     for (const turn of [...suffix.turns].reverse()) {
-      const exact = await reader.exactTurnItems(threadId, turn.id, { budget, allowLegacySummary: true });
+      const exact = await reader.exactTurnItems(threadId, turn.id, { budget });
       ids.push(...exact.items.filter((item) => item.type === "contextCompaction").map((item) => item.id));
     }
     return ids;

@@ -363,7 +363,7 @@ all providers have Codex semantics:
   Claude flow remains terminal plus targeted snapshots until the runner can
   emit rich item/delta events.
 
-Claude implements `thread/turns/list` and `thread/items/list` over positional
+Claude implements `thread/turns/list` over positional
 JSONL windows. Turn pages transfer at most 256 KiB from the worker host, exact
 turn/full-history operations at most 4 MiB, and cursors pin device, inode, and
 size. Replacement, truncation, append races, an oversized record/turn, or an
