@@ -48,12 +48,13 @@ export class SlackContextService implements ChatHistoryProvider {
       : this.channelHistory(destination, request);
   }
 
-  search(query: string, dateFrom?: string, dateTo?: string): Promise<TransientResults<SearchMatch>> {
+  search(query: string, dateFrom?: string, dateTo?: string, channelId?: string): Promise<TransientResults<SearchMatch>> {
     if (!query.trim()) throw new TypeError("Slack search query is required");
     return this.searchPages({
       query,
       ...(dateFrom === undefined ? {} : { dateFrom }),
       ...(dateTo === undefined ? {} : { dateTo }),
+      ...(channelId === undefined ? {} : { contextChannelId: channelId }),
       contentTypes: CONTENT_TYPES,
       exactMention: false,
     });
@@ -68,6 +69,7 @@ export class SlackContextService implements ChatHistoryProvider {
     query: string;
     dateFrom?: string;
     dateTo?: string;
+    contextChannelId?: string;
     contentTypes: readonly ("messages" | "files" | "channels" | "users")[];
     exactMention: boolean;
   }): Promise<TransientResults<SearchMatch>> {
@@ -104,6 +106,7 @@ export class SlackContextService implements ChatHistoryProvider {
           sort: "timestamp",
           sort_dir: "desc",
           limit: 20,
+          ...(input.contextChannelId === undefined ? {} : { context_channel_id: input.contextChannelId }),
           ...(fromMs === undefined ? {} : { after: Math.floor(fromMs / 1_000) - 1 }),
           before: Math.ceil(toMs / 1_000),
           ...(cursor ? { cursor } : {}),

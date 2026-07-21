@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const MAX_FILES = 32;
-const FILE_NAME = /^worker-conversation-\d{13}-[0-9a-f-]{36}\.json$/u;
+const FILE_NAME = /^tool-result-\d{13}-[0-9a-f-]{36}\.json$/u;
 
 export class TransientJsonStore {
   private root: string | undefined;
@@ -22,7 +22,7 @@ export class TransientJsonStore {
   async write(value: unknown): Promise<string> {
     const root = this.root;
     if (!root) throw new Error("transient JSON store is not started");
-    const path = join(root, `worker-conversation-${Date.now().toString().padStart(13, "0")}-${randomUUID()}.json`);
+    const path = join(root, `tool-result-${Date.now().toString().padStart(13, "0")}-${randomUUID()}.json`);
     const handle = await open(path, "wx", 0o600);
     try { await handle.writeFile(`${JSON.stringify(value, null, 2)}\n`, "utf8"); }
     catch (error) { await unlink(path).catch(() => undefined); throw error; }

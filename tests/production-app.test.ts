@@ -11,6 +11,7 @@ import {
   createDurableEventWakeBoundary,
   createDurableEventSourceCallbacks,
   createChatHistoryAction,
+  createSlackSearchAction,
   hasEarlierEndpointOperation,
   hasEarlierSessionCreation,
   isMissingUnmaterializedThread,
@@ -2282,9 +2283,42 @@ test("production chat history resolves the immutable assistant-attempt binding",
     delivery: { id: "slack", sendMessage: async () => ({ ok: true }) },
     history: { getHistory: async (actualBinding, request) => { seen.push({ actualBinding, request }); return { messages: [] }; } },
   }]);
-  const action = createChatHistoryAction(() => registry, (attemptId) => { assert.equal(attemptId, "attempt-1"); return binding; });
+  const action = createChatHistoryAction(
+    () => registry,
+    (attemptId) => { assert.equal(attemptId, "attempt-1"); return binding; },
+    async () => { throw new Error("small history must stay inline"); },
+  );
   assert.deepEqual(await action({ scope: "channel", count: 5 }, { attemptId: "attempt-1" }), { messages: [] });
   assert.deepEqual(seen, [{ actualBinding: binding, request: { scope: "channel", count: 5 } }]);
+});
+
+test("production chat history and Slack search spill large results before returning to QiYan", async () => {
+  const large = Array.from({ length: 1_001 }, (_, index) => `word${index}`).join(" ");
+  const binding = { adapterId: "slack", conversationKey: "slack:T1:dm:D1", destination: { workspaceId: "T1", channelId: "D1" } } as const;
+  const registry = new ChatAdapterRegistry([{
+    delivery: { id: "slack", sendMessage: async () => ({ ok: true }) },
+    history: { getHistory: async () => ({ messages: [{ text: large }] }) },
+  }]);
+  const stored: unknown[] = [];
+  const write = async (value: unknown) => { stored.push(value); return `/private/result-${stored.length}.json`; };
+
+  const history = await createChatHistoryAction(() => registry, () => binding, write)(
+    { scope: "conversation", count: 100 }, { attemptId: "attempt" },
+  );
+  const searchCalls: unknown[][] = [];
+  const search = await createSlackSearchAction(
+    () => ({ search: async (...args: unknown[]) => { searchCalls.push(args); return { order: "relevance", results: [{ kind: "message", text: large }] }; } }),
+    write,
+  )({ query: "project", channel_id: "C777" });
+
+  assert.equal(stored.length, 2);
+  assert.deepEqual(searchCalls, [["project", undefined, undefined, "C777"]]);
+  for (const [index, result] of [history, search].entries()) {
+    assert.equal((result as any).storage, "file");
+    assert.equal((result as any).path, `/private/result-${index + 1}.json`);
+    assert.match((result as any).warning, /large result.*saved.*read.*file/i);
+    assert.doesNotMatch(JSON.stringify(result), /word1000/u);
+  }
 });
 
 test("production relay work reuses the identical existing endpoint lease", async () => {

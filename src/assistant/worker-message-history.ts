@@ -1,10 +1,6 @@
-import { Buffer } from "node:buffer";
 import { AppError } from "../core/errors.ts";
 import type { WorkerNativeHistoryPage } from "../webui/worker-history-reader.ts";
-
-const MAX_INLINE_WORDS = 1_000;
-const MAX_INLINE_BYTES = 16 * 1_024;
-const wordSegmenter = new Intl.Segmenter(undefined, { granularity: "word" });
+import { boundLargeToolResult } from "./large-tool-result.ts";
 
 export interface WorkerMessageMapping {
   endpoint: string;
@@ -56,23 +52,15 @@ export async function readWorkerMessages(
     openTurnIds: page.openTurnIds,
     terminalTurnIds: page.terminalTurnIds,
   };
-  let wordCount = 0;
-  for (const message of result.messages) {
-    for (const segment of wordSegmenter.segment(message.body)) if (segment.isWordLike) wordCount += 1;
-  }
-  const inlineByteCount = Buffer.byteLength(JSON.stringify(result), "utf8");
-  if (wordCount <= MAX_INLINE_WORDS && inlineByteCount <= MAX_INLINE_BYTES) return result;
-  const path = await deps.writeResultFile(result);
-  return {
-    storage: "file" as const,
-    path,
-    format: "json" as const,
+  return boundLargeToolResult(result, {
+    writeResultFile: deps.writeResultFile,
+    wordSources: result.messages.map((message) => message.body),
+    metadata: {
     messageCount: result.messages.length,
-    wordCount,
-    inlineByteCount,
     hasOlder: result.hasOlder,
     ...(result.nextCursor ? { nextCursor: result.nextCursor } : {}),
     openTurnIds: result.openTurnIds,
     terminalTurnIds: result.terminalTurnIds,
-  };
+    },
+  });
 }

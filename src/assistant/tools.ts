@@ -52,7 +52,12 @@ export const ASSISTANT_TOOL_SCHEMAS = {
     count: z.number().int().positive().max(100).describe("how many messages to read (1-100)"),
     before: z.string().min(1).describe("only messages before this cursor/id").optional(),
   }).strict(),
-  search_slack: z.object({ query: z.string().min(1).describe("search text"), date_from: z.string().describe("ISO date lower bound").optional(), date_to: z.string().describe("ISO date upper bound").optional() }).strict(),
+  search_slack: z.object({
+    query: z.string().min(1).describe("search text"),
+    date_from: z.string().describe("ISO date lower bound").optional(),
+    date_to: z.string().describe("ISO date upper bound").optional(),
+    channel_id: z.string().min(1).describe("optional Slack channel id to scope the search; null searches all accessible channels").nullable().default(null),
+  }).strict(),
   get_slack_mentions: z.object({ date_from: z.string().describe("ISO date to list mentions since") }).strict(),
 } as const;
 
@@ -91,14 +96,14 @@ export const TOOL_DESCRIPTIONS: Partial<Record<AssistantToolName, string>> = {
   send_chat_message: "Send a message to the current chat/user.",
   prepare_chat_attachment: "Stage a worker's file for chat; returns a file_handle for send_chat_attachment.",
   send_chat_attachment: "Send a prepared attachment (file_handle) to chat with an optional caption.",
-  get_chat_history: "Read recent chat history (conversation or channel), up to count messages.",
-  search_slack: "Search Slack messages (query, optional date range).",
+  get_chat_history: "Read recent chat history (conversation or channel), up to count messages. Large results return an owner-only temporary JSON path and warning instead of inline bodies.",
+  search_slack: "Search Slack messages (query, optional date range and channel_id; null searches all accessible channels). Large results return an owner-only temporary JSON path and warning instead of inline bodies.",
   get_slack_mentions: "List Slack mentions of you since date_from.",
 };
 
 type Action = (args: any, context: ToolActionContext) => Promise<any>;
 
-export const EPHEMERAL_READ_TOOLS = new Set<AssistantToolName>(["inspect_worker_conversation", "search_slack", "get_slack_mentions"]);
+export const EPHEMERAL_READ_TOOLS = new Set<AssistantToolName>(["inspect_worker_conversation", "get_chat_history", "search_slack", "get_slack_mentions"]);
 
 export const READ_ONLY_TOOLS = new Set<AssistantToolName>([
   "list_managed_sessions", "discover_sessions", "get_session_status", "read_worker_message", "inspect_worker_conversation", "list_models", "get_goal", "get_chat_history", "search_slack", "get_slack_mentions",

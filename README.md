@@ -173,7 +173,7 @@ SQLite durability, NFS constraints, database backups, and automatic dashboard-me
 
 Inbound files are streamed into a private quota-limited store. Outbound project files are opened beneath a managed root with Linux no-follow checks and snapshotted before upload. Absolute outbound paths, traversal, symlinks, special files, and oversized content are rejected.
 
-Telegram, Slack, and WeChat delivery plus assistant tool effects are durable. Confirmed effects replay receipts; uncertain effects are reconciled against app-server or outbox state and are never blindly repeated. A visible recovery label identifies a mandatory delivery that must be retried after an ambiguous crash. Slack search bodies are transient, bounded, and never written to durable receipts or report files.
+Telegram, Slack, and WeChat delivery plus assistant tool effects are durable. Confirmed effects replay receipts; uncertain effects are reconciled against app-server or outbox state and are never blindly repeated. A visible recovery label identifies a mandatory delivery that must be retried after an ambiguous crash. Slack search bodies are transient, bounded, and never written to durable receipts; large results spill only to owner-only service-lifetime temporary JSON files.
 
 ## Development
 

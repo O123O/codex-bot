@@ -127,7 +127,7 @@ test("Slack search normalizes UTC bounds, consumes every cursor, and preserves s
     },
   });
   const service = new SlackContextService(bot({}).client, "T123", { search: fake.search, ownerUserId: "U123", coverage: searchCoverage, now: () => now });
-  const result = await service.search("launch", "2026-07-01", "2026-07-03T12:00:00.500Z");
+  const result = await service.search("launch", "2026-07-01", "2026-07-03T12:00:00.500Z", "C777");
   assert.equal(fake.calls.length, 2);
   assert.deepEqual(fake.calls[0], {
     query: "launch",
@@ -139,10 +139,12 @@ test("Slack search normalizes UTC bounds, consumes every cursor, and preserves s
     sort: "timestamp",
     sort_dir: "desc",
     limit: 20,
+    context_channel_id: "C777",
     after: Math.floor(Date.parse("2026-07-01T00:00:00Z") / 1_000) - 1,
     before: Math.ceil(Date.parse("2026-07-03T12:00:00.500Z") / 1_000),
   });
   assert.equal(fake.calls[1]?.cursor, "next-page");
+  assert.equal(fake.calls[1]?.context_channel_id, "C777");
   assert.equal(result.complete, true);
   assert.equal(result.count, 4);
   assert.deepEqual(result.results.map((item: any) => item.kind).sort(), ["channel", "file", "message", "user"]);

@@ -67,6 +67,7 @@ import {
 import { AttemptScope } from "./assistant/attempt-scope.ts";
 import { SessionObservationProcessor } from "./assistant/session-observer.ts";
 import { createAssistantTools, type AssistantToolName, type ToolHandler } from "./assistant/tools.ts";
+import { boundLargeToolResult } from "./assistant/large-tool-result.ts";
 import { readWorkerMessages } from "./assistant/worker-message-history.ts";
 import { TransientJsonStore } from "./assistant/transient-json-store.ts";
 import { prepareAssistantWorkspace } from "./assistant/workspace.ts";
@@ -3539,8 +3540,15 @@ export async function buildProductionApp(
         prepareAttachment: prepareChatAttachment,
         binding: assistantAttemptBinding,
       }),
-      get_chat_history: createChatHistoryAction(() => chatRegistry, assistantAttemptBinding),
-      search_slack: async (args) => requireSlackContext().search(args.query, args.date_from, args.date_to),
+      get_chat_history: createChatHistoryAction(
+        () => chatRegistry,
+        assistantAttemptBinding,
+        (value) => assistantToolResults.write(value),
+      ),
+      search_slack: createSlackSearchAction(
+        () => requireSlackContext(),
+        (value) => assistantToolResults.write(value),
+      ),
       get_slack_mentions: async (args) => requireSlackContext().mentions(args.date_from),
     };
   }
@@ -4913,8 +4921,22 @@ export async function buildProductionApp(
 export function createChatHistoryAction(
   registry: () => ChatAdapterRegistry,
   binding: (attemptId: string) => ConversationBinding,
+  writeResultFile: (value: unknown) => Promise<string>,
 ): (args: ChatHistoryRequest, context: { attemptId: string }) => Promise<JsonValue> {
-  return (args, context) => registry().getHistory(binding(context.attemptId), args);
+  return async (args, context) => await boundLargeToolResult(
+    await registry().getHistory(binding(context.attemptId), args),
+    { writeResultFile },
+  ) as JsonValue;
+}
+
+export function createSlackSearchAction(
+  context: () => { search(query: string, dateFrom?: string, dateTo?: string, channelId?: string): Promise<unknown> },
+  writeResultFile: (value: unknown) => Promise<string>,
+): (args: { query: string; date_from?: string; date_to?: string; channel_id?: string | null }) => Promise<unknown> {
+  return async (args) => boundLargeToolResult(
+    await context().search(args.query, args.date_from, args.date_to, args.channel_id ?? undefined),
+    { writeResultFile },
+  );
 }
 
 export function isUncertainAssistantTransportFailure(error: unknown, endpointState: ManagedEndpointContract["state"]): boolean {

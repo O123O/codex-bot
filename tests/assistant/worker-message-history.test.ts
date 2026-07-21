@@ -66,6 +66,7 @@ test("large worker conversations spill without returning message bodies", async 
     storage: "file",
     path: "/private/worker-conversation.json",
     format: "json",
+    warning: "Large result exceeded the inline safety limits and was saved to an owner-only temporary JSON file. Read or query the file at path instead of repeating the tool call.",
     messageCount: 1,
     wordCount: 1_001,
     inlineByteCount: Buffer.byteLength(JSON.stringify(stored), "utf8"),
