@@ -21,3 +21,17 @@ test("install is idempotent; the handler dispatches to the registered callback; 
   resetWebUiSignalHandlerForTest();
   assert.equal(process.listenerCount("SIGUSR2"), before, "reset detaches our listener");
 });
+
+test("a signal received during startup is delivered when reconciliation registers", () => {
+  resetWebUiSignalHandlerForTest();
+  installWebUiSignalHandler();
+  process.emit("SIGUSR2");
+
+  let calls = 0;
+  setWebUiSignalHandler(() => { calls += 1; });
+
+  assert.equal(calls, 1);
+  setWebUiSignalHandler(() => { calls += 1; });
+  assert.equal(calls, 1, "the pending signal is consumed only once");
+  resetWebUiSignalHandlerForTest();
+});

@@ -123,6 +123,7 @@ test("parses web-ui subcommands with --host/--port for start and --home for all"
   assert.deepEqual(parseCliArgs(["web-ui", "start"]), { command: "web-ui", action: "start" });
   assert.deepEqual(parseCliArgs(["web-ui", "stop"]), { command: "web-ui", action: "stop" });
   assert.deepEqual(parseCliArgs(["web-ui", "status"]), { command: "web-ui", action: "status" });
+  assert.deepEqual(parseCliArgs(["web-ui", "rotate-token"]), { command: "web-ui", action: "rotate-token" });
   assert.deepEqual(parseCliArgs(["web-ui", "status", "--home", "/srv/qiyan"]), { command: "web-ui", action: "status", qiyanHome: "/srv/qiyan" });
   assert.deepEqual(parseCliArgs(["web-ui", "start", "--host", "0.0.0.0", "--port", "8420"]), { command: "web-ui", action: "start", host: "0.0.0.0", port: 8420 });
   assert.deepEqual(parseCliArgs(["web-ui", "start", "--port", "9000", "--home", "/h"]), { command: "web-ui", action: "start", port: 9000, qiyanHome: "/h" });
@@ -135,5 +136,6 @@ test("parses web-ui subcommands with --host/--port for start and --home for all"
   assert.throws(() => parseCliArgs(["web-ui", "start", "--port", "notanum"]), /--port must be an integer/u);
   assert.throws(() => parseCliArgs(["web-ui", "start", "--host"]), /--host requires a value/u);
   assert.match(formatCliHelp("web-ui"), /web-ui start \[--host/u);
+  assert.match(formatCliHelp("web-ui"), /web-ui rotate-token/u);
   assert.match(formatCliHelp("root"), /web-ui start \[--host/u);
 });

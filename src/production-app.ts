@@ -1,7 +1,6 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { readFile } from "node:fs/promises";
-import { readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, posix, resolve } from "node:path";
 import { homedir, hostname } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -40,6 +39,7 @@ import { WebBus, createWebAdapter, createWebUiPhase, WEB_ADAPTER_ID } from "./we
 import { createWebGoalControl, type WebGoalControl } from "./webui/web-goal-control.ts";
 import { workerDeliveryNickname } from "./webui/web-reads.ts";
 import { webUiStatePath } from "./webui/webui-state.ts";
+import { ensureWebUiToken } from "./webui/web-token.ts";
 import { claudeLaunchPolicy } from "./config.ts";
 import { AppError } from "./core/errors.ts";
 import { runBackground } from "./core/background.ts";
@@ -2060,18 +2060,9 @@ export async function buildProductionApp(
       return session ? { endpointId: session.endpoint, threadId: session.thread_id, mappingId: session.mapping_id } : undefined;
     },
   });
-  // The access token is PERSISTED under the data dir so it survives restarts — otherwise every restart
-  // rotates it and open browser tabs (and their auth cookie) 401 with a stale token. Read lazily so
-  // `dataDir` is the finalized root.
-  let webTokenCache: string | undefined;
-  const webToken = (): string => {
-    if (webTokenCache) return webTokenCache;
-    const path = join(dataDir, "web-token");
-    try { const existing = readFileSync(path, "utf8").trim(); if (existing) return (webTokenCache = existing); } catch { /* create below */ }
-    const token = randomBytes(32).toString("base64url");
-    try { writeFileSync(path, token, { mode: 0o600 }); } catch { /* fall back to an ephemeral token */ }
-    return (webTokenCache = token);
-  };
+  // The access token is persisted so browser cookies survive backend restarts. Resolve it only during
+  // Web UI reconciliation, allowing `web-ui rotate-token` + SIGUSR2 to rebind the listener live.
+  const webToken = (): string => ensureWebUiToken(dataDir);
   // The web file store: inbound sends and outbound files QiYan sends both land here, and the paths
   // are surfaced to the browser (clickable preview). Read lazily so `dataDir` is the finalized root.
   const webUploads = () => ({ dir: join(dataDir, "web-uploads"), maxBytes: config.attachmentMaxBytes, ttlMs: 30 * 24 * 60 * 60 * 1000 });
@@ -3109,7 +3100,7 @@ export async function buildProductionApp(
     // The web UI server is last so it starts after every backend it reads is live, and (reverse
     // order) stops first — before the delivery/chat teardown it depends on.
     createWebUiPhase({
-      defaultHost: config.webUi.host, defaultPort: config.webUi.port, token: webToken(),
+      defaultHost: config.webUi.host, defaultPort: config.webUi.port, token: webToken,
       staticDir: webuiStaticRoot, bus: webBus,
       reads: {
         registrySnapshot: () => registry.snapshot(),

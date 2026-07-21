@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -16,12 +16,15 @@ const webUiDeps = (dir: string, over: Partial<WebUiCommandDeps> = {}): WebUiComm
 
 test("web-ui start enables + signals the running bot, defaulting host/port to env", async () => {
   const dir = await mkdtemp(join(tmpdir(), "qiyan-webui-cmd-"));
+  await writeFile(join(dir, "web-token"), "tok", { mode: 0o600 });
   const writes: string[] = [];
   let signalled: number | undefined;
   await runWebUiCommand("start", webUiDeps(dir, { signal: (pid) => { signalled = pid; return true; }, write: (t) => writes.push(t) }));
   assert.equal(signalled, 999);
   assert.deepEqual(readWebUiState(webUiStatePath(dir)), { enabled: true }, "no host/port override persisted");
-  assert.match(writes.join(""), /Web UI started on 127\.0\.0\.1:9520/u);
+  const out = writes.join("");
+  assert.match(out, /Web UI started on 127\.0\.0\.1:9520/u);
+  assert.match(out, /URL: http:\/\/127\.0\.0\.1:9520\/\?token=tok/u);
 });
 
 test("web-ui start --host --port overrides env, persists, and warns on non-loopback", async () => {
@@ -45,6 +48,21 @@ test("web-ui stop keeps the saved host/port but does not signal when the bot is 
   assert.match(writes.join(""), /apply on next start/u);
 });
 
+test("web-ui start creates and prints a token before signalling the listener", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "qiyan-webui-cmd-"));
+  const writes: string[] = [];
+  let signalled = false;
+  await runWebUiCommand("start", webUiDeps(dir, {
+    readToken: () => undefined,
+    signal: () => { signalled = true; return true; },
+    write: (text) => writes.push(text),
+  }));
+  const token = await readFile(join(dir, "web-token"), "utf8");
+  assert.match(token, /^[A-Za-z0-9_-]{43}$/u);
+  assert.equal(signalled, true);
+  assert.match(writes.join(""), new RegExp(`URL: http://127\\.0\\.0\\.1:9520/\\?token=${token}`, "u"));
+});
+
 test("web-ui status reports enabled/host-port/running/URL", async () => {
   const dir = await mkdtemp(join(tmpdir(), "qiyan-webui-cmd-"));
   const writes: string[] = [];
@@ -54,6 +72,27 @@ test("web-ui status reports enabled/host-port/running/URL", async () => {
   assert.match(out, /Host\/port: 127\.0\.0\.1:9520 \(env\/default\)/u);
   assert.match(out, /running \(pid 777\)/u);
   assert.match(out, /http:\/\/127\.0\.0\.1:9520\/\?token=tok/u);
+});
+
+test("web-ui rotate-token atomically replaces the credential and reloads a running listener", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "qiyan-webui-cmd-"));
+  const path = join(dir, "web-token");
+  await writeFile(path, "old-token", { mode: 0o600 });
+  const writes: string[] = [];
+  let signalled: number | undefined;
+
+  await runWebUiCommand("rotate-token", webUiDeps(dir, {
+    signal: (pid) => { signalled = pid; return true; },
+    write: (text) => writes.push(text),
+  }));
+
+  const token = await readFile(path, "utf8");
+  assert.notEqual(token, "old-token");
+  assert.match(token, /^[A-Za-z0-9_-]{43}$/u);
+  assert.equal((await stat(path)).mode & 0o777, 0o600);
+  assert.equal(signalled, 999);
+  assert.match(writes.join(""), new RegExp(`URL: http://127\\.0\\.0\\.1:9520/\\?token=${token}`, "u"));
+  await assert.rejects(readFile(webUiStatePath(dir)), /ENOENT/u, "rotation does not change enablement");
 });
 
 test("service restart requests a nonzero graceful SIGTERM", () => {

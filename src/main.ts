@@ -13,10 +13,10 @@ import { bootstrapWeixin } from "./chat-apps/weixin/bootstrap.ts";
 import { buildServiceEffectiveEnvironment, readServiceMainPid, SystemdUserService } from "./service/systemd-user.ts";
 import { installWebUiSignalHandler } from "./webui/webui-signal.ts";
 import { readWebUiState, webUiStatePath, writeWebUiState, type WebUiState } from "./webui/webui-state.ts";
+import { ensureWebUiToken, readWebUiToken, rotateWebUiToken } from "./webui/web-token.ts";
 import { AppError } from "./core/errors.ts";
 import { createOperationalLogSink } from "./core/operational-log.ts";
-import { readFileSync } from "node:fs";
-import { isAbsolute, join, resolve } from "node:path";
+import { isAbsolute, resolve } from "node:path";
 
 export async function main(
   env = process.env,
@@ -107,7 +107,7 @@ export async function main(
       ...(command.port === undefined ? {} : { port: command.port }),
       mainPid: () => readServiceMainPid(env),
       signal: (pid) => { try { process.kill(pid, "SIGUSR2"); return true; } catch { return false; } },
-      readToken: (dataDir) => { try { return readFileSync(join(dataDir, "web-token"), "utf8").trim() || undefined; } catch { return undefined; } },
+      readToken: (dataDir) => { try { return readWebUiToken(dataDir); } catch { return undefined; } },
       write: (text) => process.stdout.write(text),
     });
     return;
@@ -137,16 +137,36 @@ export interface WebUiCommandDeps {
   write(text: string): void;
 }
 
-// `qiyan-bot web-ui start|stop|status`. start/stop persist the control state atomically (merging any
-// --host/--port over the saved value) and, when the bot is running, signal it to reconcile live (no
-// restart). Signalling is always safe — the running bot installs its SIGUSR2 handler unconditionally
-// (see installWebUiSignalHandler).
+// Web UI commands persist control state or rotate the credential and, when the bot is running,
+// signal it to reconcile live without restarting workers or in-flight turns. Signalling is always
+// safe — the running bot installs its SIGUSR2 handler unconditionally (see installWebUiSignalHandler).
 export async function runWebUiCommand(action: WebUiAction, deps: WebUiCommandDeps): Promise<void> {
   const statePath = webUiStatePath(deps.qiyanHome);
   const effective = (state: WebUiState | undefined): { host: string; port: number } => ({
     host: state?.host ?? deps.defaults.host,
     port: state?.port ?? deps.defaults.port,
   });
+  const accessUrl = (host: string, port: number, knownToken?: string): string => {
+    const base = `http://${host}:${port}`;
+    const token = knownToken ?? deps.readToken(deps.dataDir);
+    return `URL: ${token
+      ? `${base}/?token=${token}`
+      : `${base} (token available after the bot starts; run qiyan-bot web-ui status)`}`;
+  };
+
+  if (action === "rotate-token") {
+    const token = rotateWebUiToken(deps.dataDir);
+    let state: WebUiState | undefined;
+    try { state = readWebUiState(statePath); } catch { /* use configured defaults for the URL */ }
+    const { host, port } = effective(state);
+    const pid = await deps.mainPid();
+    const signalled = pid !== undefined && deps.signal(pid);
+    deps.write(signalled
+      ? "Web UI token rotated; the listener is reloading.\n"
+      : "Web UI token rotated; no live bot was available, so it will apply on next start.\n");
+    deps.write(`${accessUrl(host, port, token)}\n`);
+    return;
+  }
 
   if (action === "status") {
     let state: WebUiState | undefined;
@@ -154,13 +174,11 @@ export async function runWebUiCommand(action: WebUiAction, deps: WebUiCommandDep
     try { state = readWebUiState(statePath); } catch { unreadable = true; }
     const { host, port } = effective(state);
     const pid = await deps.mainPid();
-    const token = deps.readToken(deps.dataDir);
-    const base = `http://${host}:${port}`;
     deps.write([
       `Enabled: ${unreadable ? "unreadable (kept as-is)" : state!.enabled ? "yes" : "no"}`,
       `Host/port: ${host}:${port}${state?.host === undefined && state?.port === undefined ? " (env/default)" : ""}`,
       `Bot service: ${pid === undefined ? "not running" : `running (pid ${pid})`}`,
-      `URL: ${token ? `${base}/?token=${token}` : `${base} (token shown by: qiyan-bot service logs)`}`,
+      accessUrl(host, port),
     ].join("\n") + "\n");
     return;
   }
@@ -173,6 +191,7 @@ export async function runWebUiCommand(action: WebUiAction, deps: WebUiCommandDep
     if (deps.host !== undefined) next.host = deps.host;
     if (deps.port !== undefined) next.port = deps.port;
   }
+  const startToken = action === "start" ? ensureWebUiToken(deps.dataDir) : undefined;
   writeWebUiState(statePath, next);
 
   const { host, port } = effective(next);
@@ -182,6 +201,7 @@ export async function runWebUiCommand(action: WebUiAction, deps: WebUiCommandDep
   deps.write(signalled
     ? `Web UI ${action === "start" ? "started" : "stopped"}${where}.\n`
     : `Saved${where}; the bot is not running — it will apply on next start.\n`);
+  if (action === "start") deps.write(`${accessUrl(host, port, startToken)}\n`);
   if (action === "start" && host !== "127.0.0.1") {
     deps.write(`Warning: ${host} is non-loopback — the web UI is reachable on the LAN over plain HTTP (token required). Prefer 127.0.0.1 + an ssh tunnel.\n`);
   }

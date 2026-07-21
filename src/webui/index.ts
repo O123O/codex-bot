@@ -23,7 +23,7 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-
 export interface WebUiPhaseDeps {
   defaultHost: string; // WEB_HOST — used when the saved state has no host override
   defaultPort: number; // WEB_PORT — used when the saved state has no port override
-  token: string;
+  token(): string;
   staticDir: string;
   bus: WebBus;
   reads: WebReadsDeps;
@@ -50,6 +50,7 @@ export interface WebUiTarget {
   enabled: boolean;
   host: string;
   port: number;
+  token?: string;
 }
 
 export interface WebUiToggle {
@@ -64,12 +65,12 @@ export interface WebUiToggle {
 // after any in-flight start()/rebind — no orphaned listener can outlive shutdown. A corrupt state
 // file (resolveTarget throws) is treated as "keep the current state" (fail-safe), never fail-open.
 export function createWebUiToggle(deps: {
-  createServer(host: string, port: number): WebServerHandle;
+  createServer(host: string, port: number, token: string): WebServerHandle;
   resolveTarget(): WebUiTarget;
   onStarted(url: string): void;
   report(event: OperationalEvent): void;
 }): WebUiToggle {
-  let current: { handle: WebServerHandle; host: string; port: number } | undefined;
+  let current: { handle: WebServerHandle; host: string; port: number; token: string } | undefined;
   let disposed = false;
   // `chain = next.catch(() => {})` is BOTH the single-flight tail AND the rejection sink for a
   // signal-triggered `void reconcile()` whose promise is discarded — do NOT collapse to `chain = next`.
@@ -88,13 +89,14 @@ export function createWebUiToggle(deps: {
       return;
     }
     if (!target.enabled) { if (current) { await current.handle.stop(); current = undefined; } return; }
-    if (current && (current.host !== target.host || current.port !== target.port)) {
-      await current.handle.stop(); current = undefined; // rebind to the new host/port
+    if (!target.token) throw new Error("web UI token is unavailable");
+    if (current && (current.host !== target.host || current.port !== target.port || current.token !== target.token)) {
+      await current.handle.stop(); current = undefined; // rebind to the new host/port or token
     }
     if (!current) {
-      const handle = deps.createServer(target.host, target.port);
+      const handle = deps.createServer(target.host, target.port, target.token);
       const { url } = await handle.start();
-      current = { handle, host: target.host, port: target.port };
+      current = { handle, host: target.host, port: target.port, token: target.token };
       deps.onStarted(url);
     }
   });
@@ -123,15 +125,16 @@ export function createWebUiPhase(deps: WebUiPhaseDeps): AppPhase {
     }
   };
 
-  const createServer = (host: string, port: number): WebServerHandle => createWebServer({
-    host, port, token: deps.token, staticDir: deps.staticDir,
+  const createServer = (host: string, port: number, token: string): WebServerHandle => createWebServer({
+    host, port, token, staticDir: deps.staticDir,
     bus: deps.bus, reads: deps.reads, files: deps.files, ...(deps.uploads ? { uploads: deps.uploads } : {}), ...(deps.remote ? { remote: deps.remote } : {}),
     submitInput, controlGoal: deps.controlGoal, openGoalAdmission: deps.openGoalAdmission,
     closeGoalAdmission: deps.closeGoalAdmission, waitForGoalControls: deps.waitForGoalControls, report: deps.report,
   });
   const resolveTarget = (): WebUiTarget => {
     const state = readWebUiState(deps.statePath);
-    return { enabled: state.enabled, host: state.host ?? deps.defaultHost, port: state.port ?? deps.defaultPort };
+    const target = { enabled: state.enabled, host: state.host ?? deps.defaultHost, port: state.port ?? deps.defaultPort };
+    return state.enabled ? { ...target, token: deps.token() } : target;
   };
 
   const toggle = createWebUiToggle({ createServer, resolveTarget, onStarted: deps.onStarted, report: deps.report });

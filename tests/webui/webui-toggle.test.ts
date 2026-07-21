@@ -16,7 +16,7 @@ function fakeServers() {
 
 test("reconcile creates + starts a server on the target host/port when enabled", async () => {
   const f = fakeServers();
-  const target: WebUiTarget = { enabled: true, host: "127.0.0.1", port: 9520 };
+  const target: WebUiTarget = { enabled: true, host: "127.0.0.1", port: 9520, token: "token" };
   const started: string[] = [];
   const toggle = createWebUiToggle({ createServer: f.createServer, resolveTarget: () => target, onStarted: (u) => started.push(u), report: () => {} });
   await toggle.reconcile();
@@ -31,7 +31,7 @@ test("reconcile creates + starts a server on the target host/port when enabled",
 
 test("disabled ⇒ no server; enabling then disabling toggles", async () => {
   const f = fakeServers();
-  let target: WebUiTarget = { enabled: false, host: "127.0.0.1", port: 9520 };
+  let target: WebUiTarget = { enabled: false, host: "127.0.0.1", port: 9520, token: "token" };
   const toggle = createWebUiToggle({ createServer: f.createServer, resolveTarget: () => target, onStarted: () => {}, report: () => {} });
   await toggle.reconcile();
   assert.equal(f.s.starts, 0);
@@ -45,16 +45,34 @@ test("disabled ⇒ no server; enabling then disabling toggles", async () => {
 
 test("a host/port change rebinds: stops the old server and starts a new one (no orphan)", async () => {
   const f = fakeServers();
-  let target: WebUiTarget = { enabled: true, host: "127.0.0.1", port: 9520 };
+  let target: WebUiTarget = { enabled: true, host: "127.0.0.1", port: 9520, token: "token" };
   const toggle = createWebUiToggle({ createServer: f.createServer, resolveTarget: () => target, onStarted: () => {}, report: () => {} });
   await toggle.reconcile();
   assert.deepEqual(f.s.live, { host: "127.0.0.1", port: 9520 });
-  target = { enabled: true, host: "0.0.0.0", port: 8420 };
+  target = { enabled: true, host: "0.0.0.0", port: 8420, token: "token" };
   await toggle.reconcile();
   assert.equal(f.s.stops, 1, "old listener stopped");
   assert.equal(f.s.starts, 2);
   assert.deepEqual(f.s.creates.map((c) => c.port), [9520, 8420]);
   assert.deepEqual(f.s.live, { host: "0.0.0.0", port: 8420 }, "only the new address listens");
+});
+
+test("a token change rebinds only the web listener", async () => {
+  const tokens: Array<string | undefined> = [];
+  let stops = 0;
+  const createServer = (_: string, __: number, token: string) => {
+    tokens.push(token);
+    return { start: async () => ({ url: "http://127.0.0.1:9520" }), stop: async () => { stops += 1; } };
+  };
+  let target: WebUiTarget = { enabled: true, host: "127.0.0.1", port: 9520, token: "first" };
+  const toggle = createWebUiToggle({ createServer, resolveTarget: () => target, onStarted: () => {}, report: () => {} });
+
+  await toggle.reconcile();
+  target = { ...target, token: "second" };
+  await toggle.reconcile();
+
+  assert.deepEqual(tokens, ["first", "second"]);
+  assert.equal(stops, 1);
 });
 
 test("a corrupt state (resolveTarget throws) keeps the current server", async () => {
@@ -63,7 +81,7 @@ test("a corrupt state (resolveTarget throws) keeps the current server", async ()
   const warnings: string[] = [];
   const toggle = createWebUiToggle({
     createServer: f.createServer,
-    resolveTarget: () => { if (throwing) throw new Error("corrupt"); return { enabled: true, host: "127.0.0.1", port: 9520 }; },
+    resolveTarget: () => { if (throwing) throw new Error("corrupt"); return { enabled: true, host: "127.0.0.1", port: 9520, token: "token" }; },
     onStarted: () => {}, report: (e) => warnings.push(e.reason ?? ""),
   });
   await toggle.reconcile();
@@ -78,7 +96,7 @@ test("a corrupt state (resolveTarget throws) keeps the current server", async ()
 test("a failed start leaves nothing running; a later reconcile retries", async () => {
   const f = fakeServers();
   f.s.failNext = true;
-  const toggle = createWebUiToggle({ createServer: f.createServer, resolveTarget: () => ({ enabled: true, host: "127.0.0.1", port: 9520 }), onStarted: () => {}, report: () => {} });
+  const toggle = createWebUiToggle({ createServer: f.createServer, resolveTarget: () => ({ enabled: true, host: "127.0.0.1", port: 9520, token: "token" }), onStarted: () => {}, report: () => {} });
   await assert.rejects(toggle.reconcile(), /EADDRINUSE/u);
   assert.equal(toggle.isRunning(), false);
   await toggle.reconcile();
@@ -96,7 +114,7 @@ test("dispose drains an in-flight start so no listener survives shutdown", async
     start: async () => { await gate; rec.starts += 1; return { url: "http://x" }; },
     stop: async () => { rec.stops += 1; },
   });
-  const toggle = createWebUiToggle({ createServer, resolveTarget: () => ({ enabled: true, host: "h", port: 1 }), onStarted: () => {}, report: () => {} });
+  const toggle = createWebUiToggle({ createServer, resolveTarget: () => ({ enabled: true, host: "h", port: 1, token: "token" }), onStarted: () => {}, report: () => {} });
   const started = toggle.reconcile(); // start op runs, passes the disposed check, awaits the gate
   await tick();
   const disposed = toggle.dispose();  // enqueues stop on the SAME chain (runs after start settles)
@@ -119,11 +137,11 @@ test("dispose during a host/port rebind drains — no listener survives", async 
       stop: async () => { rec.stops += 1; },
     };
   };
-  let target: WebUiTarget = { enabled: true, host: "127.0.0.1", port: 9520 };
+  let target: WebUiTarget = { enabled: true, host: "127.0.0.1", port: 9520, token: "token" };
   const toggle = createWebUiToggle({ createServer, resolveTarget: () => target, onStarted: () => {}, report: () => {} });
   await toggle.reconcile(); // first server up
   assert.equal(rec.starts, 1);
-  target = { enabled: true, host: "127.0.0.1", port: 8420 }; // change ⇒ rebind
+  target = { enabled: true, host: "127.0.0.1", port: 8420, token: "token" }; // change ⇒ rebind
   const rebinding = toggle.reconcile(); // stops old, creates new, awaits gate2 (current === undefined here)
   await tick();
   const disposed = toggle.dispose();    // enqueued strictly after the whole rebind op

@@ -5,24 +5,33 @@
 // can never fall through to SIGUSR2's default disposition (terminate the process) — not during
 // the slow NFS startup, not after a crash-restart, not when `.env` was edited without a restart.
 // The web-UI phase registers a reconcile callback while it is running; with none registered the
-// signal is a safe no-op. `setWebUiSignalHandler` is last-writer-wins: at most one active web-UI
-// phase per process (true in production).
+// signal is latched until the phase registers. `setWebUiSignalHandler` is last-writer-wins: at most
+// one active web-UI phase per process (true in production).
 
 let handler: (() => void) | undefined;
 let listener: (() => void) | undefined;
+let pending = false;
 
 export function installWebUiSignalHandler(): void {
   if (listener) return; // idempotent — never accumulate process listeners
-  listener = () => { handler?.(); };
+  listener = () => {
+    if (handler) handler();
+    else pending = true;
+  };
   process.on("SIGUSR2", listener);
 }
 
 export function setWebUiSignalHandler(fn: (() => void) | undefined): void {
   handler = fn;
+  if (handler && pending) {
+    pending = false;
+    handler();
+  }
 }
 
 // Test-only: detach the process listener and clear state so cases don't leak into each other.
 export function resetWebUiSignalHandlerForTest(): void {
   if (listener) { process.off("SIGUSR2", listener); listener = undefined; }
   handler = undefined;
+  pending = false;
 }

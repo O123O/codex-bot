@@ -3,7 +3,7 @@ import { AppError, StartupPhaseError, type ErrorCode } from "./core/errors.ts";
 
 export type CliHelpTopic = "root" | "assistant-login" | "weixin-login" | "config-check" | "service" | "web-ui";
 export type ServiceAction = "install" | "start" | "stop" | "restart" | "status" | "logs" | "uninstall";
-export type WebUiAction = "start" | "stop" | "status";
+export type WebUiAction = "start" | "stop" | "status" | "rotate-token";
 
 export type CliCommand =
   | { command: "run"; assistantWorkdir?: string; qiyanHome?: string }
@@ -49,12 +49,12 @@ export function formatCliHelp(topic: CliHelpTopic): string {
     return "QiYan systemd user service\n\nUsage:\n  qiyan-bot service <install|start|stop|restart|status|logs|uninstall>\n  qiyan-bot service install [--home <path>]\n\nThe service runs the foreground bot under systemd; tmux is not required.\nInstallation captures the invoking terminal's PATH; reinstall the service after PATH changes.\nUse `qiyan-bot service logs` to read the latest 100 journal entries.\n";
   }
   if (topic === "web-ui") {
-    return "QiYan web UI (live start/stop)\n\nUsage:\n  qiyan-bot web-ui start [--host <host>] [--port <port>] [--home <path>]\n  qiyan-bot web-ui stop [--home <path>]\n  qiyan-bot web-ui status [--home <path>]\n\nStarts/stops the web UI on the running bot WITHOUT restarting it (workers and in-flight turns\nkeep running); the setting persists across restarts. `start` binds WEB_HOST:WEB_PORT by default\n(127.0.0.1:9520); --host/--port override and are remembered. A non-loopback host is reachable on\nthe LAN over plain HTTP (token still required) and prints a security warning.\n\nLive toggle needs the bot under systemd; a foreground bot persists the setting for its next start.\n";
+    return "QiYan web UI (live start/stop)\n\nUsage:\n  qiyan-bot web-ui start [--host <host>] [--port <port>] [--home <path>]\n  qiyan-bot web-ui stop [--home <path>]\n  qiyan-bot web-ui status [--home <path>]\n  qiyan-bot web-ui rotate-token [--home <path>]\n\nStarts/stops the web UI on the running bot WITHOUT restarting it (workers and in-flight turns\nkeep running); the setting persists across restarts. `rotate-token` invalidates the old browser\ncredential and reloads only the Web UI listener. `start` binds WEB_HOST:WEB_PORT by default\n(127.0.0.1:9520); --host/--port override and are remembered. A non-loopback host is reachable on\nthe LAN over plain HTTP (token still required) and prints a security warning.\n\nLive changes need the bot under systemd; a foreground bot applies them on its next start.\n";
   }
   if (topic !== "root") {
     return `QiYan ${topic}\n\nUsage:\n  qiyan-bot ${topic} [--home <path>]\n\nOptions:\n  -h, --help     Show help\n  --home <path>  QiYan home directory\n`;
   }
-  return `QiYan personal assistant bot\n\nUsage:\n  qiyan-bot [--home <path>] [--workdir <path>]\n  qiyan-bot assistant-login [--home <path>]\n  qiyan-bot weixin-login [--home <path>]\n  qiyan-bot config-check [--home <path>]\n  qiyan-bot service <action>\n  qiyan-bot web-ui start [--host <host>] [--port <port>]\n  qiyan-bot web-ui <stop|status>\n  qiyan-bot --update\n  qiyan-bot --version\n\nRunning without a command starts the long-lived bot in the foreground.\n\nOptions:\n  -h, --help       Show help\n  --home <path>    QiYan home directory\n  --workdir <path> Assistant working directory (run only)\n  --update         Install the latest GitHub Release\n  --version        Print version\n\nRequires Node.js 24 or newer.\n`;
+  return `QiYan personal assistant bot\n\nUsage:\n  qiyan-bot [--home <path>] [--workdir <path>]\n  qiyan-bot assistant-login [--home <path>]\n  qiyan-bot weixin-login [--home <path>]\n  qiyan-bot config-check [--home <path>]\n  qiyan-bot service <action>\n  qiyan-bot web-ui start [--host <host>] [--port <port>]\n  qiyan-bot web-ui <stop|status|rotate-token>\n  qiyan-bot --update\n  qiyan-bot --version\n\nRunning without a command starts the long-lived bot in the foreground.\n\nOptions:\n  -h, --help       Show help\n  --home <path>    QiYan home directory\n  --workdir <path> Assistant working directory (run only)\n  --update         Install the latest GitHub Release\n  --version        Print version\n\nRequires Node.js 24 or newer.\n`;
 }
 
 const serviceActions = new Set<ServiceAction>(["install", "start", "stop", "restart", "status", "logs", "uninstall"]);
@@ -81,7 +81,7 @@ function parseServiceArgs(argv: readonly string[]): CliCommand {
   return { command: "service", action: action as Exclude<ServiceAction, "install"> };
 }
 
-const webUiActions = new Set<WebUiAction>(["start", "stop", "status"]);
+const webUiActions = new Set<WebUiAction>(["start", "stop", "status", "rotate-token"]);
 
 function parseWebUiArgs(argv: readonly string[]): CliCommand {
   if (argv[0] === "--help" || argv[0] === "-h") {
