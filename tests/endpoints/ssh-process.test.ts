@@ -119,6 +119,20 @@ test("a ready process stream consumes bounded preamble and exposes only post-mar
   await stream.close();
 });
 
+test("a readiness chunk may contain post-marker output beyond the preamble limit", async () => {
+  const program = [
+    `process.stdout.write(Buffer.concat([Buffer.from(${JSON.stringify(readyMarker.toString())}), Buffer.alloc(2048, 120)]));`,
+    "process.stdin.resume();",
+  ].join("\n");
+  const stream = await openReadyProcessStream(process.execPath, ["-e", program], {
+    readyMarker, timeoutMs: 1_000, maxPreludeBytes: 1024,
+  });
+
+  const [output] = await once(stream.output, "data");
+  assert.equal((output as Buffer).byteLength, 2048);
+  await stream.close();
+});
+
 test("a ready process stream backpressures and resumes its producer", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "qiyan-ssh-backpressure-"));
   t.after(() => rm(root, { recursive: true, force: true }));

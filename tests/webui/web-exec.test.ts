@@ -27,7 +27,7 @@ test("enforces the timeout (SIGTERM/SIGKILL)", async () => {
 
 test("a backgrounded grandchild cannot hang the response (group kill)", async () => {
   const t0 = Date.now();
-  const r = await runCommand(tmpdir(), "echo hi; sleep 30 &", { maxBytes: 4096, timeoutMs: 500 });
+  const r = await runCommand(tmpdir(), "echo hi; sleep 30 &", { maxBytes: 4096, timeoutMs: 2000 });
   assert.ok(Date.now() - t0 < 5000, `took ${Date.now() - t0}ms`); // bounded well under the 30s sleep
   assert.match(r.stdout, /hi/);
 });

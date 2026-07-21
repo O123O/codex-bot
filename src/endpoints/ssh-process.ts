@@ -99,12 +99,16 @@ export function openReadyProcessStream(
       if (terminal) return;
       if (ready) { forwardOutput(chunk); return; }
       prelude = Buffer.concat([prelude, Buffer.from(chunk)]);
-      if (prelude.byteLength > options.maxPreludeBytes) {
+      const boundary = prelude.indexOf(marker);
+      if (boundary < 0) {
+        if (prelude.byteLength <= options.maxPreludeBytes) return;
         failStartup(new AppError("ENDPOINT_UNAVAILABLE", "SSH process exceeded its readiness output limit"));
         return;
       }
-      const boundary = prelude.indexOf(marker);
-      if (boundary < 0) return;
+      if (boundary + marker.byteLength > options.maxPreludeBytes) {
+        failStartup(new AppError("ENDPOINT_UNAVAILABLE", "SSH process exceeded its readiness output limit"));
+        return;
+      }
       const following = prelude.subarray(boundary + marker.byteLength);
       prelude = Buffer.alloc(0);
       ready = true;
