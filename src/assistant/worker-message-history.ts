@@ -23,7 +23,7 @@ export interface WorkerMessageHistoryDeps {
 
 export async function readWorkerMessages(
   deps: WorkerMessageHistoryDeps,
-  args: { nickname: string; count: number; before?: string },
+  args: { nickname: string; count: number; before?: string; include_commentary?: boolean },
   signal: AbortSignal,
 ) {
   const session = deps.resolveSession(args.nickname);
@@ -36,8 +36,11 @@ export async function readWorkerMessages(
     || current.mapping_id !== session.mapping_id) {
     throw new AppError("OPERATION_CONFLICT", "worker mapping changed during message read");
   }
+  const visibleMessages = args.include_commentary === true
+    ? page.messages
+    : page.messages.filter((message) => message.phase !== "commentary");
   const result = {
-    messages: page.messages.map((message) => ({
+    messages: visibleMessages.map((message) => ({
       id: message.id,
       turnId: message.turnId,
       role: message.role === "you" ? "user" as const : "worker" as const,

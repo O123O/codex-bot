@@ -15,7 +15,8 @@ test("worker message reads delegate one bounded page and project native rows", a
       return {
         messages: [
           { id: "u1", turnId: "turn", role: "you", body: "question", completedAt: 1, terminalStatus: "completed", turnOrder: 1, itemOrder: 1, clientId: "client" },
-          { id: "a1", turnId: "turn", body: "answer", completedAt: 2, terminalStatus: "completed", turnOrder: 1, itemOrder: 2, phase: "final_answer" },
+          { id: "c1", turnId: "turn", body: "working", completedAt: 2, terminalStatus: "completed", turnOrder: 1, itemOrder: 2, phase: "commentary" },
+          { id: "a1", turnId: "turn", body: "answer", completedAt: 2, terminalStatus: "completed", turnOrder: 1, itemOrder: 3, phase: "final_answer" },
         ],
         hasOlder: true, nextCursor: "next", openTurnIds: [], terminalTurnIds: ["turn"],
       };
@@ -30,6 +31,22 @@ test("worker message reads delegate one bounded page and project native rows", a
     ],
     hasOlder: true, nextCursor: "next", openTurnIds: [], terminalTurnIds: ["turn"],
   });
+});
+
+test("worker message reads include commentary only when explicitly requested", async () => {
+  const result = await readWorkerMessages({
+    resolveSession: () => mapping,
+    writeResultFile: async () => { throw new Error("small result must stay inline"); },
+    readTurns: async () => ({
+      messages: [
+        { id: "c1", turnId: "turn", body: "working", completedAt: 1, terminalStatus: "inProgress", turnOrder: 1, itemOrder: 1, phase: "commentary" },
+        { id: "a1", turnId: "turn", body: "answer", completedAt: 2, terminalStatus: "completed", turnOrder: 1, itemOrder: 2, phase: "final_answer" },
+      ],
+      hasOlder: false, openTurnIds: [], terminalTurnIds: ["turn"],
+    }),
+  }, { nickname: "worker", count: 20, include_commentary: true }, new AbortController().signal);
+
+  assert.deepEqual((result as any).messages.map((message: any) => message.body), ["working", "answer"]);
 });
 
 test("worker message reads reject unknown and remapped nicknames", async () => {

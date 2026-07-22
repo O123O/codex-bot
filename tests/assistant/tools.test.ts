@@ -47,9 +47,11 @@ test("chat history has one bounded platform-neutral read-only schema", () => {
 
 test("transient history and Slack reads never create replay receipts", async () => {
   assert.deepEqual([...EPHEMERAL_READ_TOOLS].sort(), ["get_chat_history", "get_slack_mentions", "inspect_worker_conversation", "search_slack"]);
-  assert.deepEqual(ASSISTANT_TOOL_SCHEMAS.inspect_worker_conversation.parse({ nickname: "payments" }), { nickname: "payments", count: 20 });
-  assert.deepEqual(ASSISTANT_TOOL_SCHEMAS.inspect_worker_conversation.parse({ nickname: "payments", count: 50, before: "cursor" }), {
-    nickname: "payments", count: 50, before: "cursor",
+  assert.deepEqual(ASSISTANT_TOOL_SCHEMAS.inspect_worker_conversation.parse({ nickname: "payments" }), {
+    nickname: "payments", count: 20, include_commentary: false,
+  });
+  assert.deepEqual(ASSISTANT_TOOL_SCHEMAS.inspect_worker_conversation.parse({ nickname: "payments", count: 50, before: "cursor", include_commentary: true }), {
+    nickname: "payments", count: 50, before: "cursor", include_commentary: true,
   });
   for (const input of [
     { nickname: "payments", count: 0 }, { nickname: "payments", count: 51 }, { nickname: "payments", count: 1, message_id: "forbidden" },
