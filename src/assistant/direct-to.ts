@@ -7,12 +7,8 @@ export interface DirectToDeps {
   alreadyDelivered(sourceId: string): boolean;
   // Deliver verbatim text to a named worker (SessionService.send).
   send(nickname: string, text: string, options: { mode: "auto"; clientUserMessageId: string }): Promise<unknown>;
-  // Record the assistant's awareness copy as an INTERNAL source (source_class 'internal') — it is
-  // never steered into a live chat attempt, so a directive embedded in the payload cannot hijack an
-  // unrelated send. Idempotent on (kind, sourceId).
-  recordAwareness(input: InternalSource): void;
-  // Trigger the assistant to process the internal awareness source.
-  pump(): void;
+  // Record a completed audit row. It is never eligible for an assistant turn.
+  recordAudit(input: InternalSource): void;
   // Ack the native ingress checkpoint so the surface does not redeliver this message.
   commitCheckpoint(): void;
   report(event: OperationalEvent): void;
@@ -20,9 +16,7 @@ export interface DirectToDeps {
 
 // Handle a `/to <worker> <text>` ingress directive: deliver the text DIRECTLY to that worker
 // (deterministic target + verbatim content, in parallel — not routed by the serialized
-// assistant), then hand the assistant an awareness copy (an internal source it records but never
-// replies to; the policy for that copy lives in AGENTS.md). Idempotent per ingress message. A
-// delivery failure is non-fatal and is itself reported to the assistant as an informational note.
+// assistant). The ingress is recorded for idempotency and audit, but never wakes QiYan.
 export async function deliverDirectTo(
   deps: DirectToDeps,
   source: CanonicalChatSource,
@@ -42,11 +36,10 @@ export async function deliverDirectTo(
   // `/to` is text-only for now; make a dropped attachment visible rather than silent.
   const dropped = source.attachmentIds.length > 0 ? ` (${source.attachmentIds.length} attachment(s) were NOT forwarded — /to is text-only for now)` : "";
   const note = failure
-    ? `[direct message could NOT be delivered to worker "${target}" (${failure}); no action needed]${dropped}\n${payload}`
-    : `[the user sent this directly to worker "${target}"; for your awareness only — do not reply or resend]${dropped}\n${payload}`;
-  deps.recordAwareness({ id: `direct-to-note:${source.id}`, kind: "direct_to", sourceId, rawText: note, attachmentIds: [], receivedAt: source.receivedAt });
+    ? `[direct message could NOT be delivered to worker "${target}" (${failure})]${dropped}\n${payload}`
+    : `[direct message delivered to worker "${target}"]${dropped}\n${payload}`;
+  deps.recordAudit({ id: `direct-to-note:${source.id}`, kind: "direct_to", sourceId, rawText: note, attachmentIds: [], receivedAt: source.receivedAt });
   deps.commitCheckpoint();
-  deps.pump();
   deps.report({
     level: failure ? "warn" : "info",
     code: failure ? "direct_to_failed" : "direct_to_delivered",

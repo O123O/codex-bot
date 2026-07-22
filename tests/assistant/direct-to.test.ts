@@ -15,32 +15,30 @@ const source: CanonicalChatSource = {
 };
 
 function harness(opts: { alreadyDelivered?: boolean; sendImpl?: DirectToDeps["send"] } = {}) {
-  const calls = { sends: [] as unknown[], recorded: [] as InternalSource[], pumps: 0, checkpoints: 0, reports: [] as OperationalEvent[] };
+  const calls = { sends: [] as unknown[], recorded: [] as InternalSource[], checkpoints: 0, reports: [] as OperationalEvent[] };
   const deps: DirectToDeps = {
     alreadyDelivered: () => opts.alreadyDelivered ?? false,
     send: async (nickname, text, options) => { calls.sends.push({ nickname, text, options }); return (opts.sendImpl ?? (async () => undefined))(nickname, text, options); },
-    recordAwareness: (input) => { calls.recorded.push(input); },
-    pump: () => { calls.pumps += 1; },
+    recordAudit: (input) => { calls.recorded.push(input); },
     commitCheckpoint: () => { calls.checkpoints += 1; },
     report: (event) => { calls.reports.push(event); },
   };
   return { deps, calls };
 }
 
-test("delivers /to directly to the worker and records an INTERNAL awareness source", async () => {
+test("delivers /to directly and records an audit row without waking QiYan", async () => {
   const { deps, calls } = harness();
   const result = await deliverDirectTo(deps, source, "payments", "fix the flaky test");
 
   assert.deepEqual(calls.sends, [{ nickname: "payments", text: "fix the flaky test", options: { mode: "auto", clientUserMessageId: "to:web:owner:42" } }]);
   assert.equal(calls.recorded.length, 1);
   const note = calls.recorded[0]!;
-  assert.equal(note.kind, "direct_to");                 // internal, not a chat source (cannot be steered into an attempt)
+  assert.equal(note.kind, "direct_to");
   assert.equal(note.sourceId, "direct_to:web:owner:42"); // idempotency key derived from the ingress message
   assert.match(note.rawText, /payments/u);
-  assert.match(note.rawText, /for your awareness only — do not reply or resend/u);
+  assert.doesNotMatch(note.rawText, /awareness|reply|resend/u);
   assert.match(note.rawText, /fix the flaky test/u);
   assert.equal(calls.checkpoints, 1);                    // ingress ack — no redelivery
-  assert.equal(calls.pumps, 1);
   assert.deepEqual(calls.reports, [{ level: "info", code: "direct_to_delivered", adapter: "web" }]);
   assert.deepEqual(result, { delivered: true });
 });
@@ -51,12 +49,11 @@ test("a redelivery of the same message is a no-op except re-acking the ingress c
 
   assert.deepEqual(calls.sends, []);       // not re-sent to the worker
   assert.deepEqual(calls.recorded, []);    // not re-recorded
-  assert.equal(calls.pumps, 0);
   assert.deepEqual(calls.reports, []);
   assert.equal(calls.checkpoints, 1);      // but still acked so the surface stops redelivering
 });
 
-test("a failed direct send is non-fatal: still records an informational note, acks, and reports warn", async () => {
+test("a failed direct send is non-fatal: still records an audit row, acks, and reports warn", async () => {
   const { deps, calls } = harness({ sendImpl: async () => { throw new Error("unknown or unmanaged session: payments"); } });
   const result = await deliverDirectTo(deps, source, "payments", "fix the flaky test"); // must not throw
 

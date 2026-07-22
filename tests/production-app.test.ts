@@ -133,6 +133,21 @@ test("legacy delivery receipts are coalesced without parsing or scheduling them"
   assert.equal(db.prepare("SELECT state FROM events WHERE id = 'legacy-receipt'").get()!.state, "coalesced");
 });
 
+test("startup routes only terminal events for exact QiYan-delegated turns", () => {
+  const db = createTestDatabase();
+  db.prepare(`INSERT INTO events(id, endpoint_id, thread_id, turn_id, kind, payload_json, state, created_at)
+    VALUES ('direct-terminal', 'local', 'worker', 'direct-turn', 'turn_terminal', '{not-json', 'pending', 1),
+           ('delegated-terminal', 'local', 'worker', 'delegated-turn', 'turn_terminal', '{"final":true}', 'pending', 2)`).run();
+  db.prepare(`INSERT INTO assistant_delegated_turns(endpoint_id, thread_id, turn_id, mapping_id, operation_id, created_at)
+    VALUES ('local', 'worker', 'delegated-turn', 'mapping', 'operation', 1)`).run();
+  const scheduled: Array<{ id: string }> = [];
+
+  routePendingAssistantEvents(db, (event) => scheduled.push(event));
+
+  assert.deepEqual(scheduled.map((event) => event.id), ["delegated-terminal"]);
+  assert.equal(db.prepare("SELECT state FROM events WHERE id = 'direct-terminal'").get()!.state, "coalesced");
+});
+
 test("assistant recovery keeps bounded turn metadata when exact item hydration exceeds its budget", async () => {
   const turn = { id: "large-terminal", status: "completed", itemsView: "notLoaded", items: [] };
   const reader = {

@@ -56,7 +56,7 @@ import { buildAssistantChildEnvironment, prepareAssistantProfile, type PreparedA
 import { AssistantRuntime } from "./assistant/runtime.ts";
 import { AssistantPostTurnActions, type AssistantPostTurnAction } from "./assistant/post-turn-actions.ts";
 import { runAssistantCompaction, runAssistantRestart, startAssistantTurnWithPendingSettings } from "./assistant/self-controls.ts";
-import { recordAssistantSystemAwareness, recordCompletedSystemAction } from "./assistant/system-awareness.ts";
+import { recordCompletedSystemAction } from "./assistant/system-awareness.ts";
 import { AssistantScheduler, type EventJob } from "./assistant/scheduler.ts";
 import { checkpointAssistantStartDispatch, ConversationDispatcher, type AssistantTurnPort } from "./assistant/conversation-dispatcher.ts";
 import {
@@ -98,6 +98,7 @@ import { SessionControlStore } from "./storage/session-control-store.ts";
 import { ManagedEpochStore } from "./storage/managed-epoch-store.ts";
 import { SessionDeliveryProgressStore } from "./storage/session-delivery-progress-store.ts";
 import { SessionDashboardStore } from "./storage/session-dashboard-store.ts";
+import { AssistantDelegatedTurnStore } from "./storage/assistant-delegated-turn-store.ts";
 import type { SlackContextService } from "./chat-apps/slack/context-service.ts";
 import { SlackChatAdapter } from "./chat-apps/slack/chat-adapter.ts";
 import type { WeixinCredentialHandle } from "./chat-apps/weixin/credential-store.ts";
@@ -1118,11 +1119,17 @@ export function assistantEventIsActionable(kind: string): boolean {
 }
 
 export function routePendingAssistantEvents(db: Database, enqueue: (event: EventJob) => void): void {
-  const rows = db.prepare("SELECT id, endpoint_id, thread_id, kind, payload_json, created_at FROM events WHERE state = 'pending' ORDER BY created_at, id")
+  const rows = db.prepare(`SELECT id, endpoint_id, thread_id, turn_id, kind, payload_json, created_at,
+      EXISTS(SELECT 1 FROM assistant_delegated_turns delegated
+        WHERE delegated.endpoint_id = events.endpoint_id
+          AND delegated.thread_id = events.thread_id
+          AND delegated.turn_id = events.turn_id) AS assistant_delegated
+    FROM events WHERE state = 'pending' ORDER BY created_at, id`)
     .all() as Array<Record<string, unknown>>;
   const latestTransient = new Map<string, string>();
   for (const row of rows) {
     if (!assistantEventIsActionable(String(row.kind))) continue;
+    if (row.kind === "turn_terminal" && Number(row.assistant_delegated) !== 1) continue;
     const payload = JSON.parse(String(row.payload_json));
     if (payload && typeof payload === "object" && "status" in payload && !("final" in payload)) {
       latestTransient.set(`${row.endpoint_id}:${row.thread_id}`, String(row.id));
@@ -1130,6 +1137,10 @@ export function routePendingAssistantEvents(db: Database, enqueue: (event: Event
   }
   for (const row of rows) {
     const id = String(row.id);
+    if (row.kind === "turn_terminal" && Number(row.assistant_delegated) !== 1) {
+      db.prepare("UPDATE events SET state = 'coalesced' WHERE id = ? AND state = 'pending'").run(id);
+      continue;
+    }
     if (!assistantEventIsActionable(String(row.kind))) {
       db.prepare("UPDATE events SET state = 'coalesced' WHERE id = ? AND state = 'pending'").run(id);
       continue;
@@ -2003,6 +2014,7 @@ export async function buildProductionApp(
   let sessionControls!: SessionControlStore;
   let managedEpochs!: ManagedEpochStore;
   let sessionDeliveryProgress!: SessionDeliveryProgressStore;
+  let assistantDelegatedTurns!: AssistantDelegatedTurnStore;
   let finals!: FinalMessageStore;
   let endpoint!: ManagedAppServerEndpoint;
   let assistantEndpoint!: ManagedAppServerEndpoint;
@@ -2113,19 +2125,16 @@ export async function buildProductionApp(
   const acceptChat = async (source: CanonicalChatSource, effects: ChatAcceptanceEffects): Promise<void> => {
     const directive = parseDirective(source.rawText, source.attachmentIds, config.maxCollectCount);
     if (directive.kind === "to") {
-      // `/to <worker> <text>` is delivered directly to the worker + copied to the assistant as an
-      // internal awareness source; it does NOT run a normal assistant reply turn.
+      // `/to <worker> <text>` uses the shared worker send transport but never wakes QiYan.
       const result = await deliverDirectTo({
         alreadyDelivered: (sourceId) => conversations.hasInternalSource("direct_to", sourceId),
         send: (nickname, text, sendOptions) => sessions.send(nickname, text, sendOptions),
-        recordAwareness: (input) => { conversations.createInternalSource(input); },
-        pump: () => { void dispatcher.enqueueInternal("direct_to"); },
+        recordAudit: (input) => { conversations.recordInternalLog(input); },
         commitCheckpoint: () => effects.commitNativeCheckpoint?.(),
         report,
       }, source, directive.target, directive.payload);
-      // Chat apps get a QiYan awareness note even when direct delivery fails. The Web worker panel
-      // additionally needs an HTTP failure so it does not present an unadmitted optimistic message
-      // as accepted native history.
+      // The Web worker panel needs an HTTP failure so it does not present an unadmitted optimistic
+      // message as accepted native history.
       if (!result.delivered && source.binding.adapterId === WEB_ADAPTER_ID) {
         throw new AppError("ENDPOINT_UNAVAILABLE", result.error ?? `direct message to ${directive.target} failed`);
       }
@@ -2268,6 +2277,7 @@ export async function buildProductionApp(
           const openedSessionControls = new SessionControlStore(openedDb);
           const openedManagedEpochs = new ManagedEpochStore(openedDb);
           const openedSessionDeliveryProgress = new SessionDeliveryProgressStore(openedDb);
+          const openedAssistantDelegatedTurns = new AssistantDelegatedTurnStore(openedDb);
           const openedFinals = new FinalMessageStore(openedDb);
           const openedDashboardStore = opened.dashboardStore;
           const openedEndpointBindings = new EndpointBindingStore(openedDb);
@@ -2281,6 +2291,7 @@ export async function buildProductionApp(
           sessionControls = openedSessionControls;
           managedEpochs = openedManagedEpochs;
           sessionDeliveryProgress = openedSessionDeliveryProgress;
+          assistantDelegatedTurns = openedAssistantDelegatedTurns;
           finals = openedFinals;
           dashboardStore = openedDashboardStore;
           endpointBindings = openedEndpointBindings;
@@ -2325,6 +2336,7 @@ export async function buildProductionApp(
           assistant: { endpoint: "assistant-local", thread_id: "pending", project_dir: assistantDir },
           sessions: {},
         });
+        assistantDelegatedTurns.backfillLastSentStarts(Object.values(registry.managedSnapshot().sessions));
       }, stop: async () => undefined,
     },
     {
@@ -2983,6 +2995,9 @@ export async function buildProductionApp(
           clock: { now: () => Date.now() },
           onTerminal: (event, lease) => observations.observeTerminal(event, lease),
           onEventCommitted: durableEventSources.relayCommitted,
+          shouldWakeAssistantForTerminal: (endpointId, threadId, turnId) => (
+            assistantDelegatedTurns.has(endpointId, threadId, turnId)
+          ),
           withEndpointWorkLease: (endpointId, existingLease, run) => withRelayEndpointWorkLease(
             endpointManager,
             endpointId,
@@ -3480,6 +3495,18 @@ export async function buildProductionApp(
                 },
               });
             },
+            ...(args.mode === "start" ? {
+              onTurnAccepted: ({ session, turnId }: { session: RegistrySession; turnId: string }) => {
+                assistantDelegatedTurns.record({
+                  endpointId: session.endpoint,
+                  threadId: session.thread_id,
+                  turnId,
+                  mappingId: session.mapping_id,
+                  operationId: context.operationId,
+                  createdAt: Date.now(),
+                });
+              },
+            } : {}),
             ...(pendingSettings ? { settings: pendingSettings } : {}),
           });
         } catch (error) {
@@ -3537,7 +3564,6 @@ export async function buildProductionApp(
           assistantPostTurnActions.schedule(context.operationId, "compact", {
             endpointId: identity.endpoint,
             threadId: identity.thread_id,
-            awarenessBody: "assistant session compacted",
             ...(notice ? { notice } : {}),
           });
           return { scheduled: true, actionId: context.operationId };
@@ -3547,7 +3573,7 @@ export async function buildProductionApp(
         });
         const body = `${args.nickname} session compacted`;
         recordCompletedSystemAction(
-          conversations, deliveries, context.operationId, body, systemNoticeForAttempt(context.attemptId, body),
+          deliveries, context.operationId, systemNoticeForAttempt(context.attemptId, body),
         );
         return { nickname: args.nickname, ...result };
       },
@@ -3566,7 +3592,6 @@ export async function buildProductionApp(
           assistantPostTurnActions.schedule(context.operationId, "restart", {
             endpointId: assistantEndpoint.id,
             runtimeIdentity,
-            awarenessBody: "assistant app-server restarted",
             ...(notice ? { notice } : {}),
           });
           return { scheduled: true, actionId: context.operationId, endpoint: assistantEndpoint.id };
@@ -3591,7 +3616,6 @@ export async function buildProductionApp(
         }
         const body = `${args.nickname} will use model ${args.model} on its next turn`;
         prepareToolSystemNotice(context.operationId, context.attemptId, body);
-        if (args.nickname === "assistant") recordAssistantSystemAwareness(conversations, context.operationId, body);
         return { pending: true };
       },
       set_reasoning_effort: async (args, context) => {
@@ -3605,7 +3629,6 @@ export async function buildProductionApp(
         }
         const body = `${args.nickname} will use reasoning effort ${args.effort} on its next turn`;
         prepareToolSystemNotice(context.operationId, context.attemptId, body);
-        if (args.nickname === "assistant") recordAssistantSystemAwareness(conversations, context.operationId, body);
         return { pending: true };
       },
       get_goal: async (args) => {
@@ -3750,13 +3773,11 @@ export async function buildProductionApp(
 
   function completeDeferredSystemNotices(action: { id: string; payload: Record<string, unknown> }): void {
     const notice = action.payload.notice as { binding?: ConversationBinding; body?: string } | undefined;
-    if (typeof action.payload.awarenessBody === "string") {
+    if (notice?.binding && typeof notice.body === "string") {
       recordCompletedSystemAction(
-        conversations,
         deliveries,
         action.id,
-        action.payload.awarenessBody,
-        notice?.binding && typeof notice.body === "string" ? { binding: notice.binding, body: notice.body } : undefined,
+        { binding: notice.binding, body: notice.body },
       );
     }
   }
@@ -4463,6 +4484,17 @@ export async function buildProductionApp(
           });
           if (turn) {
             managedEpochs.recordFirstTurn(session.endpoint, session.thread_id, session.mapping_id, turn.id);
+            if (args.mode === "start") {
+              const origin = assistantDelegatedTurns.record({
+                endpointId: session.endpoint,
+                threadId: session.thread_id,
+                turnId: turn.id,
+                mappingId: session.mapping_id,
+                operationId: operation.id,
+                createdAt: operation.createdAt,
+              });
+              await eventWakeBoundary.wakeAfterDurableCommit(origin.reactivatedTerminalEvent);
+            }
             if (holds.length > 0) {
               for (const hold of holds) attachments.transferOperationToTurn(hold.id, session.endpoint, session.thread_id, turn.id);
               if (isTerminalStatus(turn.status)) attachments.releaseTurn(session.endpoint, session.thread_id, turn.id);
@@ -4523,7 +4555,7 @@ export async function buildProductionApp(
               }, () => {
                 const body = `${args.nickname} session compacted`;
                 recordCompletedSystemAction(
-                  conversations, deliveries, operation.id, body, systemNoticeForAttempt(operation.attemptId, body),
+                  deliveries, operation.id, systemNoticeForAttempt(operation.attemptId, body),
                 );
               });
               else throw new OperationRecoveryPendingError("worker compaction completion is not yet visible");
@@ -4541,7 +4573,6 @@ export async function buildProductionApp(
               ? `${args.nickname} will use model ${args.model} on its next turn`
               : `${args.nickname} will use reasoning effort ${args.effort} on its next turn`;
             prepareToolSystemNotice(operation.id, operation.attemptId, body);
-            if (args.nickname === "assistant") recordAssistantSystemAwareness(conversations, operation.id, body);
           });
           else failRecoveredNoEffect(operation.id, "pending session setting was not committed");
         } else if (["create_session", "adopt_session"].includes(operation.kind)) {

@@ -288,6 +288,27 @@ test("an authoritative native send response records the adopted epoch's first ma
   assert.deepEqual(accepted, ["started-1"]);
 });
 
+test("per-send acceptance is recorded before terminal notification work can enter the thread gate", async () => {
+  const { endpoint, gate, service } = await fixture();
+  let accepted = false;
+  let terminalSawAccepted = false;
+  let terminalWork: Promise<void> | undefined;
+  endpoint.onTurnStart = () => {
+    terminalWork = gate.run("local", "thread", async () => { terminalSawAccepted = accepted; });
+  };
+
+  await service.send("payments", "start", {
+    mode: "start",
+    onTurnAccepted: ({ turnId }) => {
+      assert.equal(turnId, "started-1");
+      accepted = true;
+    },
+  });
+  await terminalWork;
+
+  assert.equal(terminalSawAccepted, true);
+});
+
 test("a poisoned persisted active turn cannot authorize interrupt", async () => {
   const value = await fixture();
   assert.equal(value.db.prepare("SELECT name FROM sqlite_master WHERE name = 'session_runtime'").get(), undefined);

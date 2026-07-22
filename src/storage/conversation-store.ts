@@ -169,6 +169,21 @@ export class ConversationStore {
     });
   }
 
+  recordInternalLog(input: InternalSource): string {
+    return inTransaction(this.db, () => {
+      const existing = this.db.prepare("SELECT id FROM source_contexts WHERE adapter_id IS NULL AND kind = ? AND source_id = ?")
+        .get(input.kind, input.sourceId) as { id: string } | undefined;
+      if (existing) return existing.id;
+      const arrival = this.takeArrivalSequence();
+      this.db.prepare(`INSERT INTO source_contexts
+        (id, kind, source_id, raw_text, attachment_ids_json, state, created_at, adapter_id, conversation_key,
+          destination_json, native_reply_json, arrival_sequence, source_class, queue_notice_required)
+        VALUES (?, ?, ?, ?, ?, 'completed', ?, NULL, NULL, NULL, NULL, ?, 'internal', 0)`)
+        .run(input.id, input.kind, input.sourceId, input.rawText, JSON.stringify(input.attachmentIds), input.receivedAt, arrival);
+      return input.id;
+    });
+  }
+
   attempt(attemptId: string): AssistantAttempt | undefined {
     const row = this.attemptById(attemptId);
     return row ? this.parseAttempt(row) : undefined;

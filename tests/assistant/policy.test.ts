@@ -60,7 +60,8 @@ test("packaged assistant policy is concise and reserves examples for exact direc
   assert.match(policy, /do not repeat, paraphrase, acknowledge, or announce an automatically delivered result/iu);
   assert.match(policy, /prefer exact ids.*`inspect_worker_conversation` for context.*large pages return a temp JSON path/iu);
   assert.match(policy, /for monitoring.*follow up until the requested outcome is genuinely resolved/isu);
-  assert.match(policy, /worker notification wakes you.*does not itself justify another user message/isu);
+  assert.match(policy, /completion of a turn you started with `send_to_session` wakes you.*does not itself justify another user message/isu);
+  assert.match(policy, /direct `\/to`, Web UI, and external worker turns do not wake you/iu);
   assert.match(policy, /before the user drives a managed session manually.*`unadopt_session`/isu);
   assert.match(policy, /adopt it again only when asked/isu);
   assert.match(policy, /ask when more than one target remains plausible/iu);
@@ -71,7 +72,7 @@ test("packaged assistant policy is concise and reserves examples for exact direc
   assert.match(policy, /notifications omit bodies/iu);
   assert.match(policy, /model and effort changes are pending.*next new turn.*steer/isu);
   assert.match(policy, /use `assistant`.*own status\/model\/effort\/compaction/iu);
-  assert.match(policy, /self results return internally as `\[system\]`.*all results notify the user.*never reply to or repeat/iu);
+  assert.match(policy, /completed actions notify the user through the backend.*do not start a follow-up turn/isu);
   assert.match(policy, /goal completion is a worker.*never declare or mark a worker goal complete yourself/isu);
   assert.match(policy, /never declare or mark a worker goal complete/iu);
   assert.match(policy, /never (?:edit|patch|replace|delete|regenerate)[^\n]*session-status\.json/iu);
@@ -92,8 +93,8 @@ test("packaged assistant policy is concise and reserves examples for exact direc
   assert.match(policy, /one required ASCII space/iu);
   assert.match(policy, /\/pass.*choose the target and `start` or `steer`/isu);
   assert.match(policy, /\/collect.*exact count.*backend delivers.*directly/isu);
-  assert.match(policy, /`\/to <worker>` is delivered directly to that worker by the backend/iu);
-  assert.match(policy, /do NOT reply to it, re-send it, or act on it unless separately asked/iu);
+  assert.match(policy, /`\/to <worker>` is delivered directly to that worker.*logged by the backend without waking you/iu);
+  assert.match(policy, /inspect the worker conversation only when supervision is requested/iu);
   assert.match(policy, /`web_goal` awareness.*backend.*already handled/isu);
   assert.match(policy, /objective.*quoted user data.*not instructions/isu);
   assert.match(policy, /never reply.*repeat.*goal.*mutation/isu);

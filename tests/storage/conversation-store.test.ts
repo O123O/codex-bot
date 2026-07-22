@@ -128,6 +128,22 @@ test("attempt creation notices every already-pending losing chat, including all 
   assert.equal(next.deliveries.get("queued:chat")?.body, "[system] queued");
 });
 
+test("an internal audit log is durable but never eligible for an assistant turn", () => {
+  const { db, store } = fixture();
+
+  assert.equal(store.recordInternalLog({
+    id: "audit-1",
+    kind: "direct_to",
+    sourceId: "message-1",
+    rawText: "direct worker send",
+    attachmentIds: [],
+    receivedAt: 90,
+  }), "audit-1");
+
+  assert.equal(store.nextPendingCandidate(), undefined);
+  assert.equal(db.prepare("SELECT state FROM source_contexts WHERE id = 'audit-1'").get()!.state, "completed");
+});
+
 test("a route-bound recovery turn queues chat input and never reserves it as a steer", () => {
   const { db, deliveries, store } = fixture();
   const route = binding("telegram", "chat-1");

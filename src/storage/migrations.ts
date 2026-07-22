@@ -811,4 +811,31 @@ export const migrations: readonly Migration[] = [
     }
     if (!columns.has("first_turn_id")) db.exec("ALTER TABLE managed_epochs ADD COLUMN first_turn_id TEXT");
   },
+  // Only worker turns started through QiYan's send_to_session tool report completion back to
+  // QiYan. Direct /to and Web UI sends share the transport but intentionally have no row here.
+  (db) => {
+    const columns = tableColumns(db, "qiyan_state");
+    const firstUpgrade = !columns.has("delegation_backfill_completed");
+    if (firstUpgrade) {
+      db.exec(`ALTER TABLE qiyan_state ADD COLUMN delegation_backfill_completed INTEGER NOT NULL DEFAULT 0
+        CHECK(delegation_backfill_completed IN (0, 1))`);
+    }
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS assistant_delegated_turns (
+        endpoint_id TEXT NOT NULL,
+        thread_id TEXT NOT NULL,
+        turn_id TEXT NOT NULL,
+        mapping_id TEXT NOT NULL,
+        operation_id TEXT NOT NULL UNIQUE,
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY(endpoint_id, thread_id, turn_id)
+      );
+    `);
+    if (firstUpgrade) db.exec(`
+      UPDATE source_contexts SET state = 'completed'
+        WHERE source_class = 'internal' AND kind IN ('direct_to', 'system_notice') AND state = 'pending';
+      UPDATE events SET state = 'coalesced'
+        WHERE kind = 'turn_terminal' AND state = 'pending';
+    `);
+  },
 ];

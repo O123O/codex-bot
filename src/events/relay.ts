@@ -88,6 +88,7 @@ export class EventRelay {
       clock: Clock;
       onTerminal?(event: TerminalObservation, lease: EndpointWorkLease): void | Promise<void>;
       onEventCommitted?(): void | Promise<void>;
+      shouldWakeAssistantForTerminal?(endpointId: string, threadId: string, turnId: string): boolean;
       withEndpointWorkLease<T>(
         endpointId: string,
         existingLease: EndpointWorkLease | undefined,
@@ -423,6 +424,9 @@ export class EventRelay {
       });
     }
     this.attachments?.releaseTurn(target.endpointId, target.threadId, turn.id);
+    const wakeAssistant = this.options.shouldWakeAssistantForTerminal?.(
+      target.endpointId, target.threadId, turn.id,
+    ) ?? true;
     const inserted = this.persistEvent(eventId, target.endpointId, target.threadId, turn.id, "turn_terminal", {
       final: true,
       nickname,
@@ -433,8 +437,8 @@ export class EventRelay {
       status: turn.status,
       finalMessageIds: messages.map((message) => message.id),
       deliveryState: "prepared",
-    });
-    if (inserted) await this.options.onEventCommitted?.();
+    }, wakeAssistant ? "pending" : "processed");
+    if (inserted && wakeAssistant) await this.options.onEventCommitted?.();
     return "handled";
   }
 
@@ -625,10 +629,11 @@ export class EventRelay {
     turnId: string | undefined,
     kind: string,
     payload: unknown,
+    state = "pending",
   ): boolean {
     return this.db.prepare(`INSERT OR IGNORE INTO events(id, endpoint_id, thread_id, turn_id, kind, payload_json, state, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)`)
-      .run(id, endpointId, threadId, turnId ?? null, kind, JSON.stringify(payload), this.options.clock.now()).changes === 1;
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(id, endpointId, threadId, turnId ?? null, kind, JSON.stringify(payload), state, this.options.clock.now()).changes === 1;
   }
 
   private mapping(endpointId: string, threadId: string) {

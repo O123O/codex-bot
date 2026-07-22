@@ -79,6 +79,7 @@ async function fixture(
   relayOptions: {
     timers?: RelayTimers;
     onEventCommitted?: () => void | Promise<void>;
+    shouldWakeAssistantForTerminal?(endpointId: string, threadId: string, turnId: string): boolean;
     attachments?: { releaseTurn(endpointId: string, threadId: string, turnId: string): void };
     withEndpointWorkLease?<T>(
       endpointId: string,
@@ -116,6 +117,9 @@ async function fixture(
       ?? (async (_endpointId, existingLease, run) => run(existingLease ?? workLease)),
     ...(onTerminal ? { onTerminal } : {}),
     ...(relayOptions.onEventCommitted ? { onEventCommitted: relayOptions.onEventCommitted } : {}),
+    ...(relayOptions.shouldWakeAssistantForTerminal
+      ? { shouldWakeAssistantForTerminal: relayOptions.shouldWakeAssistantForTerminal }
+      : {}),
     ...(relayOptions.maxRecoveryAttempts === undefined ? {} : { maxRecoveryAttempts: relayOptions.maxRecoveryAttempts }),
   }, relayOptions.attachments, new ThreadGate(), relayOptions.timers);
   return { db, endpoint, pool, registry, epochs, progress, deliveries, relay, conversations, routes };
@@ -178,6 +182,7 @@ test("a final terminal projection wakes once only after the inserted event is re
       assert.deepEqual(readyDeliveryIds(), ["worker:local:worker:turn-1:turn-1-final"]);
       sequence.push("wake");
     },
+    shouldWakeAssistantForTerminal: () => true,
   });
   readyDeliveryIds = () => value.deliveries.listReady().map((delivery) => delivery.id);
   value.endpoint.turns = [terminal("baseline"), terminal()];
@@ -201,6 +206,21 @@ test("a final terminal projection wakes once only after the inserted event is re
   ), "handled");
   assert.deepEqual(sequence, ["terminal", "attachments", "wake", "terminal", "attachments"],
     "replaying an ignored insert does not wake again");
+});
+
+test("a terminal turn not delegated by QiYan is delivered to the owner without waking QiYan", async () => {
+  let wakes = 0;
+  const value = await fixture(undefined, {
+    onEventCommitted: async () => { wakes += 1; },
+    shouldWakeAssistantForTerminal: () => false,
+  });
+  value.endpoint.turns = [terminal("baseline"), terminal()];
+
+  await value.relay.handleNotification("local", "turn/completed", { threadId: "worker", turn: terminal() });
+
+  assert.deepEqual(value.deliveries.listReady().map((delivery) => delivery.body), ["[payments] done"]);
+  assert.equal(wakes, 0);
+  assert.equal(value.db.prepare("SELECT state FROM events WHERE id = 'terminal:local:worker:turn-1'").get()!.state, "processed");
 });
 
 test("a rejected terminal observer leaves no terminal event and does not wake", async () => {

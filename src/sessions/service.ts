@@ -46,6 +46,7 @@ export class SessionService {
       baselineTurnId?: string | null;
       lease?: EndpointWorkLease;
     }): void | Promise<void>;
+    onTurnAccepted?(context: { session: RegistrySession; mode: "start" | "steer"; turnId: string }): void;
   } = {}): Promise<{ mode: "start" | "steer"; turnId: string; terminal?: boolean; appliedSettings?: { model?: string; effort?: string } }> {
     return this.runVerifiedExecution(nickname, async (session, cwd, lease) => {
       const current = await this.currentNative(session, lease);
@@ -71,6 +72,7 @@ export class SessionService {
           const response = await this.pool.request<{ turnId: string }>(session.endpoint, "turn/steer", {
             threadId: session.thread_id, ...(options.clientUserMessageId ? { clientUserMessageId: options.clientUserMessageId } : {}), input, expectedTurnId: activeTurn,
           }, undefined, lease);
+          options.onTurnAccepted?.({ session, mode: "steer", turnId: response.turnId });
           this.onTurnAccepted(session, response.turnId);
           return { mode: "steer" as const, turnId: response.turnId };
         } catch (error) {
@@ -80,6 +82,7 @@ export class SessionService {
           );
           const proven = items.items.some((item) => item.type === "userMessage" && item.clientId === options.clientUserMessageId);
           if (!proven) throw error;
+          options.onTurnAccepted?.({ session, mode: "steer", turnId: activeTurn });
           this.onTurnAccepted(session, activeTurn);
           return { mode: "steer" as const, turnId: activeTurn };
         }
@@ -93,6 +96,7 @@ export class SessionService {
       const response = await this.pool.startTurn<{ turn: { id: string; status?: string } }>(session.endpoint, {
         threadId: session.thread_id, cwd, ...(options.clientUserMessageId ? { clientUserMessageId: options.clientUserMessageId } : {}), input, ...settings,
       }, undefined, lease);
+      options.onTurnAccepted?.({ session, mode: "start", turnId: response.turn.id });
       this.onTurnAccepted(session, response.turn.id);
       this.consumeSettingsIfNative(session.endpoint, session.thread_id, session.mapping_id, settings);
       const terminal = new Set(["completed", "failed", "interrupted"]).has(response.turn.status ?? "");
