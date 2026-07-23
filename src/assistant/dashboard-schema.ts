@@ -95,20 +95,21 @@ export const ExistingSessionDashboardDocumentSchema = z.union([
   LegacySessionDashboardDocumentSchema,
 ]);
 
+// App Server objects are additive: validate the fields QiYan consumes and let
+// Zod strip unknown protocol fields at this external boundary.
 const appServerTokenBreakdown = z.object({
   totalTokens: z.number().int().nonnegative(),
   inputTokens: z.number().int().nonnegative(),
   cachedInputTokens: z.number().int().nonnegative(),
-  cacheWriteInputTokens: z.number().int().nonnegative().optional(),
   outputTokens: z.number().int().nonnegative(),
   reasoningOutputTokens: z.number().int().nonnegative(),
-}).strict();
+});
 
 const appServerTokenUsage = z.object({
   total: appServerTokenBreakdown,
   last: appServerTokenBreakdown,
   modelContextWindow: z.number().int().nonnegative().nullable(),
-}).strict();
+});
 
 export type SessionDashboardDocument = z.infer<typeof SessionDashboardDocumentSchema>;
 export type SessionDashboardEntry = z.infer<typeof SessionDashboardEntrySchema>;
