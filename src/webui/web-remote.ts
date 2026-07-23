@@ -110,6 +110,31 @@ trap - EXIT HUP INT TERM`;
   return { error: remoteError(result, "upload failed") };
 }
 
+export async function remoteCreateEntry(
+  deps: RemoteDeps,
+  host: string,
+  root: string,
+  relPath: string,
+  kind: "file" | "dir",
+): Promise<WebFileWriteResult> {
+  if (kind === "file") return remoteUploadFile(deps, host, root, relPath, Buffer.alloc(0));
+  if (isAbsolute(relPath) || relPath.split(/[\\/]+/u).includes("..")) return { error: "path not allowed" };
+  const name = basename(relPath);
+  if (!validFileName(name)) return { error: "invalid name" };
+  const parent = dirname(relPath);
+  const script = `${guard(root, parent === "." ? "." : parent, false)}
+[ -d "$t" ] || exit 6
+target="$t/"${q(name)}
+if [ -e "$target" ] || [ -L "$target" ]; then exit 7; fi
+mkdir -- "$target" || { if [ -e "$target" ] || [ -L "$target" ]; then exit 7; fi; exit 8; }`;
+  const result = await run(deps, host, script, { maxBytes: 64 << 10, timeoutMs: 15_000 });
+  if (result.code === 0) return { ok: true, path: relPath };
+  if (result.code === 4) return { error: "path not allowed" };
+  if (result.code === 6) return { error: "destination is not a directory" };
+  if (result.code === 7) return { error: "already exists" };
+  return { error: remoteError(result, "create failed") };
+}
+
 // --- Streaming read (for /api/raw) ---
 // The owner-only preview streams ANY file the remote user can read (a worker references files outside
 // its project dir) — so, unlike browse/git, this is NOT confined to the project root. The remote OS's

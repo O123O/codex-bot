@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -366,7 +366,7 @@ test("uploads a file into the owner filesystem without overwriting it", async ()
   });
 });
 
-test("dispatches a remote session's files over ssh (browse + raw stream + upload)", async () => {
+test("dispatches a remote session's files over ssh (browse + raw stream + upload + create)", async () => {
   const { mkdtemp, chmod } = await import("node:fs/promises");
   const { tmpdir } = await import("node:os");
   const dir = await mkdtemp(join(tmpdir(), "qiyan-rsrv-"));
@@ -397,6 +397,23 @@ test("dispatches a remote session's files over ssh (browse + raw stream + upload
     });
     assert.equal(upload.status, 201);
     assert.equal(await readFile(join(remoteRoot, "new.txt"), "utf8"), "uploaded remotely\n");
+    const createdFile = await fetch(`${base}/api/fs?token=${TOKEN}`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ op: "mkfile", session: "rworker", path: "empty.txt" }),
+    });
+    assert.equal(createdFile.status, 201);
+    assert.equal(await readFile(join(remoteRoot, "empty.txt"), "utf8"), "");
+    const createdDirectory = await fetch(`${base}/api/fs?token=${TOKEN}`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ op: "mkdir", session: "rworker", path: "new-dir" }),
+    });
+    assert.equal(createdDirectory.status, 201);
+    assert.equal((await stat(join(remoteRoot, "new-dir"))).isDirectory(), true);
+    const duplicate = await fetch(`${base}/api/fs?token=${TOKEN}`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ op: "mkfile", session: "rworker", path: "empty.txt" }),
+    });
+    assert.equal(duplicate.status, 400);
     assert.equal(await (await fetch(`${base}/api/raw?session=rworker&path=r.txt&token=${TOKEN}`)).text(), "remote-bytes\n");
     // Owner-only preview streams ANY readable file over ssh (NOT confined to the project root): an
     // absolute path outside the root is served as-is.

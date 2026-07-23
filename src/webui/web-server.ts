@@ -12,7 +12,7 @@ import { browse, browseReadablePath, confine, createEntry, resolvePath, uploadCo
 import { cleanupUploads, storeUpload, type WebUploadsConfig } from "./web-uploads.ts";
 import { runCommand } from "./web-exec.ts";
 import { discoverRepos, gitCommit, gitDiff, gitStage, gitStatus, gitUnstage } from "./web-git.ts";
-import { remoteBrowse, remoteDiscover, remoteGitCommit, remoteGitDiff, remoteGitStage, remoteGitStatus, remoteGitUnstage, remoteReadStream, remoteUploadFile, type RemoteDeps } from "./web-remote.ts";
+import { remoteBrowse, remoteCreateEntry, remoteDiscover, remoteGitCommit, remoteGitDiff, remoteGitStage, remoteGitStatus, remoteGitUnstage, remoteReadStream, remoteUploadFile, type RemoteDeps } from "./web-remote.ts";
 import type { WebGoalControlInput, WebGoalControlResult } from "./web-goal-control.ts";
 
 const AUTH_COOKIE = "qiyan_web_token";
@@ -376,7 +376,15 @@ export function createWebServer(options: WebServerOptions): WebServer {
       if (!body) { json(response, 400, { error: "invalid json" }); return; }
       const { op, session, path } = body as { op?: string; session?: string; path?: string };
       if ((op !== "mkfile" && op !== "mkdir") || typeof session !== "string" || typeof path !== "string" || !path) { json(response, 400, { error: "op, session, path required" }); return; }
-      json(response, 200, await createEntry(options.files, session, path, op === "mkdir" ? "dir" : "file"));
+      const target = options.files.fileTarget(session);
+      if (!target) { json(response, 404, { error: "unknown session" }); return; }
+      const kind = op === "mkdir" ? "dir" : "file";
+      const result = target.transport === "remote"
+        ? target.host && remote
+          ? await remoteCreateEntry(remote, target.host, target.projectDir, path, kind)
+          : { error: "remote host not connected" }
+        : await createEntry(options.files, session, path, kind);
+      json(response, "error" in result ? 400 : 201, result);
       return;
     }
     // Run a one-shot shell command in a LOCAL session's project dir (the `!` command).

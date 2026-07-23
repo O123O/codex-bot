@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
-import { remoteBrowse, remoteDiscover, remoteGitDiff, remoteGitStage, remoteGitStatus, remoteReadStream, remoteUploadFile, type RemoteDeps } from "../../src/webui/web-remote.ts";
+import { remoteBrowse, remoteCreateEntry, remoteDiscover, remoteGitDiff, remoteGitStage, remoteGitStatus, remoteReadStream, remoteUploadFile, type RemoteDeps } from "../../src/webui/web-remote.ts";
 
 const run = promisify(execFile);
 
@@ -74,6 +74,22 @@ test("remoteUploadFile writes a confined new file and never overwrites", async (
   assert.ok("error" in await remoteUploadFile(d, "testhost", root, "sub/new file.txt", Buffer.from("replace")));
   assert.equal((await readdir(join(root, "sub"))).some((name) => name.startsWith(".qiyan-upload-")), false);
   assert.ok("error" in await remoteUploadFile(d, "testhost", root, "../escape.txt", Buffer.from("escape")));
+});
+
+test("remoteCreateEntry creates confined empty files and directories without overwriting", async () => {
+  const d = await deps();
+  const root = await mkdtemp(join(tmpdir(), "qiyan-rcreate-"));
+  await mkdir(join(root, "sub"));
+  assert.deepEqual(await remoteCreateEntry(d, "testhost", root, "sub/new.txt", "file"), {
+    ok: true, path: "sub/new.txt",
+  });
+  assert.equal(await readFile(join(root, "sub/new.txt"), "utf8"), "");
+  assert.deepEqual(await remoteCreateEntry(d, "testhost", root, "sub/new-dir", "dir"), {
+    ok: true, path: "sub/new-dir",
+  });
+  assert.equal((await stat(join(root, "sub/new-dir"))).isDirectory(), true);
+  assert.ok("error" in await remoteCreateEntry(d, "testhost", root, "sub/new.txt", "file"));
+  assert.ok("error" in await remoteCreateEntry(d, "testhost", root, "../escape", "dir"));
 });
 
 test("remote git status/diff/stage lifecycle + diff escape refused", async () => {
