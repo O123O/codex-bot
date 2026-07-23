@@ -12,7 +12,7 @@ import { browse, browseReadablePath, confine, createEntry, resolvePath, uploadCo
 import { cleanupUploads, storeUpload, type WebUploadsConfig } from "./web-uploads.ts";
 import { runCommand } from "./web-exec.ts";
 import { discoverRepos, gitCommit, gitDiff, gitStage, gitStatus, gitUnstage } from "./web-git.ts";
-import { remoteBrowse, remoteCreateEntry, remoteDiscover, remoteGitCommit, remoteGitDiff, remoteGitStage, remoteGitStatus, remoteGitUnstage, remoteReadStream, remoteUploadFile, type RemoteDeps } from "./web-remote.ts";
+import { remoteBrowse, remoteCreateEntry, remoteDiscover, remoteGitCommit, remoteGitDiff, remoteGitStage, remoteGitStatus, remoteGitUnstage, remoteReadStream, remoteRunCommand, remoteUploadFile, type RemoteDeps } from "./web-remote.ts";
 import type { WebGoalControlInput, WebGoalControlResult } from "./web-goal-control.ts";
 
 const AUTH_COOKIE = "qiyan_web_token";
@@ -387,15 +387,23 @@ export function createWebServer(options: WebServerOptions): WebServer {
       json(response, "error" in result ? 400 : 201, result);
       return;
     }
-    // Run a one-shot shell command in a LOCAL session's project dir (the `!` command).
+    // Run a one-shot shell command in a session's project dir (the `!` command).
     if (request.method === "POST" && url.pathname === "/api/exec") {
       const body = await readJson(request);
       if (!body) { json(response, 400, { error: "invalid json" }); return; }
       const { session, command } = body as { session?: string; command?: string };
-      const cwd = typeof session === "string" ? options.files.projectDir(session) : undefined;
-      if (!cwd) { json(response, 400, { error: "not a local session" }); return; }
+      const target = typeof session === "string" ? options.files.fileTarget(session) : undefined;
+      if (!target) { json(response, 400, { error: "unknown session" }); return; }
       if (typeof command !== "string" || !command.trim()) { json(response, 400, { error: "command required" }); return; }
-      json(response, 200, await runCommand(cwd, command, { maxBytes: 256 * 1024, timeoutMs: 30_000 }));
+      if (target.transport === "remote" && (!target.host || !remote)) {
+        json(response, 400, { error: "remote host not connected" });
+        return;
+      }
+      const execOptions = { maxBytes: 256 * 1024, timeoutMs: 30_000 };
+      const result = target.transport === "remote"
+        ? await remoteRunCommand(remote!, target.host!, target.projectDir, command, execOptions)
+        : await runCommand(target.projectDir, command, execOptions);
+      json(response, 200, result);
       return;
     }
     // Git source control. Repos are tracked MANUALLY by the client (a worker's cwd may not be a repo,

@@ -414,6 +414,13 @@ test("dispatches a remote session's files over ssh (browse + raw stream + upload
       body: JSON.stringify({ op: "mkfile", session: "rworker", path: "empty.txt" }),
     });
     assert.equal(duplicate.status, 400);
+    const executed = await (await fetch(`${base}/api/exec?token=${TOKEN}`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ session: "rworker", command: "printf 'remote command\\n'; pwd" }),
+    })).json();
+    assert.equal(executed.exitCode, 0);
+    assert.match(executed.stdout, /remote command/);
+    assert.match(executed.stdout, new RegExp(`${remoteRoot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "m"));
     assert.equal(await (await fetch(`${base}/api/raw?session=rworker&path=r.txt&token=${TOKEN}`)).text(), "remote-bytes\n");
     // Owner-only preview streams ANY readable file over ssh (NOT confined to the project root): an
     // absolute path outside the root is served as-is.

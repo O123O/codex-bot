@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
-import { remoteBrowse, remoteCreateEntry, remoteDiscover, remoteGitDiff, remoteGitStage, remoteGitStatus, remoteReadStream, remoteUploadFile, type RemoteDeps } from "../../src/webui/web-remote.ts";
+import { remoteBrowse, remoteCreateEntry, remoteDiscover, remoteGitDiff, remoteGitStage, remoteGitStatus, remoteReadStream, remoteRunCommand, remoteUploadFile, type RemoteDeps } from "../../src/webui/web-remote.ts";
 
 const run = promisify(execFile);
 
@@ -16,6 +16,7 @@ async function deps(): Promise<RemoteDeps> {
   const ssh = join(dir, "ssh");
   await writeFile(ssh, `#!/bin/bash
 if [ "$1" = "-G" ]; then printf 'hostname localhost\\nuser u\\nport 22\\ncontrolmaster no\\n'; exit 0; fi
+case " $* " in *" -T "*) : ;; *) exit 98 ;; esac
 cmd="\${@: -1}"        # last arg is the remote command string (exec bash -c '<script>')
 exec bash -c "$cmd"
 `, { mode: 0o755 });
@@ -28,6 +29,22 @@ async function collect(child: { stdout: NodeJS.ReadableStream; on: (e: string, c
     child.stdout.on("data", (b: unknown) => { text += String(b); });
     (child as { on: (e: string, cb: (c: number | null) => void) => void }).on("close", (code) => resolve({ text, code }));
   });
+}
+
+async function assertProcessStopped(pid: number, startTime: string): Promise<void> {
+  const deadline = Date.now() + 1_000;
+  while (Date.now() < deadline) {
+    let statLine: string;
+    try { statLine = await readFile(`/proc/${pid}/stat`, "utf8"); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+      throw error;
+    }
+    const fields = statLine.slice(statLine.lastIndexOf(") ") + 2).split(" ");
+    if (fields[19] !== startTime || fields[0] === "Z") return;
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  }
+  assert.fail(`process ${pid} remained live after remote command cleanup`);
 }
 
 test("remoteBrowse lists a confined dir and rejects escapes", async () => {
@@ -90,6 +107,66 @@ test("remoteCreateEntry creates confined empty files and directories without ove
   assert.equal((await stat(join(root, "sub/new-dir"))).isDirectory(), true);
   assert.ok("error" in await remoteCreateEntry(d, "testhost", root, "sub/new.txt", "file"));
   assert.ok("error" in await remoteCreateEntry(d, "testhost", root, "../escape", "dir"));
+});
+
+test("remoteRunCommand runs a bounded one-shot command in the remote project", async () => {
+  const d = await deps();
+  const root = await mkdtemp(join(tmpdir(), "qiyan-rexec-"));
+  const ok = await remoteRunCommand(d, "testhost", root, "printf 'remote ok\\n'; pwd", {
+    maxBytes: 4096, timeoutMs: 5_000,
+  });
+  assert.equal(ok.exitCode, 0);
+  assert.match(ok.stdout, /remote ok/);
+  assert.match(ok.stdout, new RegExp(`${root.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "m"));
+  const nonzero = await remoteRunCommand(d, "testhost", root, "printf 'bad\\n' >&2; exit 7", {
+    maxBytes: 4096, timeoutMs: 5_000,
+  });
+  assert.equal(nonzero.exitCode, 7);
+  assert.match(nonzero.stderr, /bad/);
+  const reservedLookingExit = await remoteRunCommand(d, "testhost", root, "exit 6", {
+    maxBytes: 4096, timeoutMs: 5_000,
+  });
+  assert.equal(reservedLookingExit.exitCode, 6);
+  assert.equal(reservedLookingExit.error, undefined);
+  const sshReservedExit = await remoteRunCommand(d, "testhost", root, "exit 255", {
+    maxBytes: 4096, timeoutMs: 5_000,
+  });
+  assert.equal(sshReservedExit.exitCode, 255);
+  assert.equal(sshReservedExit.error, undefined);
+  assert.equal((await remoteRunCommand(d, "testhost", root, "vim x", {
+    maxBytes: 4096, timeoutMs: 5_000,
+  })).error, "blocked");
+  const noninteractive = await remoteRunCommand(
+    d,
+    "testhost",
+    root,
+    "printf '%s' \"$PAGER,$SYSTEMD_PAGER,$MANPAGER,$GIT_TERMINAL_PROMPT,$GCM_INTERACTIVE,$SSH_ASKPASS_REQUIRE\"",
+    { maxBytes: 4096, timeoutMs: 5_000 },
+  );
+  assert.equal(noninteractive.stdout, "cat,cat,cat,0,Never,force");
+  const timedOut = await remoteRunCommand(d, "testhost", root, "trap '' TERM; sleep 30 & pid=$!; awk '{print $1, $22}' /proc/$pid/stat; wait", {
+    maxBytes: 4096, timeoutMs: 200,
+  });
+  assert.equal(timedOut.timedOut, true);
+  const [timedOutPidRaw, timedOutStart] = timedOut.stdout.trim().split(/\s+/u);
+  const timedOutPid = Number(timedOutPidRaw);
+  assert.ok(Number.isSafeInteger(timedOutPid) && timedOutPid > 1);
+  assert.ok(timedOutStart);
+  await assertProcessStopped(timedOutPid, timedOutStart!);
+  const truncated = await remoteRunCommand(d, "testhost", root, "yes abcdefgh | head -c 100000", {
+    maxBytes: 1024, timeoutMs: 5_000,
+  });
+  assert.equal(truncated.truncated, true);
+  assert.ok(Buffer.byteLength(truncated.stdout) <= 1024);
+  const backgrounded = await remoteRunCommand(d, "testhost", root, "sleep 30 & pid=$!; awk '{print $1, $22}' /proc/$pid/stat", {
+    maxBytes: 4096, timeoutMs: 5_000,
+  });
+  assert.equal(backgrounded.exitCode, 0);
+  const [backgroundPidRaw, backgroundStart] = backgrounded.stdout.trim().split(/\s+/u);
+  const backgroundPid = Number(backgroundPidRaw);
+  assert.ok(Number.isSafeInteger(backgroundPid) && backgroundPid > 1);
+  assert.ok(backgroundStart);
+  await assertProcessStopped(backgroundPid, backgroundStart!);
 });
 
 test("remote git status/diff/stage lifecycle + diff escape refused", async () => {

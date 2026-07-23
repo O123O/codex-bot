@@ -15,9 +15,19 @@ test("reports a non-zero exit code", async () => {
   assert.equal(r.exitCode, 3);
 });
 
-test("blocks interactive/pager commands", async () => {
+test("fast-fails obvious interactive commands without blocking useful one-shot runtimes", async () => {
   const r = await runCommand(tmpdir(), "vim x", { maxBytes: 4096, timeoutMs: 5000 });
   assert.equal(r.error, "blocked");
+  const node = await runCommand(tmpdir(), "node -e \"process.stdout.write('node ok')\"", { maxBytes: 4096, timeoutMs: 5000 });
+  assert.equal(node.exitCode, 0);
+  assert.equal(node.stdout, "node ok");
+});
+
+test("forces pager and credential prompts into noninteractive mode", async () => {
+  const r = await runCommand(tmpdir(), "printf '%s' \"$PAGER,$SYSTEMD_PAGER,$MANPAGER,$GIT_TERMINAL_PROMPT,$GCM_INTERACTIVE,$SSH_ASKPASS_REQUIRE\"", {
+    maxBytes: 4096, timeoutMs: 5000,
+  });
+  assert.equal(r.stdout, "cat,cat,cat,0,Never,force");
 });
 
 test("enforces the timeout (SIGTERM/SIGKILL)", async () => {

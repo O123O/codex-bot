@@ -9,17 +9,37 @@ export interface ExecResult {
   error?: string;
 }
 
-// One-shot commands only — reject interactive/pager programs that would hang without a TTY.
-const BLOCKED = /^\s*(sudo\s+)?(vi|vim|nvim|nano|emacs|less|more|man|top|htop|watch|ssh|telnet|ftp|sftp|python|python3|node|irb|ipython|psql|mysql|sqlite3|ncdu|fzf)\b/;
+export const ONE_SHOT_ENV = {
+  TERM: "dumb",
+  PAGER: "cat",
+  GIT_PAGER: "cat",
+  SYSTEMD_PAGER: "cat",
+  MANPAGER: "cat",
+  GIT_TERMINAL_PROMPT: "0",
+  GCM_INTERACTIVE: "Never",
+  SSH_ASKPASS: "/bin/false",
+  SSH_ASKPASS_REQUIRE: "force",
+} as const;
+
+// Fast UX rejection for obvious editor/pager commands. This is not a security boundary: no TTY,
+// closed stdin, noninteractive environment, timeout, output cap, and process-group cleanup are.
+const BLOCKED = /^\s*(sudo\s+)?(vi|vim|nvim|nano|emacs|less|more|man|top|htop|watch|ncdu|fzf)\b/;
+
+export function rejectOneShotCommand(command: string): ExecResult | undefined {
+  if (command.includes("\0")) return { stdout: "", stderr: "command contains a null byte", exitCode: null, timedOut: false, truncated: false, error: "invalid" };
+  if (BLOCKED.test(command)) return { stdout: "", stderr: "interactive commands aren't supported here", exitCode: null, timedOut: false, truncated: false, error: "blocked" };
+  return undefined;
+}
 
 // Run `command` via `bash -lc` in `cwd`, non-interactively, with an output-byte cap and a timeout that
 // escalates SIGTERM → SIGKILL. Output is not persisted by the caller; this is an ephemeral `!`-command.
 export function runCommand(cwd: string, command: string, opts: { maxBytes: number; timeoutMs: number }): Promise<ExecResult> {
-  if (BLOCKED.test(command)) return Promise.resolve({ stdout: "", stderr: "interactive commands aren't supported here", exitCode: null, timedOut: false, truncated: false, error: "blocked" });
+  const rejected = rejectOneShotCommand(command);
+  if (rejected) return Promise.resolve(rejected);
   return new Promise((resolveResult) => {
     // `detached` makes bash a process-group leader so we can kill the WHOLE group — a backgrounded
     // grandchild (`sleep 300 &`) would otherwise orphan, hold the stdout pipe, and hang the response.
-    const child = spawn("bash", ["-lc", command], { cwd, detached: true, env: { ...process.env, TERM: "dumb", PAGER: "cat", GIT_PAGER: "cat" } });
+    const child = spawn("bash", ["-lc", command], { cwd, detached: true, env: { ...process.env, ...ONE_SHOT_ENV } });
     let stdout = "", stderr = "", size = 0, truncated = false, timedOut = false, settled = false;
     let exitCode: number | null = null, errorMsg: string | undefined;
     const killGroup = (sig: NodeJS.Signals): void => { try { if (child.pid) process.kill(-child.pid, sig); } catch { /* already gone */ } };

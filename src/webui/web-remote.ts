@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { basename, dirname, isAbsolute } from "node:path";
 import { buildSshStreamArgs, parseSshConfig, planSshConnection, type SshConnectionPlan } from "../endpoints/ssh-config.ts";
 import { runBoundedProcess } from "../endpoints/ssh-process.ts";
+import { ONE_SHOT_ENV, rejectOneShotCommand, type ExecResult } from "./web-exec.ts";
 import { validFileName, type WebFilesResult, type WebFileWriteResult } from "./web-files.ts";
 import { parseGitStatus, type GitStatus } from "./web-git.ts";
 
@@ -40,21 +41,64 @@ function guard(root: string, path: string, absolute: boolean): string {
 }
 
 // The login shell only ever runs `exec bash -c '<script>'` — one argv element, sh- or csh-safe.
-const sshArgs = (plan: SshConnectionPlan, script: string): string[] => buildSshStreamArgs(plan, `exec bash -c ${q(script)}`);
+// Insert -T before the host so even a host-level RequestTTY=force cannot make Web UI jobs interactive.
+const sshArgs = (plan: SshConnectionPlan, script: string): string[] => {
+  const args = buildSshStreamArgs(plan, `exec bash -c ${q(script)}`);
+  return [...args.slice(0, -2), "-T", ...args.slice(-2)];
+};
 
-interface RunResult { code: number | null; stdout: string; stderr: string; timedOut: boolean }
-async function run(deps: RemoteDeps, host: string, script: string, opts: { maxBytes: number; timeoutMs: number; input?: Buffer }): Promise<RunResult> {
+interface RunResult { code: number | null; stdout: string; stderr: string; timedOut: boolean; truncated: boolean }
+async function run(
+  deps: RemoteDeps,
+  host: string,
+  script: string,
+  opts: { maxBytes: number; timeoutMs: number; input?: Buffer; killOnLimit?: boolean; supervised?: boolean },
+): Promise<RunResult> {
   const plan = await planFor(deps, host);
   const child = spawn(deps.sshBinary, sshArgs(plan, script), { stdio: ["pipe", "pipe", "pipe"] });
   return new Promise((resolve) => {
-    let stdout = "", stderr = "", size = 0, timedOut = false, done = false;
-    const cap = (buf: Buffer, add: (s: string) => void): void => { if (size >= opts.maxBytes) return; const c = buf.subarray(0, opts.maxBytes - size); size += c.length; add(c.toString("utf8")); };
+    let stdout = "", stderr = "", size = 0, timedOut = false, truncated = false, done = false, stopping = false;
+    let forceTimer: ReturnType<typeof setTimeout> | undefined;
+    const stop = (): void => {
+      if (stopping) return;
+      stopping = true;
+      if (opts.supervised) {
+        // The remote supervisor owns SSH stdin while the command gets /dev/null. EOF asks it to kill
+        // the remote process group; SIGKILL is only a backstop if the channel cannot drain.
+        child.stdin.end();
+        forceTimer = setTimeout(() => child.kill("SIGKILL"), 2_500);
+        forceTimer.unref?.();
+      } else {
+        child.kill("SIGKILL");
+      }
+    };
+    const cap = (buf: Buffer, add: (s: string) => void): void => {
+      if (size >= opts.maxBytes) {
+        truncated = true;
+        if (opts.killOnLimit) stop();
+        return;
+      }
+      const c = buf.subarray(0, opts.maxBytes - size);
+      size += c.length;
+      add(c.toString("utf8"));
+      if (size >= opts.maxBytes) {
+        truncated = true;
+        if (opts.killOnLimit) stop();
+      }
+    };
     child.stdout.on("data", (b: Buffer) => cap(b, (s) => { stdout += s; }));
     child.stderr.on("data", (b: Buffer) => cap(b, (s) => { stderr += s; }));
-    const timer = setTimeout(() => { timedOut = true; child.kill("SIGKILL"); }, opts.timeoutMs);
-    const finish = (code: number | null): void => { if (done) return; done = true; clearTimeout(timer); resolve({ code, stdout, stderr, timedOut }); };
+    const timer = setTimeout(() => { timedOut = true; stop(); }, opts.timeoutMs);
+    const finish = (code: number | null): void => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      if (forceTimer) clearTimeout(forceTimer);
+      child.stdin.destroy();
+      resolve({ code, stdout, stderr, timedOut, truncated });
+    };
     child.stdin.on("error", () => {});
-    child.stdin.end(opts.input);
+    if (!opts.supervised) child.stdin.end(opts.input);
     child.on("close", (code) => finish(code));
     child.on("error", () => finish(null));
   });
@@ -133,6 +177,82 @@ mkdir -- "$target" || { if [ -e "$target" ] || [ -L "$target" ]; then exit 7; fi
   if (result.code === 6) return { error: "destination is not a directory" };
   if (result.code === 7) return { error: "already exists" };
   return { error: remoteError(result, "create failed") };
+}
+
+export async function remoteRunCommand(
+  deps: RemoteDeps,
+  host: string,
+  root: string,
+  command: string,
+  opts: { maxBytes: number; timeoutMs: number },
+): Promise<ExecResult> {
+  const rejected = rejectOneShotCommand(command);
+  if (rejected) return rejected;
+  const environment = Object.entries(ONE_SHOT_ENV).map(([name, value]) => `export ${name}=${q(value)}`).join("\n");
+  const completionNonce = randomUUID();
+  // The held SSH channel normally stops the remote group first. This remote-side deadline is the
+  // backstop when a broken transport cannot deliver EOF; it intentionally trails the local deadline.
+  const remoteDeadlineSeconds = ((opts.timeoutMs + 3_000) / 1_000).toFixed(3);
+  const script = `${guard(root, ".", false)}
+[ -d "$t" ] || { printf 'project directory not found\\n' >&2; exit 125; }
+cd -- "$t" || { printf 'project directory not accessible\\n' >&2; exit 125; }
+${environment}
+command -v setsid >/dev/null 2>&1 || { printf 'remote process supervision unavailable\\n' >&2; exit 126; }
+exec 3<&0
+cmd_pid=
+watch_pid=
+cleanup_group() {
+  [ -n "$cmd_pid" ] || return
+  kill -TERM -- "-$cmd_pid" 2>/dev/null || :
+  n=0
+  while kill -0 -- "-$cmd_pid" 2>/dev/null && [ "$n" -lt 20 ]; do
+    sleep 0.1
+    n=$((n + 1))
+  done
+  kill -KILL -- "-$cmd_pid" 2>/dev/null || :
+}
+shutdown() {
+  trap - HUP INT TERM
+  cleanup_group
+  exit 143
+}
+trap shutdown HUP INT TERM
+setsid bash -lc ${q(command)} </dev/null 3<&- &
+cmd_pid=$!
+(
+  IFS= read -r -t ${remoteDeadlineSeconds} _ <&3 || :
+  kill -TERM "$$" 2>/dev/null || :
+) &
+watch_pid=$!
+wait "$cmd_pid"
+status=$?
+cleanup_group
+kill "$watch_pid" 2>/dev/null || :
+wait "$watch_pid" 2>/dev/null || :
+exec 3<&-
+trap - HUP INT TERM
+printf '\\036qiyan-exec:%s:%s\\037' ${q(completionNonce)} "$status" >&2
+exit 0`;
+  const result = await run(deps, host, script, { ...opts, killOnLimit: true, supervised: true });
+  const prefix = `\u001eqiyan-exec:${completionNonce}:`;
+  const markerStart = result.stderr.lastIndexOf(prefix);
+  const markerEnd = markerStart < 0 ? -1 : result.stderr.indexOf("\u001f", markerStart + prefix.length);
+  const rawStatus = markerEnd < 0 ? "" : result.stderr.slice(markerStart + prefix.length, markerEnd);
+  const completed = /^\d{1,3}$/u.test(rawStatus) && Number(rawStatus) <= 255;
+  const stderr = completed
+    ? result.stderr.slice(0, markerStart) + result.stderr.slice(markerEnd + 1)
+    : result.stderr;
+  const error = !completed && !result.timedOut && !result.truncated
+    ? remoteError(result, "remote command failed")
+    : undefined;
+  return {
+    stdout: result.stdout,
+    stderr,
+    exitCode: completed ? Number(rawStatus) : result.timedOut || result.truncated ? null : result.code,
+    timedOut: result.timedOut,
+    truncated: result.truncated,
+    ...(error ? { error } : {}),
+  };
 }
 
 // --- Streaming read (for /api/raw) ---

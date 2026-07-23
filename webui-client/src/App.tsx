@@ -657,7 +657,7 @@ export function App() {
   };
 
   // `!cmd` in a worker tab runs a one-shot shell command in that worker's project dir; the output is an
-  // ephemeral card (not persisted). Only local workers have a cwd.
+  // ephemeral card (not persisted).
   const runExec = async (cmd: string) => {
     if (!cmd || !selected) return;
     stickRef.current = true;
